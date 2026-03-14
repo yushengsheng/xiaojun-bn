@@ -26,7 +26,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller requests eth-account eth-utils
+          pip install pyinstaller pyinstaller-hooks-contrib requests eth-account eth-utils eth-abi eth-keyfile eth-keys eth-hash[pycryptodome] hexbytes rlp parsimonious cytoolz
 
       - name: Prepare entry script
         shell: pwsh
@@ -36,7 +36,28 @@ jobs:
       - name: Build EXE (onefile, windowed, no console)
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name xiaojun-bn --collect-submodules eth_account --collect-submodules eth_utils app_entry.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name xiaojun-bn `
+            --hidden-import page_onchain `
+            --hidden-import api_clients `
+            --hidden-import app_paths `
+            --hidden-import core_models `
+            --hidden-import shared_utils `
+            --hidden-import stores `
+            --hidden-import secret_box `
+            --hidden-import table_import_utils `
+            --hidden-import task_progress `
+            --hidden-import ui_dialogs `
+            --collect-all eth_account `
+            --collect-all eth_utils `
+            --collect-all eth_abi `
+            --collect-all eth_keyfile `
+            --collect-all eth_keys `
+            --collect-all eth_hash `
+            --collect-all hexbytes `
+            --collect-all rlp `
+            --collect-all parsimonious `
+            --collect-all cytoolz `
+            app_entry.py
 
       - name: Package release assets
         shell: pwsh
