@@ -33,44 +33,57 @@ jobs:
         run: |
           Copy-Item "小军bn.py" "app_entry.py" -Force
 
-      - name: Build EXE (onefile, windowed, no console)
+      - name: Build Windows packages (onefile + portable onedir)
         shell: pwsh
         run: |
           $appName = "xiaojun-bn-${{ github.ref_name }}-windows-x64"
-          pyinstaller --noconfirm --clean --onefile --windowed --name $appName `
-            --hidden-import page_onchain `
-            --hidden-import api_clients `
-            --hidden-import app_paths `
-            --hidden-import core_models `
-            --hidden-import shared_utils `
-            --hidden-import stores `
-            --hidden-import secret_box `
-            --hidden-import table_import_utils `
-            --hidden-import task_progress `
-            --hidden-import ui_dialogs `
-            --collect-all eth_account `
-            --collect-all eth_utils `
-            --collect-all eth_abi `
-            --collect-all eth_keyfile `
-            --collect-all eth_keys `
-            --collect-all eth_rlp `
-            --collect-all eth_hash `
-            --collect-all hexbytes `
-            --collect-all rlp `
-            --collect-all parsimonious `
-            --collect-all cytoolz `
-            --collect-all bitarray `
-            --collect-all ckzg `
-            app_entry.py
+          $portableName = "xiaojun-bn-${{ github.ref_name }}-windows-x64-portable"
+
+          $commonArgs = @(
+            '--noconfirm',
+            '--clean',
+            '--windowed',
+            '--noupx',
+            '--hidden-import', 'page_onchain',
+            '--hidden-import', 'api_clients',
+            '--hidden-import', 'app_paths',
+            '--hidden-import', 'core_models',
+            '--hidden-import', 'shared_utils',
+            '--hidden-import', 'stores',
+            '--hidden-import', 'secret_box',
+            '--hidden-import', 'table_import_utils',
+            '--hidden-import', 'task_progress',
+            '--hidden-import', 'ui_dialogs',
+            '--collect-all', 'eth_account',
+            '--collect-all', 'eth_utils',
+            '--collect-all', 'eth_abi',
+            '--collect-all', 'eth_keyfile',
+            '--collect-all', 'eth_keys',
+            '--collect-all', 'eth_rlp',
+            '--collect-all', 'eth_hash',
+            '--collect-all', 'hexbytes',
+            '--collect-all', 'rlp',
+            '--collect-all', 'parsimonious',
+            '--collect-all', 'cytoolz',
+            '--collect-all', 'bitarray',
+            '--collect-all', 'ckzg'
+          )
+
+          pyinstaller --onefile --name $appName @commonArgs app_entry.py
+          pyinstaller --onedir --name $portableName @commonArgs app_entry.py
 
       - name: Package release assets
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release -Force | Out-Null
           $exeName = "xiaojun-bn-${{ github.ref_name }}-windows-x64.exe"
-          $zipName = "xiaojun-bn-${{ github.ref_name }}-windows-x64.zip"
+          $exeZipName = "xiaojun-bn-${{ github.ref_name }}-windows-x64.zip"
+          $portableName = "xiaojun-bn-${{ github.ref_name }}-windows-x64-portable"
+          $portableZipName = "xiaojun-bn-${{ github.ref_name }}-windows-x64-portable.zip"
+
           Copy-Item "dist/$exeName" "release/$exeName"
-          Compress-Archive -Path "release/$exeName" -DestinationPath "release/$zipName" -Force
+          Compress-Archive -Path "release/$exeName" -DestinationPath "release/$exeZipName" -Force
+          Compress-Archive -Path "dist/$portableName/*" -DestinationPath "release/$portableZipName" -Force
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
