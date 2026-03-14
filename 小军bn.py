@@ -2,6 +2,7 @@ import time
 import hmac
 import hashlib
 import logging
+import ipaddress
 from typing import Dict, Any, Optional
 from urllib.parse import urlencode
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -17,6 +18,13 @@ import re
 import requests
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+
+try:
+    from page_onchain import OnchainTransferPage
+    _ONCHAIN_IMPORT_ERROR = None
+except Exception as e:
+    OnchainTransferPage = None
+    _ONCHAIN_IMPORT_ERROR = e
 
 # ====================== 默认配置 ======================
 API_KEY_DEFAULT = ""
@@ -694,13 +702,20 @@ class Strategy:
     def run(self, stop_event, progress_cb=None):
         total_steps = self.spot_rounds if self.spot_rounds > 0 else 1
         step = 0
+        withdraw_amount = 0.0
+        withdraw_error = ""
+        withdraw_attempted = False
 
         self.ensure_base_sold()
 
         for i in range(self.spot_rounds):
             if stop_event and stop_event.is_set():
                 logger.info("检测到停止信号，停止后续执行（现货阶段）")
-                return
+                return {
+                    "withdraw_amount": withdraw_amount,
+                    "withdraw_error": withdraw_error,
+                    "withdraw_attempted": withdraw_attempted,
+                }
 
             self.ensure_base_sold()
             logger.info("--- 现货轮 %d/%d 开始 ---", i + 1, self.spot_rounds)
@@ -728,23 +743,34 @@ class Strategy:
 
         if stop_event and stop_event.is_set():
             logger.info("检测到停止信号，跳过最终提现")
-            return
+            return {
+                "withdraw_amount": withdraw_amount,
+                "withdraw_error": withdraw_error,
+                "withdraw_attempted": withdraw_attempted,
+            }
 
         logger.info(f"开始最终提现所有 {self.withdraw_coin}")
+        withdraw_attempted = True
         try:
-            amount = self.c.withdraw_all_coin(
+            withdraw_amount = self.c.withdraw_all_coin(
                 coin=self.withdraw_coin,
                 address=self.withdraw_address,
                 network=self.withdraw_network,
                 fee_buffer=self.withdraw_fee_buffer,
                 enable_withdraw=self.enable_withdraw,
             )
-            if amount > 0 and self.withdraw_callback:
-                self.withdraw_callback(amount)
+            if self.withdraw_callback:
+                self.withdraw_callback(withdraw_amount)
         except Exception as e:
+            withdraw_error = str(e)
             logger.error(f"提现阶段异常: {e}")
 
         logger.info("策略执行完毕")
+        return {
+            "withdraw_amount": withdraw_amount,
+            "withdraw_error": withdraw_error,
+            "withdraw_attempted": withdraw_attempted,
+        }
 
 
 # ====================== GUI 应用 ======================
@@ -766,13 +792,21 @@ class App(tk.Tk):
         self.update_ip()
 
     def _build_ui(self):
-        frame_ip = ttk.Frame(self)
+        self.main_tabs = ttk.Notebook(self)
+        self.main_tabs.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self.exchange_tab = ttk.Frame(self.main_tabs)
+        self.onchain_tab = ttk.Frame(self.main_tabs)
+        self.main_tabs.add(self.exchange_tab, text="交易所批量")
+        self.main_tabs.add(self.onchain_tab, text="链上")
+
+        frame_ip = ttk.Frame(self.exchange_tab)
         frame_ip.pack(fill="x", padx=10, pady=3)
         ttk.Label(frame_ip, text="本机公网 IP：").pack(side="left")
         self.ip_var = tk.StringVar(value="获取中...")
         ttk.Label(frame_ip, textvariable=self.ip_var).pack(side="left")
 
-        frame_top = ttk.LabelFrame(self, text="策略配置（单账号 & 批量共享）")
+        frame_top = ttk.LabelFrame(self.exchange_tab, text="策略配置（单账号 & 批量共享）")
         frame_top.pack(fill="x", padx=10, pady=5)
 
         ttk.Label(frame_top, text="API KEY:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
@@ -842,7 +876,7 @@ class App(tk.Tk):
         self.usdt_timeout_var = tk.IntVar(value=30)
         ttk.Entry(frame_top, textvariable=self.usdt_timeout_var, width=8).grid(row=3, column=5, padx=5)
 
-        frame_mid = ttk.LabelFrame(self, text="单账号控制 & 状态")
+        frame_mid = ttk.LabelFrame(self.exchange_tab, text="单账号控制 & 状态")
         frame_mid.pack(fill="x", padx=10, pady=5)
 
         self.btn_start = ttk.Button(frame_mid, text="开始运行（当前 API）", command=self.start_bot)
@@ -869,7 +903,7 @@ class App(tk.Tk):
         self.status_var = tk.StringVar(value="状态：空闲")
         ttk.Label(frame_mid, textvariable=self.status_var).grid(row=3, column=0, columnspan=6, sticky="w", padx=5, pady=2)
 
-        frame_acc = ttk.LabelFrame(self, text="账号列表管理（批量 API + 提现地址）")
+        frame_acc = ttk.LabelFrame(self.exchange_tab, text="账号列表管理（批量 API + 提现地址）")
         frame_acc.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.acc_api_key_var = tk.StringVar()
@@ -910,11 +944,11 @@ class App(tk.Tk):
         ttk.Label(header, text="网络", width=8).pack(side="left", padx=2)
         ttk.Label(header, text="状态", width=30).pack(side="left", padx=2)
 
-        frame_list_canvas = ttk.Frame(frame_acc)
-        frame_list_canvas.pack(fill="both", expand=True, padx=5, pady=2)
+        self.frame_list_canvas = ttk.Frame(frame_acc)
+        self.frame_list_canvas.pack(fill="both", expand=True, padx=5, pady=2)
 
-        self.canvas = tk.Canvas(frame_list_canvas, height=190, bg="#f0f0f0")
-        self.scrollbar = ttk.Scrollbar(frame_list_canvas, orient="vertical", command=self.canvas.yview)
+        self.canvas = tk.Canvas(self.frame_list_canvas, height=190, bg="#f0f0f0")
+        self.scrollbar = ttk.Scrollbar(self.frame_list_canvas, orient="vertical", command=self.canvas.yview)
 
         self.accounts_container = ttk.Frame(self.canvas)
 
@@ -928,6 +962,7 @@ class App(tk.Tk):
 
         self.canvas.pack(side="left", fill="both", expand=True)
         self.scrollbar.pack(side="right", fill="y")
+        self._setup_account_list_mousewheel_bindings()
 
         frame_batch_ctrl = ttk.Frame(frame_acc)
         frame_batch_ctrl.pack(fill="x", padx=5, pady=5)
@@ -967,31 +1002,34 @@ class App(tk.Tk):
         self.skip_usdt_wait_in_batch_var = tk.BooleanVar(value=False)
         self.batch_sell_large_spot_to_bnb_var = tk.BooleanVar(value=False)
 
+        frame_batch_opts = ttk.Frame(frame_acc)
+        frame_batch_opts.pack(fill="x", padx=5, pady=(0, 5))
+
         ttk.Checkbutton(
-            frame_batch_ctrl,
+            frame_batch_opts,
             text="批量查询总资产（只运行这个功能）",
             variable=self.batch_total_asset_only_var
-        ).pack(side="left", padx=8)
+        ).pack(side="left", padx=(0, 12))
 
         ttk.Checkbutton(
-            frame_batch_ctrl,
+            frame_batch_opts,
             text="批量归集BNB模式",
             variable=self.batch_collect_bnb_mode_var
-        ).pack(side="left", padx=8)
+        ).pack(side="left", padx=(0, 12))
 
         ttk.Checkbutton(
-            frame_batch_ctrl,
+            frame_batch_opts,
             text="批量策略跳过USDT检测",
             variable=self.skip_usdt_wait_in_batch_var
-        ).pack(side="left", padx=8)
+        ).pack(side="left", padx=(0, 12))
 
         ttk.Checkbutton(
-            frame_batch_ctrl,
+            frame_batch_opts,
             text="归集BNB模式下：卖大额币买BNB",
             variable=self.batch_sell_large_spot_to_bnb_var
-        ).pack(side="left", padx=8)
+        ).pack(side="left", padx=(0, 12))
 
-        frame_log = ttk.LabelFrame(self, text="运行日志")
+        frame_log = ttk.LabelFrame(self.exchange_tab, text="运行日志")
         frame_log.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.text_log = tk.Text(frame_log, wrap="word", height=10, state="disabled")
@@ -1001,11 +1039,89 @@ class App(tk.Tk):
         scrollbar_log.pack(side="right", fill="y")
         self.text_log["yscrollcommand"] = scrollbar_log.set
 
+        onchain_shell = ttk.Frame(self.onchain_tab)
+        onchain_shell.pack(fill="both", expand=True)
+        onchain_intro = ttk.LabelFrame(onchain_shell, text="链上模块")
+        onchain_intro.pack(fill="x", padx=10, pady=(8, 6))
+        ttk.Label(onchain_intro, text="该页面为独立链上批量转账模块，与交易所批量页面配置互不影响。", foreground="#666").pack(
+            anchor="w", padx=8, pady=(6, 6)
+        )
+
+        onchain_body = ttk.Frame(onchain_shell)
+        onchain_body.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+
+        if OnchainTransferPage is not None:
+            try:
+                self.onchain_page = OnchainTransferPage(onchain_body)
+            except Exception as exc:
+                self.onchain_page = None
+                logger.exception("链上页面初始化失败: %s", exc)
+                fail_box = ttk.LabelFrame(onchain_body, text="链上模块加载失败")
+                fail_box.pack(fill="both", expand=True, padx=12, pady=12)
+                ttk.Label(fail_box, text=f"链上页面加载失败：{exc}").pack(anchor="w", padx=8, pady=(8, 4))
+                ttk.Label(fail_box, text="请检查运行依赖：eth-account、eth-utils").pack(anchor="w", padx=8, pady=(0, 8))
+        else:
+            self.onchain_page = None
+            fail_box = ttk.LabelFrame(onchain_body, text="链上模块加载失败")
+            fail_box.pack(fill="both", expand=True, padx=12, pady=12)
+            ttk.Label(fail_box, text=f"链上页面导入失败：{_ONCHAIN_IMPORT_ERROR}").pack(anchor="w", padx=8, pady=(8, 4))
+            ttk.Label(fail_box, text="请检查运行依赖：eth-account、eth-utils").pack(anchor="w", padx=8, pady=(0, 8))
+
         # 快捷键：Ctrl+V / Cmd+V 直接触发“从剪贴板导入账号”
         self.bind_all("<Control-v>", self._on_paste_shortcut, add="+")
         self.bind_all("<Control-V>", self._on_paste_shortcut, add="+")
         self.bind_all("<Command-v>", self._on_paste_shortcut, add="+")
         self.bind_all("<Command-V>", self._on_paste_shortcut, add="+")
+
+    def _setup_account_list_mousewheel_bindings(self):
+        # 账号列表区域内，鼠标滚轮可直接滚动，无需命中右侧滚动条
+        self.bind_all("<MouseWheel>", self._on_account_list_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_account_list_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_account_list_mousewheel, add="+")
+
+    def _pointer_in_account_list(self):
+        frame = getattr(self, "frame_list_canvas", None)
+        if frame is None or not frame.winfo_exists():
+            return False
+        try:
+            x = self.winfo_pointerx()
+            y = self.winfo_pointery()
+            left = frame.winfo_rootx()
+            top = frame.winfo_rooty()
+            right = left + frame.winfo_width()
+            bottom = top + frame.winfo_height()
+            return left <= x <= right and top <= y <= bottom
+        except Exception:
+            return False
+
+    def _on_account_list_mousewheel(self, event=None):
+        if not self._pointer_in_account_list():
+            return None
+        if not hasattr(self, "canvas"):
+            return None
+
+        units = 0
+        num = getattr(event, "num", None)
+        if num == 4:
+            units = -1
+        elif num == 5:
+            units = 1
+        else:
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta != 0:
+                if sys.platform == "darwin":
+                    units = -1 if delta > 0 else 1
+                else:
+                    units = -int(delta / 120) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+
+        if units == 0:
+            return None
+
+        try:
+            self.canvas.yview_scroll(units, "units")
+            return "break"
+        except Exception:
+            return None
 
     def random_sleep(self, min_ms, max_ms):
         if max_ms < min_ms:
@@ -1159,13 +1275,31 @@ class App(tk.Tk):
             logger.error("导出总资产 CSV 失败: %s", e)
             messagebox.showerror("错误", "导出总资产 CSV 失败: %s" % e)
 
+    @staticmethod
+    def _fetch_public_ip() -> str:
+        urls = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "https://ipinfo.io/ip",
+        ]
+        headers = {"User-Agent": "Mozilla/5.0"}
+        for url in urls:
+            try:
+                r = requests.get(url, headers=headers, timeout=6)
+                r.raise_for_status()
+                ip = (r.text or "").strip()
+                ipaddress.ip_address(ip)
+                return ip
+            except Exception:
+                continue
+        raise RuntimeError("网络不可达或 IP 服务异常")
+
     def update_ip(self):
         def worker():
             try:
-                r = requests.get("https://api.ipify.org", timeout=5)
-                ip = r.text.strip()
+                ip = self._fetch_public_ip()
             except Exception as e:
-                ip = "获取失败: %s" % type(e).__name__
+                ip = "获取失败: %s" % str(e)
 
             def _update():
                 self.ip_var.set(ip)
@@ -1304,7 +1438,8 @@ class App(tk.Tk):
             self.random_sleep(min_delay, max_delay)
 
         def withdraw_callback(amount, idx=1, api_key=key, address=withdraw_address):
-            self.record_withdraw(idx, api_key, address, amount)
+            if amount > 0:
+                self.record_withdraw(idx, api_key, address, amount)
 
         strategy = Strategy(
             client=self.client,
@@ -1440,10 +1575,68 @@ class App(tk.Tk):
             if "network_var" in acc:
                 acc["network_var"].set(net)
 
+    @staticmethod
+    def _account_row_color_by_status(status_text: str) -> str:
+        s = str(status_text or "").strip()
+        if not s or s == "就绪":
+            return "#f2f2f2"
+        if "未到账" in s:
+            return "#ffe3b8"
+        if any(k in s for k in ("失败", "异常")):
+            return "#f8c7c7"
+        if any(k in s for k in ("成功", "完成", "总资产", "无可提", "提现额度")):
+            return "#cfeecf"
+        return "#cfe3ff"
+
+    def _apply_account_row_style(self, acc: dict):
+        bg = self._account_row_color_by_status(acc.get("status_var").get())
+        row_frame = acc.get("frame")
+        if row_frame is not None:
+            try:
+                row_frame.configure(bg=bg)
+            except Exception:
+                pass
+        for widget in acc.get("row_widgets", []):
+            try:
+                widget.configure(bg=bg)
+            except Exception:
+                pass
+            try:
+                widget.configure(activebackground=bg)
+            except Exception:
+                pass
+
+    def _set_account_status(self, acc: dict, text: str):
+        acc["status_var"].set(str(text))
+        self._apply_account_row_style(acc)
+
+    @staticmethod
+    def _format_amount(value: float, precision: int = 8) -> str:
+        text = f"{float(value):.{precision}f}" if value is not None else "0"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text if text else "0"
+
+    @classmethod
+    def _format_withdraw_amount_status(cls, amount: float, coin: str, *, enable_withdraw: bool) -> str:
+        coin_u = str(coin or "").strip().upper()
+        if amount > 0:
+            return f"提现额度 {cls._format_amount(amount)} {coin_u}"
+        if not enable_withdraw:
+            return f"提现额度 0 {coin_u}（自动提现已关闭）"
+        return f"提现额度 0 {coin_u}（可提余额不足/预留过高）"
+
+    @staticmethod
+    def _compact_error_text(err_text: str, max_len: int = 28) -> str:
+        s = str(err_text or "").strip().replace("\n", " ")
+        if not s:
+            return "未知错误"
+        return s if len(s) <= max_len else (s[: max_len - 1] + "…")
+
     def _append_account_row(self, key, secret, addr, net, selected=True):
         net = (net or "").strip() or WITHDRAW_NETWORK_DEFAULT
 
-        row_frame = ttk.Frame(self.accounts_container)
+        row_frame = tk.Frame(self.accounts_container, bg="#f7f7f7")
         row_frame.pack(fill="x", padx=2, pady=1)
 
         index_var = tk.StringVar()
@@ -1451,15 +1644,27 @@ class App(tk.Tk):
         network_var = tk.StringVar(value=net)
         status_var = tk.StringVar(value="就绪")
 
-        ttk.Label(row_frame, textvariable=index_var, width=4).pack(side="left", padx=2)
-        ttk.Checkbutton(row_frame, variable=selected_var).pack(side="left", padx=2)
-        ttk.Label(row_frame, text=self._mask_key(key), width=25).pack(side="left", padx=2)
-        ttk.Label(row_frame, text=self._mask_addr(addr), width=35).pack(side="left", padx=2)
-        ttk.Label(row_frame, textvariable=network_var, width=8).pack(side="left", padx=2)
-        ttk.Label(row_frame, textvariable=status_var, width=30).pack(side="left", padx=2)
+        lbl_index = tk.Label(row_frame, textvariable=index_var, width=4, anchor="w", bg="#f7f7f7")
+        chk_selected = tk.Checkbutton(
+            row_frame,
+            variable=selected_var,
+            bg="#f7f7f7",
+            activebackground="#f7f7f7",
+            bd=0,
+            highlightthickness=0,
+            relief="flat",
+        )
+        lbl_key = tk.Label(row_frame, text=self._mask_key(key), width=25, anchor="w", bg="#f7f7f7")
+        lbl_addr = tk.Label(row_frame, text=self._mask_addr(addr), width=35, anchor="w", bg="#f7f7f7")
+        lbl_net = tk.Label(row_frame, textvariable=network_var, width=8, anchor="w", bg="#f7f7f7")
+        lbl_status = tk.Label(row_frame, textvariable=status_var, width=30, anchor="w", bg="#f7f7f7")
+
+        for w in (lbl_index, chk_selected, lbl_key, lbl_addr, lbl_net, lbl_status):
+            w.pack(side="left", padx=2)
 
         acc = {
             "frame": row_frame,
+            "row_widgets": [lbl_index, chk_selected, lbl_key, lbl_addr, lbl_net, lbl_status],
             "index_var": index_var,
             "selected_var": selected_var,
             "network_var": network_var,
@@ -1469,6 +1674,7 @@ class App(tk.Tk):
             "address": addr,
             "network": net,
         }
+        self._apply_account_row_style(acc)
         self.accounts.append(acc)
         return acc
 
@@ -1651,12 +1857,12 @@ class App(tk.Tk):
 
                 def set_status(text, acc_ref=acc):
                     def _u():
-                        acc_ref["status_var"].set(text)
+                        self._set_account_status(acc_ref, text)
                     self.after(0, _u)
 
                 def progress_cb(step, total, text, acc_obj=acc):
                     def _u():
-                        acc_obj["status_var"].set(text)
+                        self._set_account_status(acc_obj, text)
                     self.after(0, _u)
 
                 logger.info(f"[线程 {thread_id}] 开始处理账号 #{idx}")
@@ -1769,9 +1975,7 @@ class App(tk.Tk):
                             )
                             if amount > 0:
                                 self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
-                                set_status(f"BNB提现成功 {amount:.4f}")
-                            else:
-                                set_status("无可提BNB")
+                            set_status(self._format_withdraw_amount_status(amount, "BNB", enable_withdraw=enable_withdraw))
                         except Exception as e:
                             logger.error(f"账号 #{idx} BNB提现失败: {e}")
                             set_status("BNB提现失败")
@@ -1801,12 +2005,21 @@ class App(tk.Tk):
                                 return
                             self.random_sleep(min_delay, max_delay)
 
-                        def withdraw_callback(amount, idx_local=idx, api_key=acc["api_key"], address=acc["address"]):
-                            self.record_withdraw(idx_local, api_key, address, amount)
+                        withdraw_state = {"amount": None}
 
-                            def _u():
-                                acc["status_var"].set(f"提现成功 {amount:.4f}")
-                            self.after(0, _u)
+                        def withdraw_callback(
+                            amount,
+                            idx_local=idx,
+                            api_key=acc["api_key"],
+                            address=acc["address"],
+                        ):
+                            try:
+                                amt = float(amount)
+                            except Exception:
+                                amt = 0.0
+                            withdraw_state["amount"] = amt
+                            if amt > 0:
+                                self.record_withdraw(idx_local, api_key, address, amt)
 
                         strategy = Strategy(
                             client=client,
@@ -1822,12 +2035,23 @@ class App(tk.Tk):
                             withdraw_callback=withdraw_callback,
                         )
 
-                        strategy.run(self.stop_event, progress_cb=progress_cb)
+                        strategy_result = strategy.run(self.stop_event, progress_cb=progress_cb)
 
                         if not self.stop_event.is_set():
-                            current_status = acc["status_var"].get()
-                            if "提现成功" not in current_status:
-                                set_status("完成")
+                            callback_amount = withdraw_state.get("amount")
+                            result_amount = float((strategy_result or {}).get("withdraw_amount", 0.0)) if isinstance(strategy_result, dict) else 0.0
+                            final_amount = callback_amount if callback_amount is not None else result_amount
+
+                            if isinstance(strategy_result, dict) and strategy_result.get("withdraw_error") and (final_amount or 0) <= 0:
+                                set_status(f"提现失败 {self._compact_error_text(strategy_result.get('withdraw_error', ''))}")
+                            else:
+                                set_status(
+                                    self._format_withdraw_amount_status(
+                                        float(final_amount or 0.0),
+                                        withdraw_coin,
+                                        enable_withdraw=enable_withdraw,
+                                    )
+                                )
 
                 except Exception as e:
                     logger.error(f"账号 #{idx} 执行异常: {e}")
@@ -1907,8 +2131,8 @@ class App(tk.Tk):
                 except queue.Empty:
                     return
 
-                def set_status(text):
-                    self.after(0, lambda: acc["status_var"].set(text))
+                def set_status(text, acc_ref=acc):
+                    self.after(0, lambda: self._set_account_status(acc_ref, text))
 
                 set_status(f"提现 {coin}...")
                 try:
@@ -1922,9 +2146,7 @@ class App(tk.Tk):
                     )
                     if amount > 0:
                         self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
-                        set_status(f"成功 {amount:.4f}")
-                    else:
-                        set_status("无可提金额")
+                    set_status(self._format_withdraw_amount_status(amount, coin, enable_withdraw=enable_withdraw))
                 except Exception as e:
                     logger.error(f"账号 #{idx} 提现失败: {e}")
                     set_status("提现失败")

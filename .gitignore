@@ -4,6 +4,15 @@ __pycache__/
 *.pyd
 *.log
 bot_log.txt
+logs/
+
+# runtime outputs
+total_asset_result.txt
+withdraw_success.txt
+
+# local launcher artifacts (macOS)
+*.app/
+*.applescript
 
 build/
 dist/
