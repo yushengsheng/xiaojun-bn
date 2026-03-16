@@ -12,6 +12,10 @@ if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
 else:
     APP_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR)).resolve()
+else:
+    BUNDLE_DIR = APP_DIR
 DATA_DIR = APP_DIR / "data"
 DATA_FILE = DATA_DIR / "accounts.json"
 STRATEGY_CONFIG_FILE = DATA_DIR / "exchange_strategy_settings.json"

@@ -28,7 +28,7 @@ import requests
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-from app_paths import STRATEGY_CONFIG_FILE
+from app_paths import APP_DIR, BUNDLE_DIR, STRATEGY_CONFIG_FILE
 from secret_box import SECRET_BOX
 
 try:
@@ -169,18 +169,42 @@ class ExchangeProxyRuntime:
     @staticmethod
     def _candidate_sing_box_paths() -> list[Path]:
         home = Path.home()
-        return [
+        candidates = [
+            BUNDLE_DIR / "bin" / "sing-box" / "sing-box.exe",
+            BUNDLE_DIR / "bin" / "sing_box" / "sing-box.exe",
+            APP_DIR / "bin" / "sing-box" / "sing-box.exe",
+            APP_DIR / "bin" / "sing_box" / "sing-box.exe",
             home / "Desktop" / "v2rayN-windows-64" / "bin" / "sing_box" / "sing-box.exe",
             home / "Desktop" / "v2rayN-windows-64" / "bin" / "sing-box.exe",
         ]
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for path in candidates:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
 
     @staticmethod
     def _candidate_xray_paths() -> list[Path]:
         home = Path.home()
-        return [
+        candidates = [
+            BUNDLE_DIR / "bin" / "xray" / "xray.exe",
+            APP_DIR / "bin" / "xray" / "xray.exe",
             home / "Desktop" / "v2rayN-windows-64" / "bin" / "xray" / "xray.exe",
             home / "Desktop" / "v2rayN-windows-64" / "bin" / "xray.exe",
         ]
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for path in candidates:
+            key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
 
     @classmethod
     def find_sing_box_executable(cls) -> Path:

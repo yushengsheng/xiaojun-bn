@@ -12,10 +12,10 @@ Binance 自动化工具（Tkinter GUI）。
 ## 快速使用（Windows）
 
 1. 从 Releases 下载 `xiaojun-bn-vX.Y.Z-windows-x64.exe`，或下载 `xiaojun-bn-vX.Y.Z-windows-x64-portable.zip`
-2. 双击运行，无需本机安装 Python、`requests`、`eth-account`、`eth-utils` 等依赖
+2. 双击运行，无需本机安装 Python、交易所模块依赖、代理模块依赖、链上模块依赖、UI 运行依赖
 3. 首次运行会在程序同目录自动创建 `data/`，用于保存本地配置与链上页面数据
 
-> Windows Release 已内置主程序运行环境和链上模块依赖，换电脑后可直接运行，界面布局保持不变。
+> Windows Release 已内置主程序运行环境，以及交易所、代理、链上、UI 所需运行依赖；同时内置 `xray` 与 `sing-box`，页面内置 SS 代理在其他电脑上也可直接使用。
 
 ## 源码运行
 
@@ -41,7 +41,8 @@ py -3 小军bn.py
 
 - `windows-x64.exe`：单文件版，适合直接下载即用
 - `windows-x64-portable.zip`：便携目录版，适合长期放在固定目录运行
-- GitHub Release 构建会一并打包链上页面所需的 Python 依赖，无需在目标电脑单独安装链上模块
+- GitHub Release 构建会一并打包交易所、代理、链上、UI 所需运行依赖
+- Release 会附带页面内置 SS 代理所需的 `xray` 与 `sing-box` 运行文件，无需目标电脑额外安装 v2rayN 或单独拷贝代理内核
 
 ## 账号导入格式（交易所批量页）
 

@@ -28,6 +28,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller pyinstaller-hooks-contrib requests eth-account eth-utils eth-abi eth-keyfile eth-keys eth-rlp eth-hash[pycryptodome] hexbytes rlp parsimonious cytoolz bitarray ckzg
 
+      - name: Download proxy runtimes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $proxyRoot = Join-Path $PWD "build-proxy"
+          $xrayDir = Join-Path $proxyRoot "xray"
+          $singBoxDir = Join-Path $proxyRoot "sing-box"
+          New-Item -ItemType Directory -Path $xrayDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $singBoxDir -Force | Out-Null
+
+          $xrayRelease = gh release view --repo XTLS/Xray-core --json tagName | ConvertFrom-Json
+          $xrayTag = $xrayRelease.tagName
+          $xrayAsset = "Xray-windows-64.zip"
+          gh release download $xrayTag --repo XTLS/Xray-core --pattern $xrayAsset --dir $proxyRoot
+          Expand-Archive -Path (Join-Path $proxyRoot $xrayAsset) -DestinationPath $xrayDir -Force
+          Remove-Item (Join-Path $proxyRoot $xrayAsset) -Force
+
+          $singBoxRelease = gh release view --repo SagerNet/sing-box --json tagName | ConvertFrom-Json
+          $singBoxTag = $singBoxRelease.tagName
+          $singBoxVersion = $singBoxTag.TrimStart("v")
+          $singBoxAsset = "sing-box-$singBoxVersion-windows-amd64.zip"
+          gh release download $singBoxTag --repo SagerNet/sing-box --pattern $singBoxAsset --dir $proxyRoot
+          Expand-Archive -Path (Join-Path $proxyRoot $singBoxAsset) -DestinationPath $singBoxDir -Force
+          Remove-Item (Join-Path $proxyRoot $singBoxAsset) -Force
+
+          if (-not (Test-Path (Join-Path $xrayDir "xray.exe"))) {
+            throw "xray.exe was not found after extraction."
+          }
+          if (-not (Test-Path (Join-Path $singBoxDir "sing-box.exe"))) {
+            throw "sing-box.exe was not found after extraction."
+          }
+
       - name: Prepare entry script
         shell: pwsh
         run: |
@@ -54,6 +87,14 @@ jobs:
             '--hidden-import', 'table_import_utils',
             '--hidden-import', 'task_progress',
             '--hidden-import', 'ui_dialogs',
+            '--collect-all', 'requests',
+            '--collect-all', 'urllib3',
+            '--collect-all', 'certifi',
+            '--collect-all', 'charset_normalizer',
+            '--collect-all', 'idna',
+            '--collect-all', 'cryptography',
+            '--collect-all', 'cffi',
+            '--collect-all', 'pycparser',
             '--collect-all', 'eth_account',
             '--collect-all', 'eth_utils',
             '--collect-all', 'eth_abi',
@@ -68,6 +109,26 @@ jobs:
             '--collect-all', 'bitarray',
             '--collect-all', 'ckzg'
           )
+
+          Get-ChildItem "build-proxy/xray" -File -Recurse | ForEach-Object {
+            $sourceDir = (Resolve-Path "build-proxy/xray").Path
+            $relativeDir = Split-Path $_.FullName.Substring($sourceDir.Length).TrimStart('\') -Parent
+            $dest = "bin/xray"
+            if ($relativeDir) {
+              $dest = "$dest/$($relativeDir -replace '\\', '/')"
+            }
+            $commonArgs += @('--add-binary', "$($_.FullName);$dest")
+          }
+
+          Get-ChildItem "build-proxy/sing-box" -File -Recurse | ForEach-Object {
+            $sourceDir = (Resolve-Path "build-proxy/sing-box").Path
+            $relativeDir = Split-Path $_.FullName.Substring($sourceDir.Length).TrimStart('\') -Parent
+            $dest = "bin/sing-box"
+            if ($relativeDir) {
+              $dest = "$dest/$($relativeDir -replace '\\', '/')"
+            }
+            $commonArgs += @('--add-binary', "$($_.FullName);$dest")
+          }
 
           pyinstaller --onefile --name $appName @commonArgs app_entry.py
           pyinstaller --onedir --name $portableName @commonArgs app_entry.py
