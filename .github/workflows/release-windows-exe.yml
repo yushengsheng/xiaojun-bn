@@ -54,10 +54,12 @@ jobs:
           Expand-Archive -Path (Join-Path $proxyRoot $singBoxAsset) -DestinationPath $singBoxDir -Force
           Remove-Item (Join-Path $proxyRoot $singBoxAsset) -Force
 
-          if (-not (Test-Path (Join-Path $xrayDir "xray.exe"))) {
+          $xrayExe = Get-ChildItem $xrayDir -Filter "xray.exe" -File -Recurse | Select-Object -First 1
+          if (-not $xrayExe) {
             throw "xray.exe was not found after extraction."
           }
-          if (-not (Test-Path (Join-Path $singBoxDir "sing-box.exe"))) {
+          $singBoxExe = Get-ChildItem $singBoxDir -Filter "sing-box.exe" -File -Recurse | Select-Object -First 1
+          if (-not $singBoxExe) {
             throw "sing-box.exe was not found after extraction."
           }
 
