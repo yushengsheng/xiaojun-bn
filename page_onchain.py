@@ -9,6 +9,7 @@ import threading
 import time
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from pathlib import Path
+import tkinter as tk
 from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, BooleanVar, DoubleVar, Frame as TkFrame, Menu, StringVar
 from tkinter import messagebox, ttk
 
@@ -78,6 +79,7 @@ class OnchainTransferPage:
         self.store = OnchainStore(ONCHAIN_DATA_FILE)
         self.client = EvmClient()
         self.is_running = False
+        self.stop_requested = threading.Event()
         self._layout_mode: str | None = None
 
         self.row_index_map: dict[str, int] = {}
@@ -109,7 +111,7 @@ class OnchainTransferPage:
         self.random_max_var = StringVar(value="")
         self.delay_var = DoubleVar(value=1.0)
         self.threads_var = StringVar(value="10")
-        self.dry_run_var = BooleanVar(value=True)
+        self.dry_run_var = BooleanVar(value=False)
         self.source_credential_var = StringVar(value="")
         self.target_address_var = StringVar(value="")
         self.source_balance_var = StringVar(value="-")
@@ -149,13 +151,13 @@ class OnchainTransferPage:
             setting,
             textvariable=self.network_var,
             values=self.NETWORK_OPTIONS,
-            width=10,
+            width=8,
             state="readonly",
         )
         self.lbl_coin = ttk.Label(setting, text="币种*")
-        self.coin_box = ttk.Combobox(setting, textvariable=self.coin_var, width=16, state="readonly")
+        self.coin_box = ttk.Combobox(setting, textvariable=self.coin_var, width=14, state="readonly")
         self.lbl_contract_search = ttk.Label(setting, text="合约搜索")
-        self.ent_contract_search = ttk.Entry(setting, textvariable=self.contract_search_var, width=40)
+        self.ent_contract_search = ttk.Entry(setting, textvariable=self.contract_search_var, width=28)
         bind_paste_shortcuts(self.ent_contract_search)
         self.btn_contract_search = ttk.Button(setting, text="搜索并选择", command=self.search_contract_token)
 
@@ -168,25 +170,27 @@ class OnchainTransferPage:
             width=8,
             state="readonly",
         )
-        self.ent_amount = ttk.Entry(self.amount_ctrl, textvariable=self.amount_var, width=10)
-        self.ent_random_min = ttk.Entry(self.amount_ctrl, textvariable=self.random_min_var, width=8)
+        self.ent_amount = ttk.Entry(self.amount_ctrl, textvariable=self.amount_var, width=8)
+        self.ent_random_min = ttk.Entry(self.amount_ctrl, textvariable=self.random_min_var, width=7)
         self.lbl_random_sep = ttk.Label(self.amount_ctrl, text="~")
-        self.ent_random_max = ttk.Entry(self.amount_ctrl, textvariable=self.random_max_var, width=8)
+        self.ent_random_max = ttk.Entry(self.amount_ctrl, textvariable=self.random_max_var, width=7)
         self.lbl_amount_all_hint = ttk.Label(self.amount_ctrl, text="按钱包可用余额", style="Subtle.TLabel")
         self._apply_amount_layout()
 
         self.chk_dry_run = ttk.Checkbutton(setting, text="模拟执行", variable=self.dry_run_var)
         self.lbl_delay = ttk.Label(setting, text="执行间隔(秒)")
-        self.ent_delay = ttk.Entry(setting, textvariable=self.delay_var, width=10)
+        self.ent_delay = ttk.Entry(setting, textvariable=self.delay_var, width=7)
         self.lbl_threads = ttk.Label(setting, text="执行线程数")
-        self.spin_threads = ttk.Spinbox(setting, from_=1, to=64, textvariable=self.threads_var, width=10)
+        self.spin_threads = ttk.Spinbox(setting, from_=1, to=64, textvariable=self.threads_var, width=6)
 
         self.lbl_source_credential = ttk.Label(setting, text="转出钱包私钥/助记词*")
-        self.ent_source_credential = ttk.Entry(setting, textvariable=self.source_credential_var)
+        self.ent_source_credential = ttk.Entry(setting, textvariable=self.source_credential_var, width=34)
+        self.btn_query_source_balance = ttk.Button(setting, text="查询", command=self.query_current_source_balance)
         self.lbl_source_balance_title = ttk.Label(setting, text="转出钱包余额")
         self.lbl_source_balance_val = ttk.Label(setting, textvariable=self.source_balance_var, style="Value.TLabel")
         self.lbl_target_address = ttk.Label(setting, text="收款地址*")
-        self.ent_target_address = ttk.Entry(setting, textvariable=self.target_address_var)
+        self.ent_target_address = ttk.Entry(setting, textvariable=self.target_address_var, width=34)
+        self.btn_query_target_balance = ttk.Button(setting, text="查询", command=self.query_current_target_balance)
         bind_paste_shortcuts(self.ent_source_credential)
         bind_paste_shortcuts(self.ent_target_address)
         self.lbl_target_balance_title = ttk.Label(setting, text="收款地址余额")
@@ -256,10 +260,23 @@ class OnchainTransferPage:
         ttk.Button(action1, text="全选/取消全选", command=self.toggle_check_all).pack(side=LEFT, padx=(8, 0))
         ttk.Button(action1, text="删除选中", command=self.delete_selected).pack(side=LEFT, padx=(8, 0))
         ttk.Button(action1, text="保存配置", command=self.save_all).pack(side=LEFT, padx=(8, 0))
+        ttk.Label(action1, text="链上为独立模块，与交易所互不影响。", style="Subtle.TLabel").pack(side=LEFT, padx=(12, 0))
 
         action2 = ttk.Frame(main)
         action2.pack(fill="x", pady=(0, 10))
         ttk.Button(action2, text="查询余额", command=self.start_query_balance).pack(side=LEFT)
+        self.btn_stop_tasks = tk.Button(
+            action2,
+            text="停止",
+            command=self.stop_current_tasks,
+            bg="#C62828",
+            fg="#FFFFFF",
+            activebackground="#B71C1C",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            padx=12,
+        )
+        self.btn_stop_tasks.pack(side=LEFT, padx=(8, 0))
         self.lbl_progress = ttk.Label(action2, textvariable=self.progress_var, style="Subtle.TLabel", anchor="w", justify="left")
         self.lbl_progress.pack(side=LEFT, fill="x", expand=True, padx=(10, 0))
         ttk.Button(action2, text="执行批量转账", style="Action.TButton", command=self.start_batch_transfer).pack(side=RIGHT)
@@ -1118,7 +1135,9 @@ class OnchainTransferPage:
 
     @staticmethod
     def _layout_mode_for_width(width: int) -> str:
-        if width < 1500:
+        if width < 920:
+            return "narrow"
+        if width < 1360:
             return "medium"
         return "wide"
 
@@ -1145,10 +1164,12 @@ class OnchainTransferPage:
             self.spin_threads,
             self.lbl_source_credential,
             self.ent_source_credential,
+            self.btn_query_source_balance,
             self.lbl_source_balance_title,
             self.lbl_source_balance_val,
             self.lbl_target_address,
             self.ent_target_address,
+            self.btn_query_target_balance,
             self.lbl_target_balance_title,
             self.lbl_target_balance_val,
         ]
@@ -1173,71 +1194,74 @@ class OnchainTransferPage:
             self.chk_dry_run.grid(row=0, column=8, sticky=W, padx=(4, 0))
 
             self.lbl_contract_search.grid(row=1, column=0, sticky=W, pady=(8, 0))
-            self.ent_contract_search.grid(row=1, column=1, columnspan=5, sticky="ew", padx=(4, 10), pady=(8, 0))
-            self.btn_contract_search.grid(row=1, column=6, sticky=W, pady=(8, 0))
-            self.lbl_delay.grid(row=1, column=7, sticky=W, pady=(8, 0))
-            self.ent_delay.grid(row=1, column=8, sticky=W, padx=(4, 10), pady=(8, 0))
-            self.lbl_threads.grid(row=1, column=9, sticky=W, pady=(8, 0))
-            self.spin_threads.grid(row=1, column=10, sticky=W, padx=(4, 0), pady=(8, 0))
+            self.ent_contract_search.grid(row=1, column=1, columnspan=6, sticky="ew", padx=(4, 10), pady=(8, 0))
+            self.btn_contract_search.grid(row=1, column=7, sticky=W, pady=(8, 0))
+            self.lbl_delay.grid(row=1, column=8, sticky=W, pady=(8, 0))
+            self.ent_delay.grid(row=1, column=9, sticky=W, padx=(4, 10), pady=(8, 0))
+            self.lbl_threads.grid(row=1, column=10, sticky=W, pady=(8, 0))
+            self.spin_threads.grid(row=1, column=11, sticky=W, padx=(4, 0), pady=(8, 0))
             self.setting_frame.columnconfigure(1, weight=1)
+            self.setting_frame.columnconfigure(3, weight=1)
+            self.setting_frame.columnconfigure(5, weight=1)
+            self.setting_frame.columnconfigure(6, weight=1)
 
             row = 2
             if show_source:
                 self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
-                self.ent_source_credential.grid(row=row, column=1, columnspan=7, sticky="ew", padx=(4, 10), pady=(8, 0))
-                self.lbl_source_balance_title.grid(row=row, column=8, sticky=W, pady=(8, 0))
-                self.lbl_source_balance_val.grid(row=row, column=9, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
-                self.setting_frame.columnconfigure(1, weight=1)
+                self.ent_source_credential.grid(row=row, column=1, columnspan=4, sticky="ew", padx=(4, 8), pady=(8, 0))
+                self.btn_query_source_balance.grid(row=row, column=5, sticky=W, padx=(0, 8), pady=(8, 0))
+                self.lbl_source_balance_title.grid(row=row, column=6, sticky=W, pady=(8, 0))
+                self.lbl_source_balance_val.grid(row=row, column=7, columnspan=3, sticky=W, padx=(4, 0), pady=(8, 0))
                 row += 1
 
             if show_target:
                 self.lbl_target_address.grid(row=row, column=0, sticky=W, pady=(8, 0))
-                self.ent_target_address.grid(row=row, column=1, columnspan=7, sticky="ew", padx=(4, 10), pady=(8, 0))
-                self.lbl_target_balance_title.grid(row=row, column=8, sticky=W, pady=(8, 0))
-                self.lbl_target_balance_val.grid(row=row, column=9, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
-                self.setting_frame.columnconfigure(1, weight=1)
+                self.ent_target_address.grid(row=row, column=1, columnspan=4, sticky="ew", padx=(4, 8), pady=(8, 0))
+                self.btn_query_target_balance.grid(row=row, column=5, sticky=W, padx=(0, 8), pady=(8, 0))
+                self.lbl_target_balance_title.grid(row=row, column=6, sticky=W, pady=(8, 0))
+                self.lbl_target_balance_val.grid(row=row, column=7, columnspan=3, sticky=W, padx=(4, 0), pady=(8, 0))
                 row += 1
             return
 
         if layout_mode == "medium":
             self.lbl_mode.grid(row=0, column=0, sticky=W)
-            self.mode_box.grid(row=0, column=1, sticky="ew", padx=(4, 8))
+            self.mode_box.grid(row=0, column=1, sticky=W, padx=(4, 10))
             self.lbl_network.grid(row=0, column=2, sticky=W)
-            self.network_box.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+            self.network_box.grid(row=0, column=3, sticky=W, padx=(4, 10))
+            self.lbl_coin.grid(row=0, column=4, sticky=W)
+            self.coin_box.grid(row=0, column=5, sticky=W, padx=(4, 10))
+            self.lbl_amount.grid(row=0, column=6, sticky=W)
+            self.amount_ctrl.grid(row=0, column=7, sticky=W, padx=(4, 0))
+            self.chk_dry_run.grid(row=0, column=8, sticky=W, padx=(10, 0))
 
-            self.lbl_coin.grid(row=1, column=0, sticky=W, pady=(8, 0))
-            self.coin_box.grid(row=1, column=1, sticky="ew", padx=(4, 8), pady=(8, 0))
-            self.lbl_amount.grid(row=1, column=2, sticky=W, pady=(8, 0))
-            self.amount_ctrl.grid(row=1, column=3, sticky=W, padx=(4, 0), pady=(8, 0))
+            self.lbl_contract_search.grid(row=1, column=0, sticky=W, pady=(8, 0))
+            self.ent_contract_search.grid(row=1, column=1, columnspan=5, sticky="ew", padx=(4, 8), pady=(8, 0))
+            self.btn_contract_search.grid(row=1, column=6, sticky=W, pady=(8, 0))
+            self.lbl_delay.grid(row=1, column=7, sticky=W, padx=(10, 0), pady=(8, 0))
+            self.ent_delay.grid(row=1, column=8, sticky=W, padx=(4, 10), pady=(8, 0))
+            self.lbl_threads.grid(row=1, column=9, sticky=W, pady=(8, 0))
+            self.spin_threads.grid(row=1, column=10, sticky=W, padx=(4, 0), pady=(8, 0))
 
-            self.lbl_contract_search.grid(row=2, column=0, sticky=W, pady=(8, 0))
-            self.ent_contract_search.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=(8, 0))
-            self.btn_contract_search.grid(row=2, column=3, sticky=W, pady=(8, 0))
-
-            self.lbl_delay.grid(row=3, column=0, sticky=W, pady=(8, 0))
-            self.ent_delay.grid(row=3, column=1, sticky="ew", padx=(4, 8), pady=(8, 0))
-            self.lbl_threads.grid(row=3, column=2, sticky=W, pady=(8, 0))
-            self.spin_threads.grid(row=3, column=3, sticky="ew", padx=(4, 0), pady=(8, 0))
-
-            self.chk_dry_run.grid(row=4, column=0, sticky=W, pady=(8, 0))
-            row = 5
+            row = 2
 
             if show_source:
                 self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
-                self.ent_source_credential.grid(row=row, column=1, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
-                self.lbl_source_balance_title.grid(row=row + 1, column=0, sticky=W, pady=(6, 0))
-                self.lbl_source_balance_val.grid(row=row + 1, column=1, columnspan=3, sticky=W, padx=(4, 0), pady=(6, 0))
-                row += 2
+                self.ent_source_credential.grid(row=row, column=1, columnspan=3, sticky="ew", padx=(4, 8), pady=(8, 0))
+                self.btn_query_source_balance.grid(row=row, column=4, sticky=W, padx=(0, 8), pady=(8, 0))
+                self.lbl_source_balance_title.grid(row=row, column=5, sticky=W, pady=(8, 0))
+                self.lbl_source_balance_val.grid(row=row, column=6, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
+                row += 1
 
             if show_target:
                 self.lbl_target_address.grid(row=row, column=0, sticky=W, pady=(8, 0))
-                self.ent_target_address.grid(row=row, column=1, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
-                self.lbl_target_balance_title.grid(row=row + 1, column=0, sticky=W, pady=(6, 0))
-                self.lbl_target_balance_val.grid(row=row + 1, column=1, columnspan=3, sticky=W, padx=(4, 0), pady=(6, 0))
+                self.ent_target_address.grid(row=row, column=1, columnspan=3, sticky="ew", padx=(4, 8), pady=(8, 0))
+                self.btn_query_target_balance.grid(row=row, column=4, sticky=W, padx=(0, 8), pady=(8, 0))
+                self.lbl_target_balance_title.grid(row=row, column=5, sticky=W, pady=(8, 0))
+                self.lbl_target_balance_val.grid(row=row, column=6, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
 
             self.setting_frame.columnconfigure(1, weight=1)
-            self.setting_frame.columnconfigure(2, weight=0)
             self.setting_frame.columnconfigure(3, weight=1)
+            self.setting_frame.columnconfigure(5, weight=1)
             return
 
         row = 0
@@ -1276,19 +1300,24 @@ class OnchainTransferPage:
 
         if show_source:
             self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
-            self.ent_source_credential.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(4, 0))
-            self.lbl_source_balance_title.grid(row=row + 2, column=0, sticky=W, pady=(6, 0))
-            self.lbl_source_balance_val.grid(row=row + 2, column=1, sticky=W, padx=(4, 0), pady=(6, 0))
-            row += 3
+            self.ent_source_credential.grid(row=row, column=1, sticky="ew", padx=(4, 6), pady=(8, 0))
+            self.btn_query_source_balance.grid(row=row, column=2, sticky=W, padx=(0, 6), pady=(8, 0))
+            self.lbl_source_balance_title.grid(row=row, column=3, sticky=W, pady=(8, 0))
+            self.lbl_source_balance_val.grid(row=row, column=4, sticky=W, padx=(4, 0), pady=(8, 0))
+            row += 1
 
         if show_target:
             self.lbl_target_address.grid(row=row, column=0, sticky=W, pady=(8, 0))
-            self.ent_target_address.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(4, 0))
-            self.lbl_target_balance_title.grid(row=row + 2, column=0, sticky=W, pady=(6, 0))
-            self.lbl_target_balance_val.grid(row=row + 2, column=1, sticky=W, padx=(4, 0), pady=(6, 0))
+            self.ent_target_address.grid(row=row, column=1, sticky="ew", padx=(4, 6), pady=(8, 0))
+            self.btn_query_target_balance.grid(row=row, column=2, sticky=W, padx=(0, 6), pady=(8, 0))
+            self.lbl_target_balance_title.grid(row=row, column=3, sticky=W, pady=(8, 0))
+            self.lbl_target_balance_val.grid(row=row, column=4, sticky=W, padx=(4, 0), pady=(8, 0))
 
         self.setting_frame.columnconfigure(0, weight=0)
         self.setting_frame.columnconfigure(1, weight=1)
+        self.setting_frame.columnconfigure(2, weight=0)
+        self.setting_frame.columnconfigure(3, weight=0)
+        self.setting_frame.columnconfigure(4, weight=0)
 
     def _on_root_resize(self, _event=None):
         width = self.root.winfo_width()
@@ -1420,6 +1449,77 @@ class OnchainTransferPage:
             self._schedule_tree_refresh()
             return
         self.target_balance_var.set("-")
+
+    def _prepare_async_task(self) -> bool:
+        if self.is_running:
+            messagebox.showwarning("提示", "已有任务在运行")
+            return False
+        self.stop_requested.clear()
+        self.is_running = True
+        return True
+
+    def stop_current_tasks(self):
+        if not self.is_running:
+            self.log("当前没有运行中的链上任务")
+            return
+        self.stop_requested.set()
+        self.log("已收到停止请求，正在停止当前链上任务...")
+
+    def query_current_source_balance(self):
+        try:
+            if not self._is_mode_1m():
+                return
+            source = self.source_credential_var.get().strip()
+            if not source:
+                messagebox.showerror("参数错误", "请先填写转出钱包私钥/助记词")
+                return
+            network = self.network_var.get().strip().upper()
+            if network not in {"ETH", "BSC"}:
+                messagebox.showerror("参数错误", "未设置网络，无法查询余额")
+                return
+            token = self._selected_token(with_message=True)
+            if not token:
+                return
+            if not self._prepare_async_task():
+                return
+            threading.Thread(
+                target=self._run_query_balance_one_to_many,
+                args=(network, token, source, []),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self.log(f"转出钱包余额查询启动失败：{exc}")
+            self.is_running = False
+            messagebox.showerror("执行异常", str(exc))
+
+    def query_current_target_balance(self):
+        try:
+            if not self._is_mode_m1():
+                return
+            target = self.target_address_var.get().strip()
+            if not target:
+                messagebox.showerror("参数错误", "请先填写收款地址")
+                return
+            network = self.network_var.get().strip().upper()
+            if network not in {"ETH", "BSC"}:
+                messagebox.showerror("参数错误", "未设置网络，无法查询余额")
+                return
+            token = self._selected_token(with_message=True)
+            if not token:
+                return
+            target = self._validate_recipient_address(target, "收款地址")
+            self.target_address_var.set(target)
+            if not self._prepare_async_task():
+                return
+            threading.Thread(
+                target=self._run_query_balance_many_to_one,
+                args=(network, token, target, []),
+                daemon=True,
+            ).start()
+        except Exception as exc:
+            self.log(f"收款地址余额查询启动失败：{exc}")
+            self.is_running = False
+            messagebox.showerror("执行异常", str(exc))
 
     def _update_balance_heading(self):
         symbol = self.symbol_var.get().strip() or "-"
@@ -2134,6 +2234,8 @@ class OnchainTransferPage:
         source_key = source.strip()
         if not source_key:
             raise RuntimeError("转出钱包私钥/助记词不能为空")
+        if self.client.is_address(source_key):
+            raise RuntimeError("当前数据仅包含钱包地址，无法签名转账。真实转账请提供私钥或助记词。")
         with self.wallet_cache_lock:
             cached_pk = self.source_private_key_cache.get(source_key)
             cached_addr = self.source_address_cache.get(source_key)
@@ -2146,15 +2248,36 @@ class OnchainTransferPage:
             self.source_address_cache[source_key] = address
         return private_key, address
 
+    def _resolve_source_address(self, source: str) -> str:
+        source_key = source.strip()
+        if not source_key:
+            raise RuntimeError("转出钱包不能为空")
+        with self.wallet_cache_lock:
+            cached_addr = self.source_address_cache.get(source_key)
+            if cached_addr:
+                return cached_addr
+        if self.client.is_address(source_key):
+            address = self.client.validate_evm_address(source_key, "转出钱包地址")
+            with self.wallet_cache_lock:
+                self.source_address_cache[source_key] = address
+            return address
+        _private_key, address = self._resolve_wallet(source_key)
+        return address
+
+    def _ensure_signing_sources(self, sources: list[str]) -> None:
+        address_only = [s.strip() for s in sources if self.client.is_address(s.strip())]
+        if not address_only:
+            return
+        count = len(address_only)
+        sample = address_only[0]
+        raise RuntimeError(
+            f"当前选择的数据里有 {count} 条仅包含钱包地址，无法真实转账。请把左列改为私钥或助记词后再执行。示例：{sample}"
+        )
+
     def start_query_balance(self):
         try:
             if self.is_running:
                 messagebox.showwarning("提示", "已有任务在运行")
-                return
-            try:
-                self.client._ensure_eth_account()
-            except Exception as exc:
-                messagebox.showerror("依赖缺失", str(exc))
                 return
             network = self.network_var.get().strip().upper()
             if network not in {"ETH", "BSC"}:
@@ -2181,6 +2304,7 @@ class OnchainTransferPage:
                     return
                 self._mark_query_status_contexts([self._one_to_many_key(t) for t in targets], source)
                 self._set_query_statuses([self._one_to_many_key(t) for t in targets], "waiting")
+                self.stop_requested.clear()
                 self.is_running = True
                 threading.Thread(
                     target=self._run_query_balance_one_to_many,
@@ -2213,6 +2337,7 @@ class OnchainTransferPage:
                 target_context = self._normalize_context_target(target) if target else ""
                 self._mark_query_status_contexts([self._many_to_one_key(s) for s in sources], target_context)
                 self._set_query_statuses([self._many_to_one_key(s) for s in sources], "waiting")
+                self.stop_requested.clear()
                 self.is_running = True
                 threading.Thread(
                     target=self._run_query_balance_many_to_one,
@@ -2240,6 +2365,7 @@ class OnchainTransferPage:
 
             self._query_row_keys_by_source = {k: list(v) for k, v in row_keys_by_source.items()}
             self._set_query_statuses([key for keys in row_keys_by_source.values() for key in keys], "waiting")
+            self.stop_requested.clear()
             self.is_running = True
             threading.Thread(target=self._run_query_balance_for_sources, args=(network, token, sources), daemon=True).start()
         except Exception as exc:
@@ -2250,11 +2376,6 @@ class OnchainTransferPage:
         try:
             if self.is_running:
                 messagebox.showwarning("提示", "已有任务在运行")
-                return
-            try:
-                self.client._ensure_eth_account()
-            except Exception as exc:
-                messagebox.showerror("依赖缺失", str(exc))
                 return
             network = self.network_var.get().strip().upper()
             if network not in {"ETH", "BSC"}:
@@ -2277,6 +2398,7 @@ class OnchainTransferPage:
                 except Exception as exc:
                     messagebox.showerror("参数错误", str(exc))
                     return
+                self.stop_requested.clear()
                 self.is_running = True
                 self._mark_query_status_context(self._one_to_many_key(target), source)
                 self._set_query_status(self._one_to_many_key(target), "waiting")
@@ -2295,6 +2417,7 @@ class OnchainTransferPage:
                     except Exception as exc:
                         self.log(f"{exc}，已跳过收款地址余额查询")
                         target_addr = ""
+                self.stop_requested.clear()
                 self.is_running = True
                 self._mark_query_status_context(self._many_to_one_key(source), self._normalize_context_target(target_addr))
                 self._set_query_status(self._many_to_one_key(source), "waiting")
@@ -2306,6 +2429,7 @@ class OnchainTransferPage:
                 return
             self._query_row_keys_by_source = {source: [_row_key]}
             self._set_query_status(_row_key, "waiting")
+            self.stop_requested.clear()
             self.is_running = True
             threading.Thread(
                 target=self._run_query_balance_for_sources,
@@ -2359,6 +2483,11 @@ class OnchainTransferPage:
                 except Exception as exc:
                     messagebox.showerror("依赖缺失", str(exc))
                     return
+                try:
+                    self._ensure_signing_sources([source])
+                except Exception as exc:
+                    messagebox.showerror("参数错误", str(exc))
+                    return
             token_desc = self._token_desc_from_params(params)
             if not dry_run:
                 amount_text = params.amount
@@ -2380,6 +2509,7 @@ class OnchainTransferPage:
                     return
 
             self.log(f"已启动当前行转账任务：mode={self._mode()}，币种={token_desc}")
+            self.stop_requested.clear()
             self.is_running = True
             threading.Thread(target=self._run_batch_transfer, args=([(row_key, source, target)], params, dry_run), daemon=True).start()
         except Exception as exc:
@@ -2408,6 +2538,7 @@ class OnchainTransferPage:
             failed = 0
             total = Decimal("0")
             lock = threading.Lock()
+            done_row_keys: set[str] = set()
             jobs: queue.Queue[tuple[int, str]] = queue.Queue()
             for i, source in enumerate(sources, start=1):
                 jobs.put((i, source))
@@ -2415,6 +2546,8 @@ class OnchainTransferPage:
             def worker():
                 nonlocal ok, failed, total
                 while True:
+                    if self.stop_requested.is_set():
+                        return
                     try:
                         i, source = jobs.get_nowait()
                     except queue.Empty:
@@ -2423,7 +2556,7 @@ class OnchainTransferPage:
                     prefix = f"[{i}/{len(sources)}]"
                     dispatch_ui(lambda keys=row_keys: self._set_query_statuses(keys, "running"))
                     try:
-                        _pk, addr = self._resolve_wallet(source)
+                        addr = self._resolve_source_address(source)
                         if token.is_native:
                             units = self.client.get_balance_wei(network, addr)
                         else:
@@ -2433,6 +2566,7 @@ class OnchainTransferPage:
                             self.source_balance_cache[source] = amount
                             total += amount
                             ok += 1
+                            done_row_keys.update(row_keys)
                             balance_total_text = self._token_amount_text(symbol, total)
                         msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
                         dispatch_ui(lambda m=msg: self.log(m))
@@ -2441,6 +2575,7 @@ class OnchainTransferPage:
                     except Exception as exc:
                         with lock:
                             failed += 1
+                            done_row_keys.update(row_keys)
                         dispatch_ui(lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
                         dispatch_ui(lambda keys=row_keys: self._set_query_statuses(keys, "failed"))
                     finally:
@@ -2454,6 +2589,11 @@ class OnchainTransferPage:
                 workers.append(t)
             for t in workers:
                 t.join()
+            if self.stop_requested.is_set():
+                pending_keys = [key for key in progress_keys if key not in done_row_keys]
+                failed += len(pending_keys)
+                dispatch_ui(lambda keys=pending_keys: self._set_query_statuses(keys, "failed"))
+                dispatch_ui(lambda: self.log("余额查询已停止"))
             summary = f"余额查询结束：成功 {ok}，失败 {failed}，{symbol} 合计={self._decimal_to_text(total)}"
             dispatch_ui(lambda: self._refresh_tree())
             dispatch_ui(lambda: self.log(summary))
@@ -2487,7 +2627,7 @@ class OnchainTransferPage:
             source_query_state = "skip"
             if source:
                 try:
-                    _pk, source_addr = self._resolve_wallet(source)
+                    source_addr = self._resolve_source_address(source)
                     if token.is_native:
                         src_units = self.client.get_balance_wei(network, source_addr)
                     else:
@@ -2510,6 +2650,7 @@ class OnchainTransferPage:
             failed = 0
             total = Decimal("0")
             lock = threading.Lock()
+            done_row_keys: set[str] = set()
             jobs: queue.Queue[tuple[int, str]] = queue.Queue()
             for i, addr in enumerate(targets, start=1):
                 jobs.put((i, addr))
@@ -2519,6 +2660,8 @@ class OnchainTransferPage:
             def worker():
                 nonlocal ok, failed, total
                 while True:
+                    if self.stop_requested.is_set():
+                        return
                     try:
                         i, addr = jobs.get_nowait()
                     except queue.Empty:
@@ -2538,6 +2681,8 @@ class OnchainTransferPage:
                             self.target_balance_cache[addr] = amount
                             total += amount
                             ok += 1
+                            if row_key:
+                                done_row_keys.add(row_key)
                             balance_total_text = self._token_amount_text(symbol, total)
                         msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
                         dispatch_ui(lambda m=msg: self.log(m))
@@ -2548,6 +2693,8 @@ class OnchainTransferPage:
                     except Exception as exc:
                         with lock:
                             failed += 1
+                            if row_key:
+                                done_row_keys.add(row_key)
                         dispatch_ui(lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
                         if row_key:
                             self._mark_query_status_context(row_key, context_sig)
@@ -2563,6 +2710,11 @@ class OnchainTransferPage:
                 workers.append(t)
             for t in workers:
                 t.join()
+            if self.stop_requested.is_set():
+                pending_keys = [key for key in self._unique_row_keys(list(row_keys_by_target.values())) if key not in done_row_keys]
+                failed += len(pending_keys)
+                dispatch_ui(lambda keys=pending_keys: self._set_query_statuses(keys, "failed"))
+                dispatch_ui(lambda: self.log("余额查询已停止"))
 
             src_status_text = {"ok": "成功", "failed": "失败", "skip": "跳过"}.get(source_query_state, source_query_state)
             summary = (
@@ -2620,6 +2772,7 @@ class OnchainTransferPage:
             failed = 0
             total = Decimal("0")
             lock = threading.Lock()
+            done_row_keys: set[str] = set()
             jobs: queue.Queue[tuple[int, str]] = queue.Queue()
             for i, source in enumerate(sources, start=1):
                 jobs.put((i, source))
@@ -2629,6 +2782,8 @@ class OnchainTransferPage:
             def worker():
                 nonlocal ok, failed, total
                 while True:
+                    if self.stop_requested.is_set():
+                        return
                     try:
                         i, source = jobs.get_nowait()
                     except queue.Empty:
@@ -2639,7 +2794,7 @@ class OnchainTransferPage:
                         self._mark_query_status_context(row_key, context_sig)
                         dispatch_ui(lambda k=row_key: self._set_query_status(k, "running"))
                     try:
-                        _pk, addr = self._resolve_wallet(source)
+                        addr = self._resolve_source_address(source)
                         if token.is_native:
                             units = self.client.get_balance_wei(network, addr)
                         else:
@@ -2649,6 +2804,8 @@ class OnchainTransferPage:
                             self.source_balance_cache[source] = amount
                             total += amount
                             ok += 1
+                            if row_key:
+                                done_row_keys.add(row_key)
                             balance_total_text = self._token_amount_text(symbol, total)
                         msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
                         dispatch_ui(lambda m=msg: self.log(m))
@@ -2659,6 +2816,8 @@ class OnchainTransferPage:
                     except Exception as exc:
                         with lock:
                             failed += 1
+                            if row_key:
+                                done_row_keys.add(row_key)
                         dispatch_ui(lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
                         if row_key:
                             self._mark_query_status_context(row_key, context_sig)
@@ -2674,6 +2833,11 @@ class OnchainTransferPage:
                 workers.append(t)
             for t in workers:
                 t.join()
+            if self.stop_requested.is_set():
+                pending_keys = [key for key in self._unique_row_keys(list(row_keys_by_source.values())) if key not in done_row_keys]
+                failed += len(pending_keys)
+                dispatch_ui(lambda keys=pending_keys: self._set_query_statuses(keys, "failed"))
+                dispatch_ui(lambda: self.log("余额查询已停止"))
 
             dst_status_text = {"ok": "成功", "failed": "失败", "skip": "跳过"}.get(target_query_state, target_query_state)
             summary = (
@@ -2784,6 +2948,11 @@ class OnchainTransferPage:
                 except Exception as exc:
                     messagebox.showerror("依赖缺失", str(exc))
                     return
+                try:
+                    self._ensure_signing_sources([source for _row_key, source, _target in jobs])
+                except Exception as exc:
+                    messagebox.showerror("参数错误", str(exc))
+                    return
             if params.amount == self.AMOUNT_ALL_LABEL:
                 source_counter: dict[str, int] = {}
                 for _k, source, _target in jobs:
@@ -2814,6 +2983,7 @@ class OnchainTransferPage:
                     return
 
             self.log(f"已启动批量转账任务准备：任务={len(jobs)}，币种={token_desc}")
+            self.stop_requested.clear()
             self.is_running = True
             threading.Thread(target=self._run_batch_transfer, args=(jobs, params, dry_run), daemon=True).start()
         except Exception as exc:
@@ -2837,6 +3007,11 @@ class OnchainTransferPage:
                     self.client._ensure_eth_account()
                 except Exception as exc:
                     messagebox.showerror("依赖缺失", str(exc))
+                    return
+                try:
+                    self._ensure_signing_sources([source for _row_key, source, _target in jobs])
+                except Exception as exc:
+                    messagebox.showerror("参数错误", str(exc))
                     return
             if params.amount == self.AMOUNT_ALL_LABEL:
                 source_counter: dict[str, int] = {}
@@ -2868,6 +3043,7 @@ class OnchainTransferPage:
                     return
 
             self.log(f"开始重试失败任务：{len(jobs)}")
+            self.stop_requested.clear()
             self.is_running = True
             threading.Thread(target=self._run_batch_transfer, args=(jobs, params, dry_run), daemon=True).start()
         except Exception as exc:
@@ -2992,6 +3168,8 @@ class OnchainTransferPage:
             def worker():
                 total = len(jobs_data)
                 while True:
+                    if self.stop_requested.is_set():
+                        return
                     try:
                         i, row_key, source, target = jobs_q.get_nowait()
                     except queue.Empty:
@@ -3081,7 +3259,8 @@ class OnchainTransferPage:
                     else:
                         finalize_job(row_key, result_status, msg, amount_text=amount_text, gas_fee_wei=gas_fee_wei)
                     if params.delay > 0:
-                        time.sleep(params.delay)
+                        if self.stop_requested.wait(params.delay):
+                            return
 
             workers: list[threading.Thread] = []
             worker_count = max(1, min(params.threads, len(jobs_data)))
@@ -3091,6 +3270,15 @@ class OnchainTransferPage:
                 workers.append(t)
             for t in workers:
                 t.join()
+            if self.stop_requested.is_set():
+                with lock:
+                    pending_row_keys = [row_key for row_key in progress_keys if row_key not in resolved_row_keys]
+                for row_key in pending_row_keys:
+                    prefix = fallback_prefixes.get(row_key, "")
+                    stop_msg = f"{prefix} 已停止" if prefix else "任务已停止"
+                    finalize_job(row_key, "failed", stop_msg)
+                resolved_event.set()
+                dispatch_ui(lambda: self.log("链上转账任务已停止"))
             batch_finalize_timeout_seconds = max(
                 0.2,
                 max(0.0, float(getattr(self, "submitted_timeout_seconds", SUBMITTED_TIMEOUT_SECONDS))) + 1.0,

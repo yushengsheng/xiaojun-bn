@@ -14,6 +14,7 @@ else:
     APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DATA_FILE = DATA_DIR / "accounts.json"
+STRATEGY_CONFIG_FILE = DATA_DIR / "exchange_strategy_settings.json"
 BG_DATA_FILE = DATA_DIR / "bg_one_to_many.json"
 ONCHAIN_DATA_FILE = DATA_DIR / "onchain.json"
 SECRET_KEY_FILE = DATA_DIR / ".secret.key"

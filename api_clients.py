@@ -6,11 +6,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import importlib
 import json
 import os
 import random
 import re
+import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -27,6 +30,11 @@ class SubmissionUncertainError(RuntimeError):
 
 
 class EvmClient:
+    _DEPENDENCY_LOCK = threading.Lock()
+    _ONCHAIN_DEPENDENCY_MODULES = {
+        "eth-account": "eth_account",
+        "eth-utils": "eth_utils",
+    }
     NATIVE_GAS_LIMIT = 21000
     ERC20_DEFAULT_GAS_LIMIT = 70000
     NETWORKS = {
@@ -34,6 +42,10 @@ class EvmClient:
             "chain_id": 1,
             "symbol": "ETH",
             "rpc_urls": [
+                "https://gateway.tenderly.co/public/mainnet",
+                "https://rpc.flashbots.net",
+                "https://mainnet.gateway.tenderly.co",
+                "https://1rpc.io/eth",
                 "https://ethereum-rpc.publicnode.com",
                 "https://eth.llamarpc.com",
                 "https://cloudflare-eth.com",
@@ -45,8 +57,8 @@ class EvmClient:
             "rpc_urls": [
                 "https://bsc-dataseed.bnbchain.org",
                 "https://bsc-dataseed1.bnbchain.org",
-                "https://bsc-rpc.publicnode.com",
                 "https://bsc-dataseed.binance.org",
+                "https://bsc-rpc.publicnode.com",
             ],
         },
     }
@@ -85,14 +97,79 @@ class EvmClient:
         items = self.PRESET_TOKENS.get(net, [])
         return [EvmToken(symbol=t.symbol, contract=t.contract, decimals=t.decimals, is_native=t.is_native) for t in items]
 
-    @staticmethod
-    def _ensure_eth_account():
+    @classmethod
+    def _import_module(cls, module_name: str):
+        try:
+            return importlib.import_module(module_name)
+        except Exception:
+            return None
+
+    @classmethod
+    def _install_missing_dependencies(cls, package_names: list[str]) -> None:
+        if not package_names:
+            return
+        if getattr(sys, "frozen", False):
+            pkg_text = ", ".join(package_names)
+            raise RuntimeError(f"链上依赖缺失：{pkg_text}。当前为打包版，请在构建环境先安装后重新打包。")
+
+        cmd = [sys.executable, "-m", "pip", "install", "--user", *package_names]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except Exception as exc:
+            cmd_text = subprocess.list2cmdline(cmd)
+            raise RuntimeError(f"链上依赖自动安装失败，请手动执行：{cmd_text}") from exc
+
+    @classmethod
+    def ensure_dependencies(cls, *, require_signing: bool = True):
+        required = ["eth-utils"]
+        if require_signing:
+            required.append("eth-account")
+
+        with cls._DEPENDENCY_LOCK:
+            missing_packages: list[str] = []
+            for package_name in required:
+                module_name = cls._ONCHAIN_DEPENDENCY_MODULES[package_name]
+                if cls._import_module(module_name) is None:
+                    missing_packages.append(package_name)
+
+            if missing_packages:
+                cls._install_missing_dependencies(missing_packages)
+
+            missing_after_install: list[str] = []
+            modules: dict[str, object] = {}
+            for package_name in required:
+                module_name = cls._ONCHAIN_DEPENDENCY_MODULES[package_name]
+                module = cls._import_module(module_name)
+                if module is None:
+                    missing_after_install.append(package_name)
+                else:
+                    modules[module_name] = module
+
+            if missing_after_install:
+                pkg_text = ", ".join(missing_after_install)
+                raise RuntimeError(f"链上依赖仍不可用：{pkg_text}")
+
+            return modules
+
+    @classmethod
+    def _ensure_eth_account(cls):
+        cls.ensure_dependencies(require_signing=True)
         try:
             from eth_account import Account  # type: ignore
         except Exception as exc:
-            cmd = f'"{sys.executable}" -m pip install --user eth-account'
-            raise RuntimeError(f"链上转账依赖未安装，请先执行：{cmd}") from exc
+            cmd = f'"{sys.executable}" -m pip install --user eth-account eth-utils'
+            raise RuntimeError(f"链上签名依赖不可用，请执行：{cmd}") from exc
         return Account
+
+    @classmethod
+    def _ensure_eth_utils(cls):
+        cls.ensure_dependencies(require_signing=False)
+        try:
+            import eth_utils  # type: ignore
+        except Exception as exc:
+            cmd = f'"{sys.executable}" -m pip install --user eth-utils'
+            raise RuntimeError(f"链上地址校验依赖不可用，请执行：{cmd}") from exc
+        return eth_utils
 
     @staticmethod
     def _ensure_hex_prefixed(value: str) -> str:
@@ -110,9 +187,8 @@ class EvmClient:
     def to_checksum_address(cls, value: str) -> str:
         normalized = cls.normalize_address(value)
         try:
-            from eth_utils import to_checksum_address  # type: ignore
-
-            return str(to_checksum_address(normalized))
+            eth_utils = cls._ensure_eth_utils()
+            return str(eth_utils.to_checksum_address(normalized))
         except Exception:
             return normalized
 
@@ -131,10 +207,10 @@ class EvmClient:
         has_upper = any(ch.isalpha() and ch.isupper() for ch in body)
         if has_lower and has_upper:
             try:
-                from eth_utils import is_checksum_address  # type: ignore
+                eth_utils = cls._ensure_eth_utils()
             except Exception as exc:
                 raise RuntimeError(f"{field_label}校验失败：缺少 checksum 校验依赖，无法验证大小写混合地址") from exc
-            if not bool(is_checksum_address(cls._ensure_hex_prefixed(raw))):
+            if not bool(eth_utils.is_checksum_address(cls._ensure_hex_prefixed(raw))):
                 raise RuntimeError(f"{field_label}校验失败：大小写混合地址不符合 EVM checksum 规范")
 
         return cls.to_checksum_address(raw)
@@ -442,13 +518,70 @@ class EvmClient:
 
 
 class BinanceClient:
+    SERVER_TIME_CACHE_TTL_SECONDS = 30.0
+
     def __init__(self, base_url: str = "https://api.binance.com", recv_window: int = 60000):
         self.base_url = base_url.rstrip("/")
         self.recv_window = recv_window
+        self._server_time_offset_ms = 0
+        self._server_time_synced_at = 0.0
+        self._server_time_lock = threading.Lock()
 
     @staticmethod
     def _sign(secret: str, query: str) -> str:
         return hmac.new(secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _local_timestamp_ms() -> int:
+        return int(time.time() * 1000)
+
+    def _server_time_path(self) -> str:
+        if "fapi.binance.com" in self.base_url:
+            return "/fapi/v1/time"
+        if "dapi.binance.com" in self.base_url:
+            return "/dapi/v1/time"
+        return "/api/v3/time"
+
+    def _fetch_server_time_offset_ms(self) -> int:
+        url = f"{self.base_url}{self._server_time_path()}"
+        request = urllib.request.Request(url=url, method="GET")
+        start_ms = self._local_timestamp_ms()
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = response.read().decode("utf-8")
+        end_ms = self._local_timestamp_ms()
+        try:
+            data = json.loads(payload) if payload else {}
+            server_time_ms = int(data.get("serverTime"))
+        except Exception as exc:
+            raise RuntimeError(f"服务器时间接口返回异常：{payload}") from exc
+        midpoint_ms = (start_ms + end_ms) // 2
+        return int(server_time_ms - midpoint_ms)
+
+    def _sync_server_time_offset(self, *, force: bool = False) -> int:
+        now_mono = time.monotonic()
+        with self._server_time_lock:
+            if (not force) and (now_mono - self._server_time_synced_at) < self.SERVER_TIME_CACHE_TTL_SECONDS:
+                return int(self._server_time_offset_ms)
+
+        offset_ms = self._fetch_server_time_offset_ms()
+        with self._server_time_lock:
+            self._server_time_offset_ms = int(offset_ms)
+            self._server_time_synced_at = time.monotonic()
+        return int(offset_ms)
+
+    def _signed_params(self, params: dict, *, force_time_sync: bool = False) -> dict:
+        signed_params = dict(params)
+        offset_ms = 0
+        try:
+            offset_ms = self._sync_server_time_offset(force=force_time_sync)
+        except Exception:
+            if force_time_sync:
+                raise
+            with self._server_time_lock:
+                offset_ms = int(self._server_time_offset_ms)
+        signed_params["timestamp"] = self._local_timestamp_ms() + int(offset_ms)
+        signed_params["recvWindow"] = self.recv_window
+        return signed_params
 
     def _signed_request(
         self,
@@ -462,9 +595,7 @@ class BinanceClient:
     ) -> dict:
         max_attempts = 1 if non_idempotent else 3
         for attempt in range(1, max_attempts + 1):
-            signed_params = dict(params)
-            signed_params["timestamp"] = int(time.time() * 1000)
-            signed_params["recvWindow"] = self.recv_window
+            signed_params = self._signed_params(params)
             query = urllib.parse.urlencode(signed_params)
             signature = self._sign(api_secret, query)
             url = f"{self.base_url}{path}?{query}&signature={signature}"
@@ -501,6 +632,53 @@ class BinanceClient:
                     err_msg = j.get("msg")
                 except json.JSONDecodeError:
                     pass
+
+                if err_code == -1021:
+                    try:
+                        signed_params = self._signed_params(params, force_time_sync=True)
+                        query = urllib.parse.urlencode(signed_params)
+                        signature = self._sign(api_secret, query)
+                        url = f"{self.base_url}{path}?{query}&signature={signature}"
+                        retry_request = urllib.request.Request(
+                            url=url,
+                            data=data,
+                            method=method.upper(),
+                            headers={
+                                "X-MBX-APIKEY": api_key,
+                                "Content-Type": "application/x-www-form-urlencoded",
+                            },
+                        )
+                        with urllib.request.urlopen(retry_request, timeout=30) as response:
+                            retry_payload = response.read().decode("utf-8")
+                        try:
+                            return json.loads(retry_payload) if retry_payload else {}
+                        except json.JSONDecodeError as retry_exc:
+                            if non_idempotent:
+                                raise SubmissionUncertainError(
+                                    "提现请求结果不确定：响应无法解析，系统将自动继续确认"
+                                ) from retry_exc
+                            raise RuntimeError("响应解析失败")
+                    except urllib.error.HTTPError as retry_http_exc:
+                        payload = retry_http_exc.read().decode("utf-8", errors="ignore")
+                        err_code = None
+                        err_msg = payload
+                        try:
+                            j = json.loads(payload)
+                            err_code = j.get("code")
+                            err_msg = j.get("msg")
+                        except json.JSONDecodeError:
+                            pass
+                        if non_idempotent and err_code != -1021 and retry_http_exc.code in {418, 429, 500, 502, 503, 504}:
+                            raise SubmissionUncertainError(
+                                f"提现请求结果不确定：HTTP {retry_http_exc.code} / code={err_code} msg={err_msg}，系统将自动继续确认"
+                            )
+                        raise RuntimeError(f"HTTP {retry_http_exc.code} / code={err_code} msg={err_msg}")
+                    except urllib.error.URLError as retry_url_exc:
+                        if non_idempotent:
+                            raise SubmissionUncertainError(
+                                f"提现请求结果不确定：网络错误：{retry_url_exc}，系统将自动继续确认"
+                            )
+                        raise RuntimeError(f"网络错误：{retry_url_exc}")
 
                 retryable = exc.code in {418, 429, 500, 502, 503, 504} or err_code in {-1003, -1021}
                 if non_idempotent and retryable:
