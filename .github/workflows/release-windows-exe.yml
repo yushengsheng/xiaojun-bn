@@ -141,16 +141,24 @@ jobs:
         run: |
           $appName = "xiaojun-bn-${{ github.ref_name }}-windows-x64"
           $portableName = "xiaojun-bn-${{ github.ref_name }}-windows-x64-portable"
+          function Invoke-Selftest($exePath, $workingDir, $label) {
+            $logPath = Join-Path $workingDir "bot_log.txt"
+            if (Test-Path $logPath) {
+              Remove-Item $logPath -Force
+            }
 
-          & "dist/$appName.exe" --selftest
-          if ($LASTEXITCODE -ne 0) {
-            throw "Onefile selftest failed with exit code $LASTEXITCODE"
+            $proc = Start-Process -FilePath $exePath -ArgumentList '--selftest' -WorkingDirectory $workingDir -PassThru -Wait
+            if ($proc.ExitCode -ne 0) {
+              if (Test-Path $logPath) {
+                Write-Host "===== $label bot_log.txt ====="
+                Get-Content $logPath
+              }
+              throw "$label selftest failed with exit code $($proc.ExitCode)"
+            }
           }
 
-          & "dist/$portableName/$portableName.exe" --selftest
-          if ($LASTEXITCODE -ne 0) {
-            throw "Portable selftest failed with exit code $LASTEXITCODE"
-          }
+          Invoke-Selftest (Resolve-Path "dist/$appName.exe") (Resolve-Path "dist") "Onefile"
+          Invoke-Selftest (Resolve-Path "dist/$portableName/$portableName.exe") (Resolve-Path "dist/$portableName") "Portable"
 
       - name: Package release assets
         shell: pwsh
