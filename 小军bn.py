@@ -29,7 +29,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from api_clients import EvmClient
-from app_paths import APP_DIR, BUNDLE_DIR, STRATEGY_CONFIG_FILE
+from app_paths import APP_DIR, BUNDLE_DIR, EXCHANGE_PROXY_CONFIG_FILE, STRATEGY_CONFIG_FILE
 from secret_box import SECRET_BOX
 
 try:
@@ -2057,33 +2057,11 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         self._load_strategy_config()
+        self._load_exchange_proxy_config()
         self.after(100, self._poll_log_queue)
         self.update_ip()
 
     def _build_ui(self):
-        self.main_tabs = ttk.Notebook(self)
-        self.main_tabs.pack(fill="both", expand=True, padx=8, pady=8)
-
-        self.exchange_tab = ttk.Frame(self.main_tabs)
-        self.onchain_tab = ttk.Frame(self.main_tabs)
-        self.main_tabs.add(self.exchange_tab, text="交易所批量")
-        self.main_tabs.add(self.onchain_tab, text="链上")
-
-        frame_ip = ttk.Frame(self.exchange_tab)
-        frame_ip.pack(fill="x", padx=10, pady=3)
-        ttk.Label(frame_ip, text="本机直连 IP：").pack(side="left")
-        self.ip_var = tk.StringVar(value="获取中...")
-        ttk.Label(frame_ip, textvariable=self.ip_var).pack(side="left")
-        ttk.Label(frame_ip, text="   交易所代理：").pack(side="left", padx=(16, 0))
-        self.exchange_proxy_status_var = tk.StringVar(value="未启用")
-        ttk.Label(frame_ip, textvariable=self.exchange_proxy_status_var).pack(side="left")
-        ttk.Label(frame_ip, text="   交易所出口 IP：").pack(side="left", padx=(16, 0))
-        self.exchange_proxy_exit_ip_var = tk.StringVar(value="--")
-        ttk.Label(frame_ip, textvariable=self.exchange_proxy_exit_ip_var).pack(side="left")
-
-        frame_top = ttk.LabelFrame(self.exchange_tab, text="策略配置（单账号 & 批量共享）")
-        frame_top.pack(fill="x", padx=10, pady=5)
-
         self.api_key_var = tk.StringVar(value=API_KEY_DEFAULT)
         self.api_secret_var = tk.StringVar(value=API_SECRET_DEFAULT)
         self.exchange_proxy_var = tk.StringVar(value=EXCHANGE_PROXY_DEFAULT)
@@ -2105,6 +2083,67 @@ class App(tk.Tk):
         self.min_delay_var = tk.StringVar(value="")
         self.max_delay_var = tk.StringVar(value="")
         self.usdt_timeout_var = tk.IntVar(value=30)
+        self.ip_var = tk.StringVar(value="获取中...")
+        self.exchange_proxy_status_var = tk.StringVar(value="未启用")
+        self.exchange_proxy_exit_ip_var = tk.StringVar(value="--")
+        self._current_main_page = "exchange"
+
+        self.main_tabs = None
+
+        top_bar = ttk.Frame(self)
+        top_bar.pack(fill="x", padx=8, pady=(8, 0))
+        top_bar.columnconfigure(1, weight=1)
+
+        tab_bar = ttk.Frame(top_bar)
+        tab_bar.grid(row=0, column=0, sticky="w")
+        self.btn_exchange_tab = tk.Button(
+            tab_bar,
+            text="交易所批量",
+            command=lambda: self._show_main_page("exchange"),
+            bd=1,
+            relief="sunken",
+            padx=14,
+            pady=5,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.btn_exchange_tab.pack(side="left")
+        self.btn_onchain_tab = tk.Button(
+            tab_bar,
+            text="链上",
+            command=lambda: self._show_main_page("onchain"),
+            bd=1,
+            relief="raised",
+            padx=14,
+            pady=5,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.btn_onchain_tab.pack(side="left", padx=(6, 0))
+
+        proxy_bar = ttk.Frame(top_bar)
+        proxy_bar.grid(row=0, column=1, sticky="e")
+        ttk.Label(proxy_bar, text="本机直连 IP:").grid(row=0, column=0, sticky="e")
+        ttk.Label(proxy_bar, textvariable=self.ip_var).grid(row=0, column=1, sticky="w", padx=(4, 12))
+        ttk.Label(proxy_bar, text="代理:").grid(row=0, column=2, sticky="e")
+        ttk.Entry(proxy_bar, textvariable=self.exchange_proxy_var, width=24).grid(row=0, column=3, sticky="w", padx=(4, 6))
+        self.btn_test_exchange_proxy = ttk.Button(proxy_bar, text="代理测试", command=self.test_exchange_proxy)
+        self.btn_test_exchange_proxy.grid(row=0, column=4, sticky="w", padx=(0, 12))
+        ttk.Label(proxy_bar, text="状态:").grid(row=0, column=5, sticky="e")
+        ttk.Label(proxy_bar, textvariable=self.exchange_proxy_status_var).grid(row=0, column=6, sticky="w", padx=(4, 12))
+        ttk.Label(proxy_bar, text="出口 IP:").grid(row=0, column=7, sticky="e")
+        ttk.Label(proxy_bar, textvariable=self.exchange_proxy_exit_ip_var).grid(row=0, column=8, sticky="w", padx=(4, 0))
+
+        self.main_content = ttk.Frame(self)
+        self.main_content.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+
+        self.exchange_tab = ttk.Frame(self.main_content)
+        self.onchain_tab = ttk.Frame(self.main_content)
+        self._refresh_main_page_tab_buttons()
+        self._show_main_page(self._current_main_page)
+
+        frame_top = ttk.LabelFrame(self.exchange_tab, text="策略配置（单账号 & 批量共享）")
+        frame_top.pack(fill="x", padx=10, pady=5)
 
         frame_mid = ttk.LabelFrame(self.exchange_tab, text="状态控制")
         frame_mid.pack(fill="x", padx=10, pady=5)
@@ -2263,6 +2302,36 @@ class App(tk.Tk):
         self.bind_all("<Control-V>", self._on_paste_shortcut, add="+")
         self.bind_all("<Command-v>", self._on_paste_shortcut, add="+")
         self.bind_all("<Command-V>", self._on_paste_shortcut, add="+")
+
+    def _refresh_main_page_tab_buttons(self):
+        tabs = (
+            (self.btn_exchange_tab, "exchange"),
+            (self.btn_onchain_tab, "onchain"),
+        )
+        for btn, page_name in tabs:
+            is_active = self._current_main_page == page_name
+            btn.configure(
+                relief="sunken" if is_active else "raised",
+                bg="#ffffff" if is_active else "#e9e9e9",
+                fg="#111111" if is_active else "#555555",
+                activebackground="#ffffff" if is_active else "#f1f1f1",
+                activeforeground="#111111",
+            )
+
+    def _show_main_page(self, page_name: str):
+        target = self.exchange_tab if page_name == "exchange" else self.onchain_tab
+        if self._current_main_page != page_name:
+            self._current_main_page = page_name
+        try:
+            self.exchange_tab.pack_forget()
+        except Exception:
+            pass
+        try:
+            self.onchain_tab.pack_forget()
+        except Exception:
+            pass
+        target.pack(fill="both", expand=True)
+        self._refresh_main_page_tab_buttons()
 
     @staticmethod
     def _clear_container_children(container):
@@ -2519,16 +2588,9 @@ class App(tk.Tk):
         row1 = ttk.Frame(frame_top)
         row1.pack(fill="x", padx=5, pady=(2, 3))
 
-        ttk.Label(row1, text="\u4ee3\u7406:").grid(row=0, column=0, sticky="w")
-        proxy_wrap = ttk.Frame(row1)
-        proxy_wrap.grid(row=0, column=1, sticky="w", padx=(4, 8))
-        ttk.Entry(proxy_wrap, textvariable=self.exchange_proxy_var, width=24).grid(row=0, column=0, sticky="w")
-        self.btn_test_exchange_proxy = ttk.Button(proxy_wrap, text="\u4ee3\u7406\u6d4b\u8bd5", command=self.test_exchange_proxy)
-        self.btn_test_exchange_proxy.grid(row=0, column=1, padx=(6, 0))
-
-        ttk.Label(row1, text="\u968f\u673a\u5ef6\u8fdf(\u6beb\u79d2):").grid(row=0, column=2, sticky="e")
+        ttk.Label(row1, text="\u968f\u673a\u5ef6\u8fdf(\u6beb\u79d2):").grid(row=0, column=0, sticky="e")
         delay_wrap = ttk.Frame(row1)
-        delay_wrap.grid(row=0, column=3, sticky="w", padx=(4, 8))
+        delay_wrap.grid(row=0, column=1, sticky="w", padx=(4, 8))
         self.min_delay_entry = tk.Entry(delay_wrap, textvariable=self.min_delay_var, width=8)
         self.min_delay_entry.pack(side="left")
         self.max_delay_entry = tk.Entry(delay_wrap, textvariable=self.max_delay_var, width=8)
@@ -2537,7 +2599,7 @@ class App(tk.Tk):
         self._install_entry_placeholder(self.max_delay_entry, self.max_delay_var, "\u6700\u5927")
 
         self.btn_save_strategy_config = ttk.Button(row1, text="\u4fdd\u5b58\u914d\u7f6e", command=self.save_strategy_config)
-        self.btn_save_strategy_config.grid(row=0, column=4, sticky="w")
+        self.btn_save_strategy_config.grid(row=0, column=2, sticky="w")
 
         row2 = ttk.Frame(frame_top)
         row2.pack(fill="x", padx=5, pady=3)
@@ -2963,7 +3025,6 @@ class App(tk.Tk):
         return {
             "api_key": SECRET_BOX.encrypt(self.api_key_var.get().strip()),
             "api_secret": SECRET_BOX.encrypt(self.api_secret_var.get().strip()),
-            "exchange_proxy_enc": self._encrypt_optional_text(self._get_exchange_proxy()),
             "spot_rounds": int(trade_settings["stored_spot_rounds"]),
             "trade_mode": trade_settings["trade_mode"],
             "premium_percent": trade_settings["premium_percent"],
@@ -2988,13 +3049,53 @@ class App(tk.Tk):
             STRATEGY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             STRATEGY_CONFIG_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             logger.info("策略配置已保存到：%s", STRATEGY_CONFIG_FILE)
-            self.update_ip(schedule_next=False)
             messagebox.showinfo("成功", f"策略配置已保存到：\n{STRATEGY_CONFIG_FILE}")
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("错误", str(e) or "配置格式不正确，请检查交易模式、轮次、溢价比例、手续费停止值和超时时间")
         except Exception as e:
             logger.error("保存策略配置失败: %s", e)
             messagebox.showerror("错误", "保存策略配置失败: %s" % e)
+
+    def _save_exchange_proxy_config_only(self) -> None:
+        payload = {
+            "exchange_proxy_enc": self._encrypt_optional_text(self._get_exchange_proxy()),
+        }
+        EXCHANGE_PROXY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        EXCHANGE_PROXY_CONFIG_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _proxy_text_from_config_payload(self, raw: object) -> str:
+        if not isinstance(raw, dict):
+            return ""
+        proxy_enc = str(raw.get("exchange_proxy_enc", "") or "").strip()
+        legacy_proxy = str(raw.get("exchange_proxy", EXCHANGE_PROXY_DEFAULT) or EXCHANGE_PROXY_DEFAULT).strip()
+        try:
+            return self._decrypt_optional_text(proxy_enc) if proxy_enc else legacy_proxy
+        except Exception:
+            return legacy_proxy
+
+    def _load_exchange_proxy_config(self):
+        proxy_text = ""
+        if EXCHANGE_PROXY_CONFIG_FILE.exists():
+            try:
+                raw = json.loads(EXCHANGE_PROXY_CONFIG_FILE.read_text(encoding="utf-8"))
+                proxy_text = self._proxy_text_from_config_payload(raw)
+                logger.info("已加载代理配置：%s", EXCHANGE_PROXY_CONFIG_FILE)
+            except Exception as e:
+                logger.error("加载代理配置失败: %s", e)
+        elif STRATEGY_CONFIG_FILE.exists():
+            try:
+                raw = json.loads(STRATEGY_CONFIG_FILE.read_text(encoding="utf-8"))
+                proxy_text = self._proxy_text_from_config_payload(raw)
+                if proxy_text:
+                    try:
+                        self.exchange_proxy_var.set(proxy_text)
+                        self._save_exchange_proxy_config_only()
+                        logger.info("已迁移旧版代理配置到：%s", EXCHANGE_PROXY_CONFIG_FILE)
+                    except Exception as save_exc:
+                        logger.error("迁移旧版代理配置失败: %s", save_exc)
+            except Exception as e:
+                logger.error("读取旧版代理配置失败: %s", e)
+        self.exchange_proxy_var.set(proxy_text)
 
     def _load_strategy_config(self):
         if not STRATEGY_CONFIG_FILE.exists():
@@ -3006,13 +3107,6 @@ class App(tk.Tk):
 
             self.api_key_var.set(SECRET_BOX.decrypt(str(raw.get("api_key", "") or "").strip()).strip())
             self.api_secret_var.set(SECRET_BOX.decrypt(str(raw.get("api_secret", "") or "").strip()).strip())
-            proxy_enc = str(raw.get("exchange_proxy_enc", "") or "").strip()
-            legacy_proxy = str(raw.get("exchange_proxy", EXCHANGE_PROXY_DEFAULT) or EXCHANGE_PROXY_DEFAULT).strip()
-            try:
-                proxy_text = self._decrypt_optional_text(proxy_enc) if proxy_enc else legacy_proxy
-            except Exception:
-                proxy_text = legacy_proxy
-            self.exchange_proxy_var.set(proxy_text)
             self.spot_rounds_var.set(int(raw.get("spot_rounds", SPOT_ROUNDS_DEFAULT)))
             self.trade_mode_var.set(self._normalize_trade_mode(raw.get("trade_mode", TRADE_MODE_DEFAULT)))
             self.premium_percent_var.set(str(raw.get("premium_percent", PREMIUM_PERCENT_DEFAULT) or PREMIUM_PERCENT_DEFAULT).strip())
@@ -3091,10 +3185,21 @@ class App(tk.Tk):
 
     def test_exchange_proxy(self):
         def worker():
+            test_ok = False
+            save_err = ""
             try:
                 status, exit_ip = self._test_exchange_proxy_once()
                 route_text = self._exchange_proxy_route_text()
+                try:
+                    self._save_exchange_proxy_config_only()
+                except Exception as e:
+                    save_err = str(e)
+                test_ok = True
                 log_text = f"交易所代理测试成功：status={status}，exit_ip={exit_ip}，route={route_text}"
+                if save_err:
+                    log_text = f"{log_text}，但保存配置失败：{save_err}"
+                else:
+                    log_text = f"{log_text}，已自动保存配置"
             except Exception as e:
                 status = "连接失败" if self.exchange_proxy_var.get().strip() else "未启用"
                 exit_ip = "--"
@@ -3105,8 +3210,10 @@ class App(tk.Tk):
                 self.exchange_proxy_status_var.set(status)
                 self.exchange_proxy_exit_ip_var.set(exit_ip)
                 self._append_log(log_text)
-                if "失败" in log_text:
+                if not test_ok:
                     messagebox.showerror("代理测试失败", log_text)
+                elif save_err:
+                    messagebox.showwarning("代理测试成功", log_text)
                 else:
                     messagebox.showinfo("代理测试成功", log_text)
 
