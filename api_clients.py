@@ -19,6 +19,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from decimal import Decimal
+from typing import Callable
+
+import requests
 
 from core_models import AccountEntry, EvmToken
 
@@ -74,6 +77,31 @@ class EvmClient:
             EvmToken(symbol="USDC", contract="0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", decimals=18, is_native=False),
         ],
     }
+
+    def __init__(self, proxy_provider: Callable[[], str] | None = None, *, allow_system_proxy: bool = True):
+        self._proxy_provider = proxy_provider
+        self._allow_system_proxy = bool(allow_system_proxy)
+
+    def _current_proxy_url(self) -> str:
+        if self._proxy_provider is None:
+            return ""
+        try:
+            value = self._proxy_provider()
+        except Exception as exc:
+            raise RuntimeError(f"RPC 代理初始化失败：{exc}") from exc
+        return str(value or "").strip()
+
+    def _new_rpc_session(self) -> tuple[requests.Session, str]:
+        proxy_url = self._current_proxy_url()
+        session = requests.Session()
+        session.trust_env = self._allow_system_proxy and not bool(proxy_url)
+        if proxy_url:
+            session.proxies = {
+                "http": proxy_url,
+                "https": proxy_url,
+            }
+        return session, proxy_url
+
     def _network_info(self, network: str) -> dict:
         net = network.strip().upper()
         info = self.NETWORKS.get(net)
@@ -261,15 +289,22 @@ class EvmClient:
         last_err = ""
         for url in info["rpc_urls"]:
             for attempt in range(1, max_attempts + 1):
-                req = urllib.request.Request(
-                    url=url,
-                    data=body,
-                    method="POST",
-                    headers={"Content-Type": "application/json"},
-                )
+                session = None
+                proxy_url = ""
                 try:
-                    with urllib.request.urlopen(req, timeout=20) as resp:
-                        text = resp.read().decode("utf-8", errors="ignore")
+                    session, proxy_url = self._new_rpc_session()
+                    resp = session.post(
+                        url,
+                        data=body,
+                        headers={"Content-Type": "application/json"},
+                        timeout=20,
+                    )
+                    text = resp.text
+                    if resp.status_code >= 400:
+                        preview = (text or "").strip()
+                        if len(preview) > 240:
+                            preview = preview[:240] + "..."
+                        raise RuntimeError(f"RPC({url}) HTTP {resp.status_code} {preview}".strip())
                     j = json.loads(text) if text else {}
                     if "error" in j:
                         err = j.get("error") or {}
@@ -278,11 +313,17 @@ class EvmClient:
                         raise RuntimeError(f"RPC({url}) code={code} msg={msg}")
                     return j.get("result")
                 except Exception as exc:
-                    last_err = str(exc)
+                    err_text = str(exc)
+                    if proxy_url and "Missing dependencies for SOCKS support" in err_text:
+                        err_text = f"当前代理为 SOCKS，但运行环境缺少 PySocks：{proxy_url}"
+                    last_err = err_text
                     if attempt < max_attempts:
                         time.sleep(0.4 * attempt)
                         continue
                     break
+                finally:
+                    if session is not None:
+                        session.close()
         raise RuntimeError(f"{network} RPC 请求失败：{last_err}")
 
     @staticmethod

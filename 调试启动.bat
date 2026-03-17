@@ -33,14 +33,14 @@ if %errorlevel%==0 (
     )
 )
 
-%PYTHON_CMD% -c "import importlib.util, sys; missing=[]; mapping={'requests':'requests','eth_account':'eth-account','eth_utils':'eth-utils'}; [missing.append(pkg) for mod,pkg in mapping.items() if importlib.util.find_spec(mod) is None]; sys.exit(0 if not missing else 1)"
+%PYTHON_CMD% -c "import importlib.util, sys; missing=[]; mapping={'requests':'requests','socks':'PySocks','eth_account':'eth-account','eth_utils':'eth-utils'}; [missing.append(pkg) for mod,pkg in mapping.items() if importlib.util.find_spec(mod) is None]; sys.exit(0 if not missing else 1)"
 if %errorlevel% neq 0 (
     echo [INFO] Installing runtime dependencies...
-    %PYTHON_CMD% -m pip install --user requests eth-account eth-utils
+    %PYTHON_CMD% -m pip install --user requests PySocks eth-account eth-utils
     if %errorlevel% neq 0 (
         echo [ERROR] Dependency installation failed.
         echo Try:
-        echo   %PYTHON_CMD% -m pip install --user requests eth-account eth-utils
+        echo   %PYTHON_CMD% -m pip install --user requests PySocks eth-account eth-utils
         pause
         exit /b %errorlevel%
     )
@@ -52,7 +52,7 @@ if %errorlevel% neq 0 (
     echo.
     echo [ERROR] Program failed to start.
     echo If needed, install dependencies:
-    echo   py -3 -m pip install requests eth-account eth-utils
+    echo   py -3 -m pip install requests PySocks eth-account eth-utils
     pause
     exit /b %errorlevel%
 )

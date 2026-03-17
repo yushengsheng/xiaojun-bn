@@ -28,6 +28,7 @@ import requests
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+from api_clients import EvmClient
 from app_paths import APP_DIR, BUNDLE_DIR, STRATEGY_CONFIG_FILE
 from secret_box import SECRET_BOX
 
@@ -813,6 +814,44 @@ class BinanceClient:
             total += bal
         return total, rows
 
+    def query_asset_balances_breakdown(self) -> dict[str, Decimal]:
+        totals: dict[str, Decimal] = {}
+
+        def add_amount(asset: str, amount) -> None:
+            asset_u = str(asset or "").strip().upper()
+            if not asset_u:
+                return
+            amount_dec = Decimal(str(amount or "0"))
+            if amount_dec <= 0:
+                return
+            totals[asset_u] = totals.get(asset_u, Decimal("0")) + amount_dec
+
+        try:
+            for item in self.spot_all_balances():
+                add_amount(item.get("asset", ""), item.get("total", 0))
+        except Exception as e:
+            logger.warning("查询现货资产明细失败: %s", e)
+
+        try:
+            for item in self.funding_positive_assets():
+                add_amount(item.get("asset", ""), item.get("free", 0))
+        except Exception as e:
+            logger.warning("查询资金账户资产明细失败: %s", e)
+
+        try:
+            for item in self.um_futures_transferable_assets():
+                add_amount(item.get("asset", ""), item.get("amount", 0))
+        except Exception as e:
+            logger.warning("查询 U本位资产明细失败: %s", e)
+
+        try:
+            for item in self.cm_futures_transferable_assets():
+                add_amount(item.get("asset", ""), item.get("amount", 0))
+        except Exception as e:
+            logger.warning("查询 币本位资产明细失败: %s", e)
+
+        return totals
+
     # -------- 工具：从 symbol 推断现货基础币种 --------
     @staticmethod
     def split_spot_symbol(symbol: str) -> tuple[str, str]:
@@ -1310,7 +1349,17 @@ class BinanceClient:
         network: str,
         fee_buffer: float = WITHDRAW_FEE_BUFFER_DEFAULT,
         enable_withdraw: bool = True,
+        auto_collect_to_spot: bool = False,
     ) -> float:
+        coin = str(coin or "").strip().upper()
+        if auto_collect_to_spot and coin:
+            try:
+                moved_count = self.collect_asset_to_spot(coin)
+                if moved_count > 0:
+                    # Give Binance a brief moment to reflect the transfer in spot balance.
+                    time.sleep(0.5)
+            except Exception as e:
+                logger.warning("提现前归集 %s 到现货失败: %s", coin, e)
         balance = self.spot_balance(coin)
         amount = balance - fee_buffer
         if amount <= 0:
@@ -1434,6 +1483,65 @@ class BinanceClient:
         )
         logger.info("划转成功: %s %s %s", transfer_type, asset, amt_str)
         return True
+
+    def collect_asset_to_spot(self, asset: str) -> int:
+        asset_u = str(asset or "").strip().upper()
+        if not asset_u:
+            return 0
+
+        total_count = 0
+
+        try:
+            items = self.um_futures_transferable_assets()
+            for item in items:
+                if str(item.get("asset") or "").strip().upper() != asset_u:
+                    continue
+                amount = float(item.get("amount", 0) or 0)
+                if amount <= 0:
+                    continue
+                try:
+                    self.universal_transfer("UMFUTURE_MAIN", asset_u, amount)
+                    total_count += 1
+                except Exception as e:
+                    logger.warning("提现前 U本位划转失败 %s %.8f: %s", asset_u, amount, e)
+        except Exception as e:
+            logger.warning("提现前查询 U本位 %s 余额失败: %s", asset_u, e)
+
+        try:
+            items = self.cm_futures_transferable_assets()
+            for item in items:
+                if str(item.get("asset") or "").strip().upper() != asset_u:
+                    continue
+                amount = float(item.get("amount", 0) or 0)
+                if amount <= 0:
+                    continue
+                try:
+                    self.universal_transfer("CMFUTURE_MAIN", asset_u, amount)
+                    total_count += 1
+                except Exception as e:
+                    logger.warning("提现前 币本位划转失败 %s %.8f: %s", asset_u, amount, e)
+        except Exception as e:
+            logger.warning("提现前查询 币本位 %s 余额失败: %s", asset_u, e)
+
+        try:
+            items = self.funding_positive_assets()
+            for item in items:
+                if str(item.get("asset") or "").strip().upper() != asset_u:
+                    continue
+                amount = float(item.get("free", 0) or 0)
+                if amount <= 0:
+                    continue
+                try:
+                    self.universal_transfer("FUNDING_MAIN", asset_u, amount)
+                    total_count += 1
+                except Exception as e:
+                    logger.warning("提现前 资金账户划转失败 %s %.8f: %s", asset_u, amount, e)
+        except Exception as e:
+            logger.warning("提现前查询 资金账户 %s 余额失败: %s", asset_u, e)
+
+        if total_count > 0:
+            logger.info("提现前归集 %s 到现货完成，共处理 %d 项", asset_u, total_count)
+        return total_count
 
     # -------- 归集合约/资金到现货 --------
     def collect_all_to_spot(self):
@@ -1902,6 +2010,35 @@ class Strategy:
 
 
 # ====================== GUI 应用 ======================
+class CombinedStopEvent:
+    def __init__(self, *events):
+        self._events = [event for event in events if event is not None]
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
+
+    def wait(self, timeout=None) -> bool:
+        if self.is_set():
+            return True
+        if timeout is None:
+            while not self.is_set():
+                time.sleep(0.1)
+            return True
+
+        end_time = time.time() + max(0.0, float(timeout))
+        while True:
+            if self.is_set():
+                return True
+            remaining = end_time - time.time()
+            if remaining <= 0:
+                return self.is_set()
+            step = min(0.2, remaining)
+            if self._events:
+                self._events[0].wait(step)
+            else:
+                time.sleep(step)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1911,6 +2048,7 @@ class App(tk.Tk):
         self.client = None
         self.worker_thread = None
         self.stop_event = None
+        self._batch_task_active = False
         self.exchange_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent)
 
         self.accounts = []
@@ -2029,6 +2167,7 @@ class App(tk.Tk):
         self.account_row_menu = tk.Menu(self, tearoff=0)
         self.account_row_menu.add_command(label="查询", command=self.run_context_account_query)
         self.account_row_menu.add_command(label="执行", command=self.run_context_account_execute)
+        self.account_row_menu.add_command(label="停止", command=self.run_context_account_stop)
         self.account_row_menu.add_command(label="提现", command=self.run_context_account_withdraw)
         self.account_row_menu.add_command(label="归集BNB", command=self.run_context_account_collect_bnb)
         self._context_account = None
@@ -2104,7 +2243,7 @@ class App(tk.Tk):
 
         if OnchainTransferPage is not None:
             try:
-                self.onchain_page = OnchainTransferPage(onchain_body)
+                self.onchain_page = OnchainTransferPage(onchain_body, rpc_proxy_getter=self._get_exchange_proxy_url)
             except Exception as exc:
                 self.onchain_page = None
                 logger.exception("链上页面初始化失败: %s", exc)
@@ -3218,6 +3357,8 @@ class App(tk.Tk):
         self.worker_thread.start()
 
     def _on_worker_finished(self):
+        self._batch_task_active = False
+        self._clear_account_batch_runtime()
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.btn_run_accounts.config(state="normal")
@@ -3269,7 +3410,6 @@ class App(tk.Tk):
             messagebox.showerror("错误", "请先使用当前 API 创建连接（点击一次开始或刷新余额）")
             return
 
-        enable_withdraw = bool(self.enable_withdraw_var.get())
         address = self.withdraw_addr_var.get().strip()
         network = self.withdraw_net_var.get().strip()
         coin = self.withdraw_coin_var.get().strip().upper()
@@ -3279,7 +3419,7 @@ class App(tk.Tk):
             messagebox.showerror("错误", "手续费预留格式不正确")
             return
 
-        if enable_withdraw and (not address or not network or not coin):
+        if not address or not network or not coin:
             messagebox.showerror("错误", "请填写 提现地址 / 网络 / 币种")
             return
 
@@ -3291,7 +3431,8 @@ class App(tk.Tk):
                     address=address,
                     network=network,
                     fee_buffer=buffer_val,
-                    enable_withdraw=enable_withdraw,
+                    enable_withdraw=True,
+                    auto_collect_to_spot=True,
                 )
                 if amount > 0:
                     self.record_withdraw(1, self.client.key, address, amount)
@@ -3321,6 +3462,8 @@ class App(tk.Tk):
         if not s or s == "就绪":
             return "#f2f2f2"
         if "未到账" in s:
+            return "#ffe3b8"
+        if any(k in s for k in ("已停止", "已请求停止")):
             return "#ffe3b8"
         if any(k in s for k in ("失败", "异常")):
             return "#f8c7c7"
@@ -3370,6 +3513,30 @@ class App(tk.Tk):
         acc["status_var"].set(str(text))
         self._apply_account_row_style(acc)
 
+    def _get_account_stop_event(self, acc: dict):
+        stop_event = acc.get("stop_event")
+        if stop_event is None:
+            stop_event = threading.Event()
+            acc["stop_event"] = stop_event
+        return stop_event
+
+    def _clear_account_stop_request(self, acc: dict):
+        self._get_account_stop_event(acc).clear()
+
+    def _set_account_batch_active(self, acc: dict, active: bool):
+        acc["batch_active"] = bool(active)
+
+    def _prepare_accounts_for_batch(self, selected_accounts):
+        selected_ids = {id(acc) for acc in selected_accounts}
+        for acc in self.accounts:
+            self._clear_account_stop_request(acc)
+            self._set_account_batch_active(acc, id(acc) in selected_ids)
+
+    def _clear_account_batch_runtime(self):
+        for acc in self.accounts:
+            self._clear_account_stop_request(acc)
+            self._set_account_batch_active(acc, False)
+
     def _set_context_account(self, acc: dict | None):
         previous = getattr(self, "_context_account", None)
         self._context_account = acc
@@ -3413,6 +3580,30 @@ class App(tk.Tk):
             require_confirm=False,
         )
 
+    def run_context_account_stop(self):
+        acc = self._get_context_account_or_warn()
+        if acc is None:
+            return
+        if not self._batch_task_active or not (self.worker_thread and self.worker_thread.is_alive()):
+            messagebox.showinfo("提示", "当前没有运行中的批量任务")
+            return
+        if not bool(acc.get("batch_active")):
+            messagebox.showinfo("提示", "该账号当前不在运行队列中")
+            return
+
+        account_stop_event = self._get_account_stop_event(acc)
+        if account_stop_event.is_set():
+            messagebox.showinfo("提示", "该账号已请求停止")
+            return
+
+        account_stop_event.set()
+        self._set_account_status(acc, "已请求停止")
+        try:
+            idx_text = acc["index_var"].get()
+        except Exception:
+            idx_text = "?"
+        logger.info("已请求停止账号 #%s", idx_text)
+
     def run_context_account_withdraw(self):
         acc = self._get_context_account_or_warn()
         if acc is None:
@@ -3444,6 +3635,21 @@ class App(tk.Tk):
                 continue
             parts.append(f"{asset} {cls._format_amount(total)}")
         return " | ".join(parts) if parts else "--"
+
+    @classmethod
+    def _format_asset_breakdown_text(cls, balances: dict[str, Decimal]) -> str:
+        if not balances:
+            return "--"
+        items = []
+        for asset, amount in balances.items():
+            amount_dec = Decimal(str(amount or "0"))
+            if amount_dec <= 0:
+                continue
+            items.append((asset, amount_dec))
+        if not items:
+            return "--"
+        items.sort(key=lambda item: (-item[1], item[0]))
+        return " | ".join(f"{asset} {cls._format_amount(float(amount_dec))}" for asset, amount_dec in items)
 
     @classmethod
     def _format_withdraw_amount_status(cls, amount: float, coin: str, *, enable_withdraw: bool) -> str:
@@ -3486,7 +3692,7 @@ class App(tk.Tk):
         lbl_key = tk.Label(row_frame, text=self._mask_key(key), width=25, anchor="w", bg="#f7f7f7")
         lbl_addr = tk.Label(row_frame, text=self._mask_addr(addr), width=35, anchor="w", bg="#f7f7f7")
         lbl_net = tk.Label(row_frame, textvariable=network_var, width=8, anchor="w", bg="#f7f7f7")
-        lbl_status = tk.Label(row_frame, textvariable=status_var, width=30, anchor="w", bg="#f7f7f7")
+        lbl_status = tk.Label(row_frame, textvariable=status_var, width=52, anchor="w", bg="#f7f7f7")
 
         for w in (lbl_index, chk_selected, lbl_key, lbl_addr, lbl_net, lbl_status):
             w.pack(side="left", padx=2)
@@ -3498,6 +3704,8 @@ class App(tk.Tk):
             "selected_var": selected_var,
             "network_var": network_var,
             "status_var": status_var,
+            "stop_event": threading.Event(),
+            "batch_active": False,
             "api_key": key,
             "api_secret": secret,
             "address": addr,
@@ -3726,6 +3934,8 @@ class App(tk.Tk):
 
         logger.info("交易所批量链路：%s", self._exchange_proxy_route_text())
         self.stop_event = threading.Event()
+        self._batch_task_active = True
+        self._prepare_accounts_for_batch(selected)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.btn_run_accounts.config(state="disabled")
@@ -3785,9 +3995,24 @@ class App(tk.Tk):
                         self._set_account_status(acc_obj, text)
                     self.after(0, _u)
 
+                combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
                 logger.info(f"[线程 {thread_id}] 开始处理账号 #{idx}")
 
                 should_finish_in_finally = True
+
+                def finish_current_now(final_status: str | None = None):
+                    nonlocal should_finish_in_finally
+                    if final_status is not None:
+                        set_status(final_status)
+                    self._set_account_batch_active(acc, False)
+                    should_finish_in_finally = False
+                    finish_one()
+                    task_queue.task_done()
+                    logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
+
+                if combined_stop.is_set():
+                    finish_current_now("已停止")
+                    continue
 
                 try:
                     client = self._create_binance_client(acc["api_key"], acc["api_secret"])
@@ -3796,6 +4021,8 @@ class App(tk.Tk):
                     if batch_total_asset_only:
                         set_status("查询总资产...")
                         total_usdt, rows = client.query_total_wallet_balance("USDT")
+                        asset_breakdown = client.query_asset_balances_breakdown()
+                        asset_text = self._format_asset_breakdown_text(asset_breakdown)
 
                         self.record_total_asset(
                             idx,
@@ -3809,13 +4036,14 @@ class App(tk.Tk):
                             [f'{r["walletName"]}:{r["balance"]:.4f}' for r in rows if r["balance"] > 0]
                         )
                         logger.info(
-                            "账号 #%d 总资产约 %s USDT；%s",
+                            "账号 #%d 总资产约 %s USDT；钱包=%s；币种=%s",
                             idx,
                             f"{total_usdt:.8f}",
-                            detail_text if detail_text else "无非零钱包余额"
+                            detail_text if detail_text else "无非零钱包余额",
+                            asset_text if asset_text != "--" else "无币种资产",
                         )
 
-                        set_status(f"总资产 {Decimal(str(total_usdt)):.4f} USDT")
+                        set_status(asset_text if asset_text != "--" else f"总资产 {Decimal(str(total_usdt)):.4f} USDT")
 
                     # 2) 批量归集BNB模式
                     elif batch_collect_bnb_mode:
@@ -3823,13 +4051,9 @@ class App(tk.Tk):
                         set_status("归集合约/资金...")
                         client.collect_all_to_spot()
 
-                        if self.stop_event.is_set():
-                            set_status("已停止")
-                            should_finish_in_finally = False
-                            finish_one()
-                            task_queue.task_done()
-                            logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
-                            return
+                        if combined_stop.is_set():
+                            finish_current_now("已停止")
+                            continue
 
                         time.sleep(1)
 
@@ -3840,13 +4064,9 @@ class App(tk.Tk):
                         except Exception as e:
                             logger.warning(f"账号 #{idx} 小额兑换失败: {e}")
 
-                        if self.stop_event.is_set():
-                            set_status("已停止")
-                            should_finish_in_finally = False
-                            finish_one()
-                            task_queue.task_done()
-                            logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
-                            return
+                        if combined_stop.is_set():
+                            finish_current_now("已停止")
+                            continue
 
                         time.sleep(1)
 
@@ -3858,13 +4078,9 @@ class App(tk.Tk):
                             except Exception as e:
                                 logger.warning(f"账号 #{idx} 大额币卖出失败: {e}")
 
-                            if self.stop_event.is_set():
-                                set_status("已停止")
-                                should_finish_in_finally = False
-                                finish_one()
-                                task_queue.task_done()
-                                logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
-                                return
+                            if combined_stop.is_set():
+                                finish_current_now("已停止")
+                                continue
 
                             time.sleep(1)
 
@@ -3906,13 +4122,14 @@ class App(tk.Tk):
 
                         if need_wait_usdt:
                             set_status(f"检测 {quote_asset} 到账...")
-                            if not self.wait_for_usdt(usdt_timeout, self.stop_event, client=client, symbol=spot_symbol):
-                                logger.info(f"账号 #{idx} {quote_asset} 检测超时，跳过")
-                                set_status(f"{quote_asset} 未到账")
-                                should_finish_in_finally = False
-                                finish_one()
-                                task_queue.task_done()
-                                logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
+                            if not self.wait_for_usdt(usdt_timeout, combined_stop, client=client, symbol=spot_symbol):
+                                if combined_stop.is_set():
+                                    logger.info(f"账号 #{idx} 已请求停止")
+                                    finish_current_now("已停止")
+                                else:
+                                    logger.info(f"账号 #{idx} {quote_asset} 检测超时，跳过")
+                                    set_status(f"{quote_asset} 未到账")
+                                    finish_current_now()
                                 continue
                         else:
                             logger.info(f"账号 #{idx} 已开启“批量策略跳过{quote_asset}检测”")
@@ -3940,9 +4157,13 @@ class App(tk.Tk):
                             )
 
                         def sleep_fn():
-                            if self.stop_event.is_set():
+                            if combined_stop.is_set():
                                 return
-                            self.random_sleep(min_delay, max_delay)
+                            if max_delay < min_delay:
+                                low_ms, high_ms = max_delay, min_delay
+                            else:
+                                low_ms, high_ms = min_delay, max_delay
+                            combined_stop.wait(random.randint(low_ms, high_ms) / 1000.0)
 
                         withdraw_state = {"amount": None}
 
@@ -3979,9 +4200,9 @@ class App(tk.Tk):
                             reprice_threshold_percent=reprice_threshold_percent_value,
                         )
 
-                        strategy_result = strategy.run(self.stop_event, progress_cb=progress_cb)
+                        strategy_result = strategy.run(combined_stop, progress_cb=progress_cb)
 
-                        if not self.stop_event.is_set():
+                        if not combined_stop.is_set():
                             callback_amount = withdraw_state.get("amount")
                             result_amount = float((strategy_result or {}).get("withdraw_amount", 0.0)) if isinstance(strategy_result, dict) else 0.0
                             final_amount = callback_amount if callback_amount is not None else result_amount
@@ -3996,12 +4217,15 @@ class App(tk.Tk):
                                         enable_withdraw=enable_withdraw,
                                     )
                                 )
+                        else:
+                            set_status("已停止")
 
                 except Exception as e:
                     logger.error(f"账号 #{idx} 执行异常: {e}")
                     set_status("异常")
                 finally:
                     if should_finish_in_finally:
+                        self._set_account_batch_active(acc, False)
                         finish_one()
                         task_queue.task_done()
                         logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
@@ -4045,11 +4269,15 @@ class App(tk.Tk):
         if max_threads < 1:
             max_threads = 1
 
-        enable_withdraw = bool(self.enable_withdraw_var.get())
         coin = self.withdraw_coin_var.get().strip().upper()
+        if not coin:
+            messagebox.showerror("错误", "请先填写提现币种")
+            return
 
         logger.info("交易所批量提现链路：%s", self._exchange_proxy_route_text())
         self.stop_event = threading.Event()
+        self._batch_task_active = True
+        self._prepare_accounts_for_batch(selected)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.btn_run_accounts.config(state="disabled")
@@ -4083,23 +4311,32 @@ class App(tk.Tk):
                 def set_status(text, acc_ref=acc):
                     self.after(0, lambda: self._set_account_status(acc_ref, text))
 
-                set_status(f"提现 {coin}...")
+                combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
                 try:
-                    client = self._create_binance_client(acc["api_key"], acc["api_secret"])
-                    amount = client.withdraw_all_coin(
-                        coin=coin,
-                        address=acc["address"],
-                        network=acc["network"],
-                        fee_buffer=withdraw_buffer,
-                        enable_withdraw=enable_withdraw,
-                    )
-                    if amount > 0:
-                        self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
-                    set_status(self._format_withdraw_amount_status(amount, coin, enable_withdraw=enable_withdraw))
+                    if combined_stop.is_set():
+                        set_status("已停止")
+                    else:
+                        set_status(f"提现 {coin}...")
+                        client = self._create_binance_client(acc["api_key"], acc["api_secret"])
+                        if combined_stop.is_set():
+                            set_status("已停止")
+                        else:
+                            amount = client.withdraw_all_coin(
+                                coin=coin,
+                                address=acc["address"],
+                                network=acc["network"],
+                                fee_buffer=withdraw_buffer,
+                                enable_withdraw=True,
+                                auto_collect_to_spot=True,
+                            )
+                            if amount > 0:
+                                self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
+                            set_status(self._format_withdraw_amount_status(amount, coin, enable_withdraw=True))
                 except Exception as e:
                     logger.error(f"账号 #{idx} 提现失败: {e}")
                     set_status("提现失败")
                 finally:
+                    self._set_account_batch_active(acc, False)
                     task_queue.task_done()
                     with count_lock:
                         completed_count += 1
@@ -4125,6 +4362,50 @@ class App(tk.Tk):
         self.worker_thread = threading.Thread(target=controller, daemon=True)
         self.worker_thread.start()
 
+def run_selftest() -> int:
+    try:
+        checks: list[str] = []
+
+        if OnchainTransferPage is None:
+            raise RuntimeError(f"链上模块导入失败: {_ONCHAIN_IMPORT_ERROR}")
+        checks.append("onchain-import")
+
+        EvmClient.ensure_dependencies(require_signing=True)
+        client = EvmClient()
+        checks.append("evm-deps")
+
+        zero_address = "0x0000000000000000000000000000000000000000"
+        eth_balance = client.get_balance_wei("ETH", zero_address)
+        bsc_balance = client.get_balance_wei("BSC", zero_address)
+        checks.append(f"eth-rpc={eth_balance}")
+        checks.append(f"bsc-rpc={bsc_balance}")
+
+        session = requests.Session()
+        session.trust_env = False
+        session.proxies = {
+            "http": "socks5://127.0.0.1:9",
+            "https": "socks5://127.0.0.1:9",
+        }
+        try:
+            session.get("http://example.com", timeout=1)
+        except Exception as exc:
+            if "Missing dependencies for SOCKS support" in str(exc):
+                raise RuntimeError("requests 缺少 SOCKS 支持（PySocks 未打包）") from exc
+        finally:
+            session.close()
+        checks.append("socks-support")
+
+        xray_path = ExchangeProxyRuntime.find_xray_executable()
+        sing_box_path = ExchangeProxyRuntime.find_sing_box_executable()
+        checks.append(f"xray={xray_path.name}")
+        checks.append(f"sing-box={sing_box_path.name}")
+
+        logger.info("SELFTEST OK: %s", ", ".join(checks))
+        return 0
+    except Exception as exc:
+        logger.exception("SELFTEST FAILED: %s", exc)
+        return 1
+
 
 # ====================== 入口 ======================
 if __name__ == "__main__":
@@ -4137,6 +4418,8 @@ if __name__ == "__main__":
         os.chdir(application_path)
     except Exception as e:
         print(f"路径设置失败: {e}")
+    if "--selftest" in sys.argv:
+        raise SystemExit(run_selftest())
 
     app = App()
     app.mainloop()

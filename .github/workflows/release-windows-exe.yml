@@ -26,7 +26,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller pyinstaller-hooks-contrib requests eth-account eth-utils eth-abi eth-keyfile eth-keys eth-rlp eth-hash[pycryptodome] hexbytes rlp parsimonious cytoolz bitarray ckzg
+          pip install pyinstaller pyinstaller-hooks-contrib requests PySocks eth-account eth-utils eth-abi eth-keyfile eth-keys eth-rlp eth-hash[pycryptodome] hexbytes rlp parsimonious cytoolz bitarray ckzg
 
       - name: Download proxy runtimes
         shell: pwsh
@@ -94,6 +94,7 @@ jobs:
             '--collect-all', 'certifi',
             '--collect-all', 'charset_normalizer',
             '--collect-all', 'idna',
+            '--collect-all', 'socks',
             '--collect-all', 'cryptography',
             '--collect-all', 'cffi',
             '--collect-all', 'pycparser',
@@ -134,6 +135,22 @@ jobs:
 
           pyinstaller --onefile --name $appName @commonArgs app_entry.py
           pyinstaller --onedir --name $portableName @commonArgs app_entry.py
+
+      - name: Smoke test packaged apps
+        shell: pwsh
+        run: |
+          $appName = "xiaojun-bn-${{ github.ref_name }}-windows-x64"
+          $portableName = "xiaojun-bn-${{ github.ref_name }}-windows-x64-portable"
+
+          & "dist/$appName.exe" --selftest
+          if ($LASTEXITCODE -ne 0) {
+            throw "Onefile selftest failed with exit code $LASTEXITCODE"
+          }
+
+          & "dist/$portableName/$portableName.exe" --selftest
+          if ($LASTEXITCODE -ne 0) {
+            throw "Portable selftest failed with exit code $LASTEXITCODE"
+          }
 
       - name: Package release assets
         shell: pwsh

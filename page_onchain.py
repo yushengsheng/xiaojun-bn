@@ -73,11 +73,11 @@ class OnchainTransferPage:
         "balance": 1,
     }
 
-    def __init__(self, parent):
+    def __init__(self, parent, rpc_proxy_getter=None):
         self.parent = parent
         self.root = parent.winfo_toplevel()
         self.store = OnchainStore(ONCHAIN_DATA_FILE)
-        self.client = EvmClient()
+        self.client = EvmClient(proxy_provider=rpc_proxy_getter)
         self.is_running = False
         self.stop_requested = threading.Event()
         self._layout_mode: str | None = None
