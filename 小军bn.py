@@ -46,6 +46,13 @@ EXCHANGE_PROXY_DEFAULT = ""
 
 SPOT_SYMBOL_DEFAULT = "BNBUSDT"
 SPOT_ROUNDS_DEFAULT = 20
+TRADE_ACCOUNT_TYPE_SPOT = "现货"
+TRADE_ACCOUNT_TYPE_FUTURES = "合约"
+TRADE_ACCOUNT_TYPE_OPTIONS = (
+    TRADE_ACCOUNT_TYPE_SPOT,
+    TRADE_ACCOUNT_TYPE_FUTURES,
+)
+TRADE_ACCOUNT_TYPE_DEFAULT = TRADE_ACCOUNT_TYPE_SPOT
 TRADE_MODE_MARKET = "市价"
 TRADE_MODE_LIMIT = "挂单"
 TRADE_MODE_PREMIUM = "溢价单"
@@ -59,6 +66,24 @@ PREMIUM_PERCENT_DEFAULT = ""
 BNB_FEE_STOP_DEFAULT = ""
 BNB_TOPUP_AMOUNT_DEFAULT = "0"
 REPRICE_THRESHOLD_PERCENT_DEFAULT = "1"
+FUTURES_SYMBOL_DEFAULT = "BTCUSDT"
+FUTURES_ROUNDS_DEFAULT = 20
+FUTURES_AMOUNT_DEFAULT = "100"
+FUTURES_LEVERAGE_DEFAULT = 10
+FUTURES_MARGIN_TYPE_CROSSED = "CROSSED"
+FUTURES_MARGIN_TYPE_ISOLATED = "ISOLATED"
+FUTURES_MARGIN_TYPE_OPTIONS = (
+    FUTURES_MARGIN_TYPE_CROSSED,
+    FUTURES_MARGIN_TYPE_ISOLATED,
+)
+FUTURES_MARGIN_TYPE_DEFAULT = FUTURES_MARGIN_TYPE_CROSSED
+FUTURES_SIDE_LONG = "做多"
+FUTURES_SIDE_SHORT = "做空"
+FUTURES_SIDE_OPTIONS = (
+    FUTURES_SIDE_LONG,
+    FUTURES_SIDE_SHORT,
+)
+FUTURES_SIDE_DEFAULT = FUTURES_SIDE_LONG
 SUPPORTED_QUOTE_ASSET_SUFFIXES = (
     "FDUSD",
     "USDT",
@@ -651,6 +676,8 @@ class BinanceClient:
 
         self._exchange_info_cache = {}
         self._price_cache = {}
+        self._um_futures_exchange_info_cache = {}
+        self._um_futures_price_cache = {}
         self._server_time_offset_ms = {}
         self._server_time_synced_at = {}
         self._server_time_lock = threading.Lock()
@@ -966,6 +993,360 @@ class BinanceClient:
             "baseAsset": info.get("baseAsset"),
         }
 
+    @staticmethod
+    def _error_text_contains(exc: Exception, *snippets: str) -> bool:
+        text = str(exc or "").lower()
+        return any(str(snippet or "").lower() in text for snippet in snippets if snippet)
+
+    def get_um_futures_exchange_info(self, symbol: str):
+        symbol_u = str(symbol or "").strip().upper()
+        if not symbol_u:
+            return None
+        if symbol_u in self._um_futures_exchange_info_cache:
+            return self._um_futures_exchange_info_cache[symbol_u]
+        data = self.public_get(self.um_futures, "/fapi/v1/exchangeInfo", {"symbol": symbol_u})
+        symbols = data.get("symbols", [])
+        if not symbols:
+            return None
+        info = symbols[0]
+        self._um_futures_exchange_info_cache[symbol_u] = info
+        return info
+
+    def get_um_futures_symbol_price(self, symbol: str) -> Optional[Decimal]:
+        symbol_u = str(symbol or "").strip().upper()
+        if not symbol_u:
+            return None
+        try:
+            data = self.public_get(self.um_futures, "/fapi/v1/ticker/price", {"symbol": symbol_u})
+            price = Decimal(str(data.get("price")))
+            self._um_futures_price_cache[symbol_u] = price
+            return price
+        except Exception:
+            return None
+
+    def get_um_futures_trade_rules(self, symbol: str):
+        info = self.get_um_futures_exchange_info(symbol)
+        if not info:
+            return None
+
+        lot = self._extract_filter(info, "LOT_SIZE")
+        market_lot = self._extract_filter(info, "MARKET_LOT_SIZE")
+        min_notional = self._extract_filter(info, "MIN_NOTIONAL")
+        notional = self._extract_filter(info, "NOTIONAL")
+        price_filter = self._extract_filter(info, "PRICE_FILTER")
+
+        market_lot = market_lot or lot or {}
+        lot = lot or market_lot or {}
+        price_filter = price_filter or {}
+
+        step_size = self._decimal_from_str((market_lot or {}).get("stepSize", "0.00000001"), "0.00000001")
+        min_qty = self._decimal_from_str((market_lot or {}).get("minQty", "0"), "0")
+        max_qty = self._decimal_from_str((market_lot or {}).get("maxQty", "999999999"), "999999999")
+        tick_size = self._decimal_from_str((price_filter or {}).get("tickSize", "0.00000001"), "0.00000001")
+        min_price = self._decimal_from_str((price_filter or {}).get("minPrice", "0"), "0")
+        max_price = self._decimal_from_str((price_filter or {}).get("maxPrice", "999999999"), "999999999")
+
+        min_notional_val = Decimal("0")
+        if min_notional:
+            min_notional_val = self._decimal_from_str(min_notional.get("notional", "0"), "0")
+        elif notional:
+            min_notional_val = self._decimal_from_str(notional.get("minNotional", "0"), "0")
+
+        return {
+            "stepSize": step_size,
+            "minQty": min_qty,
+            "maxQty": max_qty,
+            "tickSize": tick_size,
+            "minPrice": min_price,
+            "maxPrice": max_price,
+            "minNotional": min_notional_val,
+            "status": info.get("status"),
+            "quoteAsset": info.get("quoteAsset"),
+            "baseAsset": info.get("baseAsset"),
+            "marginAsset": info.get("marginAsset"),
+            "marketTakeBound": self._decimal_from_str(info.get("marketTakeBound", "0"), "0"),
+        }
+
+    def get_um_futures_margin_asset(self, symbol: str) -> str:
+        rules = self.get_um_futures_trade_rules(symbol)
+        if not rules:
+            return "USDT"
+        return str(rules.get("marginAsset") or rules.get("quoteAsset") or "USDT").strip().upper()
+
+    def get_um_futures_book_ticker(self, symbol: str) -> dict[str, Decimal]:
+        symbol_u = str(symbol or "").strip().upper()
+        data = self.public_get(self.um_futures, "/fapi/v1/ticker/bookTicker", {"symbol": symbol_u})
+        bid_price = self._decimal_from_str(data.get("bidPrice"), "0")
+        ask_price = self._decimal_from_str(data.get("askPrice"), "0")
+        if bid_price <= 0 or ask_price <= 0:
+            raise RuntimeError(f"读取合约盘口失败：{symbol_u} bid/ask 无效")
+        return {
+            "bidPrice": bid_price,
+            "askPrice": ask_price,
+        }
+
+    def get_um_futures_symbol_config(self, symbol: str) -> dict | None:
+        symbol_u = str(symbol or "").strip().upper()
+        if not symbol_u:
+            return None
+        data = self.request(
+            self.um_futures,
+            "GET",
+            "/fapi/v1/symbolConfig",
+            {"symbol": symbol_u},
+        )
+        if isinstance(data, list):
+            return data[0] if data else None
+        if isinstance(data, dict):
+            return data
+        return None
+
+    def get_um_futures_position_mode(self) -> bool:
+        data = self.request(
+            self.um_futures,
+            "GET",
+            "/fapi/v1/positionSide/dual",
+            {},
+        )
+        return bool(data.get("dualSidePosition"))
+
+    def ensure_um_futures_one_way_mode(self) -> bool:
+        dual_mode = self.get_um_futures_position_mode()
+        if not dual_mode:
+            return False
+        try:
+            self.request(
+                self.um_futures,
+                "POST",
+                "/fapi/v1/positionSide/dual",
+                {"dualSidePosition": "false"},
+            )
+            logger.info("U本位合约已切换为单向仓模式")
+            return True
+        except Exception as exc:
+            if self._error_text_contains(exc, "no need to change position side"):
+                return False
+            raise
+
+    def ensure_um_futures_margin_type(self, symbol: str, margin_type: str) -> bool:
+        symbol_u = str(symbol or "").strip().upper()
+        target_margin_type = str(margin_type or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
+        config = self.get_um_futures_symbol_config(symbol_u)
+        current_margin_type = str((config or {}).get("marginType") or "").strip().upper()
+        if current_margin_type == target_margin_type:
+            return False
+        try:
+            self.request(
+                self.um_futures,
+                "POST",
+                "/fapi/v1/marginType",
+                {
+                    "symbol": symbol_u,
+                    "marginType": target_margin_type,
+                },
+            )
+            logger.info("U本位合约 %s 保证金模式已设置为 %s", symbol_u, target_margin_type)
+            return True
+        except Exception as exc:
+            if self._error_text_contains(exc, "no need to change margin type"):
+                return False
+            raise
+
+    def ensure_um_futures_leverage(self, symbol: str, leverage: int) -> int:
+        symbol_u = str(symbol or "").strip().upper()
+        leverage_i = int(leverage)
+        if leverage_i < 1 or leverage_i > 125:
+            raise RuntimeError("合约杠杆必须在 1-125 之间")
+        config = self.get_um_futures_symbol_config(symbol_u)
+        try:
+            current_leverage = int((config or {}).get("leverage"))
+        except Exception:
+            current_leverage = 0
+        if current_leverage == leverage_i:
+            return leverage_i
+        data = self.request(
+            self.um_futures,
+            "POST",
+            "/fapi/v1/leverage",
+            {
+                "symbol": symbol_u,
+                "leverage": leverage_i,
+            },
+        )
+        final_leverage = leverage_i
+        try:
+            final_leverage = int(data.get("leverage", leverage_i))
+        except Exception:
+            pass
+        logger.info("U本位合约 %s 杠杆已设置为 %s", symbol_u, final_leverage)
+        return final_leverage
+
+    def um_futures_account_info(self) -> dict:
+        return self.request(
+            self.um_futures,
+            "GET",
+            "/fapi/v3/account",
+            {},
+        )
+
+    def um_futures_asset_balance(self, asset: str) -> dict[str, Decimal]:
+        asset_u = str(asset or "").strip().upper()
+        info = self.um_futures_account_info()
+        for item in info.get("assets", []):
+            if str(item.get("asset") or "").strip().upper() != asset_u:
+                continue
+            return {
+                "walletBalance": self._decimal_from_str(item.get("walletBalance", "0"), "0"),
+                "availableBalance": self._decimal_from_str(item.get("availableBalance", "0"), "0"),
+                "marginBalance": self._decimal_from_str(item.get("marginBalance", "0"), "0"),
+                "crossWalletBalance": self._decimal_from_str(item.get("crossWalletBalance", "0"), "0"),
+                "maxWithdrawAmount": self._decimal_from_str(item.get("maxWithdrawAmount", "0"), "0"),
+            }
+        return {
+            "walletBalance": Decimal("0"),
+            "availableBalance": Decimal("0"),
+            "marginBalance": Decimal("0"),
+            "crossWalletBalance": Decimal("0"),
+            "maxWithdrawAmount": Decimal("0"),
+        }
+
+    def get_um_futures_position(self, symbol: str) -> dict | None:
+        symbol_u = str(symbol or "").strip().upper()
+        data = self.request(
+            self.um_futures,
+            "GET",
+            "/fapi/v3/positionRisk",
+            {"symbol": symbol_u},
+        )
+        items = data if isinstance(data, list) else [data]
+        selected = None
+        for item in items:
+            if str(item.get("symbol") or "").strip().upper() != symbol_u:
+                continue
+            position_side = str(item.get("positionSide") or "").strip().upper()
+            if position_side == "BOTH":
+                return item
+            if selected is None:
+                selected = item
+        return selected
+
+    def calculate_um_futures_order_quantity(self, symbol: str, notional_amount, direction_side: str) -> Decimal:
+        symbol_u = str(symbol or "").strip().upper()
+        amount = Decimal(str(notional_amount))
+        if amount <= 0:
+            raise RuntimeError("合约下单金额必须大于 0")
+
+        rules = self.get_um_futures_trade_rules(symbol_u)
+        if not rules:
+            raise RuntimeError(f"找不到合约交易对规则：{symbol_u}")
+        if rules["status"] != "TRADING":
+            raise RuntimeError(f"合约交易对不可交易：{symbol_u}")
+
+        book_ticker = self.get_um_futures_book_ticker(symbol_u)
+        side_u = str(direction_side or "").strip().upper()
+        reference_price = Decimal(str(book_ticker["askPrice"])) if side_u == "BUY" else Decimal(str(book_ticker["bidPrice"]))
+        if reference_price <= 0:
+            raise RuntimeError(f"合约参考价格无效：{symbol_u}")
+
+        effective_min_qty = rules["minQty"]
+        if rules["minNotional"] > 0:
+            effective_min_qty = max(
+                effective_min_qty,
+                self._ceil_to_step(rules["minNotional"] / reference_price, rules["stepSize"]),
+            )
+        effective_min_notional = effective_min_qty * reference_price
+
+        qty = self._floor_to_step(amount / reference_price, rules["stepSize"])
+        if qty <= 0 or qty < rules["minQty"]:
+            raise RuntimeError(
+                f"{symbol_u} 合约下单数量过小：{self._format_decimal(qty)} < 最小数量 {self._format_decimal(rules['minQty'])}"
+            )
+        if qty > rules["maxQty"]:
+            qty = rules["maxQty"]
+
+        if rules["minNotional"] > 0 and (qty * reference_price) < rules["minNotional"]:
+            margin_asset = str(rules.get("marginAsset") or rules.get("quoteAsset") or "USDT").strip().upper()
+            raise RuntimeError(
+                f"{symbol_u} 当前市价下最小可下金额约为 {self._format_decimal(effective_min_notional)} {margin_asset}，"
+                f"你填写的是 {self._format_decimal(amount)} {margin_asset}"
+            )
+        return qty
+
+    def place_um_futures_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal | str | float | int,
+        *,
+        reduce_only: bool = False,
+    ):
+        symbol_u = str(symbol or "").strip().upper()
+        side_u = str(side or "").strip().upper()
+        rules = self.get_um_futures_trade_rules(symbol_u)
+        if not rules:
+            raise RuntimeError(f"找不到合约交易对规则：{symbol_u}")
+        if rules["status"] != "TRADING":
+            raise RuntimeError(f"合约交易对不可交易：{symbol_u}")
+
+        qty_raw = Decimal(str(quantity))
+        qty = self._floor_to_step(qty_raw, rules["stepSize"])
+        if qty <= 0 or qty < rules["minQty"]:
+            raise RuntimeError(
+                f"{symbol_u} 合约下单数量过小：{self._format_decimal(qty)} < 最小数量 {self._format_decimal(rules['minQty'])}"
+            )
+        if qty > rules["maxQty"]:
+            qty = rules["maxQty"]
+
+        if not reduce_only:
+            ref_price = self.get_um_futures_symbol_price(symbol_u)
+            if ref_price and rules["minNotional"] > 0 and (qty * ref_price) < rules["minNotional"]:
+                raise RuntimeError(
+                    f"{symbol_u} 合约下单金额过小：{self._format_decimal(qty * ref_price)} < 最小下单额 {self._format_decimal(rules['minNotional'])}"
+                )
+
+        params = {
+            "symbol": symbol_u,
+            "side": side_u,
+            "type": "MARKET",
+            "quantity": self._format_decimal(qty),
+            "newOrderRespType": "RESULT",
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+
+        data = self.request(
+            self.um_futures,
+            "POST",
+            "/fapi/v1/order",
+            params,
+        )
+        logger.info(
+            "U本位合约市价下单 %s %s，数量=%s，reduceOnly=%s",
+            symbol_u,
+            side_u,
+            params["quantity"],
+            "true" if reduce_only else "false",
+        )
+        return data
+
+    def close_um_futures_position_market(self, symbol: str):
+        position = self.get_um_futures_position(symbol)
+        if not position:
+            return None
+
+        position_amt = self._decimal_from_str(position.get("positionAmt", "0"), "0")
+        if position_amt == 0:
+            return None
+
+        side = "SELL" if position_amt > 0 else "BUY"
+        qty = abs(position_amt)
+        return self.place_um_futures_market_order(
+            symbol,
+            side,
+            qty,
+            reduce_only=True,
+        )
+
     def get_book_ticker(self, symbol: str) -> dict[str, Decimal]:
         symbol_u = symbol.upper()
         data = self.public_get(self.spot, "/api/v3/ticker/bookTicker", {"symbol": symbol_u})
@@ -1098,6 +1479,7 @@ class BinanceClient:
             return None
 
         quote_asset = self.get_spot_quote_asset(symbol)
+        self.collect_funding_asset_to_spot(quote_asset)
         quote_balance = Decimal(str(self.spot_balance(quote_asset)))
         if quote_balance <= 0:
             logger.info("现货 %s 余额不足，跳过挂单买入", quote_asset)
@@ -1131,6 +1513,7 @@ class BinanceClient:
             return False
 
         quote_asset = self.get_spot_quote_asset(symbol_u)
+        self.collect_funding_asset_to_spot(quote_asset)
         quote_balance = Decimal(str(self.spot_balance(quote_asset)))
         if quote_balance < amount:
             raise RuntimeError(
@@ -1286,6 +1669,7 @@ class BinanceClient:
     # -------- 现货买入（全部 USDT） --------
     def spot_buy_all_usdt(self, buffer=0.2, symbol="BTCUSDT"):
         quote_asset = self.get_spot_quote_asset(symbol)
+        self.collect_funding_asset_to_spot(quote_asset)
         quote_balance = self.spot_balance(quote_asset)
         if quote_balance <= buffer:
             logger.info("现货 %s %.8f <= buffer %.8f，跳过买入", quote_asset, quote_balance, buffer)
@@ -1423,6 +1807,43 @@ class BinanceClient:
         return result
 
     # -------- U本位合约可转出余额 --------
+    def funding_asset_balance(self, asset: str) -> Decimal:
+        asset_u = str(asset or "").strip().upper()
+        if not asset_u:
+            return Decimal("0")
+        data = self.request(
+            self.spot,
+            "POST",
+            "/sapi/v1/asset/get-funding-asset",
+            {"needBtcValuation": "false"},
+        )
+        total = Decimal("0")
+        for item in data:
+            if str(item.get("asset") or "").strip().upper() != asset_u:
+                continue
+            total += self._decimal_from_str(item.get("free", "0"), "0")
+        return total
+
+    def collect_funding_asset_to_spot(self, asset: str) -> Decimal:
+        asset_u = str(asset or "").strip().upper()
+        if not asset_u:
+            return Decimal("0")
+        try:
+            amount = self.funding_asset_balance(asset_u)
+        except Exception as e:
+            logger.warning("查询资金账户 %s 余额失败: %s", asset_u, e)
+            return Decimal("0")
+        if amount <= 0:
+            return Decimal("0")
+        try:
+            self.universal_transfer("FUNDING_MAIN", asset_u, amount)
+            logger.info("检测到资金账户 %s 余额，已自动划转到现货：%s", asset_u, self._format_decimal(amount))
+            time.sleep(0.5)
+            return amount
+        except Exception as e:
+            logger.warning("资金账户划转到现货失败 %s %s: %s", asset_u, self._format_decimal(amount), e)
+            return Decimal("0")
+
     def um_futures_transferable_assets(self):
         data = self.request(
             self.um_futures,
@@ -1648,11 +2069,18 @@ class Strategy:
         sleep_fn,
         enable_withdraw,
         withdraw_callback=None,
+        trade_account_type: str = TRADE_ACCOUNT_TYPE_DEFAULT,
         trade_mode: str = TRADE_MODE_DEFAULT,
         premium_percent: Decimal | None = None,
         bnb_fee_stop_value: Decimal | None = None,
         bnb_topup_amount: Decimal | None = None,
         reprice_threshold_percent: Decimal | None = None,
+        futures_symbol: str = FUTURES_SYMBOL_DEFAULT,
+        futures_rounds: int = FUTURES_ROUNDS_DEFAULT,
+        futures_amount: Decimal | None = None,
+        futures_leverage: int = FUTURES_LEVERAGE_DEFAULT,
+        futures_margin_type: str = FUTURES_MARGIN_TYPE_DEFAULT,
+        futures_side: str = FUTURES_SIDE_DEFAULT,
     ):
         self.c = client
         self.spot_rounds = spot_rounds
@@ -1665,6 +2093,7 @@ class Strategy:
         self.sleep_fn = sleep_fn
         self.enable_withdraw = enable_withdraw
         self.withdraw_callback = withdraw_callback
+        self.trade_account_type = str(trade_account_type or TRADE_ACCOUNT_TYPE_DEFAULT)
         self.trade_mode = str(trade_mode or TRADE_MODE_DEFAULT)
         self.premium_percent = Decimal(str(premium_percent if premium_percent is not None else "0"))
         self.bnb_fee_stop_value = Decimal(str(bnb_fee_stop_value if bnb_fee_stop_value is not None else "0"))
@@ -1672,6 +2101,16 @@ class Strategy:
         self.reprice_threshold_percent = Decimal(
             str(reprice_threshold_percent if reprice_threshold_percent is not None else REPRICE_THRESHOLD_PERCENT_DEFAULT)
         )
+        self.futures_symbol = str(futures_symbol or FUTURES_SYMBOL_DEFAULT).strip().upper()
+        self.futures_rounds = max(1, int(futures_rounds or FUTURES_ROUNDS_DEFAULT))
+        self.futures_amount = Decimal(str(futures_amount if futures_amount is not None else "0"))
+        self.futures_leverage = max(1, int(futures_leverage or FUTURES_LEVERAGE_DEFAULT))
+        self.futures_margin_type = str(futures_margin_type or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
+        self.futures_side = str(futures_side or FUTURES_SIDE_DEFAULT).strip()
+        if self.futures_margin_type not in FUTURES_MARGIN_TYPE_OPTIONS:
+            self.futures_margin_type = FUTURES_MARGIN_TYPE_DEFAULT
+        if self.futures_side not in FUTURES_SIDE_OPTIONS:
+            self.futures_side = FUTURES_SIDE_DEFAULT
 
     def ensure_base_sold(self):
         try:
@@ -1680,6 +2119,27 @@ class Strategy:
                 logger.info("【补救措施】检测到残留基础币，已执行补充卖出。")
         except Exception as e:
             logger.warning(f"补救卖出时发生错误（可忽略）: {e}")
+
+    def _trade_account_type_name(self) -> str:
+        mode = str(self.trade_account_type or TRADE_ACCOUNT_TYPE_DEFAULT)
+        return mode if mode in TRADE_ACCOUNT_TYPE_OPTIONS else TRADE_ACCOUNT_TYPE_DEFAULT
+
+    def _is_futures_mode(self) -> bool:
+        return self._trade_account_type_name() == TRADE_ACCOUNT_TYPE_FUTURES
+
+    def _futures_side_order(self) -> str:
+        return "BUY" if self.futures_side == FUTURES_SIDE_LONG else "SELL"
+
+    def _futures_margin_asset(self) -> str:
+        return self.c.get_um_futures_margin_asset(self.futures_symbol)
+
+    def ensure_futures_position_closed(self):
+        try:
+            close_order = self.c.close_um_futures_position_market(self.futures_symbol)
+            if close_order:
+                logger.info("【补救措施】检测到残留合约持仓，已执行市价平仓。")
+        except Exception as e:
+            logger.warning(f"补救平仓时发生错误（可忽略）: {e}")
 
     def _mode_name(self) -> str:
         mode = str(self.trade_mode or TRADE_MODE_DEFAULT)
@@ -1717,6 +2177,8 @@ class Strategy:
         return percent / Decimal("100")
 
     def _run_bnb_topup_if_needed(self):
+        if self._is_futures_mode():
+            return False
         topup_amount = Decimal(str(self.bnb_topup_amount or "0"))
         if topup_amount <= 0:
             return False
@@ -1965,6 +2427,125 @@ class Strategy:
                 progress_cb(step, max(step, 1), f"{mode_name}轮 {step}")
             self.sleep_fn()
 
+    def _prepare_futures_symbol_settings(self):
+        current_dual_mode = self.c.get_um_futures_position_mode()
+        logger.info("U本位合约当前持仓模式：%s", "双向仓" if current_dual_mode else "单向仓")
+
+        symbol_config = self.c.get_um_futures_symbol_config(self.futures_symbol) or {}
+        logger.info(
+            "U本位合约 %s 当前配置：杠杆=%s，保证金模式=%s",
+            self.futures_symbol,
+            symbol_config.get("leverage", "--"),
+            symbol_config.get("marginType", "--"),
+        )
+
+        self.c.ensure_um_futures_one_way_mode()
+        self.c.ensure_um_futures_margin_type(self.futures_symbol, self.futures_margin_type)
+        final_leverage = self.c.ensure_um_futures_leverage(self.futures_symbol, self.futures_leverage)
+        self.futures_leverage = int(final_leverage)
+
+    def _ensure_futures_available_balance(self):
+        margin_asset = self._futures_margin_asset()
+        balance = self.c.um_futures_asset_balance(margin_asset)
+        available_balance = Decimal(str(balance.get("availableBalance", "0")))
+        required_margin = Decimal("0")
+        if self.futures_leverage > 0:
+            required_margin = self.futures_amount / Decimal(str(self.futures_leverage))
+        logger.info(
+            "U本位合约 %s 可用保证金 %s=%s，预计占用保证金=%s，下单金额=%s，杠杆=%s",
+            self.futures_symbol,
+            margin_asset,
+            BinanceClient._format_decimal(available_balance),
+            BinanceClient._format_decimal(required_margin),
+            BinanceClient._format_decimal(self.futures_amount),
+            self.futures_leverage,
+        )
+        if required_margin > 0 and available_balance < required_margin:
+            raise RuntimeError(
+                f"U本位合约 {margin_asset} 可用保证金不足：需要至少 {BinanceClient._format_decimal(required_margin)}，当前 {BinanceClient._format_decimal(available_balance)}"
+            )
+        return margin_asset, available_balance
+
+    def _run_futures_mode(self, stop_event, progress_cb=None):
+        total_steps = self.futures_rounds if self.futures_rounds > 0 else 1
+        step = 0
+        open_side = self._futures_side_order()
+        side_text = self.futures_side if self.futures_side in FUTURES_SIDE_OPTIONS else FUTURES_SIDE_DEFAULT
+
+        self.ensure_futures_position_closed()
+        self._prepare_futures_symbol_settings()
+        self._ensure_futures_available_balance()
+        preview_qty = self.c.calculate_um_futures_order_quantity(
+            self.futures_symbol,
+            self.futures_amount,
+            open_side,
+        )
+        logger.info(
+            "U本位合约预检通过：%s %s，单轮预计下单数量=%s，下单金额=%s",
+            self.futures_symbol,
+            side_text,
+            BinanceClient._format_decimal(preview_qty),
+            BinanceClient._format_decimal(self.futures_amount),
+        )
+
+        for i in range(self.futures_rounds):
+            if stop_event and stop_event.is_set():
+                logger.info("检测到停止信号，停止后续执行（合约阶段）")
+                return
+
+            self.ensure_futures_position_closed()
+            logger.info("--- 合约轮 %d/%d 开始：%s %s ---", i + 1, self.futures_rounds, self.futures_symbol, side_text)
+
+            try:
+                qty = self.c.calculate_um_futures_order_quantity(
+                    self.futures_symbol,
+                    self.futures_amount,
+                    open_side,
+                )
+                open_order = self.c.place_um_futures_market_order(
+                    self.futures_symbol,
+                    open_side,
+                    qty,
+                )
+                try:
+                    avg_price = Decimal(str(open_order.get("avgPrice", "0")))
+                except Exception:
+                    avg_price = Decimal("0")
+                logger.info(
+                    "U本位合约开仓完成：%s %s，数量=%s，均价=%s",
+                    self.futures_symbol,
+                    side_text,
+                    BinanceClient._format_decimal(qty),
+                    BinanceClient._format_decimal(avg_price),
+                )
+
+                self.sleep_fn()
+                close_order = self.c.close_um_futures_position_market(self.futures_symbol)
+                if not close_order:
+                    raise RuntimeError("合约平仓未执行：未检测到可平持仓")
+                try:
+                    close_price = Decimal(str(close_order.get("avgPrice", "0")))
+                except Exception:
+                    close_price = Decimal("0")
+                logger.info(
+                    "U本位合约平仓完成：%s %s，均价=%s",
+                    self.futures_symbol,
+                    side_text,
+                    BinanceClient._format_decimal(close_price),
+                )
+            except Exception as e:
+                logger.error("合约轮 %d 执行异常: %s", i + 1, e)
+                time.sleep(3)
+            finally:
+                self.ensure_futures_position_closed()
+
+            step += 1
+            if progress_cb:
+                progress_cb(step, total_steps, "合约轮 %d/%d" % (i + 1, self.futures_rounds))
+            self.sleep_fn()
+
+        self.ensure_futures_position_closed()
+
     def run(self, stop_event, progress_cb=None):
         withdraw_amount = 0.0
         withdraw_error = ""
@@ -1972,7 +2553,9 @@ class Strategy:
 
         self._run_bnb_topup_if_needed()
 
-        if self._mode_name() == TRADE_MODE_MARKET:
+        if self._is_futures_mode():
+            self._run_futures_mode(stop_event, progress_cb=progress_cb)
+        elif self._mode_name() == TRADE_MODE_MARKET:
             self._run_market_mode(stop_event, progress_cb=progress_cb)
         else:
             self._run_limit_like_mode(stop_event, progress_cb=progress_cb)
@@ -1994,6 +2577,7 @@ class Strategy:
                 network=self.withdraw_network,
                 fee_buffer=self.withdraw_fee_buffer,
                 enable_withdraw=self.enable_withdraw,
+                auto_collect_to_spot=self._is_futures_mode(),
             )
             if self.withdraw_callback:
                 self.withdraw_callback(withdraw_amount)
@@ -2065,6 +2649,7 @@ class App(tk.Tk):
         self.api_key_var = tk.StringVar(value=API_KEY_DEFAULT)
         self.api_secret_var = tk.StringVar(value=API_SECRET_DEFAULT)
         self.exchange_proxy_var = tk.StringVar(value=EXCHANGE_PROXY_DEFAULT)
+        self.trade_account_type_var = tk.StringVar(value=TRADE_ACCOUNT_TYPE_DEFAULT)
         self.spot_rounds_var = tk.IntVar(value=SPOT_ROUNDS_DEFAULT)
         self.trade_mode_var = tk.StringVar(value=TRADE_MODE_DEFAULT)
         self.premium_percent_var = tk.StringVar(value=PREMIUM_PERCENT_DEFAULT)
@@ -2073,6 +2658,12 @@ class App(tk.Tk):
         self.reprice_threshold_percent_var = tk.StringVar(value=REPRICE_THRESHOLD_PERCENT_DEFAULT)
         self.spot_symbol_var = tk.StringVar(value=SPOT_SYMBOL_DEFAULT)
         self.spot_precision_var = tk.IntVar(value=SPOT_PRECISION_DEFAULT)
+        self.futures_symbol_var = tk.StringVar(value=FUTURES_SYMBOL_DEFAULT)
+        self.futures_rounds_var = tk.IntVar(value=FUTURES_ROUNDS_DEFAULT)
+        self.futures_amount_var = tk.StringVar(value=FUTURES_AMOUNT_DEFAULT)
+        self.futures_leverage_var = tk.IntVar(value=FUTURES_LEVERAGE_DEFAULT)
+        self.futures_margin_type_var = tk.StringVar(value=FUTURES_MARGIN_TYPE_DEFAULT)
+        self.futures_side_var = tk.StringVar(value=FUTURES_SIDE_DEFAULT)
 
         self.withdraw_addr_var = tk.StringVar(value=WITHDRAW_ADDRESS_DEFAULT)
         self.withdraw_net_var = tk.StringVar(value=WITHDRAW_NETWORK_DEFAULT)
@@ -2408,6 +2999,11 @@ class App(tk.Tk):
         return int(text)
 
     @staticmethod
+    def _normalize_trade_account_type(value) -> str:
+        text = str(value or "").strip()
+        return text if text in TRADE_ACCOUNT_TYPE_OPTIONS else TRADE_ACCOUNT_TYPE_DEFAULT
+
+    @staticmethod
     def _normalize_trade_mode(value) -> str:
         text = str(value or "").strip()
         return text if text in TRADE_MODE_OPTIONS else TRADE_MODE_DEFAULT
@@ -2473,39 +3069,82 @@ class App(tk.Tk):
         return value
 
     def _collect_trade_mode_settings(self) -> dict[str, object]:
+        trade_account_type = self._normalize_trade_account_type(self.trade_account_type_var.get())
         mode = self._normalize_trade_mode(self.trade_mode_var.get())
         try:
             stored_rounds = int(self.spot_rounds_var.get())
         except Exception:
             stored_rounds = SPOT_ROUNDS_DEFAULT
+        try:
+            stored_futures_rounds = int(self.futures_rounds_var.get())
+        except Exception:
+            stored_futures_rounds = FUTURES_ROUNDS_DEFAULT
 
         premium_text = str(self.premium_percent_var.get() or "").strip()
         fee_stop_text = str(self.bnb_fee_stop_var.get() or "").strip()
         bnb_topup_text = str(self.bnb_topup_amount_var.get() or "").strip()
         reprice_threshold_text = str(self.reprice_threshold_percent_var.get() or "").strip()
+        futures_symbol = str(self.futures_symbol_var.get() or "").strip().upper()
+        futures_amount_text = str(self.futures_amount_var.get() or "").strip()
+        futures_margin_type = str(self.futures_margin_type_var.get() or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
+        futures_side = str(self.futures_side_var.get() or FUTURES_SIDE_DEFAULT).strip()
         premium_value: Decimal | None = None
         fee_stop_value: Decimal | None = None
-        if not bnb_topup_text:
-            bnb_topup_text = "0"
-        if not reprice_threshold_text:
-            reprice_threshold_text = REPRICE_THRESHOLD_PERCENT_DEFAULT
-        bnb_topup_value = self._decimal_field_value(bnb_topup_text, "预买BNB金额", min_value=0)
-        reprice_threshold_value = self._decimal_field_value(reprice_threshold_text, "重新挂单阈值百分比", min_value=0)
+        bnb_topup_value = Decimal("0")
+        reprice_threshold_value = Decimal(REPRICE_THRESHOLD_PERCENT_DEFAULT)
+        futures_rounds = stored_futures_rounds if stored_futures_rounds > 0 else FUTURES_ROUNDS_DEFAULT
+        futures_amount_value: Decimal | None = None
+        try:
+            futures_leverage = int(self.futures_leverage_var.get())
+        except Exception:
+            futures_leverage = FUTURES_LEVERAGE_DEFAULT
 
-        if mode == TRADE_MODE_MARKET:
-            try:
-                runtime_rounds = int(self.spot_rounds_var.get())
-            except Exception as exc:
-                raise RuntimeError("市价模式下必须填写现货轮次") from exc
-            if runtime_rounds < 1:
-                raise RuntimeError("市价模式下现货轮次必须大于等于 1")
+        if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT:
+            if not bnb_topup_text:
+                bnb_topup_text = "0"
+            if not reprice_threshold_text:
+                reprice_threshold_text = REPRICE_THRESHOLD_PERCENT_DEFAULT
+            bnb_topup_value = self._decimal_field_value(bnb_topup_text, "预买BNB金额", min_value=0)
+            reprice_threshold_value = self._decimal_field_value(reprice_threshold_text, "重新挂单阈值百分比", min_value=0)
+
+            if mode == TRADE_MODE_MARKET:
+                try:
+                    runtime_rounds = int(self.spot_rounds_var.get())
+                except Exception as exc:
+                    raise RuntimeError("市价模式下必须填写现货轮次") from exc
+                if runtime_rounds < 1:
+                    raise RuntimeError("市价模式下现货轮次必须大于等于 1")
+            else:
+                runtime_rounds = stored_rounds if stored_rounds > 0 else SPOT_ROUNDS_DEFAULT
+                fee_stop_value = self._decimal_field_value(fee_stop_text, "剩余 BNB 手续费停止值", min_value=0)
+                if mode == TRADE_MODE_PREMIUM:
+                    premium_value = self._decimal_field_value(premium_text, "溢价百分比", min_value=0)
         else:
             runtime_rounds = stored_rounds if stored_rounds > 0 else SPOT_ROUNDS_DEFAULT
-            fee_stop_value = self._decimal_field_value(fee_stop_text, "剩余 BNB 手续费停止值", min_value=0)
-            if mode == TRADE_MODE_PREMIUM:
-                premium_value = self._decimal_field_value(premium_text, "溢价百分比", min_value=0)
+            try:
+                futures_rounds = int(self.futures_rounds_var.get())
+            except Exception as exc:
+                raise RuntimeError("合约模式下必须填写轮次") from exc
+            if futures_rounds < 1:
+                raise RuntimeError("合约轮次必须大于等于 1")
+            if not futures_symbol:
+                raise RuntimeError("合约交易对不能为空")
+            futures_amount_value = self._decimal_field_value(futures_amount_text, "合约下单金额", min_value=0)
+            if futures_amount_value <= 0:
+                raise RuntimeError("合约下单金额必须大于 0")
+            try:
+                futures_leverage = int(self.futures_leverage_var.get())
+            except Exception as exc:
+                raise RuntimeError("合约杠杆格式不正确") from exc
+            if futures_leverage < 1 or futures_leverage > 125:
+                raise RuntimeError("合约杠杆必须在 1-125 之间")
+            if futures_margin_type not in FUTURES_MARGIN_TYPE_OPTIONS:
+                futures_margin_type = FUTURES_MARGIN_TYPE_DEFAULT
+            if futures_side not in FUTURES_SIDE_OPTIONS:
+                futures_side = FUTURES_SIDE_DEFAULT
 
         return {
+            "trade_account_type": trade_account_type,
             "trade_mode": mode,
             "spot_rounds": runtime_rounds,
             "stored_spot_rounds": stored_rounds,
@@ -2517,6 +3156,14 @@ class App(tk.Tk):
             "bnb_topup_amount_value": bnb_topup_value,
             "reprice_threshold_percent": reprice_threshold_text,
             "reprice_threshold_percent_value": reprice_threshold_value,
+            "futures_symbol": futures_symbol,
+            "futures_rounds": futures_rounds,
+            "stored_futures_rounds": stored_futures_rounds,
+            "futures_amount": futures_amount_text,
+            "futures_amount_value": futures_amount_value,
+            "futures_leverage": futures_leverage,
+            "futures_margin_type": futures_margin_type,
+            "futures_side": futures_side,
         }
 
     def _install_entry_placeholder(self, entry, variable, placeholder: str):
@@ -2604,6 +3251,7 @@ class App(tk.Tk):
         row2 = ttk.Frame(frame_top)
         row2.pack(fill="x", padx=5, pady=3)
         self._strategy_row2 = row2
+        current_trade_account_type = self._normalize_trade_account_type(self.trade_account_type_var.get())
         current_trade_mode = self._normalize_trade_mode(self.trade_mode_var.get())
         row2_left = ttk.Frame(row2)
         row2_left.grid(row=0, column=0, sticky="w")
@@ -2611,26 +3259,70 @@ class App(tk.Tk):
         row2_right = ttk.Frame(row2)
         row2_right.grid(row=0, column=1, sticky="w")
         row2.grid_columnconfigure(2, weight=1)
+        self.trade_mode_combo = None
+        self.trade_account_type_combo = None
+        self.futures_margin_type_combo = None
+        self.futures_side_combo = None
 
-        ttk.Label(row2_left, text="\u73b0\u8d27\u4ea4\u6613\u5bf9:", style="ExchangeAccent.TLabel").pack(side="left")
-        ttk.Entry(row2_left, textvariable=self.spot_symbol_var, width=14).pack(side="left", padx=(4, 12))
-        ttk.Label(row2_left, text="\u73b0\u8d27\u6570\u91cf\u7cbe\u5ea6:").pack(side="left")
-        ttk.Entry(row2_left, textvariable=self.spot_precision_var, width=6).pack(side="left", padx=(4, 12))
-        ttk.Label(row2_left, text="\u624b\u7eed\u8d39\u9884\u7559:").pack(side="left")
-        ttk.Entry(row2_left, textvariable=self.withdraw_buffer_var, width=8).pack(side="left", padx=(4, 12))
-
-        ttk.Label(row2_right, text="交易模式:").pack(side="left")
-        self.trade_mode_combo = ttk.Combobox(
+        ttk.Label(row2_right, text="交易类型:").pack(side="left")
+        self.trade_account_type_combo = ttk.Combobox(
             row2_right,
-            textvariable=self.trade_mode_var,
-            values=TRADE_MODE_OPTIONS,
+            textvariable=self.trade_account_type_var,
+            values=TRADE_ACCOUNT_TYPE_OPTIONS,
             width=8,
             state="readonly",
         )
-        self.trade_mode_combo.pack(side="left", padx=(4, 12))
-        self.trade_mode_combo.bind("<<ComboboxSelected>>", self._on_trade_mode_changed, add="+")
-        ttk.Label(row2_right, text="预买BNB金额:").pack(side="left")
-        ttk.Entry(row2_right, textvariable=self.bnb_topup_amount_var, width=10).pack(side="left", padx=(4, 12))
+        self.trade_account_type_combo.pack(side="left", padx=(4, 12))
+        self.trade_account_type_combo.bind("<<ComboboxSelected>>", self._on_trade_mode_changed, add="+")
+
+        if current_trade_account_type == TRADE_ACCOUNT_TYPE_SPOT:
+            ttk.Label(row2_left, text="现货交易对:", style="ExchangeAccent.TLabel").pack(side="left")
+            ttk.Entry(row2_left, textvariable=self.spot_symbol_var, width=14).pack(side="left", padx=(4, 12))
+            ttk.Label(row2_left, text="现货数量精度:").pack(side="left")
+            ttk.Entry(row2_left, textvariable=self.spot_precision_var, width=6).pack(side="left", padx=(4, 12))
+            ttk.Label(row2_left, text="手续费预留:").pack(side="left")
+            ttk.Entry(row2_left, textvariable=self.withdraw_buffer_var, width=8).pack(side="left", padx=(4, 12))
+
+            ttk.Label(row2_right, text="交易模式:").pack(side="left")
+            self.trade_mode_combo = ttk.Combobox(
+                row2_right,
+                textvariable=self.trade_mode_var,
+                values=TRADE_MODE_OPTIONS,
+                width=8,
+                state="readonly",
+            )
+            self.trade_mode_combo.pack(side="left", padx=(4, 12))
+            self.trade_mode_combo.bind("<<ComboboxSelected>>", self._on_trade_mode_changed, add="+")
+            ttk.Label(row2_right, text="预买BNB金额:").pack(side="left")
+            ttk.Entry(row2_right, textvariable=self.bnb_topup_amount_var, width=10).pack(side="left", padx=(4, 12))
+        else:
+            ttk.Label(row2_left, text="合约交易对:", style="ExchangeAccent.TLabel").pack(side="left")
+            ttk.Entry(row2_left, textvariable=self.futures_symbol_var, width=14).pack(side="left", padx=(4, 12))
+            ttk.Label(row2_left, text="保证金模式:").pack(side="left")
+            self.futures_margin_type_combo = ttk.Combobox(
+                row2_left,
+                textvariable=self.futures_margin_type_var,
+                values=FUTURES_MARGIN_TYPE_OPTIONS,
+                width=10,
+                state="readonly",
+            )
+            self.futures_margin_type_combo.pack(side="left", padx=(4, 12))
+            ttk.Label(row2_left, text="杠杆:").pack(side="left")
+            ttk.Spinbox(row2_left, from_=1, to=125, textvariable=self.futures_leverage_var, width=6).pack(side="left", padx=(4, 12))
+            ttk.Label(row2_left, text="手续费预留:").pack(side="left")
+            ttk.Entry(row2_left, textvariable=self.withdraw_buffer_var, width=8).pack(side="left", padx=(4, 12))
+
+            ttk.Label(row2_right, text="开仓方向:").pack(side="left")
+            self.futures_side_combo = ttk.Combobox(
+                row2_right,
+                textvariable=self.futures_side_var,
+                values=FUTURES_SIDE_OPTIONS,
+                width=8,
+                state="readonly",
+            )
+            self.futures_side_combo.pack(side="left", padx=(4, 12))
+            ttk.Label(row2_right, text="下单金额:").pack(side="left")
+            ttk.Entry(row2_right, textvariable=self.futures_amount_var, width=10).pack(side="left", padx=(4, 12))
 
         row3 = ttk.Frame(frame_top)
         row3.pack(fill="x", padx=5, pady=(3, 2))
@@ -2664,21 +3356,25 @@ class App(tk.Tk):
         ttk.Entry(row3_left, textvariable=self.usdt_timeout_var, width=8).pack(side="left", padx=(4, 12))
         ttk.Checkbutton(row3_left, text="\u81ea\u52a8\u63d0\u73b0", variable=self.enable_withdraw_var).pack(side="left")
 
-        if current_trade_mode == TRADE_MODE_MARKET:
-            ttk.Label(row3_right, text="现货轮次:").pack(side="left")
-            ttk.Spinbox(row3_right, from_=1, to=100, textvariable=self.spot_rounds_var, width=6).pack(side="left", padx=(4, 12))
-        elif current_trade_mode == TRADE_MODE_LIMIT:
-            ttk.Label(row3_right, text="剩余 BNB 手续费停止值:").pack(side="left")
-            ttk.Entry(row3_right, textvariable=self.bnb_fee_stop_var, width=10).pack(side="left", padx=(4, 12))
-            ttk.Label(row3_right, text="重新挂单阈值(%):").pack(side="left")
-            ttk.Entry(row3_right, textvariable=self.reprice_threshold_percent_var, width=8).pack(side="left", padx=(4, 12))
+        if current_trade_account_type == TRADE_ACCOUNT_TYPE_SPOT:
+            if current_trade_mode == TRADE_MODE_MARKET:
+                ttk.Label(row3_right, text="现货轮次:").pack(side="left")
+                ttk.Spinbox(row3_right, from_=1, to=100, textvariable=self.spot_rounds_var, width=6).pack(side="left", padx=(4, 12))
+            elif current_trade_mode == TRADE_MODE_LIMIT:
+                ttk.Label(row3_right, text="剩余 BNB 手续费停止值:").pack(side="left")
+                ttk.Entry(row3_right, textvariable=self.bnb_fee_stop_var, width=10).pack(side="left", padx=(4, 12))
+                ttk.Label(row3_right, text="重新挂单阈值(%):").pack(side="left")
+                ttk.Entry(row3_right, textvariable=self.reprice_threshold_percent_var, width=8).pack(side="left", padx=(4, 12))
+            else:
+                ttk.Label(row3_right, text="溢价百分比(%):").pack(side="left")
+                ttk.Entry(row3_right, textvariable=self.premium_percent_var, width=10).pack(side="left", padx=(4, 12))
+                ttk.Label(row3_right, text="剩余 BNB 手续费停止值:").pack(side="left")
+                ttk.Entry(row3_right, textvariable=self.bnb_fee_stop_var, width=10).pack(side="left", padx=(4, 12))
+                ttk.Label(row3_right, text="重新挂单阈值(%):").pack(side="left")
+                ttk.Entry(row3_right, textvariable=self.reprice_threshold_percent_var, width=8).pack(side="left", padx=(4, 12))
         else:
-            ttk.Label(row3_right, text="溢价百分比(%):").pack(side="left")
-            ttk.Entry(row3_right, textvariable=self.premium_percent_var, width=10).pack(side="left", padx=(4, 12))
-            ttk.Label(row3_right, text="剩余 BNB 手续费停止值:").pack(side="left")
-            ttk.Entry(row3_right, textvariable=self.bnb_fee_stop_var, width=10).pack(side="left", padx=(4, 12))
-            ttk.Label(row3_right, text="重新挂单阈值(%):").pack(side="left")
-            ttk.Entry(row3_right, textvariable=self.reprice_threshold_percent_var, width=8).pack(side="left", padx=(4, 12))
+            ttk.Label(row3_right, text="合约轮次:").pack(side="left")
+            ttk.Spinbox(row3_right, from_=1, to=100, textvariable=self.futures_rounds_var, width=6).pack(side="left", padx=(4, 12))
 
         self.after_idle(self._align_trade_mode_sections)
 
@@ -3022,9 +3718,14 @@ class App(tk.Tk):
 
     def _strategy_config_payload(self):
         trade_settings = self._collect_trade_mode_settings()
+        try:
+            spot_precision = int(self.spot_precision_var.get())
+        except Exception:
+            spot_precision = SPOT_PRECISION_DEFAULT
         return {
             "api_key": SECRET_BOX.encrypt(self.api_key_var.get().strip()),
             "api_secret": SECRET_BOX.encrypt(self.api_secret_var.get().strip()),
+            "trade_account_type": trade_settings["trade_account_type"],
             "spot_rounds": int(trade_settings["stored_spot_rounds"]),
             "trade_mode": trade_settings["trade_mode"],
             "premium_percent": trade_settings["premium_percent"],
@@ -3032,7 +3733,13 @@ class App(tk.Tk):
             "bnb_topup_amount": trade_settings["bnb_topup_amount"],
             "reprice_threshold_percent": trade_settings["reprice_threshold_percent"],
             "spot_symbol": self.spot_symbol_var.get().strip().upper(),
-            "spot_precision": int(self.spot_precision_var.get()),
+            "spot_precision": spot_precision,
+            "futures_symbol": str(trade_settings["futures_symbol"] or "").strip().upper(),
+            "futures_rounds": int(trade_settings["stored_futures_rounds"]),
+            "futures_amount": str(trade_settings["futures_amount"] or "").strip(),
+            "futures_leverage": int(trade_settings["futures_leverage"]),
+            "futures_margin_type": str(trade_settings["futures_margin_type"] or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper(),
+            "futures_side": str(trade_settings["futures_side"] or FUTURES_SIDE_DEFAULT).strip(),
             "withdraw_address": self.withdraw_addr_var.get().strip(),
             "withdraw_network": self.withdraw_net_var.get().strip(),
             "withdraw_coin": self.withdraw_coin_var.get().strip().upper(),
@@ -3107,6 +3814,9 @@ class App(tk.Tk):
 
             self.api_key_var.set(SECRET_BOX.decrypt(str(raw.get("api_key", "") or "").strip()).strip())
             self.api_secret_var.set(SECRET_BOX.decrypt(str(raw.get("api_secret", "") or "").strip()).strip())
+            self.trade_account_type_var.set(
+                self._normalize_trade_account_type(raw.get("trade_account_type", TRADE_ACCOUNT_TYPE_DEFAULT))
+            )
             self.spot_rounds_var.set(int(raw.get("spot_rounds", SPOT_ROUNDS_DEFAULT)))
             self.trade_mode_var.set(self._normalize_trade_mode(raw.get("trade_mode", TRADE_MODE_DEFAULT)))
             self.premium_percent_var.set(str(raw.get("premium_percent", PREMIUM_PERCENT_DEFAULT) or PREMIUM_PERCENT_DEFAULT).strip())
@@ -3117,6 +3827,20 @@ class App(tk.Tk):
             )
             self.spot_symbol_var.set(str(raw.get("spot_symbol", SPOT_SYMBOL_DEFAULT) or SPOT_SYMBOL_DEFAULT).strip().upper())
             self.spot_precision_var.set(int(raw.get("spot_precision", SPOT_PRECISION_DEFAULT)))
+            self.futures_symbol_var.set(
+                str(raw.get("futures_symbol", FUTURES_SYMBOL_DEFAULT) or FUTURES_SYMBOL_DEFAULT).strip().upper()
+            )
+            self.futures_rounds_var.set(int(raw.get("futures_rounds", FUTURES_ROUNDS_DEFAULT)))
+            self.futures_amount_var.set(str(raw.get("futures_amount", FUTURES_AMOUNT_DEFAULT) or FUTURES_AMOUNT_DEFAULT).strip())
+            self.futures_leverage_var.set(int(raw.get("futures_leverage", FUTURES_LEVERAGE_DEFAULT)))
+            self.futures_margin_type_var.set(
+                str(raw.get("futures_margin_type", FUTURES_MARGIN_TYPE_DEFAULT) or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
+            )
+            if str(self.futures_margin_type_var.get() or "").strip().upper() not in FUTURES_MARGIN_TYPE_OPTIONS:
+                self.futures_margin_type_var.set(FUTURES_MARGIN_TYPE_DEFAULT)
+            self.futures_side_var.set(str(raw.get("futures_side", FUTURES_SIDE_DEFAULT) or FUTURES_SIDE_DEFAULT).strip())
+            if str(self.futures_side_var.get() or "").strip() not in FUTURES_SIDE_OPTIONS:
+                self.futures_side_var.set(FUTURES_SIDE_DEFAULT)
             self.withdraw_addr_var.set(str(raw.get("withdraw_address", WITHDRAW_ADDRESS_DEFAULT) or WITHDRAW_ADDRESS_DEFAULT).strip())
             self.withdraw_net_var.set(str(raw.get("withdraw_network", WITHDRAW_NETWORK_DEFAULT) or WITHDRAW_NETWORK_DEFAULT).strip())
             self.withdraw_coin_var.set(str(raw.get("withdraw_coin", WITHDRAW_COIN_DEFAULT) or WITHDRAW_COIN_DEFAULT).strip().upper())
@@ -3285,7 +4009,10 @@ class App(tk.Tk):
     def _set_combo_states_for_run(self, is_running):
         state = "disabled" if is_running else "readonly"
         for name in (
+            "trade_account_type_combo",
             "trade_mode_combo",
+            "futures_margin_type_combo",
+            "futures_side_combo",
             "withdraw_net_combo",
             "acc_network_combo",
             "withdraw_coin_combo",
@@ -3297,21 +4024,37 @@ class App(tk.Tk):
                 except Exception:
                     pass
 
-    def wait_for_usdt(self, timeout_sec, stop_event, client=None, symbol: str = ""):
+    def wait_for_usdt(
+        self,
+        timeout_sec,
+        stop_event,
+        client=None,
+        symbol: str = "",
+        trade_account_type: str = TRADE_ACCOUNT_TYPE_SPOT,
+    ):
         start = time.time()
         c = client or self.client
         if c is None:
             logger.error("wait_for_usdt 调用时没有可用的 BinanceClient")
             return False
-        quote_asset = BinanceClient.get_spot_quote_asset(symbol) if symbol else "USDT"
+        trade_type = self._normalize_trade_account_type(trade_account_type)
+        if trade_type == TRADE_ACCOUNT_TYPE_FUTURES:
+            quote_asset = c.get_um_futures_margin_asset(symbol) if symbol else "USDT"
+        else:
+            quote_asset = BinanceClient.get_spot_quote_asset(symbol) if symbol else "USDT"
 
         while time.time() - start < timeout_sec:
             if stop_event and stop_event.is_set():
                 logger.info("检测 %s 时收到停止信号，结束检测", quote_asset)
                 return False
             try:
-                quote_balance = c.spot_balance(quote_asset)
-                logger.info("%s 到账检测中，当前现货 %s = %.8f", quote_asset, quote_asset, quote_balance)
+                if trade_type == TRADE_ACCOUNT_TYPE_FUTURES:
+                    quote_balance = float(c.um_futures_asset_balance(quote_asset).get("availableBalance", Decimal("0")))
+                    logger.info("%s 到账检测中，当前 U本位可用 %s = %.8f", quote_asset, quote_asset, quote_balance)
+                else:
+                    c.collect_funding_asset_to_spot(quote_asset)
+                    quote_balance = c.spot_balance(quote_asset)
+                    logger.info("%s 到账检测中，当前现货 %s = %.8f", quote_asset, quote_asset, quote_balance)
             except Exception as e:
                 logger.error("检测 %s 余额失败: %s", quote_asset, e)
                 quote_balance = 0.0
@@ -3347,23 +4090,30 @@ class App(tk.Tk):
 
         try:
             trade_settings = self._collect_trade_mode_settings()
+            trade_account_type = str(trade_settings["trade_account_type"])
             spot_rounds = int(trade_settings["spot_rounds"])
             trade_mode = str(trade_settings["trade_mode"])
             premium_percent_value = trade_settings["premium_percent_value"]
             bnb_fee_stop_value = trade_settings["bnb_fee_stop_value"]
             bnb_topup_amount_value = trade_settings["bnb_topup_amount_value"]
             reprice_threshold_percent_value = trade_settings["reprice_threshold_percent_value"]
+            futures_symbol = str(trade_settings["futures_symbol"])
+            futures_rounds = int(trade_settings["futures_rounds"])
+            futures_amount_value = trade_settings["futures_amount_value"]
+            futures_leverage = int(trade_settings["futures_leverage"])
+            futures_margin_type = str(trade_settings["futures_margin_type"])
+            futures_side = str(trade_settings["futures_side"])
             withdraw_buffer = float(self.withdraw_buffer_var.get())
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "\u6700\u5c0f")
             max_delay = self._delay_var_value(self.max_delay_var, 3000, "\u6700\u5927")
             usdt_timeout = int(self.usdt_timeout_var.get())
-            spot_precision = int(self.spot_precision_var.get())
+            spot_precision = int(self.spot_precision_var.get()) if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT else SPOT_PRECISION_DEFAULT
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("错误", str(e) or "参数格式不正确")
             return
 
         spot_symbol = self.spot_symbol_var.get().strip().upper()
-        quote_asset = BinanceClient.get_spot_quote_asset(spot_symbol)
+        trade_symbol = futures_symbol if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES else spot_symbol
         enable_withdraw = bool(self.enable_withdraw_var.get())
         withdraw_address = self.withdraw_addr_var.get().strip()
         withdraw_network = self.withdraw_net_var.get().strip()
@@ -3378,6 +4128,11 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("错误", "创建 BinanceClient 失败: %s" % e)
             return
+        quote_asset = (
+            self.client.get_um_futures_margin_asset(trade_symbol)
+            if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES
+            else BinanceClient.get_spot_quote_asset(trade_symbol)
+        )
 
         logger.info("交易所单账号链路：%s", self._exchange_proxy_route_text())
         self.stop_event = threading.Event()
@@ -3393,7 +4148,10 @@ class App(tk.Tk):
         self._set_combo_states_for_run(True)
         self.status_var.set("状态：单账号运行中...")
         self.progress["value"] = 0
-        total_steps = max(spot_rounds, 1) if trade_mode == TRADE_MODE_MARKET else 1
+        if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
+            total_steps = max(futures_rounds, 1)
+        else:
+            total_steps = max(spot_rounds, 1) if trade_mode == TRADE_MODE_MARKET else 1
         self.progress["maximum"] = total_steps
 
         def sleep_fn():
@@ -3417,11 +4175,18 @@ class App(tk.Tk):
             sleep_fn=sleep_fn,
             enable_withdraw=enable_withdraw,
             withdraw_callback=withdraw_callback,
+            trade_account_type=trade_account_type,
             trade_mode=trade_mode,
             premium_percent=premium_percent_value,
             bnb_fee_stop_value=bnb_fee_stop_value,
             bnb_topup_amount=bnb_topup_amount_value,
             reprice_threshold_percent=reprice_threshold_percent_value,
+            futures_symbol=futures_symbol,
+            futures_rounds=futures_rounds,
+            futures_amount=futures_amount_value,
+            futures_leverage=futures_leverage,
+            futures_margin_type=futures_margin_type,
+            futures_side=futures_side,
         )
 
         def progress_cb(step, total, text):
@@ -3433,11 +4198,21 @@ class App(tk.Tk):
 
         def worker():
             try:
-                if not self.wait_for_usdt(usdt_timeout, self.stop_event, symbol=spot_symbol):
+                if not self.wait_for_usdt(usdt_timeout, self.stop_event, symbol=trade_symbol, trade_account_type=trade_account_type):
                     logger.info("%s 检测未通过，任务结束", quote_asset)
                     return
 
-                if trade_mode == TRADE_MODE_MARKET:
+                if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
+                    logger.info(
+                        "开始执行合约策略：%s，方向=%s，轮次=%d，下单金额=%s，杠杆=%s，保证金模式=%s",
+                        futures_symbol,
+                        futures_side,
+                        futures_rounds,
+                        futures_amount_value,
+                        futures_leverage,
+                        futures_margin_type,
+                    )
+                elif trade_mode == TRADE_MODE_MARKET:
                     logger.info("开始执行策略：市价 %d 轮，预买BNB金额=%s", spot_rounds, bnb_topup_amount_value)
                 elif trade_mode == TRADE_MODE_LIMIT:
                     logger.info(
@@ -4004,10 +4779,12 @@ class App(tk.Tk):
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "\u6700\u5c0f")
             max_delay = self._delay_var_value(self.max_delay_var, 3000, "\u6700\u5927")
             usdt_timeout = int(self.usdt_timeout_var.get())
-            spot_precision = int(self.spot_precision_var.get())
+            spot_precision = SPOT_PRECISION_DEFAULT
             max_threads = int(self.max_threads_var.get())
             if (not batch_total_asset_only) and (not batch_collect_bnb_mode):
                 trade_settings = self._collect_trade_mode_settings()
+                if str(trade_settings.get("trade_account_type")) == TRADE_ACCOUNT_TYPE_SPOT:
+                    spot_precision = int(self.spot_precision_var.get())
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("错误", str(e) or "参数格式不正确 (请检查轮数/线程数/延迟等)")
             return
@@ -4016,23 +4793,45 @@ class App(tk.Tk):
             max_threads = 1
 
         spot_symbol = self.spot_symbol_var.get().strip().upper()
-        quote_asset = BinanceClient.get_spot_quote_asset(spot_symbol)
         enable_withdraw = bool(self.enable_withdraw_var.get())
         withdraw_coin = self.withdraw_coin_var.get().strip().upper()
         if trade_settings:
+            trade_account_type = str(trade_settings["trade_account_type"])
             spot_rounds = int(trade_settings["spot_rounds"])
             trade_mode = str(trade_settings["trade_mode"])
             premium_percent_value = trade_settings["premium_percent_value"]
             bnb_fee_stop_value = trade_settings["bnb_fee_stop_value"]
             bnb_topup_amount_value = trade_settings["bnb_topup_amount_value"]
             reprice_threshold_percent_value = trade_settings["reprice_threshold_percent_value"]
+            futures_symbol = str(trade_settings["futures_symbol"])
+            futures_rounds = int(trade_settings["futures_rounds"])
+            futures_amount_value = trade_settings["futures_amount_value"]
+            futures_leverage = int(trade_settings["futures_leverage"])
+            futures_margin_type = str(trade_settings["futures_margin_type"])
+            futures_side = str(trade_settings["futures_side"])
         else:
+            trade_account_type = TRADE_ACCOUNT_TYPE_SPOT
             spot_rounds = max(1, int(self.spot_rounds_var.get() or SPOT_ROUNDS_DEFAULT))
             trade_mode = TRADE_MODE_MARKET
             premium_percent_value = None
             bnb_fee_stop_value = None
             bnb_topup_amount_value = Decimal("0")
             reprice_threshold_percent_value = Decimal(REPRICE_THRESHOLD_PERCENT_DEFAULT)
+            futures_symbol = self.futures_symbol_var.get().strip().upper()
+            try:
+                futures_rounds = max(1, int(self.futures_rounds_var.get() or FUTURES_ROUNDS_DEFAULT))
+            except Exception:
+                futures_rounds = FUTURES_ROUNDS_DEFAULT
+            try:
+                futures_amount_value = Decimal(str(self.futures_amount_var.get() or FUTURES_AMOUNT_DEFAULT))
+            except Exception:
+                futures_amount_value = Decimal(FUTURES_AMOUNT_DEFAULT)
+            try:
+                futures_leverage = int(self.futures_leverage_var.get() or FUTURES_LEVERAGE_DEFAULT)
+            except Exception:
+                futures_leverage = FUTURES_LEVERAGE_DEFAULT
+            futures_margin_type = str(self.futures_margin_type_var.get() or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
+            futures_side = str(self.futures_side_var.get() or FUTURES_SIDE_DEFAULT).strip()
 
         skip_usdt_wait_in_batch = bool(self.skip_usdt_wait_in_batch_var.get())
 
@@ -4123,6 +4922,12 @@ class App(tk.Tk):
 
                 try:
                     client = self._create_binance_client(acc["api_key"], acc["api_secret"])
+                    trade_symbol = futures_symbol if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES else spot_symbol
+                    quote_asset = (
+                        client.get_um_futures_margin_asset(trade_symbol)
+                        if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES
+                        else BinanceClient.get_spot_quote_asset(trade_symbol)
+                    )
 
                     # 1) 只查询总资产
                     if batch_total_asset_only:
@@ -4229,7 +5034,13 @@ class App(tk.Tk):
 
                         if need_wait_usdt:
                             set_status(f"检测 {quote_asset} 到账...")
-                            if not self.wait_for_usdt(usdt_timeout, combined_stop, client=client, symbol=spot_symbol):
+                            if not self.wait_for_usdt(
+                                usdt_timeout,
+                                combined_stop,
+                                client=client,
+                                symbol=trade_symbol,
+                                trade_account_type=trade_account_type,
+                            ):
                                 if combined_stop.is_set():
                                     logger.info(f"账号 #{idx} 已请求停止")
                                     finish_current_now("已停止")
@@ -4243,7 +5054,18 @@ class App(tk.Tk):
                             set_status(f"跳过{quote_asset}检测")
 
                         set_status("策略执行中...")
-                        if trade_mode == TRADE_MODE_MARKET:
+                        if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
+                            logger.info(
+                                "账号 #%d 开始执行合约策略：%s，方向=%s，轮次=%d，下单金额=%s，杠杆=%s，保证金模式=%s",
+                                idx,
+                                futures_symbol,
+                                futures_side,
+                                futures_rounds,
+                                futures_amount_value,
+                                futures_leverage,
+                                futures_margin_type,
+                            )
+                        elif trade_mode == TRADE_MODE_MARKET:
                             logger.info("账号 #%d 开始执行市价策略：%d 轮，预买BNB金额=%s", idx, spot_rounds, bnb_topup_amount_value)
                         elif trade_mode == TRADE_MODE_LIMIT:
                             logger.info(
@@ -4300,11 +5122,18 @@ class App(tk.Tk):
                             sleep_fn=sleep_fn,
                             enable_withdraw=enable_withdraw,
                             withdraw_callback=withdraw_callback,
+                            trade_account_type=trade_account_type,
                             trade_mode=trade_mode,
                             premium_percent=premium_percent_value,
                             bnb_fee_stop_value=bnb_fee_stop_value,
                             bnb_topup_amount=bnb_topup_amount_value,
                             reprice_threshold_percent=reprice_threshold_percent_value,
+                            futures_symbol=futures_symbol,
+                            futures_rounds=futures_rounds,
+                            futures_amount=futures_amount_value,
+                            futures_leverage=futures_leverage,
+                            futures_margin_type=futures_margin_type,
+                            futures_side=futures_side,
                         )
 
                         strategy_result = strategy.run(combined_stop, progress_cb=progress_cb)
