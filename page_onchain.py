@@ -279,7 +279,20 @@ class OnchainTransferPage:
         self.btn_stop_tasks.pack(side=LEFT, padx=(8, 0))
         self.lbl_progress = ttk.Label(action2, textvariable=self.progress_var, style="Subtle.TLabel", anchor="w", justify="left")
         self.lbl_progress.pack(side=LEFT, fill="x", expand=True, padx=(10, 0))
-        ttk.Button(action2, text="执行批量转账", style="Action.TButton", command=self.start_batch_transfer).pack(side=RIGHT)
+        self.btn_batch_transfer = tk.Button(
+            action2,
+            text="执行批量转账",
+            command=self.start_batch_transfer,
+            bg="#1E8449",
+            fg="#FFFFFF",
+            activebackground="#186A3B",
+            activeforeground="#FFFFFF",
+            disabledforeground="#E8F5E9",
+            relief="flat",
+            padx=12,
+            pady=2,
+        )
+        self.btn_batch_transfer.pack(side=RIGHT)
         ttk.Button(action2, text="失败重试", style="Action.TButton", command=self.start_retry_failed).pack(side=RIGHT, padx=(8, 0))
 
         self.log_box = ttk.LabelFrame(main, text="执行日志", padding=8)
@@ -844,6 +857,57 @@ class OnchainTransferPage:
             flush_queued_log_rows(self, log_tree, max_rows=LOG_MAX_ROWS)
         clear_ui_batch_size(self)
         task_progress.finish(self, kind, success, failed)
+
+    def _show_result_summary_dialog(
+        self,
+        *,
+        title: str,
+        summary_title: str,
+        success: int,
+        failed: int,
+        detail_text: str = "",
+    ) -> None:
+        parent = getattr(self, "root", None) or self.parent
+        dialog = tk.Toplevel(parent)
+        dialog.title(str(title or "执行完成"))
+        dialog.transient(parent)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill=BOTH, expand=True)
+
+        ttk.Label(body, text=str(summary_title or "执行完成"), font=("", 11, "bold")).pack(anchor="w")
+
+        counts = ttk.Frame(body)
+        counts.pack(anchor="w", pady=(10, 0))
+        ttk.Label(counts, text="成功：").pack(side=LEFT)
+        tk.Label(counts, text=str(int(success)), fg="#1E8449").pack(side=LEFT)
+        ttk.Label(counts, text="   失败：").pack(side=LEFT)
+        tk.Label(counts, text=str(int(failed)), fg="#C62828").pack(side=LEFT)
+
+        detail = str(detail_text or "").strip()
+        if detail:
+            ttk.Label(body, text=detail, foreground="#666666", wraplength=420, justify="left").pack(anchor="w", pady=(10, 0))
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x", pady=(14, 0))
+        ttk.Button(btn_row, text="确定", command=dialog.destroy).pack(side=RIGHT)
+
+        dialog.update_idletasks()
+        try:
+            parent_x = parent.winfo_rootx()
+            parent_y = parent.winfo_rooty()
+            parent_w = parent.winfo_width()
+            parent_h = parent.winfo_height()
+            width = dialog.winfo_width()
+            height = dialog.winfo_height()
+            x = parent_x + max(0, (parent_w - width) // 2)
+            y = parent_y + max(0, (parent_h - height) // 2)
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        dialog.focus_set()
 
     def _set_progress_metrics(
         self,
@@ -3302,7 +3366,15 @@ class OnchainTransferPage:
             else:
                 summary = f"{summary}，转账总额={self._token_amount_text(params.coin, total_amount) if track_amount_total else '-'}，预估gas合计=-"
             dispatch_ui(lambda: self.log(summary))
-            dispatch_ui(lambda: messagebox.showinfo("执行完成", summary))
+            dispatch_ui(
+                lambda s=success, f=failed, detail=summary: self._show_result_summary_dialog(
+                    title="执行完成",
+                    summary_title="链上批量转账完成",
+                    success=s,
+                    failed=f,
+                    detail_text=detail,
+                )
+            )
             dispatch_ui(lambda s=success, f=failed: self._finish_progress("transfer", s, f))
         except Exception as exc:
             err_text = str(exc)

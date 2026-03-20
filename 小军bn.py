@@ -1,18 +1,12 @@
 import time
-import hmac
-import hashlib
 import logging
-from logging.handlers import RotatingFileHandler
 import ipaddress
 import base64
-from typing import Dict, Any, Optional
-from urllib.parse import urlencode
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
 import threading
 import queue
 import random
 import os
-import functools
 import sys
 import csv
 import json
@@ -29,7 +23,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from api_clients import EvmClient
-from app_paths import APP_DIR, BUNDLE_DIR, EXCHANGE_PROXY_CONFIG_FILE, STRATEGY_CONFIG_FILE
+from app_paths import APP_DIR, BUNDLE_DIR, DATA_DIR, EXCHANGE_PROXY_CONFIG_FILE, STRATEGY_CONFIG_FILE
+from exchange_binance_client import BinanceClient
 from secret_box import SECRET_BOX
 
 try:
@@ -72,11 +67,25 @@ FUTURES_AMOUNT_DEFAULT = "100"
 FUTURES_LEVERAGE_DEFAULT = 10
 FUTURES_MARGIN_TYPE_CROSSED = "CROSSED"
 FUTURES_MARGIN_TYPE_ISOLATED = "ISOLATED"
+FUTURES_MARGIN_TYPE_LABEL_CROSSED = "全仓"
+FUTURES_MARGIN_TYPE_LABEL_ISOLATED = "逐仓"
 FUTURES_MARGIN_TYPE_OPTIONS = (
     FUTURES_MARGIN_TYPE_CROSSED,
     FUTURES_MARGIN_TYPE_ISOLATED,
 )
+FUTURES_MARGIN_TYPE_LABEL_OPTIONS = (
+    FUTURES_MARGIN_TYPE_LABEL_CROSSED,
+    FUTURES_MARGIN_TYPE_LABEL_ISOLATED,
+)
 FUTURES_MARGIN_TYPE_DEFAULT = FUTURES_MARGIN_TYPE_CROSSED
+FUTURES_MARGIN_TYPE_VALUE_TO_LABEL = {
+    FUTURES_MARGIN_TYPE_CROSSED: FUTURES_MARGIN_TYPE_LABEL_CROSSED,
+    FUTURES_MARGIN_TYPE_ISOLATED: FUTURES_MARGIN_TYPE_LABEL_ISOLATED,
+}
+FUTURES_MARGIN_TYPE_LABEL_TO_VALUE = {
+    FUTURES_MARGIN_TYPE_LABEL_CROSSED: FUTURES_MARGIN_TYPE_CROSSED,
+    FUTURES_MARGIN_TYPE_LABEL_ISOLATED: FUTURES_MARGIN_TYPE_ISOLATED,
+}
 FUTURES_SIDE_LONG = "做多"
 FUTURES_SIDE_SHORT = "做空"
 FUTURES_SIDE_OPTIONS = (
@@ -84,18 +93,6 @@ FUTURES_SIDE_OPTIONS = (
     FUTURES_SIDE_SHORT,
 )
 FUTURES_SIDE_DEFAULT = FUTURES_SIDE_LONG
-SUPPORTED_QUOTE_ASSET_SUFFIXES = (
-    "FDUSD",
-    "USDT",
-    "USDC",
-    "USD1",
-    "BUSD",
-    "BTC",
-    "ETH",
-    "BNB",
-    "TRY",
-    "EUR",
-)
 
 WITHDRAW_ADDRESS_DEFAULT = ""
 WITHDRAW_NETWORK_DEFAULT = "BSC"
@@ -565,9 +562,11 @@ def http_get_via_proxy(
 
 # ====================== 日志 & 队列 ======================
 log_queue = queue.Queue()
-LOG_FILE_PATH = "bot_log.txt"
-LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
-LOG_FILE_BACKUP_COUNT = 2
+LOG_DIR = DATA_DIR / "logs"
+LOG_FILE_PATH = APP_DIR / "bot_log.txt"
+LOG_FILE_RUNTIME_PREFIX = "exchange_runtime"
+LOG_FILE_RETENTION_COUNT = 20
+LOG_FILE_TOTAL_SIZE_LIMIT_BYTES = 200 * 1024 * 1024
 
 _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("bot")
@@ -584,1474 +583,68 @@ class TkLogHandler(logging.Handler):
             pass
 
 
-class SafeRotatingFileHandler(RotatingFileHandler):
-    def doRollover(self):
+def _create_runtime_log_path() -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return LOG_DIR / f"{LOG_FILE_RUNTIME_PREFIX}_{timestamp}_{os.getpid()}.log"
+
+
+def _prune_runtime_logs(current_path: Path | None = None) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    entries = []
+    for path in LOG_DIR.glob(f"{LOG_FILE_RUNTIME_PREFIX}_*.log"):
         try:
-            super().doRollover()
-        except PermissionError:
-            # Windows 下另一个进程占用日志文件时，跳过轮转但继续写当前文件。
-            return
+            stat = path.stat()
+        except OSError:
+            continue
+        entries.append((path, stat.st_mtime, stat.st_size))
+
+    entries.sort(key=lambda item: item[1], reverse=True)
+    kept_count = 0
+    kept_size = 0
+    for path, _, size in entries:
+        if current_path is not None and path == current_path:
+            kept_count += 1
+            kept_size += size
+            continue
+        if kept_count < LOG_FILE_RETENTION_COUNT and (kept_size + size) <= LOG_FILE_TOTAL_SIZE_LIMIT_BYTES:
+            kept_count += 1
+            kept_size += size
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 _tk_handler = TkLogHandler()
 _tk_handler.setFormatter(_formatter)
 logger.addHandler(_tk_handler)
 
+_runtime_log_path = None
 try:
-    _file_handler = SafeRotatingFileHandler(
-        LOG_FILE_PATH,
-        maxBytes=LOG_FILE_MAX_BYTES,
-        backupCount=LOG_FILE_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    _file_handler.setFormatter(_formatter)
-    logger.addHandler(_file_handler)
+    _prune_runtime_logs()
+    _runtime_log_path = _create_runtime_log_path()
+    _runtime_file_handler = logging.FileHandler(_runtime_log_path, encoding="utf-8")
+    _runtime_file_handler.setFormatter(_formatter)
+    logger.addHandler(_runtime_file_handler)
+    _prune_runtime_logs(_runtime_log_path)
 except Exception as e:
     print(f"无法创建日志文件: {e}")
 
-
-# ====================== 自定义错误 & 装饰器 ======================
-class BinanceAPIError(Exception):
-    def __init__(self, code: int, msg: str):
-        self.code = code
-        self.msg = msg
-        super().__init__(f"Binance API error {code}: {msg}")
-
-
-def retry_request(max_retries=3, delay=2):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            for i in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except (requests.exceptions.RequestException, ConnectionError, TimeoutError) as e:
-                    last_exception = e
-                    logger.warning(f"网络请求失败 ({i + 1}/{max_retries}): {e}，将在 {delay} 秒后重试...")
-                    time.sleep(delay)
-                except BinanceAPIError as e:
-                    last_exception = e
-                    if e.code in [-1001, -1003]:
-                        logger.warning(f"Binance 系统繁忙 ({i + 1}/{max_retries}): {e}，重试中...")
-                        time.sleep(delay)
-                    else:
-                        raise e
-            logger.error(f"重试 {max_retries} 次后仍然失败。")
-            if last_exception:
-                raise last_exception
-            raise RuntimeError("未知错误：重试失败")
-        return wrapper
-    return decorator
-
-
-# ====================== Binance 客户端 ======================
-class BinanceClient:
-    SERVER_TIME_CACHE_TTL_SECONDS = 30.0
-    DEFAULT_RECV_WINDOW_MS = 10000
-
-    def __init__(self, key: str, secret: str, proxy_url: str = ""):
-        if not key or not secret:
-            raise ValueError("API KEY / SECRET 不能为空")
-
-        self.key = key
-        self.secret = secret.encode()
-        self.session = requests.Session()
-        self.session.headers.update({"X-MBX-APIKEY": key})
-        try:
-            self.recv_window_ms = max(1000, int(self.DEFAULT_RECV_WINDOW_MS))
-        except Exception:
-            self.recv_window_ms = self.DEFAULT_RECV_WINDOW_MS
-        proxy = str(proxy_url or "").strip()
-        self.session.trust_env = not bool(proxy)
-        if proxy:
-            self.session.proxies.update({
-                "http": proxy,
-                "https": proxy,
-            })
-
-        self.spot = "https://api.binance.com"
-        self.um_futures = "https://fapi.binance.com"
-        self.cm_futures = "https://dapi.binance.com"
-
-        self._exchange_info_cache = {}
-        self._price_cache = {}
-        self._um_futures_exchange_info_cache = {}
-        self._um_futures_price_cache = {}
-        self._server_time_offset_ms = {}
-        self._server_time_synced_at = {}
-        self._server_time_lock = threading.Lock()
-
-    @staticmethod
-    def _normalize_base_url(base: str) -> str:
-        return str(base or "").rstrip("/")
-
-    def _server_time_path(self, base: str) -> str:
-        base_n = self._normalize_base_url(base)
-        if base_n == self._normalize_base_url(self.um_futures):
-            return "/fapi/v1/time"
-        if base_n == self._normalize_base_url(self.cm_futures):
-            return "/dapi/v1/time"
-        return "/api/v3/time"
-
-    @staticmethod
-    def _local_timestamp_ms() -> int:
-        return int(time.time() * 1000)
-
-    def _fetch_server_time_ms(self, base: str) -> int:
-        base_n = self._normalize_base_url(base)
-        url = base_n + self._server_time_path(base_n)
-        start_ms = self._local_timestamp_ms()
-        r = self.session.get(url, timeout=10)
-        end_ms = self._local_timestamp_ms()
-        r.raise_for_status()
-        data = r.json()
-        try:
-            server_time_ms = int(data.get("serverTime"))
-        except Exception as exc:
-            raise RuntimeError(f"服务器时间接口返回异常：{data}") from exc
-        midpoint_ms = (start_ms + end_ms) // 2
-        return int(server_time_ms - midpoint_ms)
-
-    def _sync_server_time_offset(self, base: str, *, force: bool = False) -> int:
-        base_n = self._normalize_base_url(base)
-        now_mono = time.monotonic()
-        with self._server_time_lock:
-            cached_offset = self._server_time_offset_ms.get(base_n)
-            synced_at = self._server_time_synced_at.get(base_n, 0.0)
-            if (not force) and cached_offset is not None and (now_mono - synced_at) < self.SERVER_TIME_CACHE_TTL_SECONDS:
-                return int(cached_offset)
-
-        offset_ms = self._fetch_server_time_ms(base_n)
-        with self._server_time_lock:
-            self._server_time_offset_ms[base_n] = int(offset_ms)
-            self._server_time_synced_at[base_n] = time.monotonic()
-        return int(offset_ms)
-
-    def _signed_params(self, base: str, params=None, *, force_time_sync: bool = False) -> dict[str, Any]:
-        signed_params = dict(params or {})
-        offset_ms = 0
-        try:
-            offset_ms = self._sync_server_time_offset(base, force=force_time_sync)
-        except Exception:
-            if force_time_sync:
-                raise
-            base_n = self._normalize_base_url(base)
-            with self._server_time_lock:
-                cached_offset = self._server_time_offset_ms.get(base_n)
-            if cached_offset is not None:
-                offset_ms = int(cached_offset)
-
-        signed_params["timestamp"] = self._local_timestamp_ms() + int(offset_ms)
-        signed_params["recvWindow"] = self.recv_window_ms
-        signed_params["signature"] = self.sign(signed_params)
-        return signed_params
-
-    def sign(self, params: Dict[str, Any]):
-        return hmac.new(
-            self.secret, urlencode(params, True).encode(), hashlib.sha256
-        ).hexdigest()
-
-    @retry_request(max_retries=3, delay=1)
-    def request(self, base, method, path, params=None):
-        url = base + path
-        last_error = None
-
-        for attempt in range(2):
-            signed_params = self._signed_params(base, params, force_time_sync=(attempt > 0))
-
-            if method == "GET":
-                r = self.session.get(url, params=signed_params, timeout=15)
-            else:
-                r = self.session.request(method, url, data=signed_params, timeout=15)
-
-            try:
-                data = r.json()
-            except Exception:
-                r.raise_for_status()
-
-            if r.status_code == 200:
-                return data
-
-            err = BinanceAPIError(data.get("code", -1), data.get("msg", "Unknown"))
-            last_error = err
-            if err.code == -1021 and attempt == 0:
-                try:
-                    self._sync_server_time_offset(base, force=True)
-                    logger.warning("Binance 返回 -1021，已重新同步服务器时间并重试一次")
-                    continue
-                except Exception as sync_exc:
-                    logger.warning("Binance 返回 -1021，但服务器时间同步失败: %s", sync_exc)
-            raise err
-
-        if last_error:
-            raise last_error
-        raise RuntimeError("签名请求失败")
-
-    @retry_request(max_retries=3, delay=1)
-    def public_get(self, base, path, params=None):
-        params = params or {}
-        url = base + path
-        r = self.session.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        return r.json()
-
-    # -------- 余额 --------
-    def spot_balance(self, asset: str) -> float:
-        data = self.request(self.spot, "GET", "/api/v3/account")
-        for b in data.get("balances", []):
-            if b.get("asset") == asset:
-                return float(b.get("free", 0))
-        return 0.0
-
-    def spot_all_balances(self):
-        data = self.request(self.spot, "GET", "/api/v3/account")
-        result = []
-        for b in data.get("balances", []):
-            free_amt = float(b.get("free", 0) or 0)
-            locked_amt = float(b.get("locked", 0) or 0)
-            total = free_amt + locked_amt
-            if total > 0:
-                result.append({
-                    "asset": b.get("asset"),
-                    "free": free_amt,
-                    "locked": locked_amt,
-                    "total": total,
-                })
-        return result
-
-    def query_total_wallet_balance(self, quote_asset="USDT"):
-        data = self.request(
-            self.spot,
-            "GET",
-            "/sapi/v1/asset/wallet/balance",
-            {"quoteAsset": quote_asset},
-        )
-        total = Decimal("0")
-        rows = []
-        for item in data:
-            bal = Decimal(str(item.get("balance", "0")))
-            wallet_name = item.get("walletName", "Unknown")
-            active = bool(item.get("activate", False))
-            rows.append({
-                "walletName": wallet_name,
-                "balance": bal,
-                "activate": active,
-            })
-            total += bal
-        return total, rows
-
-    def query_asset_balances_breakdown(self) -> dict[str, Decimal]:
-        totals: dict[str, Decimal] = {}
-
-        def add_amount(asset: str, amount) -> None:
-            asset_u = str(asset or "").strip().upper()
-            if not asset_u:
-                return
-            amount_dec = Decimal(str(amount or "0"))
-            if amount_dec <= 0:
-                return
-            totals[asset_u] = totals.get(asset_u, Decimal("0")) + amount_dec
-
-        try:
-            for item in self.spot_all_balances():
-                add_amount(item.get("asset", ""), item.get("total", 0))
-        except Exception as e:
-            logger.warning("查询现货资产明细失败: %s", e)
-
-        try:
-            for item in self.funding_positive_assets():
-                add_amount(item.get("asset", ""), item.get("free", 0))
-        except Exception as e:
-            logger.warning("查询资金账户资产明细失败: %s", e)
-
-        try:
-            for item in self.um_futures_transferable_assets():
-                add_amount(item.get("asset", ""), item.get("amount", 0))
-        except Exception as e:
-            logger.warning("查询 U本位资产明细失败: %s", e)
-
-        try:
-            for item in self.cm_futures_transferable_assets():
-                add_amount(item.get("asset", ""), item.get("amount", 0))
-        except Exception as e:
-            logger.warning("查询 币本位资产明细失败: %s", e)
-
-        return totals
-
-    # -------- 工具：从 symbol 推断现货基础币种 --------
-    @staticmethod
-    def split_spot_symbol(symbol: str) -> tuple[str, str]:
-        symbol_u = str(symbol or "").strip().upper()
-        for suffix in SUPPORTED_QUOTE_ASSET_SUFFIXES:
-            if symbol_u.endswith(suffix) and len(symbol_u) > len(suffix):
-                return symbol_u[:-len(suffix)], suffix
-        return "BTC", "USDT"
-
-    @classmethod
-    def get_spot_base_asset(cls, symbol: str) -> str:
-        base_asset, _quote_asset = cls.split_spot_symbol(symbol)
-        return base_asset
-
-    @classmethod
-    def get_spot_quote_asset(cls, symbol: str) -> str:
-        _base_asset, quote_asset = cls.split_spot_symbol(symbol)
-        return quote_asset
-
-    # -------- 公共行情 / 交易规则 --------
-    def get_exchange_info(self, symbol: str):
-        symbol = symbol.upper()
-        if symbol in self._exchange_info_cache:
-            return self._exchange_info_cache[symbol]
-        data = self.public_get(self.spot, "/api/v3/exchangeInfo", {"symbol": symbol})
-        symbols = data.get("symbols", [])
-        if not symbols:
-            return None
-        info = symbols[0]
-        self._exchange_info_cache[symbol] = info
-        return info
-
-    def get_symbol_price(self, symbol: str) -> Optional[Decimal]:
-        symbol = symbol.upper()
-        try:
-            data = self.public_get(self.spot, "/api/v3/ticker/price", {"symbol": symbol})
-            price = Decimal(str(data.get("price")))
-            self._price_cache[symbol] = price
-            return price
-        except Exception:
-            return None
-
-    @staticmethod
-    def _extract_filter(symbol_info: dict, filter_type: str):
-        for f in symbol_info.get("filters", []):
-            if f.get("filterType") == filter_type:
-                return f
-        return None
-
-    @staticmethod
-    def _decimal_from_str(v, default="0"):
-        try:
-            return Decimal(str(v))
-        except (InvalidOperation, TypeError, ValueError):
-            return Decimal(default)
-
-    @staticmethod
-    def _floor_to_step(qty: Decimal, step: Decimal) -> Decimal:
-        if step <= 0:
-            return qty
-        return (qty // step) * step
-
-    @staticmethod
-    def _ceil_to_step(value: Decimal, step: Decimal) -> Decimal:
-        if step <= 0:
-            return value
-        if value <= 0:
-            return Decimal("0")
-        units = (value / step).to_integral_value(rounding=ROUND_UP)
-        return units * step
-
-    @staticmethod
-    def _format_decimal(value: Decimal) -> str:
-        text = format(Decimal(str(value)).normalize(), "f")
-        if text in {"-0", "-0.0"}:
-            return "0"
-        return text
-
-    def get_symbol_trade_rules(self, symbol: str):
-        info = self.get_exchange_info(symbol)
-        if not info:
-            return None
-
-        lot = self._extract_filter(info, "LOT_SIZE")
-        min_notional = self._extract_filter(info, "MIN_NOTIONAL")
-        notional = self._extract_filter(info, "NOTIONAL")
-        price_filter = self._extract_filter(info, "PRICE_FILTER")
-
-        step_size = self._decimal_from_str((lot or {}).get("stepSize", "0.00000001"), "0.00000001")
-        min_qty = self._decimal_from_str((lot or {}).get("minQty", "0"), "0")
-        max_qty = self._decimal_from_str((lot or {}).get("maxQty", "999999999"), "999999999")
-        tick_size = self._decimal_from_str((price_filter or {}).get("tickSize", "0.00000001"), "0.00000001")
-        min_price = self._decimal_from_str((price_filter or {}).get("minPrice", "0"), "0")
-        max_price = self._decimal_from_str((price_filter or {}).get("maxPrice", "999999999"), "999999999")
-
-        min_notional_val = Decimal("0")
-        if min_notional:
-            min_notional_val = self._decimal_from_str(min_notional.get("minNotional", "0"), "0")
-        elif notional:
-            min_notional_val = self._decimal_from_str(notional.get("minNotional", "0"), "0")
-
-        return {
-            "stepSize": step_size,
-            "minQty": min_qty,
-            "maxQty": max_qty,
-            "tickSize": tick_size,
-            "minPrice": min_price,
-            "maxPrice": max_price,
-            "minNotional": min_notional_val,
-            "status": info.get("status"),
-            "quoteAsset": info.get("quoteAsset"),
-            "baseAsset": info.get("baseAsset"),
-        }
-
-    @staticmethod
-    def _error_text_contains(exc: Exception, *snippets: str) -> bool:
-        text = str(exc or "").lower()
-        return any(str(snippet or "").lower() in text for snippet in snippets if snippet)
-
-    def get_um_futures_exchange_info(self, symbol: str):
-        symbol_u = str(symbol or "").strip().upper()
-        if not symbol_u:
-            return None
-        if symbol_u in self._um_futures_exchange_info_cache:
-            return self._um_futures_exchange_info_cache[symbol_u]
-        data = self.public_get(self.um_futures, "/fapi/v1/exchangeInfo", {"symbol": symbol_u})
-        symbols = data.get("symbols", [])
-        if not symbols:
-            return None
-        info = symbols[0]
-        self._um_futures_exchange_info_cache[symbol_u] = info
-        return info
-
-    def get_um_futures_symbol_price(self, symbol: str) -> Optional[Decimal]:
-        symbol_u = str(symbol or "").strip().upper()
-        if not symbol_u:
-            return None
-        try:
-            data = self.public_get(self.um_futures, "/fapi/v1/ticker/price", {"symbol": symbol_u})
-            price = Decimal(str(data.get("price")))
-            self._um_futures_price_cache[symbol_u] = price
-            return price
-        except Exception:
-            return None
-
-    def get_um_futures_trade_rules(self, symbol: str):
-        info = self.get_um_futures_exchange_info(symbol)
-        if not info:
-            return None
-
-        lot = self._extract_filter(info, "LOT_SIZE")
-        market_lot = self._extract_filter(info, "MARKET_LOT_SIZE")
-        min_notional = self._extract_filter(info, "MIN_NOTIONAL")
-        notional = self._extract_filter(info, "NOTIONAL")
-        price_filter = self._extract_filter(info, "PRICE_FILTER")
-
-        market_lot = market_lot or lot or {}
-        lot = lot or market_lot or {}
-        price_filter = price_filter or {}
-
-        step_size = self._decimal_from_str((market_lot or {}).get("stepSize", "0.00000001"), "0.00000001")
-        min_qty = self._decimal_from_str((market_lot or {}).get("minQty", "0"), "0")
-        max_qty = self._decimal_from_str((market_lot or {}).get("maxQty", "999999999"), "999999999")
-        tick_size = self._decimal_from_str((price_filter or {}).get("tickSize", "0.00000001"), "0.00000001")
-        min_price = self._decimal_from_str((price_filter or {}).get("minPrice", "0"), "0")
-        max_price = self._decimal_from_str((price_filter or {}).get("maxPrice", "999999999"), "999999999")
-
-        min_notional_val = Decimal("0")
-        if min_notional:
-            min_notional_val = self._decimal_from_str(min_notional.get("notional", "0"), "0")
-        elif notional:
-            min_notional_val = self._decimal_from_str(notional.get("minNotional", "0"), "0")
-
-        return {
-            "stepSize": step_size,
-            "minQty": min_qty,
-            "maxQty": max_qty,
-            "tickSize": tick_size,
-            "minPrice": min_price,
-            "maxPrice": max_price,
-            "minNotional": min_notional_val,
-            "status": info.get("status"),
-            "quoteAsset": info.get("quoteAsset"),
-            "baseAsset": info.get("baseAsset"),
-            "marginAsset": info.get("marginAsset"),
-            "marketTakeBound": self._decimal_from_str(info.get("marketTakeBound", "0"), "0"),
-        }
-
-    def get_um_futures_margin_asset(self, symbol: str) -> str:
-        rules = self.get_um_futures_trade_rules(symbol)
-        if not rules:
-            return "USDT"
-        return str(rules.get("marginAsset") or rules.get("quoteAsset") or "USDT").strip().upper()
-
-    def get_um_futures_book_ticker(self, symbol: str) -> dict[str, Decimal]:
-        symbol_u = str(symbol or "").strip().upper()
-        data = self.public_get(self.um_futures, "/fapi/v1/ticker/bookTicker", {"symbol": symbol_u})
-        bid_price = self._decimal_from_str(data.get("bidPrice"), "0")
-        ask_price = self._decimal_from_str(data.get("askPrice"), "0")
-        if bid_price <= 0 or ask_price <= 0:
-            raise RuntimeError(f"读取合约盘口失败：{symbol_u} bid/ask 无效")
-        return {
-            "bidPrice": bid_price,
-            "askPrice": ask_price,
-        }
-
-    def get_um_futures_symbol_config(self, symbol: str) -> dict | None:
-        symbol_u = str(symbol or "").strip().upper()
-        if not symbol_u:
-            return None
-        data = self.request(
-            self.um_futures,
-            "GET",
-            "/fapi/v1/symbolConfig",
-            {"symbol": symbol_u},
-        )
-        if isinstance(data, list):
-            return data[0] if data else None
-        if isinstance(data, dict):
-            return data
-        return None
-
-    def get_um_futures_position_mode(self) -> bool:
-        data = self.request(
-            self.um_futures,
-            "GET",
-            "/fapi/v1/positionSide/dual",
-            {},
-        )
-        return bool(data.get("dualSidePosition"))
-
-    def ensure_um_futures_one_way_mode(self) -> bool:
-        dual_mode = self.get_um_futures_position_mode()
-        if not dual_mode:
-            return False
-        try:
-            self.request(
-                self.um_futures,
-                "POST",
-                "/fapi/v1/positionSide/dual",
-                {"dualSidePosition": "false"},
-            )
-            logger.info("U本位合约已切换为单向仓模式")
-            return True
-        except Exception as exc:
-            if self._error_text_contains(exc, "no need to change position side"):
-                return False
-            raise
-
-    def ensure_um_futures_margin_type(self, symbol: str, margin_type: str) -> bool:
-        symbol_u = str(symbol or "").strip().upper()
-        target_margin_type = str(margin_type or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
-        config = self.get_um_futures_symbol_config(symbol_u)
-        current_margin_type = str((config or {}).get("marginType") or "").strip().upper()
-        if current_margin_type == target_margin_type:
-            return False
-        try:
-            self.request(
-                self.um_futures,
-                "POST",
-                "/fapi/v1/marginType",
-                {
-                    "symbol": symbol_u,
-                    "marginType": target_margin_type,
-                },
-            )
-            logger.info("U本位合约 %s 保证金模式已设置为 %s", symbol_u, target_margin_type)
-            return True
-        except Exception as exc:
-            if self._error_text_contains(exc, "no need to change margin type"):
-                return False
-            raise
-
-    def ensure_um_futures_leverage(self, symbol: str, leverage: int) -> int:
-        symbol_u = str(symbol or "").strip().upper()
-        leverage_i = int(leverage)
-        if leverage_i < 1 or leverage_i > 125:
-            raise RuntimeError("合约杠杆必须在 1-125 之间")
-        config = self.get_um_futures_symbol_config(symbol_u)
-        try:
-            current_leverage = int((config or {}).get("leverage"))
-        except Exception:
-            current_leverage = 0
-        if current_leverage == leverage_i:
-            return leverage_i
-        data = self.request(
-            self.um_futures,
-            "POST",
-            "/fapi/v1/leverage",
-            {
-                "symbol": symbol_u,
-                "leverage": leverage_i,
-            },
-        )
-        final_leverage = leverage_i
-        try:
-            final_leverage = int(data.get("leverage", leverage_i))
-        except Exception:
-            pass
-        logger.info("U本位合约 %s 杠杆已设置为 %s", symbol_u, final_leverage)
-        return final_leverage
-
-    def um_futures_account_info(self) -> dict:
-        return self.request(
-            self.um_futures,
-            "GET",
-            "/fapi/v3/account",
-            {},
-        )
-
-    def um_futures_asset_balance(self, asset: str) -> dict[str, Decimal]:
-        asset_u = str(asset or "").strip().upper()
-        info = self.um_futures_account_info()
-        for item in info.get("assets", []):
-            if str(item.get("asset") or "").strip().upper() != asset_u:
-                continue
-            return {
-                "walletBalance": self._decimal_from_str(item.get("walletBalance", "0"), "0"),
-                "availableBalance": self._decimal_from_str(item.get("availableBalance", "0"), "0"),
-                "marginBalance": self._decimal_from_str(item.get("marginBalance", "0"), "0"),
-                "crossWalletBalance": self._decimal_from_str(item.get("crossWalletBalance", "0"), "0"),
-                "maxWithdrawAmount": self._decimal_from_str(item.get("maxWithdrawAmount", "0"), "0"),
-            }
-        return {
-            "walletBalance": Decimal("0"),
-            "availableBalance": Decimal("0"),
-            "marginBalance": Decimal("0"),
-            "crossWalletBalance": Decimal("0"),
-            "maxWithdrawAmount": Decimal("0"),
-        }
-
-    def get_um_futures_position(self, symbol: str) -> dict | None:
-        symbol_u = str(symbol or "").strip().upper()
-        data = self.request(
-            self.um_futures,
-            "GET",
-            "/fapi/v3/positionRisk",
-            {"symbol": symbol_u},
-        )
-        items = data if isinstance(data, list) else [data]
-        selected = None
-        for item in items:
-            if str(item.get("symbol") or "").strip().upper() != symbol_u:
-                continue
-            position_side = str(item.get("positionSide") or "").strip().upper()
-            if position_side == "BOTH":
-                return item
-            if selected is None:
-                selected = item
-        return selected
-
-    def calculate_um_futures_order_quantity(self, symbol: str, notional_amount, direction_side: str) -> Decimal:
-        symbol_u = str(symbol or "").strip().upper()
-        amount = Decimal(str(notional_amount))
-        if amount <= 0:
-            raise RuntimeError("合约下单金额必须大于 0")
-
-        rules = self.get_um_futures_trade_rules(symbol_u)
-        if not rules:
-            raise RuntimeError(f"找不到合约交易对规则：{symbol_u}")
-        if rules["status"] != "TRADING":
-            raise RuntimeError(f"合约交易对不可交易：{symbol_u}")
-
-        book_ticker = self.get_um_futures_book_ticker(symbol_u)
-        side_u = str(direction_side or "").strip().upper()
-        reference_price = Decimal(str(book_ticker["askPrice"])) if side_u == "BUY" else Decimal(str(book_ticker["bidPrice"]))
-        if reference_price <= 0:
-            raise RuntimeError(f"合约参考价格无效：{symbol_u}")
-
-        effective_min_qty = rules["minQty"]
-        if rules["minNotional"] > 0:
-            effective_min_qty = max(
-                effective_min_qty,
-                self._ceil_to_step(rules["minNotional"] / reference_price, rules["stepSize"]),
-            )
-        effective_min_notional = effective_min_qty * reference_price
-
-        qty = self._floor_to_step(amount / reference_price, rules["stepSize"])
-        if qty <= 0 or qty < rules["minQty"]:
-            raise RuntimeError(
-                f"{symbol_u} 合约下单数量过小：{self._format_decimal(qty)} < 最小数量 {self._format_decimal(rules['minQty'])}"
-            )
-        if qty > rules["maxQty"]:
-            qty = rules["maxQty"]
-
-        if rules["minNotional"] > 0 and (qty * reference_price) < rules["minNotional"]:
-            margin_asset = str(rules.get("marginAsset") or rules.get("quoteAsset") or "USDT").strip().upper()
-            raise RuntimeError(
-                f"{symbol_u} 当前市价下最小可下金额约为 {self._format_decimal(effective_min_notional)} {margin_asset}，"
-                f"你填写的是 {self._format_decimal(amount)} {margin_asset}"
-            )
-        return qty
-
-    def place_um_futures_market_order(
-        self,
-        symbol: str,
-        side: str,
-        quantity: Decimal | str | float | int,
-        *,
-        reduce_only: bool = False,
-    ):
-        symbol_u = str(symbol or "").strip().upper()
-        side_u = str(side or "").strip().upper()
-        rules = self.get_um_futures_trade_rules(symbol_u)
-        if not rules:
-            raise RuntimeError(f"找不到合约交易对规则：{symbol_u}")
-        if rules["status"] != "TRADING":
-            raise RuntimeError(f"合约交易对不可交易：{symbol_u}")
-
-        qty_raw = Decimal(str(quantity))
-        qty = self._floor_to_step(qty_raw, rules["stepSize"])
-        if qty <= 0 or qty < rules["minQty"]:
-            raise RuntimeError(
-                f"{symbol_u} 合约下单数量过小：{self._format_decimal(qty)} < 最小数量 {self._format_decimal(rules['minQty'])}"
-            )
-        if qty > rules["maxQty"]:
-            qty = rules["maxQty"]
-
-        if not reduce_only:
-            ref_price = self.get_um_futures_symbol_price(symbol_u)
-            if ref_price and rules["minNotional"] > 0 and (qty * ref_price) < rules["minNotional"]:
-                raise RuntimeError(
-                    f"{symbol_u} 合约下单金额过小：{self._format_decimal(qty * ref_price)} < 最小下单额 {self._format_decimal(rules['minNotional'])}"
-                )
-
-        params = {
-            "symbol": symbol_u,
-            "side": side_u,
-            "type": "MARKET",
-            "quantity": self._format_decimal(qty),
-            "newOrderRespType": "RESULT",
-        }
-        if reduce_only:
-            params["reduceOnly"] = "true"
-
-        data = self.request(
-            self.um_futures,
-            "POST",
-            "/fapi/v1/order",
-            params,
-        )
-        logger.info(
-            "U本位合约市价下单 %s %s，数量=%s，reduceOnly=%s",
-            symbol_u,
-            side_u,
-            params["quantity"],
-            "true" if reduce_only else "false",
-        )
-        return data
-
-    def close_um_futures_position_market(self, symbol: str):
-        position = self.get_um_futures_position(symbol)
-        if not position:
-            return None
-
-        position_amt = self._decimal_from_str(position.get("positionAmt", "0"), "0")
-        if position_amt == 0:
-            return None
-
-        side = "SELL" if position_amt > 0 else "BUY"
-        qty = abs(position_amt)
-        return self.place_um_futures_market_order(
-            symbol,
-            side,
-            qty,
-            reduce_only=True,
-        )
-
-    def get_book_ticker(self, symbol: str) -> dict[str, Decimal]:
-        symbol_u = symbol.upper()
-        data = self.public_get(self.spot, "/api/v3/ticker/bookTicker", {"symbol": symbol_u})
-        bid_price = self._decimal_from_str(data.get("bidPrice"), "0")
-        ask_price = self._decimal_from_str(data.get("askPrice"), "0")
-        if bid_price <= 0 or ask_price <= 0:
-            raise RuntimeError(f"读取盘口失败：{symbol_u} bid/ask 无效")
-        return {
-            "bidPrice": bid_price,
-            "askPrice": ask_price,
-        }
-
-    def place_limit_order(self, symbol: str, side: str, quantity: Decimal, price: Decimal):
-        symbol_u = symbol.upper()
-        side_u = side.upper()
-        rules = self.get_symbol_trade_rules(symbol_u)
-        if not rules:
-            logger.info("找不到交易对规则，跳过挂单 %s", symbol_u)
-            return None
-        if rules["status"] != "TRADING":
-            logger.info("交易对 %s 非 TRADING，跳过挂单", symbol_u)
-            return None
-
-        qty = self._floor_to_step(Decimal(str(quantity)), rules["stepSize"])
-        order_price = Decimal(str(price))
-        tick_size = Decimal(str(rules.get("tickSize", "0") or "0"))
-        if tick_size > 0 and self._floor_to_step(order_price, tick_size) != order_price:
-            raise RuntimeError(f"挂单价格不符合最小价格精度：{order_price}")
-
-        if qty <= 0 or qty < rules["minQty"]:
-            logger.info("交易对 %s 挂单数量过小，跳过", symbol_u)
-            return None
-
-        if qty > rules["maxQty"]:
-            qty = rules["maxQty"]
-
-        if rules["minNotional"] > 0 and (qty * order_price) < rules["minNotional"]:
-            logger.info(
-                "交易对 %s 挂单金额 %s 小于最小下单额 %s，跳过",
-                symbol_u,
-                self._format_decimal(qty * order_price),
-                self._format_decimal(rules["minNotional"]),
-            )
-            return None
-
-        params = {
-            "symbol": symbol_u,
-            "side": side_u,
-            "type": "LIMIT",
-            "timeInForce": "GTC",
-            "quantity": self._format_decimal(qty),
-            "price": self._format_decimal(order_price),
-        }
-        data = self.request(self.spot, "POST", "/api/v3/order", params)
-        logger.info(
-            "限价挂单 %s %s：数量=%s 价格=%s",
-            symbol_u,
-            side_u,
-            params["quantity"],
-            params["price"],
-        )
-        return data
-
-    def get_order(self, symbol: str, order_id: int | str):
-        return self.request(
-            self.spot,
-            "GET",
-            "/api/v3/order",
-            {
-                "symbol": symbol.upper(),
-                "orderId": int(order_id),
-            },
-        )
-
-    def cancel_order(self, symbol: str, order_id: int | str):
-        return self.request(
-            self.spot,
-            "DELETE",
-            "/api/v3/order",
-            {
-                "symbol": symbol.upper(),
-                "orderId": int(order_id),
-            },
-        )
-
-    def wait_order_filled(self, symbol: str, order_id: int | str, stop_event=None, poll_interval: float = 1.0):
-        symbol_u = symbol.upper()
-        while True:
-            if stop_event and stop_event.is_set():
-                try:
-                    self.cancel_order(symbol_u, order_id)
-                    logger.info("停止时已尝试撤销未完成订单 %s #%s", symbol_u, order_id)
-                except Exception as cancel_exc:
-                    logger.warning("停止时撤销订单失败 %s #%s: %s", symbol_u, order_id, cancel_exc)
-                raise RuntimeError("收到停止信号，已停止等待挂单成交")
-
-            order = self.get_order(symbol_u, order_id)
-            status = str(order.get("status") or "").upper()
-            if status == "FILLED":
-                return order
-            if status in {"CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
-                raise RuntimeError(f"订单未成交，状态={status}")
-            time.sleep(max(0.2, float(poll_interval)))
-
-    def get_order_average_price(self, order_data: dict) -> Decimal | None:
-        if not isinstance(order_data, dict):
-            return None
-        try:
-            executed_qty = Decimal(str(order_data.get("executedQty", "0")))
-        except Exception:
-            executed_qty = Decimal("0")
-        try:
-            quote_qty = Decimal(str(order_data.get("cummulativeQuoteQty", "0")))
-        except Exception:
-            quote_qty = Decimal("0")
-        if executed_qty > 0 and quote_qty > 0:
-            try:
-                return quote_qty / executed_qty
-            except Exception:
-                pass
-        try:
-            price = Decimal(str(order_data.get("price", "0")))
-        except Exception:
-            price = Decimal("0")
-        return price if price > 0 else None
-
-    def spot_limit_buy_all_usdt(self, symbol: str, price: Decimal, reserve_ratio: Decimal = Decimal("1")):
-        rules = self.get_symbol_trade_rules(symbol)
-        if not rules:
-            return None
-
-        quote_asset = self.get_spot_quote_asset(symbol)
-        self.collect_funding_asset_to_spot(quote_asset)
-        quote_balance = Decimal(str(self.spot_balance(quote_asset)))
-        if quote_balance <= 0:
-            logger.info("现货 %s 余额不足，跳过挂单买入", quote_asset)
-            return None
-
-        price_dec = Decimal(str(price))
-        tick_size = Decimal(str(rules.get("tickSize", "0") or "0"))
-        if tick_size > 0:
-            price_dec = self._floor_to_step(price_dec, tick_size)
-        if price_dec <= 0:
-            logger.info("挂单买入价格无效，跳过")
-            return None
-
-        amount_quote = quote_balance * Decimal(str(reserve_ratio))
-        qty = self._floor_to_step(amount_quote / price_dec, rules["stepSize"])
-        return self.place_limit_order(symbol, "BUY", qty, price_dec)
-
-    def spot_buy_quote_amount(self, symbol: str, quote_amount: Decimal | str | float | int):
-        symbol_u = str(symbol or "").strip().upper()
-        amount = Decimal(str(quote_amount))
-        if amount <= 0:
-            logger.info("买入金额 <= 0，跳过买入 %s", symbol_u)
-            return False
-
-        rules = self.get_symbol_trade_rules(symbol_u)
-        if not rules:
-            logger.info("找不到交易对规则，跳过买入 %s", symbol_u)
-            return False
-        if rules["status"] != "TRADING":
-            logger.info("交易对 %s 非 TRADING，跳过买入", symbol_u)
-            return False
-
-        quote_asset = self.get_spot_quote_asset(symbol_u)
-        self.collect_funding_asset_to_spot(quote_asset)
-        quote_balance = Decimal(str(self.spot_balance(quote_asset)))
-        if quote_balance < amount:
-            raise RuntimeError(
-                f"现货 {quote_asset} 余额不足：需要 {self._format_decimal(amount)}，当前 {self._format_decimal(quote_balance)}"
-            )
-
-        if rules["minNotional"] > 0 and amount < rules["minNotional"]:
-            raise RuntimeError(
-                f"{symbol_u} 买入金额过小：{self._format_decimal(amount)} < 最小下单额 {self._format_decimal(rules['minNotional'])}"
-            )
-
-        self.request(
-            self.spot,
-            "POST",
-            "/api/v3/order",
-            {
-                "symbol": symbol_u,
-                "side": "BUY",
-                "type": "MARKET",
-                "quoteOrderQty": self._format_decimal(amount),
-            },
-        )
-        logger.info("现货市价买入 %s，使用 %s 金额 %s", symbol_u, quote_asset, self._format_decimal(amount))
-        return True
-
-    def buy_bnb_with_quote_amount(self, quote_asset: str, amount: Decimal | str | float | int):
-        quote_asset_u = str(quote_asset or "").strip().upper()
-        if not quote_asset_u:
-            raise RuntimeError("后置币种为空，无法预买 BNB")
-        if quote_asset_u == "BNB":
-            logger.info("后置币种为 BNB，无需预买 BNB")
-            return False
-        symbol = f"BNB{quote_asset_u}"
-        return self.spot_buy_quote_amount(symbol, amount)
-
-    def spot_limit_sell_all_base(self, symbol: str, price: Decimal, reserve_ratio: Decimal = Decimal("1")):
-        rules = self.get_symbol_trade_rules(symbol)
-        if not rules:
-            return None
-
-        base = self.get_spot_base_asset(symbol)
-        balance = Decimal(str(self.spot_balance(base)))
-        if balance <= 0:
-            logger.info("现货 %s 余额不足，跳过挂单卖出", base)
-            return None
-
-        price_dec = Decimal(str(price))
-        tick_size = Decimal(str(rules.get("tickSize", "0") or "0"))
-        if tick_size > 0:
-            price_dec = self._floor_to_step(price_dec, tick_size)
-        if price_dec <= 0:
-            logger.info("挂单卖出价格无效，跳过")
-            return None
-
-        qty = self._floor_to_step(balance * Decimal(str(reserve_ratio)), rules["stepSize"])
-        return self.place_limit_order(symbol, "SELL", qty, price_dec)
-
-    def adjust_price_to_valid_tick(self, symbol: str, target_price: Decimal, *, round_up: bool = False) -> Decimal:
-        rules = self.get_symbol_trade_rules(symbol)
-        if not rules:
-            return Decimal(str(target_price))
-        price = Decimal(str(target_price))
-        tick_size = Decimal(str(rules.get("tickSize", "0") or "0"))
-        if tick_size <= 0:
-            return price
-        normalized = self._floor_to_step(price, tick_size)
-        if normalized == price:
-            return price
-        if round_up:
-            return self._ceil_to_step(price, tick_size)
-        return normalized
-
-    def sell_asset_market(self, symbol: str, free_balance: float, reserve_ratio=Decimal("0.999")) -> bool:
-        rules = self.get_symbol_trade_rules(symbol)
-        if not rules:
-            logger.info("找不到交易对规则，跳过卖出 %s", symbol)
-            return False
-        if rules["status"] != "TRADING":
-            logger.info("交易对 %s 非 TRADING，跳过", symbol)
-            return False
-
-        qty = Decimal(str(free_balance)) * reserve_ratio
-        qty = self._floor_to_step(qty, rules["stepSize"])
-
-        if qty <= 0 or qty < rules["minQty"]:
-            logger.info("交易对 %s 数量过小，跳过卖出", symbol)
-            return False
-
-        if qty > rules["maxQty"]:
-            qty = rules["maxQty"]
-
-        price = self.get_symbol_price(symbol)
-        if price:
-            notional = qty * price
-            if rules["minNotional"] > 0 and notional < rules["minNotional"]:
-                logger.info("交易对 %s 名义价值 %.8f 小于最小下单额 %.8f，跳过",
-                            symbol, float(notional), float(rules["minNotional"]))
-                return False
-
-        self.request(
-            self.spot,
-            "POST",
-            "/api/v3/order",
-            {
-                "symbol": symbol,
-                "side": "SELL",
-                "type": "MARKET",
-                "quantity": format(qty.normalize(), "f"),
-            },
-        )
-        logger.info("现货市价卖出 %s，数量 %s", symbol, format(qty.normalize(), "f"))
-        return True
-
-    def find_usdt_symbol_for_asset(self, asset: str) -> Optional[str]:
-        asset = asset.upper()
-        if asset in ("USDT", "BNB"):
-            return None
-        symbol = f"{asset}USDT"
-        info = self.get_exchange_info(symbol)
-        if info and info.get("status") == "TRADING":
-            return symbol
-        return None
-
-    def sell_large_spot_assets_to_usdt(self, skip_assets=None):
-        skip_assets = set(a.upper() for a in (skip_assets or []))
-        skip_assets.update({"USDT", "BNB"})
-
-        sold_assets = []
-        balances = self.spot_all_balances()
-        for item in balances:
-            asset = (item.get("asset") or "").upper()
-            free_amt = float(item.get("free", 0) or 0)
-
-            if asset in skip_assets or free_amt <= 0:
-                continue
-
-            symbol = self.find_usdt_symbol_for_asset(asset)
-            if not symbol:
-                logger.info("未找到 %sUSDT 交易对，跳过 %s", asset, asset)
-                continue
-
-            try:
-                ok = self.sell_asset_market(symbol, free_amt)
-                if ok:
-                    sold_assets.append(asset)
-                    time.sleep(0.3)
-            except Exception as e:
-                logger.warning("卖出大额币 %s 失败: %s", asset, e)
-
-        logger.info("大额币卖出为 USDT 完成，成功处理 %d 个币种", len(sold_assets))
-        return sold_assets
-
-    # -------- 现货买入（全部 USDT） --------
-    def spot_buy_all_usdt(self, buffer=0.2, symbol="BTCUSDT"):
-        quote_asset = self.get_spot_quote_asset(symbol)
-        self.collect_funding_asset_to_spot(quote_asset)
-        quote_balance = self.spot_balance(quote_asset)
-        if quote_balance <= buffer:
-            logger.info("现货 %s %.8f <= buffer %.8f，跳过买入", quote_asset, quote_balance, buffer)
-            return False
-
-        amount = (quote_balance - buffer) * 0.999
-        if amount <= 0:
-            logger.info("可用 %s 金额太小，跳过买入", quote_asset)
-            return False
-
-        self.request(
-            self.spot,
-            "POST",
-            "/api/v3/order",
-            {
-                "symbol": symbol,
-                "side": "BUY",
-                "type": "MARKET",
-                "quoteOrderQty": f"{amount:.8f}",
-            },
-        )
-        logger.info("现货市价买入 %s，使用 %s 金额 %.8f", symbol, quote_asset, amount)
-        return True
-
-    # -------- 现货卖出（全部基础币，精度由参数决定） --------
-    def spot_sell_all_base(self, symbol: str, precision: int):
-        base = self.get_spot_base_asset(symbol)
-        balance = self.spot_balance(base)
-
-        if balance <= 0:
-            return False
-
-        qty = Decimal(str(balance)) * Decimal("0.999")
-        if precision < 0:
-            precision = 0
-        step = Decimal("1").scaleb(-precision)
-        qty = qty.quantize(step, rounding=ROUND_DOWN)
-
-        if qty <= step:
-            return False
-
-        self.request(
-            self.spot,
-            "POST",
-            "/api/v3/order",
-            {
-                "symbol": symbol,
-                "side": "SELL",
-                "type": "MARKET",
-                "quantity": str(qty),
-            },
-        )
-        logger.info("现货市价卖出 %s 数量 %s（基础币 %s）", symbol, qty, base)
-        return True
-
-    # -------- 提现 --------
-    def withdraw_all_coin(
-        self,
-        coin: str,
-        address: str,
-        network: str,
-        fee_buffer: float = WITHDRAW_FEE_BUFFER_DEFAULT,
-        enable_withdraw: bool = True,
-        auto_collect_to_spot: bool = False,
-    ) -> float:
-        coin = str(coin or "").strip().upper()
-        if auto_collect_to_spot and coin:
-            try:
-                moved_count = self.collect_asset_to_spot(coin)
-                if moved_count > 0:
-                    # Give Binance a brief moment to reflect the transfer in spot balance.
-                    time.sleep(0.5)
-            except Exception as e:
-                logger.warning("提现前归集 %s 到现货失败: %s", coin, e)
-        balance = self.spot_balance(coin)
-        amount = balance - fee_buffer
-        if amount <= 0:
-            logger.info("%s 余额 %.8f 不足以提现（需 > buffer %.8f）", coin, balance, fee_buffer)
-            return 0.0
-
-        params = {
-            "coin": coin,
-            "address": address,
-            "network": network,
-            "amount": f"{amount:.8f}",
-        }
-
-        if enable_withdraw:
-            self.request(
-                self.spot,
-                "POST",
-                "/sapi/v1/capital/withdraw/apply",
-                params,
-            )
-            logger.info("已提交提现 %.8f %s → %s (%s)", amount, coin, address, network)
-            return amount
-        else:
-            logger.info("提现开关关闭，仅打印参数: %s", params)
-            return 0.0
-
-    # -------- 现货正余额资产 --------
-    def spot_positive_assets(self):
-        data = self.request(
-            self.spot,
-            "POST",
-            "/sapi/v3/asset/getUserAsset",
-            {"needBtcValuation": "false"},
-        )
-        result = []
-        for item in data:
-            free_amt = float(item.get("free", 0) or 0)
-            if free_amt > 0:
-                result.append({
-                    "asset": item.get("asset"),
-                    "free": free_amt,
-                })
-        return result
-
-    # -------- 资金账户正余额资产 --------
-    def funding_positive_assets(self):
-        data = self.request(
-            self.spot,
-            "POST",
-            "/sapi/v1/asset/get-funding-asset",
-            {"needBtcValuation": "false"},
-        )
-        result = []
-        for item in data:
-            free_amt = float(item.get("free", 0) or 0)
-            if free_amt > 0:
-                result.append({
-                    "asset": item.get("asset"),
-                    "free": free_amt,
-                })
-        return result
-
-    # -------- U本位合约可转出余额 --------
-    def funding_asset_balance(self, asset: str) -> Decimal:
-        asset_u = str(asset or "").strip().upper()
-        if not asset_u:
-            return Decimal("0")
-        data = self.request(
-            self.spot,
-            "POST",
-            "/sapi/v1/asset/get-funding-asset",
-            {"needBtcValuation": "false"},
-        )
-        total = Decimal("0")
-        for item in data:
-            if str(item.get("asset") or "").strip().upper() != asset_u:
-                continue
-            total += self._decimal_from_str(item.get("free", "0"), "0")
-        return total
-
-    def collect_funding_asset_to_spot(self, asset: str) -> Decimal:
-        asset_u = str(asset or "").strip().upper()
-        if not asset_u:
-            return Decimal("0")
-        try:
-            amount = self.funding_asset_balance(asset_u)
-        except Exception as e:
-            logger.warning("查询资金账户 %s 余额失败: %s", asset_u, e)
-            return Decimal("0")
-        if amount <= 0:
-            return Decimal("0")
-        try:
-            self.universal_transfer("FUNDING_MAIN", asset_u, amount)
-            logger.info("检测到资金账户 %s 余额，已自动划转到现货：%s", asset_u, self._format_decimal(amount))
-            time.sleep(0.5)
-            return amount
-        except Exception as e:
-            logger.warning("资金账户划转到现货失败 %s %s: %s", asset_u, self._format_decimal(amount), e)
-            return Decimal("0")
-
-    def um_futures_transferable_assets(self):
-        data = self.request(
-            self.um_futures,
-            "GET",
-            "/fapi/v2/balance",
-            {},
-        )
-        result = []
-        for item in data:
-            amt = float(item.get("maxWithdrawAmount", 0) or 0)
-            if amt > 0:
-                result.append({
-                    "asset": item.get("asset"),
-                    "amount": amt,
-                })
-        return result
-
-    # -------- 币本位合约可转出余额 --------
-    def cm_futures_transferable_assets(self):
-        data = self.request(
-            self.cm_futures,
-            "GET",
-            "/dapi/v1/balance",
-            {},
-        )
-        result = []
-        for item in data:
-            amt = float(item.get("withdrawAvailable", 0) or 0)
-            if amt > 0:
-                result.append({
-                    "asset": item.get("asset"),
-                    "amount": amt,
-                })
-        return result
-
-    # -------- 通用划转 --------
-    def universal_transfer(self, transfer_type: str, asset: str, amount: float):
-        if amount <= 0:
-            return False
-
-        amount_dec = Decimal(str(amount))
-        if amount_dec <= 0:
-            return False
-
-        amt_str = format(amount_dec.normalize(), "f")
-        if amt_str == "0":
-            return False
-
-        self.request(
-            self.spot,
-            "POST",
-            "/sapi/v1/asset/transfer",
-            {
-                "type": transfer_type,
-                "asset": asset,
-                "amount": amt_str,
-            },
-        )
-        logger.info("划转成功: %s %s %s", transfer_type, asset, amt_str)
-        return True
-
-    def collect_asset_to_spot(self, asset: str) -> int:
-        asset_u = str(asset or "").strip().upper()
-        if not asset_u:
-            return 0
-
-        total_count = 0
-
-        try:
-            items = self.um_futures_transferable_assets()
-            for item in items:
-                if str(item.get("asset") or "").strip().upper() != asset_u:
-                    continue
-                amount = float(item.get("amount", 0) or 0)
-                if amount <= 0:
-                    continue
-                try:
-                    self.universal_transfer("UMFUTURE_MAIN", asset_u, amount)
-                    total_count += 1
-                except Exception as e:
-                    logger.warning("提现前 U本位划转失败 %s %.8f: %s", asset_u, amount, e)
-        except Exception as e:
-            logger.warning("提现前查询 U本位 %s 余额失败: %s", asset_u, e)
-
-        try:
-            items = self.cm_futures_transferable_assets()
-            for item in items:
-                if str(item.get("asset") or "").strip().upper() != asset_u:
-                    continue
-                amount = float(item.get("amount", 0) or 0)
-                if amount <= 0:
-                    continue
-                try:
-                    self.universal_transfer("CMFUTURE_MAIN", asset_u, amount)
-                    total_count += 1
-                except Exception as e:
-                    logger.warning("提现前 币本位划转失败 %s %.8f: %s", asset_u, amount, e)
-        except Exception as e:
-            logger.warning("提现前查询 币本位 %s 余额失败: %s", asset_u, e)
-
-        try:
-            items = self.funding_positive_assets()
-            for item in items:
-                if str(item.get("asset") or "").strip().upper() != asset_u:
-                    continue
-                amount = float(item.get("free", 0) or 0)
-                if amount <= 0:
-                    continue
-                try:
-                    self.universal_transfer("FUNDING_MAIN", asset_u, amount)
-                    total_count += 1
-                except Exception as e:
-                    logger.warning("提现前 资金账户划转失败 %s %.8f: %s", asset_u, amount, e)
-        except Exception as e:
-            logger.warning("提现前查询 资金账户 %s 余额失败: %s", asset_u, e)
-
-        if total_count > 0:
-            logger.info("提现前归集 %s 到现货完成，共处理 %d 项", asset_u, total_count)
-        return total_count
-
-    # -------- 归集合约/资金到现货 --------
-    def collect_all_to_spot(self):
-        total_count = 0
-
-        try:
-            items = self.um_futures_transferable_assets()
-            if items:
-                logger.info("检测到 U本位可划转资产 %d 项", len(items))
-            for item in items:
-                asset = item["asset"]
-                amount = item["amount"]
-                try:
-                    self.universal_transfer("UMFUTURE_MAIN", asset, amount)
-                    total_count += 1
-                except Exception as e:
-                    logger.warning("U本位划转失败 %s %.8f: %s", asset, amount, e)
-        except Exception as e:
-            logger.warning("查询 U本位合约余额失败: %s", e)
-
-        try:
-            items = self.cm_futures_transferable_assets()
-            if items:
-                logger.info("检测到 币本位可划转资产 %d 项", len(items))
-            for item in items:
-                asset = item["asset"]
-                amount = item["amount"]
-                try:
-                    self.universal_transfer("CMFUTURE_MAIN", asset, amount)
-                    total_count += 1
-                except Exception as e:
-                    logger.warning("币本位划转失败 %s %.8f: %s", asset, amount, e)
-        except Exception as e:
-            logger.warning("查询 币本位合约余额失败: %s", e)
-
-        try:
-            items = self.funding_positive_assets()
-            if items:
-                logger.info("检测到 资金账户可划转资产 %d 项", len(items))
-            for item in items:
-                asset = item["asset"]
-                amount = item["free"]
-                try:
-                    self.universal_transfer("FUNDING_MAIN", asset, amount)
-                    total_count += 1
-                except Exception as e:
-                    logger.warning("资金账户划转失败 %s %.8f: %s", asset, amount, e)
-        except Exception as e:
-            logger.warning("查询资金账户余额失败: %s", e)
-
-        logger.info("归集到现货完成，共处理 %d 项资产", total_count)
-        return total_count
-
-    # -------- 查询现货可小额兑换资产 --------
-    def get_spot_dust_assets(self):
-        data = self.request(
-            self.spot,
-            "POST",
-            "/sapi/v1/asset/dust-btc",
-            {"accountType": "SPOT"},
-        )
-
-        assets = []
-        for item in data.get("details", []):
-            asset = item.get("asset")
-            amount_free = float(item.get("amountFree", 0) or 0)
-            if asset and amount_free > 0 and asset != "BNB":
-                assets.append(asset)
-        return assets
-
-    # -------- 小额兑换：现货可兑换资产 -> BNB --------
-    def convert_spot_dust_to_bnb(self):
-        assets = self.get_spot_dust_assets()
-        if not assets:
-            logger.info("没有可进行小额兑换的现货资产")
-            return []
-
-        data = self.request(
-            self.spot,
-            "POST",
-            "/sapi/v1/asset/dust",
-            {
-                "asset": assets,
-                "accountType": "SPOT",
-            },
-        )
-        result = data.get("transferResult", [])
-        logger.info("小额兑换完成，兑换资产数: %d", len(result))
-        return result
+try:
+    _compat_file_handler = logging.FileHandler(LOG_FILE_PATH, mode="w", encoding="utf-8")
+    _compat_file_handler.setFormatter(_formatter)
+    logger.addHandler(_compat_file_handler)
+except Exception as e:
+    print(f"无法创建兼容日志文件: {e}")
+
+if _runtime_log_path is not None:
+    logger.info("当前运行日志文件：%s", _runtime_log_path)
 
 
 # ====================== 策略 ======================
@@ -2105,7 +698,7 @@ class Strategy:
         self.futures_rounds = max(1, int(futures_rounds or FUTURES_ROUNDS_DEFAULT))
         self.futures_amount = Decimal(str(futures_amount if futures_amount is not None else "0"))
         self.futures_leverage = max(1, int(futures_leverage or FUTURES_LEVERAGE_DEFAULT))
-        self.futures_margin_type = str(futures_margin_type or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
+        self.futures_margin_type = App._normalize_futures_margin_type(futures_margin_type)
         self.futures_side = str(futures_side or FUTURES_SIDE_DEFAULT).strip()
         if self.futures_margin_type not in FUTURES_MARGIN_TYPE_OPTIONS:
             self.futures_margin_type = FUTURES_MARGIN_TYPE_DEFAULT
@@ -2135,9 +728,20 @@ class Strategy:
 
     def ensure_futures_position_closed(self):
         try:
-            close_order = self.c.close_um_futures_position_market(self.futures_symbol)
-            if close_order:
-                logger.info("【补救措施】检测到残留合约持仓，已执行市价平仓。")
+            close_orders = self.c.close_all_um_futures_positions_market(self.futures_symbol)
+            if close_orders:
+                logger.info("【补救措施】检测到残留合约持仓，已执行 %d 笔市价平仓。", len(close_orders))
+                deadline = time.time() + 8
+                while time.time() < deadline:
+                    remaining_positions = [
+                        position
+                        for position in self.c.get_um_futures_positions(self.futures_symbol)
+                        if Decimal(str(position.get("positionAmt", "0"))) != 0
+                    ]
+                    if not remaining_positions:
+                        return
+                    time.sleep(0.3)
+                logger.warning("残留合约持仓平仓后仍未完全归零，后续设置可能被交易所拒绝")
         except Exception as e:
             logger.warning(f"补救平仓时发生错误（可忽略）: {e}")
 
@@ -2427,7 +1031,7 @@ class Strategy:
                 progress_cb(step, max(step, 1), f"{mode_name}轮 {step}")
             self.sleep_fn()
 
-    def _prepare_futures_symbol_settings(self):
+    def _log_futures_symbol_settings(self):
         current_dual_mode = self.c.get_um_futures_position_mode()
         logger.info("U本位合约当前持仓模式：%s", "双向仓" if current_dual_mode else "单向仓")
 
@@ -2439,6 +1043,7 @@ class Strategy:
             symbol_config.get("marginType", "--"),
         )
 
+    def _prepare_futures_symbol_settings(self):
         self.c.ensure_um_futures_one_way_mode()
         self.c.ensure_um_futures_margin_type(self.futures_symbol, self.futures_margin_type)
         final_leverage = self.c.ensure_um_futures_leverage(self.futures_symbol, self.futures_leverage)
@@ -2451,6 +1056,19 @@ class Strategy:
         required_margin = Decimal("0")
         if self.futures_leverage > 0:
             required_margin = self.futures_amount / Decimal(str(self.futures_leverage))
+        if required_margin > 0 and available_balance < required_margin:
+            missing_margin = required_margin - available_balance
+            moved_amount = self.c.transfer_spot_asset_to_um_futures(margin_asset, missing_margin)
+            if moved_amount > 0:
+                balance = self.c.um_futures_asset_balance(margin_asset)
+                available_balance = Decimal(str(balance.get("availableBalance", "0")))
+                logger.info(
+                    "U本位合约 %s 已自动补划保证金 %s=%s，当前可用=%s",
+                    self.futures_symbol,
+                    margin_asset,
+                    BinanceClient._format_decimal(moved_amount),
+                    BinanceClient._format_decimal(available_balance),
+                )
         logger.info(
             "U本位合约 %s 可用保证金 %s=%s，预计占用保证金=%s，下单金额=%s，杠杆=%s",
             self.futures_symbol,
@@ -2473,20 +1091,21 @@ class Strategy:
         side_text = self.futures_side if self.futures_side in FUTURES_SIDE_OPTIONS else FUTURES_SIDE_DEFAULT
 
         self.ensure_futures_position_closed()
-        self._prepare_futures_symbol_settings()
-        self._ensure_futures_available_balance()
+        self._log_futures_symbol_settings()
         preview_qty = self.c.calculate_um_futures_order_quantity(
             self.futures_symbol,
             self.futures_amount,
             open_side,
         )
+        self._ensure_futures_available_balance()
         logger.info(
-            "U本位合约预检通过：%s %s，单轮预计下单数量=%s，下单金额=%s",
+            "【合约预检通过】%s %s，单轮预计下单数量=%s，下单金额=%s",
             self.futures_symbol,
             side_text,
             BinanceClient._format_decimal(preview_qty),
             BinanceClient._format_decimal(self.futures_amount),
         )
+        self._prepare_futures_symbol_settings()
 
         for i in range(self.futures_rounds):
             if stop_event and stop_event.is_set():
@@ -2497,11 +1116,13 @@ class Strategy:
             logger.info("--- 合约轮 %d/%d 开始：%s %s ---", i + 1, self.futures_rounds, self.futures_symbol, side_text)
 
             try:
+                stage_label = "开仓前预检"
                 qty = self.c.calculate_um_futures_order_quantity(
                     self.futures_symbol,
                     self.futures_amount,
                     open_side,
                 )
+                stage_label = "开仓下单"
                 open_order = self.c.place_um_futures_market_order(
                     self.futures_symbol,
                     open_side,
@@ -2512,7 +1133,7 @@ class Strategy:
                 except Exception:
                     avg_price = Decimal("0")
                 logger.info(
-                    "U本位合约开仓完成：%s %s，数量=%s，均价=%s",
+                    "【开仓成功】%s %s，数量=%s，均价=%s",
                     self.futures_symbol,
                     side_text,
                     BinanceClient._format_decimal(qty),
@@ -2520,6 +1141,7 @@ class Strategy:
                 )
 
                 self.sleep_fn()
+                stage_label = "平仓下单"
                 close_order = self.c.close_um_futures_position_market(self.futures_symbol)
                 if not close_order:
                     raise RuntimeError("合约平仓未执行：未检测到可平持仓")
@@ -2528,13 +1150,13 @@ class Strategy:
                 except Exception:
                     close_price = Decimal("0")
                 logger.info(
-                    "U本位合约平仓完成：%s %s，均价=%s",
+                    "【平仓成功】%s %s，均价=%s",
                     self.futures_symbol,
                     side_text,
                     BinanceClient._format_decimal(close_price),
                 )
             except Exception as e:
-                logger.error("合约轮 %d 执行异常: %s", i + 1, e)
+                logger.error("【%s失败】合约轮 %d：%s", stage_label, i + 1, e)
                 time.sleep(3)
             finally:
                 self.ensure_futures_position_closed()
@@ -2662,7 +1284,7 @@ class App(tk.Tk):
         self.futures_rounds_var = tk.IntVar(value=FUTURES_ROUNDS_DEFAULT)
         self.futures_amount_var = tk.StringVar(value=FUTURES_AMOUNT_DEFAULT)
         self.futures_leverage_var = tk.IntVar(value=FUTURES_LEVERAGE_DEFAULT)
-        self.futures_margin_type_var = tk.StringVar(value=FUTURES_MARGIN_TYPE_DEFAULT)
+        self.futures_margin_type_var = tk.StringVar(value=FUTURES_MARGIN_TYPE_LABEL_CROSSED)
         self.futures_side_var = tk.StringVar(value=FUTURES_SIDE_DEFAULT)
 
         self.withdraw_addr_var = tk.StringVar(value=WITHDRAW_ADDRESS_DEFAULT)
@@ -2808,7 +1430,19 @@ class App(tk.Tk):
 
         self.btn_toggle_select_accounts = ttk.Button(frame_batch_ctrl, text="全选", width=8, command=self.toggle_select_all_accounts)
         self.btn_toggle_select_accounts.pack(side="left", padx=(0, 5))
-        self.btn_run_accounts = ttk.Button(frame_batch_ctrl, text="批量执行", command=self.run_selected_accounts)
+        self.btn_run_accounts = tk.Button(
+            frame_batch_ctrl,
+            text="批量执行",
+            command=self.run_selected_accounts,
+            bg="#1E8449",
+            fg="#FFFFFF",
+            activebackground="#186A3B",
+            activeforeground="#FFFFFF",
+            disabledforeground="#E8F5E9",
+            relief="flat",
+            padx=12,
+            pady=2,
+        )
         self.btn_run_accounts.pack(side="left", padx=5)
         self.btn_query_all_assets = ttk.Button(frame_batch_ctrl, text="查询全部总资产", command=self.run_query_total_assets_for_all_accounts)
         self.btn_query_all_assets.pack(side="left", padx=5)
@@ -2830,6 +1464,8 @@ class App(tk.Tk):
             pass
 
         self.skip_usdt_wait_in_batch_var = tk.BooleanVar(value=False)
+        self._current_batch_summary = None
+        self._last_batch_retry = None
 
         frame_batch_opts = ttk.Frame(frame_acc)
         frame_batch_opts.pack(fill="x", padx=5, pady=(0, 5))
@@ -2848,6 +1484,13 @@ class App(tk.Tk):
             text="批量策略跳过USDT检测",
             variable=self.skip_usdt_wait_in_batch_var
         ).pack(side="left", padx=(12, 0))
+        self.btn_retry_failed_accounts = ttk.Button(
+            frame_batch_opts,
+            text="失败重试",
+            command=self.retry_last_failed_batch_operation,
+            state="disabled",
+        )
+        self.btn_retry_failed_accounts.pack(side="left", padx=(8, 0))
 
         frame_log = ttk.LabelFrame(self.exchange_tab, text="运行日志")
         frame_log.pack(fill="both", expand=True, padx=10, pady=5)
@@ -3008,6 +1651,21 @@ class App(tk.Tk):
         text = str(value or "").strip()
         return text if text in TRADE_MODE_OPTIONS else TRADE_MODE_DEFAULT
 
+    @staticmethod
+    def _normalize_futures_margin_type(value) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return FUTURES_MARGIN_TYPE_DEFAULT
+        upper_text = text.upper()
+        if upper_text in FUTURES_MARGIN_TYPE_OPTIONS:
+            return upper_text
+        return FUTURES_MARGIN_TYPE_LABEL_TO_VALUE.get(text, FUTURES_MARGIN_TYPE_DEFAULT)
+
+    @staticmethod
+    def _futures_margin_type_label(value) -> str:
+        normalized = App._normalize_futures_margin_type(value)
+        return FUTURES_MARGIN_TYPE_VALUE_TO_LABEL.get(normalized, FUTURES_MARGIN_TYPE_LABEL_CROSSED)
+
     def _refresh_strategy_panel_layout(self):
         frame_top = getattr(self, "exchange_strategy_frame", None)
         if frame_top is not None:
@@ -3086,7 +1744,7 @@ class App(tk.Tk):
         reprice_threshold_text = str(self.reprice_threshold_percent_var.get() or "").strip()
         futures_symbol = str(self.futures_symbol_var.get() or "").strip().upper()
         futures_amount_text = str(self.futures_amount_var.get() or "").strip()
-        futures_margin_type = str(self.futures_margin_type_var.get() or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
+        futures_margin_type = self._normalize_futures_margin_type(self.futures_margin_type_var.get())
         futures_side = str(self.futures_side_var.get() or FUTURES_SIDE_DEFAULT).strip()
         premium_value: Decimal | None = None
         fee_stop_value: Decimal | None = None
@@ -3138,8 +1796,7 @@ class App(tk.Tk):
                 raise RuntimeError("合约杠杆格式不正确") from exc
             if futures_leverage < 1 or futures_leverage > 125:
                 raise RuntimeError("合约杠杆必须在 1-125 之间")
-            if futures_margin_type not in FUTURES_MARGIN_TYPE_OPTIONS:
-                futures_margin_type = FUTURES_MARGIN_TYPE_DEFAULT
+            futures_margin_type = self._normalize_futures_margin_type(futures_margin_type)
             if futures_side not in FUTURES_SIDE_OPTIONS:
                 futures_side = FUTURES_SIDE_DEFAULT
 
@@ -3245,8 +1902,11 @@ class App(tk.Tk):
         self._install_entry_placeholder(self.min_delay_entry, self.min_delay_var, "\u6700\u5c0f")
         self._install_entry_placeholder(self.max_delay_entry, self.max_delay_var, "\u6700\u5927")
 
+        ttk.Label(row1, text="USDT \u5230\u8d26\u8d85\u65f6(\u79d2):").grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Entry(row1, textvariable=self.usdt_timeout_var, width=8).grid(row=0, column=3, sticky="w", padx=(4, 12))
+
         self.btn_save_strategy_config = ttk.Button(row1, text="\u4fdd\u5b58\u914d\u7f6e", command=self.save_strategy_config)
-        self.btn_save_strategy_config.grid(row=0, column=2, sticky="w")
+        self.btn_save_strategy_config.grid(row=0, column=4, sticky="w")
 
         row2 = ttk.Frame(frame_top)
         row2.pack(fill="x", padx=5, pady=3)
@@ -3302,7 +1962,7 @@ class App(tk.Tk):
             self.futures_margin_type_combo = ttk.Combobox(
                 row2_left,
                 textvariable=self.futures_margin_type_var,
-                values=FUTURES_MARGIN_TYPE_OPTIONS,
+                values=FUTURES_MARGIN_TYPE_LABEL_OPTIONS,
                 width=10,
                 state="readonly",
             )
@@ -3352,8 +2012,6 @@ class App(tk.Tk):
             state="readonly",
         )
         self.withdraw_net_combo.pack(side="left", padx=(4, 12))
-        ttk.Label(row3_left, text="USDT \u5230\u8d26\u8d85\u65f6(\u79d2):").pack(side="left")
-        ttk.Entry(row3_left, textvariable=self.usdt_timeout_var, width=8).pack(side="left", padx=(4, 12))
         ttk.Checkbutton(row3_left, text="\u81ea\u52a8\u63d0\u73b0", variable=self.enable_withdraw_var).pack(side="left")
 
         if current_trade_account_type == TRADE_ACCOUNT_TYPE_SPOT:
@@ -3834,10 +2492,8 @@ class App(tk.Tk):
             self.futures_amount_var.set(str(raw.get("futures_amount", FUTURES_AMOUNT_DEFAULT) or FUTURES_AMOUNT_DEFAULT).strip())
             self.futures_leverage_var.set(int(raw.get("futures_leverage", FUTURES_LEVERAGE_DEFAULT)))
             self.futures_margin_type_var.set(
-                str(raw.get("futures_margin_type", FUTURES_MARGIN_TYPE_DEFAULT) or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
+                self._futures_margin_type_label(raw.get("futures_margin_type", FUTURES_MARGIN_TYPE_DEFAULT))
             )
-            if str(self.futures_margin_type_var.get() or "").strip().upper() not in FUTURES_MARGIN_TYPE_OPTIONS:
-                self.futures_margin_type_var.set(FUTURES_MARGIN_TYPE_DEFAULT)
             self.futures_side_var.set(str(raw.get("futures_side", FUTURES_SIDE_DEFAULT) or FUTURES_SIDE_DEFAULT).strip())
             if str(self.futures_side_var.get() or "").strip() not in FUTURES_SIDE_OPTIONS:
                 self.futures_side_var.set(FUTURES_SIDE_DEFAULT)
@@ -4031,6 +2687,7 @@ class App(tk.Tk):
         client=None,
         symbol: str = "",
         trade_account_type: str = TRADE_ACCOUNT_TYPE_SPOT,
+        required_quote_amount: Decimal | None = None,
     ):
         start = time.time()
         c = client or self.client
@@ -4042,6 +2699,7 @@ class App(tk.Tk):
             quote_asset = c.get_um_futures_margin_asset(symbol) if symbol else "USDT"
         else:
             quote_asset = BinanceClient.get_spot_quote_asset(symbol) if symbol else "USDT"
+        required_amount = Decimal(str(required_quote_amount)) if required_quote_amount is not None else Decimal("0")
 
         while time.time() - start < timeout_sec:
             if stop_event and stop_event.is_set():
@@ -4049,8 +2707,24 @@ class App(tk.Tk):
                 return False
             try:
                 if trade_type == TRADE_ACCOUNT_TYPE_FUTURES:
-                    quote_balance = float(c.um_futures_asset_balance(quote_asset).get("availableBalance", Decimal("0")))
-                    logger.info("%s 到账检测中，当前 U本位可用 %s = %.8f", quote_asset, quote_asset, quote_balance)
+                    quote_balance_dec = Decimal(str(c.um_futures_asset_balance(quote_asset).get("availableBalance", Decimal("0"))))
+                    if required_amount > 0 and quote_balance_dec < required_amount:
+                        moved_amount = c.transfer_spot_asset_to_um_futures(quote_asset, required_amount - quote_balance_dec)
+                        if moved_amount > 0:
+                            quote_balance_dec = Decimal(
+                                str(c.um_futures_asset_balance(quote_asset).get("availableBalance", Decimal("0")))
+                            )
+                    quote_balance = float(quote_balance_dec)
+                    if required_amount > 0:
+                        logger.info(
+                            "%s 到账检测中，当前 U本位可用 %s = %.8f，目标至少 %.8f",
+                            quote_asset,
+                            quote_asset,
+                            quote_balance,
+                            float(required_amount),
+                        )
+                    else:
+                        logger.info("%s 到账检测中，当前 U本位可用 %s = %.8f", quote_asset, quote_asset, quote_balance)
                 else:
                     c.collect_funding_asset_to_spot(quote_asset)
                     quote_balance = c.spot_balance(quote_asset)
@@ -4059,7 +2733,11 @@ class App(tk.Tk):
                 logger.error("检测 %s 余额失败: %s", quote_asset, e)
                 quote_balance = 0.0
 
-            if quote_balance > 0:
+            balance_ready = quote_balance > 0
+            if trade_type == TRADE_ACCOUNT_TYPE_FUTURES and required_amount > 0:
+                balance_ready = Decimal(str(quote_balance)) >= required_amount
+
+            if balance_ready:
                 logger.info("检测到 %s 已到账，开始执行后续策略", quote_asset)
                 return True
 
@@ -4133,6 +2811,9 @@ class App(tk.Tk):
             if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES
             else BinanceClient.get_spot_quote_asset(trade_symbol)
         )
+        required_quote_amount = None
+        if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES and futures_amount_value is not None and futures_leverage > 0:
+            required_quote_amount = futures_amount_value / Decimal(str(futures_leverage))
 
         logger.info("交易所单账号链路：%s", self._exchange_proxy_route_text())
         self.stop_event = threading.Event()
@@ -4198,7 +2879,13 @@ class App(tk.Tk):
 
         def worker():
             try:
-                if not self.wait_for_usdt(usdt_timeout, self.stop_event, symbol=trade_symbol, trade_account_type=trade_account_type):
+                if not self.wait_for_usdt(
+                    usdt_timeout,
+                    self.stop_event,
+                    symbol=trade_symbol,
+                    trade_account_type=trade_account_type,
+                    required_quote_amount=required_quote_amount,
+                ):
                     logger.info("%s 检测未通过，任务结束", quote_asset)
                     return
 
@@ -4249,6 +2936,7 @@ class App(tk.Tk):
         self.btn_batch_withdraw.config(state="normal")
         self.btn_refresh.config(state="normal")
         self.btn_withdraw.config(state="normal")
+        self._finish_batch_summary_tracking()
         self._set_account_manage_buttons_state("normal")
         self._set_combo_states_for_run(False)
         self.status_var.set("状态：已完成/已停止")
@@ -4549,6 +3237,174 @@ class App(tk.Tk):
             return "未知错误"
         return s if len(s) <= max_len else (s[: max_len - 1] + "…")
 
+    @staticmethod
+    def _account_batch_key(acc: dict) -> str:
+        key = str((acc or {}).get("api_key") or "").strip()
+        return key or f"account:{id(acc)}"
+
+    def _set_retry_failed_button_state(self) -> None:
+        btn = getattr(self, "btn_retry_failed_accounts", None)
+        if btn is None:
+            return
+        can_retry = bool(self._last_batch_retry and self._last_batch_retry.get("failed_account_keys"))
+        if self.worker_thread and self.worker_thread.is_alive():
+            can_retry = False
+        try:
+            btn.config(state="normal" if can_retry else "disabled")
+        except Exception:
+            pass
+
+    def _begin_batch_summary_tracking(
+        self,
+        *,
+        action_label: str,
+        runner: str,
+        retry_kwargs: dict | None,
+        selected_accounts: list[dict],
+    ) -> None:
+        accounts_by_key = {
+            self._account_batch_key(acc): acc
+            for acc in list(selected_accounts or [])
+        }
+        self._current_batch_summary = {
+            "action_label": action_label,
+            "runner": runner,
+            "retry_kwargs": dict(retry_kwargs or {}),
+            "accounts_by_key": accounts_by_key,
+            "results": {key: None for key in accounts_by_key},
+        }
+        self._last_batch_retry = None
+        self._set_retry_failed_button_state()
+
+    def _mark_batch_account_result(self, acc: dict, success: bool) -> None:
+        summary = self._current_batch_summary
+        if not summary:
+            return
+        key = self._account_batch_key(acc)
+        results = summary.get("results") or {}
+        if key not in results:
+            return
+        results[key] = bool(success)
+
+    def _finish_batch_summary_tracking(self) -> None:
+        summary = self._current_batch_summary
+        self._current_batch_summary = None
+        if not summary:
+            self._set_retry_failed_button_state()
+            return
+
+        results = dict(summary.get("results") or {})
+        accounts_by_key = dict(summary.get("accounts_by_key") or {})
+        total_count = len(results)
+        success_count = sum(1 for value in results.values() if value is True)
+        failed_account_keys = [key for key, value in results.items() if value is not True]
+        failed_count = len(failed_account_keys)
+
+        if failed_account_keys:
+            self._last_batch_retry = {
+                "action_label": str(summary.get("action_label") or "批量任务"),
+                "runner": str(summary.get("runner") or ""),
+                "retry_kwargs": dict(summary.get("retry_kwargs") or {}),
+                "failed_account_keys": list(failed_account_keys),
+                "accounts_by_key": accounts_by_key,
+            }
+        else:
+            self._last_batch_retry = None
+
+        self._set_retry_failed_button_state()
+        self._show_batch_result_dialog(
+            title=f"{summary.get('action_label', '批量任务')}完成",
+            action_label=str(summary.get("action_label") or "批量任务"),
+            success_count=success_count,
+            failed_count=failed_count,
+            total_count=total_count,
+        )
+
+    def _show_batch_result_dialog(
+        self,
+        *,
+        title: str,
+        action_label: str,
+        success_count: int,
+        failed_count: int,
+        total_count: int,
+    ) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title(str(title or "执行完成"))
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text=str(action_label or "批量任务"), font=("", 11, "bold")).pack(anchor="w")
+        ttk.Label(body, text=f"总数：{int(total_count)}", foreground="#555555").pack(anchor="w", pady=(6, 0))
+
+        counts = ttk.Frame(body)
+        counts.pack(anchor="w", pady=(8, 0))
+        ttk.Label(counts, text="成功：").pack(side="left")
+        tk.Label(counts, text=str(int(success_count)), fg="#1E8449").pack(side="left")
+        ttk.Label(counts, text="   失败：").pack(side="left")
+        tk.Label(counts, text=str(int(failed_count)), fg="#C62828").pack(side="left")
+
+        hint_text = "失败账号可点击“失败重试”继续执行上一次批量操作。" if failed_count > 0 else "本次批量操作没有失败账号。"
+        ttk.Label(body, text=hint_text, foreground="#666666", wraplength=320, justify="left").pack(anchor="w", pady=(10, 0))
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x", pady=(14, 0))
+        ttk.Button(btn_row, text="确定", command=dialog.destroy).pack(side="right")
+
+        dialog.update_idletasks()
+        try:
+            parent_x = self.winfo_rootx()
+            parent_y = self.winfo_rooty()
+            parent_w = self.winfo_width()
+            parent_h = self.winfo_height()
+            width = dialog.winfo_width()
+            height = dialog.winfo_height()
+            x = parent_x + max(0, (parent_w - width) // 2)
+            y = parent_y + max(0, (parent_h - height) // 2)
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        dialog.focus_set()
+
+    def retry_last_failed_batch_operation(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("提示", "已有任务在运行中，请先停止当前任务")
+            return
+        retry_info = self._last_batch_retry or {}
+        failed_keys = list(retry_info.get("failed_account_keys") or [])
+        if not failed_keys:
+            messagebox.showinfo("提示", "当前没有可重试的失败账号")
+            return
+
+        current_accounts_by_key = {self._account_batch_key(acc): acc for acc in self.accounts}
+        stored_accounts_by_key = dict(retry_info.get("accounts_by_key") or {})
+        accounts_to_retry = []
+        for key in failed_keys:
+            if key in current_accounts_by_key:
+                accounts_to_retry.append(current_accounts_by_key[key])
+            elif key in stored_accounts_by_key:
+                accounts_to_retry.append(stored_accounts_by_key[key])
+        if not accounts_to_retry:
+            messagebox.showinfo("提示", "失败账号已不存在，无法重试")
+            self._last_batch_retry = None
+            self._set_retry_failed_button_state()
+            return
+
+        action_label = str(retry_info.get("action_label") or "批量任务")
+        if not messagebox.askyesno("确认重试", f"确认对 {len(accounts_to_retry)} 个失败账号重试“{action_label}”吗？"):
+            return
+
+        runner = str(retry_info.get("runner") or "")
+        retry_kwargs = dict(retry_info.get("retry_kwargs") or {})
+        if runner == "batch_manual_withdraw":
+            self.batch_manual_withdraw(accounts_to_run=accounts_to_retry, require_confirm=False)
+            return
+        self.run_selected_accounts(accounts_to_run=accounts_to_retry, require_confirm=False, **retry_kwargs)
+
     def _append_account_row(self, key, secret, addr, net, selected=True):
         net = (net or "").strip() or WITHDRAW_NETWORK_DEFAULT
 
@@ -4830,7 +3686,7 @@ class App(tk.Tk):
                 futures_leverage = int(self.futures_leverage_var.get() or FUTURES_LEVERAGE_DEFAULT)
             except Exception:
                 futures_leverage = FUTURES_LEVERAGE_DEFAULT
-            futures_margin_type = str(self.futures_margin_type_var.get() or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
+            futures_margin_type = self._normalize_futures_margin_type(self.futures_margin_type_var.get())
             futures_side = str(self.futures_side_var.get() or FUTURES_SIDE_DEFAULT).strip()
 
         skip_usdt_wait_in_batch = bool(self.skip_usdt_wait_in_batch_var.get())
@@ -4838,9 +3694,28 @@ class App(tk.Tk):
         if batch_total_asset_only:
             self.total_asset_results = {}
 
+        if batch_total_asset_only:
+            batch_action_label = "查询全部总资产"
+        elif batch_collect_bnb_mode and batch_sell_large_spot_to_bnb:
+            batch_action_label = "归集并买BNB"
+        elif batch_collect_bnb_mode:
+            batch_action_label = "归集BNB"
+        else:
+            batch_action_label = "批量执行"
+
         logger.info("交易所批量链路：%s", self._exchange_proxy_route_text())
         self.stop_event = threading.Event()
         self._batch_task_active = True
+        self._begin_batch_summary_tracking(
+            action_label=batch_action_label,
+            runner="run_selected_accounts",
+            retry_kwargs={
+                "batch_total_asset_only": bool(batch_total_asset_only),
+                "batch_collect_bnb_mode": bool(batch_collect_bnb_mode),
+                "batch_sell_large_spot_to_bnb": bool(batch_sell_large_spot_to_bnb),
+            },
+            selected_accounts=selected,
+        )
         self._prepare_accounts_for_batch(selected)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -4848,6 +3723,7 @@ class App(tk.Tk):
         self.btn_query_all_assets.config(state="disabled")
         self.btn_collect_bnb_combo.config(state="disabled")
         self.btn_batch_withdraw.config(state="disabled")
+        self._set_retry_failed_button_state()
         self.btn_refresh.config(state="disabled")
         self.btn_withdraw.config(state="disabled")
         self._set_account_manage_buttons_state("disabled")
@@ -4905,19 +3781,21 @@ class App(tk.Tk):
                 logger.info(f"[线程 {thread_id}] 开始处理账号 #{idx}")
 
                 should_finish_in_finally = True
+                op_success = False
 
-                def finish_current_now(final_status: str | None = None):
+                def finish_current_now(final_status: str | None = None, *, success: bool = False):
                     nonlocal should_finish_in_finally
                     if final_status is not None:
                         set_status(final_status)
                     self._set_account_batch_active(acc, False)
+                    self._mark_batch_account_result(acc, success)
                     should_finish_in_finally = False
                     finish_one()
                     task_queue.task_done()
                     logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
 
                 if combined_stop.is_set():
-                    finish_current_now("已停止")
+                    finish_current_now("已停止", success=False)
                     continue
 
                 try:
@@ -4928,6 +3806,9 @@ class App(tk.Tk):
                         if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES
                         else BinanceClient.get_spot_quote_asset(trade_symbol)
                     )
+                    required_quote_amount = None
+                    if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES and futures_amount_value is not None and futures_leverage > 0:
+                        required_quote_amount = futures_amount_value / Decimal(str(futures_leverage))
 
                     # 1) 只查询总资产
                     if batch_total_asset_only:
@@ -4956,6 +3837,7 @@ class App(tk.Tk):
                         )
 
                         set_status(asset_text if asset_text != "--" else f"总资产 {Decimal(str(total_usdt)):.4f} USDT")
+                        op_success = True
 
                     # 2) 批量归集BNB模式
                     elif batch_collect_bnb_mode:
@@ -5024,9 +3906,11 @@ class App(tk.Tk):
                             if amount > 0:
                                 self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
                             set_status(self._format_withdraw_amount_status(amount, "BNB", enable_withdraw=enable_withdraw))
+                            op_success = True
                         except Exception as e:
                             logger.error(f"账号 #{idx} BNB提现失败: {e}")
                             set_status("BNB提现失败")
+                            op_success = False
 
                     # 3) 原批量现货策略
                     else:
@@ -5040,14 +3924,15 @@ class App(tk.Tk):
                                 client=client,
                                 symbol=trade_symbol,
                                 trade_account_type=trade_account_type,
+                                required_quote_amount=required_quote_amount,
                             ):
                                 if combined_stop.is_set():
                                     logger.info(f"账号 #{idx} 已请求停止")
-                                    finish_current_now("已停止")
+                                    finish_current_now("已停止", success=False)
                                 else:
                                     logger.info(f"账号 #{idx} {quote_asset} 检测超时，跳过")
                                     set_status(f"{quote_asset} 未到账")
-                                    finish_current_now()
+                                    finish_current_now(success=False)
                                 continue
                         else:
                             logger.info(f"账号 #{idx} 已开启“批量策略跳过{quote_asset}检测”")
@@ -5145,6 +4030,7 @@ class App(tk.Tk):
 
                             if isinstance(strategy_result, dict) and strategy_result.get("withdraw_error") and (final_amount or 0) <= 0:
                                 set_status(f"提现失败 {self._compact_error_text(strategy_result.get('withdraw_error', ''))}")
+                                op_success = False
                             else:
                                 set_status(
                                     self._format_withdraw_amount_status(
@@ -5153,15 +4039,19 @@ class App(tk.Tk):
                                         enable_withdraw=enable_withdraw,
                                     )
                                 )
+                                op_success = True
                         else:
                             set_status("已停止")
+                            op_success = False
 
                 except Exception as e:
                     logger.error(f"账号 #{idx} 执行异常: {e}")
                     set_status("异常")
+                    op_success = False
                 finally:
                     if should_finish_in_finally:
                         self._set_account_batch_active(acc, False)
+                        self._mark_batch_account_result(acc, op_success)
                         finish_one()
                         task_queue.task_done()
                         logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
@@ -5213,6 +4103,12 @@ class App(tk.Tk):
         logger.info("交易所批量提现链路：%s", self._exchange_proxy_route_text())
         self.stop_event = threading.Event()
         self._batch_task_active = True
+        self._begin_batch_summary_tracking(
+            action_label="批量提现",
+            runner="batch_manual_withdraw",
+            retry_kwargs={},
+            selected_accounts=selected,
+        )
         self._prepare_accounts_for_batch(selected)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -5220,6 +4116,7 @@ class App(tk.Tk):
         self.btn_query_all_assets.config(state="disabled")
         self.btn_collect_bnb_combo.config(state="disabled")
         self.btn_batch_withdraw.config(state="disabled")
+        self._set_retry_failed_button_state()
         self.btn_refresh.config(state="disabled")
         self.btn_withdraw.config(state="disabled")
         self._set_account_manage_buttons_state("disabled")
@@ -5248,14 +4145,17 @@ class App(tk.Tk):
                     self.after(0, lambda: self._set_account_status(acc_ref, text))
 
                 combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
+                op_success = False
                 try:
                     if combined_stop.is_set():
                         set_status("已停止")
+                        op_success = False
                     else:
                         set_status(f"提现 {coin}...")
                         client = self._create_binance_client(acc["api_key"], acc["api_secret"])
                         if combined_stop.is_set():
                             set_status("已停止")
+                            op_success = False
                         else:
                             amount = client.withdraw_all_coin(
                                 coin=coin,
@@ -5268,11 +4168,14 @@ class App(tk.Tk):
                             if amount > 0:
                                 self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
                             set_status(self._format_withdraw_amount_status(amount, coin, enable_withdraw=True))
+                            op_success = True
                 except Exception as e:
                     logger.error(f"账号 #{idx} 提现失败: {e}")
                     set_status("提现失败")
+                    op_success = False
                 finally:
                     self._set_account_batch_active(acc, False)
+                    self._mark_batch_account_result(acc, op_success)
                     task_queue.task_done()
                     with count_lock:
                         completed_count += 1

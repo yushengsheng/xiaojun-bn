@@ -81,6 +81,7 @@ jobs:
             '--noupx',
             '--hidden-import', 'page_onchain',
             '--hidden-import', 'api_clients',
+            '--hidden-import', 'exchange_binance_client',
             '--hidden-import', 'app_paths',
             '--hidden-import', 'core_models',
             '--hidden-import', 'shared_utils',
