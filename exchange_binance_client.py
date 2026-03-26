@@ -416,6 +416,27 @@ class BinanceClient:
             "baseAsset": info.get("baseAsset"),
         }
 
+    def get_symbol_tick_size(self, symbol: str) -> Decimal:
+        rules = self.get_symbol_trade_rules(symbol)
+        if not rules:
+            return Decimal("0")
+        tick_size = self._decimal_from_str(rules.get("tickSize", "0"), "0")
+        return tick_size if tick_size > 0 else Decimal("0")
+
+    def normalize_price_delta(self, symbol: str, delta: Decimal | str | float | int, *, min_one_tick: bool = True) -> Decimal:
+        value = self._decimal_from_str(delta, "0")
+        if value < 0:
+            value = Decimal("0")
+        tick_size = self.get_symbol_tick_size(symbol)
+        if tick_size <= 0:
+            return value
+        if min_one_tick and value <= 0:
+            return tick_size
+        normalized = self._ceil_to_step(value, tick_size)
+        if min_one_tick and normalized < tick_size:
+            normalized = tick_size
+        return normalized
+
     @staticmethod
     def _error_text_contains(exc: Exception, *snippets: str) -> bool:
         text = str(exc or "").lower()
@@ -964,6 +985,48 @@ class BinanceClient:
         amount_quote = quote_balance * Decimal(str(reserve_ratio))
         qty = self._floor_to_step(amount_quote / price_dec, rules["stepSize"])
         return self.place_limit_order(symbol, "BUY", qty, price_dec)
+
+    def spot_limit_buy_quote_amount(self, symbol: str, price: Decimal, quote_amount: Decimal | str | float | int):
+        rules = self.get_symbol_trade_rules(symbol)
+        if not rules:
+            return None
+
+        amount_quote = Decimal(str(quote_amount))
+        if amount_quote <= 0:
+            logger.info("挂单买入金额 <= 0，跳过 %s", symbol)
+            return None
+
+        price_dec = Decimal(str(price))
+        tick_size = Decimal(str(rules.get("tickSize", "0") or "0"))
+        if tick_size > 0:
+            price_dec = self._floor_to_step(price_dec, tick_size)
+        if price_dec <= 0:
+            logger.info("挂单买入价格无效，跳过")
+            return None
+
+        qty = self._floor_to_step(amount_quote / price_dec, rules["stepSize"])
+        return self.place_limit_order(symbol, "BUY", qty, price_dec)
+
+    def spot_limit_sell_quantity(self, symbol: str, price: Decimal, quantity: Decimal | str | float | int):
+        rules = self.get_symbol_trade_rules(symbol)
+        if not rules:
+            return None
+
+        qty = Decimal(str(quantity))
+        if qty <= 0:
+            logger.info("挂单卖出数量 <= 0，跳过 %s", symbol)
+            return None
+
+        price_dec = Decimal(str(price))
+        tick_size = Decimal(str(rules.get("tickSize", "0") or "0"))
+        if tick_size > 0:
+            price_dec = self._floor_to_step(price_dec, tick_size)
+        if price_dec <= 0:
+            logger.info("挂单卖出价格无效，跳过")
+            return None
+
+        qty = self._floor_to_step(qty, rules["stepSize"])
+        return self.place_limit_order(symbol, "SELL", qty, price_dec)
 
     def spot_buy_quote_amount(self, symbol: str, quote_amount: Decimal | str | float | int):
         symbol_u = str(symbol or "").strip().upper()

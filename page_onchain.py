@@ -18,6 +18,7 @@ from app_paths import ONCHAIN_DATA_FILE
 from core_models import EvmToken, OnchainPairEntry, WithdrawRuntimeParams
 from shared_utils import (
     LOG_MAX_ROWS,
+    SolidButton,
     bind_paste_shortcuts,
     clear_ui_batch_size,
     decimal_to_text,
@@ -31,6 +32,7 @@ from shared_utils import (
     queue_ui_render,
     random_decimal_between,
     schedule_ui_callback,
+    start_ui_bridge,
     set_ui_batch_size,
 )
 from stores import OnchainStore
@@ -128,6 +130,7 @@ class OnchainTransferPage:
         self.checked_m2m_draft_rows: set[int] = set()
 
         self._build_ui()
+        start_ui_bridge(self, root=self.root)
         self._load_data()
 
     def _build_ui(self):
@@ -265,7 +268,7 @@ class OnchainTransferPage:
         action2 = ttk.Frame(main)
         action2.pack(fill="x", pady=(0, 10))
         ttk.Button(action2, text="查询余额", command=self.start_query_balance).pack(side=LEFT)
-        self.btn_stop_tasks = tk.Button(
+        self.btn_stop_tasks = SolidButton(
             action2,
             text="停止",
             command=self.stop_current_tasks,
@@ -279,7 +282,7 @@ class OnchainTransferPage:
         self.btn_stop_tasks.pack(side=LEFT, padx=(8, 0))
         self.lbl_progress = ttk.Label(action2, textvariable=self.progress_var, style="Subtle.TLabel", anchor="w", justify="left")
         self.lbl_progress.pack(side=LEFT, fill="x", expand=True, padx=(10, 0))
-        self.btn_batch_transfer = tk.Button(
+        self.btn_batch_transfer = SolidButton(
             action2,
             text="执行批量转账",
             command=self.start_batch_transfer,

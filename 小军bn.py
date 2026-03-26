@@ -2,11 +2,13 @@ import time
 import logging
 import ipaddress
 import base64
+import hashlib
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
 import threading
 import queue
 import random
 import os
+import platform
 import sys
 import csv
 import json
@@ -14,7 +16,10 @@ import re
 import shutil
 import socket
 import subprocess
+import tarfile
+import tempfile
 import uuid
+import zipfile
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
@@ -26,6 +31,7 @@ from api_clients import EvmClient
 from app_paths import APP_DIR, BUNDLE_DIR, DATA_DIR, EXCHANGE_PROXY_CONFIG_FILE, STRATEGY_CONFIG_FILE
 from exchange_binance_client import BinanceClient
 from secret_box import SECRET_BOX
+from shared_utils import SolidButton, dispatch_ui_callback, make_scrollbar, start_ui_bridge
 
 try:
     from page_onchain import OnchainTransferPage
@@ -60,7 +66,7 @@ TRADE_MODE_DEFAULT = TRADE_MODE_MARKET
 PREMIUM_PERCENT_DEFAULT = ""
 BNB_FEE_STOP_DEFAULT = ""
 BNB_TOPUP_AMOUNT_DEFAULT = "0"
-REPRICE_THRESHOLD_PERCENT_DEFAULT = "1"
+REPRICE_THRESHOLD_DEFAULT = "0"
 FUTURES_SYMBOL_DEFAULT = "BTCUSDT"
 FUTURES_ROUNDS_DEFAULT = 20
 FUTURES_AMOUNT_DEFAULT = "100"
@@ -122,6 +128,13 @@ MAX_THREADS_DEFAULT = 5
 
 
 class ExchangeProxyRuntime:
+    _RUNTIME_PREPARE_LOCK = threading.Lock()
+    _RUNTIME_HTTP_HEADERS = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "xiaojun-bn/1.0",
+    }
+    _SING_BOX_RELEASE_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+
     def __init__(self, work_dir: Path):
         self.work_dir = Path(work_dir)
         self._lock = threading.RLock()
@@ -190,14 +203,18 @@ class ExchangeProxyRuntime:
             return int(sock.getsockname()[1])
 
     @staticmethod
-    def _collect_executable_candidates(base_dirs: list[Path], exe_name: str) -> list[Path]:
+    def _collect_executable_candidates(base_dirs: list[Path], exe_names: str | list[str]) -> list[Path]:
+        names = [str(exe_names)] if isinstance(exe_names, str) else [str(name) for name in exe_names if str(name).strip()]
         unique: list[Path] = []
         seen: set[str] = set()
         for base_dir in base_dirs:
-            candidates = [base_dir / exe_name]
+            candidates: list[Path] = []
+            for exe_name in names:
+                candidates.append(base_dir / exe_name)
             if base_dir.exists():
                 try:
-                    candidates.extend(sorted(base_dir.rglob(exe_name)))
+                    for exe_name in names:
+                        candidates.extend(sorted(base_dir.rglob(exe_name)))
                 except Exception:
                     pass
             for path in candidates:
@@ -209,14 +226,57 @@ class ExchangeProxyRuntime:
         return unique
 
     @staticmethod
+    def _runtime_cache_dir(backend: str) -> Path:
+        return DATA_DIR / "proxy_runtimes" / backend
+
+    @staticmethod
+    def _runtime_platform_tag() -> str:
+        if os.name == "nt":
+            return "windows"
+        if sys.platform == "darwin":
+            return "darwin"
+        if sys.platform.startswith("linux"):
+            return "linux"
+        raise RuntimeError(f"当前系统暂不支持内置 SS 代理自动准备：{sys.platform}")
+
+    @staticmethod
+    def _runtime_arch_tag() -> str:
+        machine = platform.machine().lower()
+        mapping = {
+            "x86_64": "amd64",
+            "amd64": "amd64",
+            "arm64": "arm64",
+            "aarch64": "arm64",
+            "i386": "386",
+            "i686": "386",
+        }
+        return mapping.get(machine, machine)
+
+    @classmethod
+    def _executable_name(cls, base_name: str) -> str:
+        return f"{base_name}.exe" if os.name == "nt" else base_name
+
+    @classmethod
+    def _candidate_executable_names(cls, base_name: str) -> list[str]:
+        preferred = cls._executable_name(base_name)
+        names = [preferred]
+        alt = base_name if preferred.endswith(".exe") else f"{base_name}.exe"
+        if alt not in names:
+            names.append(alt)
+        return names
+
+    @staticmethod
     def _candidate_sing_box_paths() -> list[Path]:
         home = Path.home()
         bundled_candidates = ExchangeProxyRuntime._collect_executable_candidates([
+            BUNDLE_DIR / "bin",
             BUNDLE_DIR / "bin" / "sing-box",
             BUNDLE_DIR / "bin" / "sing_box",
+            APP_DIR / "bin",
             APP_DIR / "bin" / "sing-box",
             APP_DIR / "bin" / "sing_box",
-        ], "sing-box.exe")
+            ExchangeProxyRuntime._runtime_cache_dir("sing-box"),
+        ], ExchangeProxyRuntime._candidate_executable_names("sing-box"))
         candidates = bundled_candidates + [
             home / "Desktop" / "v2rayN-windows-64" / "bin" / "sing_box" / "sing-box.exe",
             home / "Desktop" / "v2rayN-windows-64" / "bin" / "sing-box.exe",
@@ -235,9 +295,12 @@ class ExchangeProxyRuntime:
     def _candidate_xray_paths() -> list[Path]:
         home = Path.home()
         bundled_candidates = ExchangeProxyRuntime._collect_executable_candidates([
+            BUNDLE_DIR / "bin",
             BUNDLE_DIR / "bin" / "xray",
+            APP_DIR / "bin",
             APP_DIR / "bin" / "xray",
-        ], "xray.exe")
+            ExchangeProxyRuntime._runtime_cache_dir("xray"),
+        ], ExchangeProxyRuntime._candidate_executable_names("xray"))
         candidates = bundled_candidates + [
             home / "Desktop" / "v2rayN-windows-64" / "bin" / "xray" / "xray.exe",
             home / "Desktop" / "v2rayN-windows-64" / "bin" / "xray.exe",
@@ -252,6 +315,129 @@ class ExchangeProxyRuntime:
             unique.append(path)
         return unique
 
+    @staticmethod
+    def _download_release_json(url: str) -> dict[str, object]:
+        resp = requests.get(url, headers=ExchangeProxyRuntime._RUNTIME_HTTP_HEADERS, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("上游发布信息格式异常")
+        return data
+
+    @classmethod
+    def _select_sing_box_asset(cls, assets: object) -> dict[str, object]:
+        if not isinstance(assets, list):
+            raise RuntimeError("sing-box 发布资产列表无效")
+        platform_tag = cls._runtime_platform_tag()
+        arch_tag = cls._runtime_arch_tag()
+        archive_suffix = ".zip" if platform_tag == "windows" else ".tar.gz"
+        matches: list[dict[str, object]] = []
+        legacy_matches: list[dict[str, object]] = []
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = str(asset.get("name") or "").strip()
+            if not name.startswith("sing-box-") or not name.endswith(archive_suffix):
+                continue
+            if f"-{platform_tag}-{arch_tag}" not in name:
+                continue
+            if "legacy-" in name:
+                legacy_matches.append(asset)
+                continue
+            matches.append(asset)
+        candidates = matches or legacy_matches
+        if not candidates:
+            raise RuntimeError(f"官方发布中未找到适配当前系统的 sing-box 资产（platform={platform_tag}, arch={arch_tag}）")
+        candidates.sort(key=lambda item: (len(str(item.get("name") or "")), str(item.get("name") or "")))
+        return candidates[0]
+
+    @staticmethod
+    def _download_asset(url: str, destination: Path, *, digest: str = "") -> None:
+        expected_sha256 = ""
+        digest_text = str(digest or "").strip()
+        if digest_text.startswith("sha256:"):
+            expected_sha256 = digest_text.split(":", 1)[1].strip().lower()
+        hasher = hashlib.sha256() if expected_sha256 else None
+        with requests.get(
+            url,
+            headers=ExchangeProxyRuntime._RUNTIME_HTTP_HEADERS,
+            timeout=(15, 120),
+            stream=True,
+        ) as resp:
+            resp.raise_for_status()
+            with open(destination, "wb") as handle:
+                for chunk in resp.iter_content(chunk_size=262144):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    if hasher is not None:
+                        hasher.update(chunk)
+        if hasher is not None and hasher.hexdigest().lower() != expected_sha256:
+            raise RuntimeError("下载的 sing-box 运行时校验失败")
+
+    @staticmethod
+    def _extract_archive(archive_path: Path, destination: Path) -> None:
+        if str(archive_path).lower().endswith(".zip"):
+            with zipfile.ZipFile(archive_path) as archive:
+                archive.extractall(destination)
+            return
+        with tarfile.open(archive_path, "r:gz") as archive:
+            base_dir = destination.resolve()
+            for member in archive.getmembers():
+                member_path = (destination / member.name).resolve()
+                if os.path.commonpath([str(base_dir), str(member_path)]) != str(base_dir):
+                    raise RuntimeError(f"压缩包包含非法路径：{member.name}")
+            archive.extractall(destination)
+
+    @classmethod
+    def _find_extracted_executable(cls, root_dir: Path, base_name: str) -> Path | None:
+        for name in cls._candidate_executable_names(base_name):
+            try:
+                for path in sorted(root_dir.rglob(name)):
+                    if path.is_file():
+                        return path
+            except Exception:
+                continue
+        return None
+
+    @classmethod
+    def _ensure_sing_box_runtime(cls) -> Path:
+        with cls._RUNTIME_PREPARE_LOCK:
+            for path in cls._candidate_sing_box_paths():
+                if path.exists():
+                    return path
+
+            release = cls._download_release_json(cls._SING_BOX_RELEASE_API)
+            asset = cls._select_sing_box_asset(release.get("assets"))
+            asset_name = str(asset.get("name") or "").strip()
+            download_url = str(asset.get("browser_download_url") or "").strip()
+            if not asset_name or not download_url:
+                raise RuntimeError("sing-box 发布资产缺少下载地址")
+
+            tag = str(release.get("tag_name") or "latest").strip() or "latest"
+            install_dir = cls._runtime_cache_dir("sing-box") / tag
+            install_path = install_dir / cls._executable_name("sing-box")
+            if install_path.exists():
+                return install_path
+
+            logger.info("未找到 sing-box，开始下载项目内运行时：%s", asset_name)
+            install_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="sing-box_", dir=str(cls._runtime_cache_dir("sing-box"))) as tmp_dir:
+                tmp_root = Path(tmp_dir)
+                archive_path = tmp_root / asset_name
+                extract_dir = tmp_root / "extract"
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                cls._download_asset(download_url, archive_path, digest=str(asset.get("digest") or ""))
+                cls._extract_archive(archive_path, extract_dir)
+                extracted = cls._find_extracted_executable(extract_dir, "sing-box")
+                if extracted is None:
+                    raise RuntimeError("sing-box 压缩包已下载，但未找到可执行文件")
+                shutil.copy2(extracted, install_path)
+            if os.name != "nt":
+                install_path.chmod(install_path.stat().st_mode | 0o755)
+            logger.info("sing-box 已缓存到项目目录：%s", install_path)
+            return install_path
+
     @classmethod
     def find_sing_box_executable(cls) -> Path:
         env_path = os.environ.get("SING_BOX_PATH", "").strip()
@@ -259,13 +445,17 @@ class ExchangeProxyRuntime:
             p = Path(env_path)
             if p.exists():
                 return p
-        which_path = shutil.which("sing-box")
-        if which_path:
-            return Path(which_path)
+        for exe_name in cls._candidate_executable_names("sing-box"):
+            which_path = shutil.which(exe_name)
+            if which_path:
+                return Path(which_path)
         for p in cls._candidate_sing_box_paths():
             if p.exists():
                 return p
-        raise RuntimeError("未找到 sing-box.exe，请先安装 sing-box 或 v2rayN/sing-box 内核")
+        try:
+            return cls._ensure_sing_box_runtime()
+        except Exception as exc:
+            raise RuntimeError(f"未找到 sing-box 可执行文件，且项目内自动准备失败：{exc}") from exc
 
     @classmethod
     def find_xray_executable(cls) -> Path:
@@ -274,13 +464,14 @@ class ExchangeProxyRuntime:
             p = Path(env_path)
             if p.exists():
                 return p
-        which_path = shutil.which("xray")
-        if which_path:
-            return Path(which_path)
+        for exe_name in cls._candidate_executable_names("xray"):
+            which_path = shutil.which(exe_name)
+            if which_path:
+                return Path(which_path)
         for p in cls._candidate_xray_paths():
             if p.exists():
                 return p
-        raise RuntimeError("未找到 xray.exe，请先安装 xray 或 v2rayN/xray 内核")
+        raise RuntimeError("未找到 xray 可执行文件，请先安装 xray 或放到项目 bin/ 目录")
 
     def _stop_locked(self) -> None:
         proc = self._proc
@@ -477,7 +668,8 @@ class ExchangeProxyRuntime:
             config_path = None
             local_proxy_url = ""
             runtime_log_handle = None
-            for backend in ("xray", "sing-box"):
+            backends = ("xray", "sing-box") if os.name == "nt" else ("sing-box", "xray")
+            for backend in backends:
                 try:
                     runtime_log_handle = self._open_runtime_log()
                     if backend == "xray":
@@ -667,7 +859,7 @@ class Strategy:
         premium_percent: Decimal | None = None,
         bnb_fee_stop_value: Decimal | None = None,
         bnb_topup_amount: Decimal | None = None,
-        reprice_threshold_percent: Decimal | None = None,
+        reprice_threshold_amount: Decimal | None = None,
         futures_symbol: str = FUTURES_SYMBOL_DEFAULT,
         futures_rounds: int = FUTURES_ROUNDS_DEFAULT,
         futures_amount: Decimal | None = None,
@@ -691,8 +883,8 @@ class Strategy:
         self.premium_percent = Decimal(str(premium_percent if premium_percent is not None else "0"))
         self.bnb_fee_stop_value = Decimal(str(bnb_fee_stop_value if bnb_fee_stop_value is not None else "0"))
         self.bnb_topup_amount = Decimal(str(bnb_topup_amount if bnb_topup_amount is not None else "0"))
-        self.reprice_threshold_percent = Decimal(
-            str(reprice_threshold_percent if reprice_threshold_percent is not None else REPRICE_THRESHOLD_PERCENT_DEFAULT)
+        self.reprice_threshold_amount = Decimal(
+            str(reprice_threshold_amount if reprice_threshold_amount is not None else REPRICE_THRESHOLD_DEFAULT)
         )
         self.futures_symbol = str(futures_symbol or FUTURES_SYMBOL_DEFAULT).strip().upper()
         self.futures_rounds = max(1, int(futures_rounds or FUTURES_ROUNDS_DEFAULT))
@@ -774,11 +966,14 @@ class Strategy:
         desired_price = Decimal(str(buy_price)) * premium_ratio
         return self.c.adjust_price_to_valid_tick(self.spot_symbol, desired_price, round_up=True)
 
-    def _reprice_threshold_ratio(self) -> Decimal:
-        percent = Decimal(str(self.reprice_threshold_percent or "0"))
-        if percent < 0:
-            percent = Decimal("0")
-        return percent / Decimal("100")
+    def _reprice_threshold_value(self) -> Decimal:
+        threshold = Decimal(str(self.reprice_threshold_amount or "0"))
+        return self.c.normalize_price_delta(self.spot_symbol, threshold, min_one_tick=True)
+
+    def _reprice_threshold_log_text(self) -> str:
+        quote_asset = self.c.get_spot_quote_asset(self.spot_symbol)
+        threshold = self._reprice_threshold_value()
+        return f"{BinanceClient._format_decimal(threshold)} {quote_asset}"
 
     def _run_bnb_topup_if_needed(self):
         if self._is_futures_mode():
@@ -799,21 +994,6 @@ class Strategy:
             logger.info("预买 BNB 未执行")
         return bool(bought)
 
-    def _prepare_quote_by_selling_base(self, stop_event, ask_price: Decimal, mode_name: str) -> bool:
-        sell_order = self.c.spot_limit_sell_all_base(symbol=self.spot_symbol, price=ask_price)
-        if not sell_order:
-            return False
-
-        sell_order_id = sell_order.get("orderId")
-        if not sell_order_id:
-            raise RuntimeError("预处理卖单返回缺少 orderId")
-        self.c.wait_order_filled(self.spot_symbol, sell_order_id, stop_event=stop_event)
-        logger.info(
-            "%s模式检测到后置币种余额不足，已先将前置币种按卖一价格卖出，下一轮继续",
-            mode_name,
-        )
-        return True
-
     @staticmethod
     def _order_price_decimal(order_data: dict, fallback_price: Decimal) -> Decimal:
         try:
@@ -827,14 +1007,14 @@ class Strategy:
     def _should_reprice_open_order(self, side: str, order_price: Decimal, book_ticker: dict[str, Decimal]) -> tuple[bool, Decimal]:
         side_u = str(side or "").strip().upper()
         price = Decimal(str(order_price))
-        threshold_ratio = self._reprice_threshold_ratio()
+        threshold_amount = self._reprice_threshold_value()
         if side_u == "BUY":
             current_ref = Decimal(str(book_ticker["bidPrice"]))
-            trigger_price = price * (Decimal("1") + threshold_ratio)
-            return current_ref > trigger_price, current_ref
+            trigger_price = price + threshold_amount
+            return current_ref >= trigger_price, current_ref
         current_ref = Decimal(str(book_ticker["askPrice"]))
-        trigger_price = price * (Decimal("1") - threshold_ratio)
-        return current_ref < trigger_price, current_ref
+        trigger_price = price - threshold_amount
+        return current_ref <= trigger_price, current_ref
 
     def _wait_order_filled_or_reprice(
         self,
@@ -871,10 +1051,10 @@ class Strategy:
                     try:
                         self.c.cancel_order(symbol_u, order_id)
                         logger.info(
-                            "%s模式%s单价格偏离超过 %s%%，已撤单重挂：旧价=%s，当前参考价=%s",
+                            "%s模式%s单价格偏离超过 %s，已撤单重挂：旧价=%s，当前参考价=%s",
                             mode_name,
                             "买" if side_u == "BUY" else "卖",
-                            BinanceClient._format_decimal(self.reprice_threshold_percent),
+                            self._reprice_threshold_log_text(),
                             BinanceClient._format_decimal(order_price),
                             BinanceClient._format_decimal(current_ref),
                         )
@@ -950,6 +1130,226 @@ class Strategy:
                 return payload
             premium_reprice_by_market = True
 
+    def _cancel_limit_order_with_fill_guard(self, order_id: int | str, side: str) -> dict:
+        symbol_u = self.spot_symbol.upper()
+        latest_order = None
+        try:
+            latest_order = self.c.get_order(symbol_u, order_id)
+        except Exception:
+            latest_order = None
+
+        if latest_order is not None:
+            latest_status = str(latest_order.get("status") or "").upper()
+            if latest_status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+                return latest_order
+
+        try:
+            self.c.cancel_order(symbol_u, order_id)
+        except Exception as cancel_exc:
+            try:
+                latest_order = self.c.get_order(symbol_u, order_id)
+            except Exception:
+                latest_order = None
+            if latest_order is not None and str(latest_order.get("status") or "").upper() == "FILLED":
+                return latest_order
+            raise cancel_exc
+
+        try:
+            latest_order = self.c.get_order(symbol_u, order_id)
+        except Exception:
+            if latest_order is None:
+                latest_order = {
+                    "orderId": order_id,
+                    "side": side,
+                    "status": "CANCELED",
+                }
+            else:
+                latest_order = dict(latest_order)
+                latest_order["status"] = str(latest_order.get("status") or "CANCELED").upper()
+        return latest_order
+
+    def _limit_order_plan(self, book_ticker: dict[str, Decimal]) -> dict[str, Decimal | str]:
+        symbol_u = self.spot_symbol.upper()
+        quote_asset = self.c.get_spot_quote_asset(symbol_u)
+        base_asset = self.c.get_spot_base_asset(symbol_u)
+        self.c.collect_funding_asset_to_spot(quote_asset)
+
+        bid_price = Decimal(str(book_ticker["bidPrice"]))
+        ask_price = Decimal(str(book_ticker["askPrice"]))
+        mid_price = (bid_price + ask_price) / Decimal("2")
+        quote_balance = self.c.spot_asset_balance_decimal(quote_asset)
+        base_balance = self.c.spot_asset_balance_decimal(base_asset)
+        base_notional = base_balance * mid_price
+
+        return {
+            "quote_asset": quote_asset,
+            "base_asset": base_asset,
+            "quote_balance": quote_balance,
+            "base_balance": base_balance,
+            "base_notional": base_notional,
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+        }
+
+    def _place_limit_orders(self, mode_name: str, book_ticker: dict[str, Decimal]) -> tuple[dict | None, dict | None]:
+        plan = self._limit_order_plan(book_ticker)
+        quote_asset = str(plan["quote_asset"])
+        base_asset = str(plan["base_asset"])
+        quote_balance = Decimal(str(plan["quote_balance"]))
+        base_balance = Decimal(str(plan["base_balance"]))
+        base_notional = Decimal(str(plan["base_notional"]))
+        bid_price = Decimal(str(plan["bid_price"]))
+        ask_price = Decimal(str(plan["ask_price"]))
+
+        if quote_balance <= 0 and base_balance <= 0:
+            logger.info("%s模式当前现货 %s 和 %s 余额均为 0，结束本次运行", mode_name, quote_asset, base_asset)
+            return None, None
+
+        buy_order = None
+        sell_order = None
+        if quote_balance > 0:
+            buy_order = self.c.spot_limit_buy_quote_amount(self.spot_symbol, bid_price, quote_balance)
+        if base_balance > 0:
+            sell_order = self.c.spot_limit_sell_quantity(self.spot_symbol, ask_price, base_balance)
+
+        buy_text = "未挂出"
+        if buy_order:
+            buy_qty = Decimal(str(buy_order.get("origQty", buy_order.get("executedQty", "0")) or "0"))
+            buy_price = self._order_price_decimal(buy_order, bid_price)
+            buy_text = f"{BinanceClient._format_decimal(buy_qty)} @ {BinanceClient._format_decimal(buy_price)}"
+
+        sell_text = "未挂出"
+        if sell_order:
+            sell_qty = Decimal(str(sell_order.get("origQty", sell_order.get("executedQty", "0")) or "0"))
+            sell_price = self._order_price_decimal(sell_order, ask_price)
+            sell_text = f"{BinanceClient._format_decimal(sell_qty)} @ {BinanceClient._format_decimal(sell_price)}"
+
+        logger.info(
+            "%s模式双边挂单：%s=%s | %s=%s(约 %s %s) | 买1=%s | 卖1=%s",
+            mode_name,
+            quote_asset,
+            BinanceClient._format_decimal(quote_balance),
+            base_asset,
+            BinanceClient._format_decimal(base_balance),
+            BinanceClient._format_decimal(base_notional),
+            quote_asset,
+            buy_text,
+            sell_text,
+        )
+        return buy_order, sell_order
+
+    def _monitor_limit_orders(
+        self,
+        stop_event,
+        mode_name: str,
+        *,
+        buy_order: dict | None,
+        sell_order: dict | None,
+        poll_interval: float = 1.0,
+    ) -> tuple[str, dict[str, object]]:
+        symbol_u = self.spot_symbol.upper()
+        active_orders: dict[str, dict[str, object]] = {}
+        if buy_order and buy_order.get("orderId"):
+            active_orders["BUY"] = {
+                "order_id": buy_order.get("orderId"),
+                "price": self._order_price_decimal(buy_order, Decimal("0")),
+            }
+        if sell_order and sell_order.get("orderId"):
+            active_orders["SELL"] = {
+                "order_id": sell_order.get("orderId"),
+                "price": self._order_price_decimal(sell_order, Decimal("0")),
+            }
+
+        if not active_orders:
+            return "idle", {"filled_orders": []}
+
+        while True:
+            if stop_event and stop_event.is_set():
+                for side_u, state in list(active_orders.items()):
+                    try:
+                        self._cancel_limit_order_with_fill_guard(state["order_id"], side_u)
+                    except Exception:
+                        pass
+                raise RuntimeError("收到停止信号，已停止等待挂单成交")
+
+            book_ticker = self.c.get_book_ticker(symbol_u)
+            filled_orders: list[tuple[str, dict]] = []
+            reprice_triggered = False
+
+            for side_u, state in list(active_orders.items()):
+                order = self.c.get_order(symbol_u, state["order_id"])
+                status = str(order.get("status") or "").upper()
+                if status == "FILLED":
+                    filled_orders.append((side_u, order))
+                    active_orders.pop(side_u, None)
+                    continue
+                if status in {"CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+                    active_orders.pop(side_u, None)
+                    continue
+
+                order_price = self._order_price_decimal(order, Decimal(str(state["price"])))
+                state["price"] = order_price
+                should_reprice, current_ref = self._should_reprice_open_order(side_u, order_price, book_ticker)
+                if not should_reprice:
+                    continue
+
+                latest_order = self._cancel_limit_order_with_fill_guard(state["order_id"], side_u)
+                latest_status = str(latest_order.get("status") or "").upper()
+                if latest_status == "FILLED":
+                    filled_orders.append((side_u, latest_order))
+                else:
+                    logger.info(
+                        "%s模式%s单价格偏离超过 %s，已撤单准备按最新余额重挂：旧价=%s，当前参考价=%s",
+                        mode_name,
+                        "买" if side_u == "BUY" else "卖",
+                        self._reprice_threshold_log_text(),
+                        BinanceClient._format_decimal(order_price),
+                        BinanceClient._format_decimal(current_ref),
+                    )
+                active_orders.pop(side_u, None)
+                reprice_triggered = True
+
+            if filled_orders:
+                for side_u, state in list(active_orders.items()):
+                    latest_order = self._cancel_limit_order_with_fill_guard(state["order_id"], side_u)
+                    if str(latest_order.get("status") or "").upper() == "FILLED":
+                        filled_orders.append((side_u, latest_order))
+                    active_orders.pop(side_u, None)
+                return "filled", {"filled_orders": filled_orders}
+
+            if reprice_triggered:
+                for side_u, state in list(active_orders.items()):
+                    latest_order = self._cancel_limit_order_with_fill_guard(state["order_id"], side_u)
+                    if str(latest_order.get("status") or "").upper() == "FILLED":
+                        filled_orders.append((side_u, latest_order))
+                    active_orders.pop(side_u, None)
+                if filled_orders:
+                    return "filled", {"filled_orders": filled_orders}
+                return "reprice", {"book_ticker": book_ticker}
+
+            if not active_orders:
+                return "idle", {"filled_orders": []}
+
+            if stop_event and stop_event.wait(max(0.2, float(poll_interval))):
+                continue
+            if not stop_event:
+                time.sleep(max(0.2, float(poll_interval)))
+
+    def _limit_fill_summary(self, filled_orders: list[tuple[str, dict]]) -> str:
+        if not filled_orders:
+            return "本轮无成交"
+
+        parts: list[str] = []
+        for side_u, order in filled_orders:
+            side_text = "买单" if side_u == "BUY" else "卖单"
+            qty = Decimal(str(order.get("executedQty", order.get("origQty", "0")) or "0"))
+            avg_price = self.c.get_order_average_price(order) or self._order_price_decimal(order, Decimal("0"))
+            text = f"{side_text}成交 数量={BinanceClient._format_decimal(qty)}"
+            if avg_price > 0:
+                text += f" 均价={BinanceClient._format_decimal(avg_price)}"
+            parts.append(text)
+        return "；".join(parts)
+
     def _run_market_mode(self, stop_event, progress_cb=None):
         total_steps = self.spot_rounds if self.spot_rounds > 0 else 1
         step = 0
@@ -985,7 +1385,51 @@ class Strategy:
 
         self.ensure_base_sold()
 
-    def _run_limit_like_mode(self, stop_event, progress_cb=None):
+    def _run_limit_mode(self, stop_event, progress_cb=None):
+        step = 0
+        mode_name = self._mode_name()
+
+        while True:
+            if stop_event and stop_event.is_set():
+                logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
+                return
+            if self._should_stop_for_bnb_fee():
+                return
+
+            try:
+                book_ticker = self.c.get_book_ticker(self.spot_symbol)
+                buy_order, sell_order = self._place_limit_orders(mode_name, book_ticker)
+                if not buy_order and not sell_order:
+                    logger.info("%s模式当前无可挂出的买卖单（余额不足或不满足最小下单额），结束本次运行", mode_name)
+                    return
+
+                action, payload = self._monitor_limit_orders(
+                    stop_event,
+                    mode_name,
+                    buy_order=buy_order,
+                    sell_order=sell_order,
+                )
+                if action == "filled":
+                    step += 1
+                    filled_summary = self._limit_fill_summary(list(payload.get("filled_orders") or []))
+                    logger.info("--- %s轮 %d 完成：%s ---", mode_name, step, filled_summary)
+                    if progress_cb:
+                        progress_cb(step, max(step, 1), f"{mode_name}轮 {step}")
+                    self.sleep_fn()
+                    continue
+                if action == "reprice":
+                    continue
+
+                logger.info("%s模式当前无活动挂单，结束本次运行", mode_name)
+                return
+            except Exception as e:
+                if stop_event and stop_event.is_set():
+                    logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
+                    return
+                logger.error("%s轮 %d 执行异常: %s", mode_name, step, e)
+                time.sleep(3)
+
+    def _run_premium_mode(self, stop_event, progress_cb=None):
         step = 0
         mode_name = self._mode_name()
 
@@ -999,12 +1443,9 @@ class Strategy:
             step += 1
             logger.info("--- %s轮 %d 开始 ---", mode_name, step)
             try:
-                buy_result, ask_price = self._place_buy_order_with_reprice(stop_event, mode_name)
+                buy_result, _ask_price = self._place_buy_order_with_reprice(stop_event, mode_name)
                 buy_order = buy_result
                 if not buy_order:
-                    if self._prepare_quote_by_selling_base(stop_event, ask_price, mode_name):
-                        self.sleep_fn()
-                        continue
                     logger.info("%s模式买入未执行（可能余额不足或不满足最小下单额），结束本次运行", mode_name)
                     return
 
@@ -1030,6 +1471,12 @@ class Strategy:
             if progress_cb:
                 progress_cb(step, max(step, 1), f"{mode_name}轮 {step}")
             self.sleep_fn()
+
+    def _run_limit_like_mode(self, stop_event, progress_cb=None):
+        if self._mode_name() == TRADE_MODE_LIMIT:
+            self._run_limit_mode(stop_event, progress_cb=progress_cb)
+            return
+        self._run_premium_mode(stop_event, progress_cb=progress_cb)
 
     def _log_futures_symbol_settings(self):
         current_dual_mode = self.c.get_um_futures_position_mode()
@@ -1262,6 +1709,7 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
+        start_ui_bridge(self, root=self)
         self._load_strategy_config()
         self._load_exchange_proxy_config()
         self.after(100, self._poll_log_queue)
@@ -1277,7 +1725,7 @@ class App(tk.Tk):
         self.premium_percent_var = tk.StringVar(value=PREMIUM_PERCENT_DEFAULT)
         self.bnb_fee_stop_var = tk.StringVar(value=BNB_FEE_STOP_DEFAULT)
         self.bnb_topup_amount_var = tk.StringVar(value=BNB_TOPUP_AMOUNT_DEFAULT)
-        self.reprice_threshold_percent_var = tk.StringVar(value=REPRICE_THRESHOLD_PERCENT_DEFAULT)
+        self.reprice_threshold_var = tk.StringVar(value=REPRICE_THRESHOLD_DEFAULT)
         self.spot_symbol_var = tk.StringVar(value=SPOT_SYMBOL_DEFAULT)
         self.spot_precision_var = tk.IntVar(value=SPOT_PRECISION_DEFAULT)
         self.futures_symbol_var = tk.StringVar(value=FUTURES_SYMBOL_DEFAULT)
@@ -1376,34 +1824,45 @@ class App(tk.Tk):
         self.withdraw_net_var.trace_add("write", self._on_global_network_changed)
         self.max_threads_var = tk.IntVar(value=MAX_THREADS_DEFAULT)
 
-        header = ttk.Frame(frame_acc)
-        header.pack(fill="x", padx=5)
-        ttk.Label(header, text="No.", width=4).pack(side="left", padx=2)
-        ttk.Label(header, text="选", width=4).pack(side="left", padx=2)
-        ttk.Label(header, text="API KEY", width=25).pack(side="left", padx=2)
-        ttk.Label(header, text="提现地址", width=35).pack(side="left", padx=2)
-        ttk.Label(header, text="网络", width=8).pack(side="left", padx=2)
-        ttk.Label(header, text="状态", width=30).pack(side="left", padx=2)
-
         self.frame_list_canvas = ttk.Frame(frame_acc)
         self.frame_list_canvas.pack(fill="both", expand=True, padx=5, pady=2)
+        self.frame_list_canvas.columnconfigure(0, weight=1)
+        self.frame_list_canvas.rowconfigure(0, weight=1)
 
-        self.canvas = tk.Canvas(self.frame_list_canvas, height=190, bg="#f0f0f0")
-        self.canvas.configure(takefocus=1, highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(self.frame_list_canvas, orient="vertical", command=self.canvas.yview)
-
-        self.accounts_container = ttk.Frame(self.canvas)
-
-        self.accounts_container.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        tree_cols = ("checked", "idx", "api_key", "address", "network", "status")
+        self.account_tree = ttk.Treeview(
+            self.frame_list_canvas,
+            columns=tree_cols,
+            show="headings",
+            selectmode="browse",
+            height=9,
         )
+        self._account_tree_row_to_account = {}
+        self.account_tree.heading("checked", text="勾选")
+        self.account_tree.heading("idx", text="编号")
+        self.account_tree.heading("api_key", text="API KEY")
+        self.account_tree.heading("address", text="提现地址")
+        self.account_tree.heading("network", text="网络")
+        self.account_tree.heading("status", text="状态")
+        self.account_tree.column("checked", width=52, minwidth=52, stretch=False, anchor="center")
+        self.account_tree.column("idx", width=52, minwidth=52, stretch=False, anchor="center")
+        self.account_tree.column("api_key", width=220, minwidth=180, anchor="w")
+        self.account_tree.column("address", width=330, minwidth=260, anchor="w")
+        self.account_tree.column("network", width=76, minwidth=68, stretch=False, anchor="center")
+        self.account_tree.column("status", width=500, minwidth=240, anchor="w")
+        self.account_tree.tag_configure("acc_ready", foreground="#111111", background="#F2F2F2")
+        self.account_tree.tag_configure("acc_running", foreground="#111111", background="#CFE3FF")
+        self.account_tree.tag_configure("acc_warn", foreground="#111111", background="#FFE3B8")
+        self.account_tree.tag_configure("acc_failed", foreground="#111111", background="#F8C7C7")
+        self.account_tree.tag_configure("acc_success", foreground="#111111", background="#CFEECF")
+        self.account_tree.tag_configure("acc_context", foreground="#FFFFFF", background="#7A3FF2")
 
-        self.canvas.create_window((0, 0), window=self.accounts_container, anchor="nw")
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
+        self.account_tree_ybar = make_scrollbar(self.frame_list_canvas, orient="vertical", command=self.account_tree.yview)
+        self.account_tree_xbar = make_scrollbar(self.frame_list_canvas, orient="horizontal", command=self.account_tree.xview)
+        self.account_tree.configure(yscrollcommand=self.account_tree_ybar.set, xscrollcommand=self.account_tree_xbar.set)
+        self.account_tree.grid(row=0, column=0, sticky="nsew")
+        self.account_tree_ybar.grid(row=0, column=1, sticky="ns")
+        self.account_tree_xbar.grid(row=1, column=0, sticky="ew")
         self.account_list_hint = ttk.Label(
             self.frame_list_canvas,
             text="账号列表为空。点击此区域后可直接 Ctrl+V / Cmd+V 粘贴导入账号。\n导入格式：每 3 段一组，依次为 API KEY / SECRET / 提现地址。",
@@ -1411,8 +1870,11 @@ class App(tk.Tk):
             justify="center",
             anchor="center",
         )
-        self.canvas.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
-        self.accounts_container.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
+        self.account_tree.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
+        self.account_tree.bind("<Double-Button-1>", self._on_account_tree_double_click, add="+")
+        self.account_tree.bind("<Button-2>", self._on_account_tree_right_click, add="+")
+        self.account_tree.bind("<Button-3>", self._on_account_tree_right_click, add="+")
+        self.account_tree.bind("<Control-Button-1>", self._on_account_tree_right_click, add="+")
         self.frame_list_canvas.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
         self.account_list_hint.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
         self._refresh_account_list_hint()
@@ -1430,7 +1892,7 @@ class App(tk.Tk):
 
         self.btn_toggle_select_accounts = ttk.Button(frame_batch_ctrl, text="全选", width=8, command=self.toggle_select_all_accounts)
         self.btn_toggle_select_accounts.pack(side="left", padx=(0, 5))
-        self.btn_run_accounts = tk.Button(
+        self.btn_run_accounts = SolidButton(
             frame_batch_ctrl,
             text="批量执行",
             command=self.run_selected_accounts,
@@ -1714,6 +2176,10 @@ class App(tk.Tk):
         self._refresh_strategy_panel_layout()
 
     @staticmethod
+    def _reprice_threshold_label_text() -> str:
+        return "重新挂单阈值(后置币):"
+
+    @staticmethod
     def _decimal_field_value(raw_value, field_label: str, *, min_value: Decimal | str | int | float = Decimal("0")) -> Decimal:
         text = str(raw_value or "").strip()
         if not text:
@@ -1741,7 +2207,7 @@ class App(tk.Tk):
         premium_text = str(self.premium_percent_var.get() or "").strip()
         fee_stop_text = str(self.bnb_fee_stop_var.get() or "").strip()
         bnb_topup_text = str(self.bnb_topup_amount_var.get() or "").strip()
-        reprice_threshold_text = str(self.reprice_threshold_percent_var.get() or "").strip()
+        reprice_threshold_text = str(self.reprice_threshold_var.get() or "").strip()
         futures_symbol = str(self.futures_symbol_var.get() or "").strip().upper()
         futures_amount_text = str(self.futures_amount_var.get() or "").strip()
         futures_margin_type = self._normalize_futures_margin_type(self.futures_margin_type_var.get())
@@ -1749,7 +2215,7 @@ class App(tk.Tk):
         premium_value: Decimal | None = None
         fee_stop_value: Decimal | None = None
         bnb_topup_value = Decimal("0")
-        reprice_threshold_value = Decimal(REPRICE_THRESHOLD_PERCENT_DEFAULT)
+        reprice_threshold_value = Decimal(REPRICE_THRESHOLD_DEFAULT)
         futures_rounds = stored_futures_rounds if stored_futures_rounds > 0 else FUTURES_ROUNDS_DEFAULT
         futures_amount_value: Decimal | None = None
         try:
@@ -1761,9 +2227,9 @@ class App(tk.Tk):
             if not bnb_topup_text:
                 bnb_topup_text = "0"
             if not reprice_threshold_text:
-                reprice_threshold_text = REPRICE_THRESHOLD_PERCENT_DEFAULT
+                reprice_threshold_text = REPRICE_THRESHOLD_DEFAULT
             bnb_topup_value = self._decimal_field_value(bnb_topup_text, "预买BNB金额", min_value=0)
-            reprice_threshold_value = self._decimal_field_value(reprice_threshold_text, "重新挂单阈值百分比", min_value=0)
+            reprice_threshold_value = self._decimal_field_value(reprice_threshold_text, "重新挂单阈值", min_value=0)
 
             if mode == TRADE_MODE_MARKET:
                 try:
@@ -1811,8 +2277,8 @@ class App(tk.Tk):
             "bnb_fee_stop_value": fee_stop_value,
             "bnb_topup_amount": bnb_topup_text,
             "bnb_topup_amount_value": bnb_topup_value,
-            "reprice_threshold_percent": reprice_threshold_text,
-            "reprice_threshold_percent_value": reprice_threshold_value,
+            "reprice_threshold": reprice_threshold_text,
+            "reprice_threshold_value": reprice_threshold_value,
             "futures_symbol": futures_symbol,
             "futures_rounds": futures_rounds,
             "stored_futures_rounds": stored_futures_rounds,
@@ -2021,15 +2487,15 @@ class App(tk.Tk):
             elif current_trade_mode == TRADE_MODE_LIMIT:
                 ttk.Label(row3_right, text="剩余 BNB 手续费停止值:").pack(side="left")
                 ttk.Entry(row3_right, textvariable=self.bnb_fee_stop_var, width=10).pack(side="left", padx=(4, 12))
-                ttk.Label(row3_right, text="重新挂单阈值(%):").pack(side="left")
-                ttk.Entry(row3_right, textvariable=self.reprice_threshold_percent_var, width=8).pack(side="left", padx=(4, 12))
+                ttk.Label(row3_right, text=self._reprice_threshold_label_text()).pack(side="left")
+                ttk.Entry(row3_right, textvariable=self.reprice_threshold_var, width=10).pack(side="left", padx=(4, 12))
             else:
                 ttk.Label(row3_right, text="溢价百分比(%):").pack(side="left")
                 ttk.Entry(row3_right, textvariable=self.premium_percent_var, width=10).pack(side="left", padx=(4, 12))
                 ttk.Label(row3_right, text="剩余 BNB 手续费停止值:").pack(side="left")
                 ttk.Entry(row3_right, textvariable=self.bnb_fee_stop_var, width=10).pack(side="left", padx=(4, 12))
-                ttk.Label(row3_right, text="重新挂单阈值(%):").pack(side="left")
-                ttk.Entry(row3_right, textvariable=self.reprice_threshold_percent_var, width=8).pack(side="left", padx=(4, 12))
+                ttk.Label(row3_right, text=self._reprice_threshold_label_text()).pack(side="left")
+                ttk.Entry(row3_right, textvariable=self.reprice_threshold_var, width=10).pack(side="left", padx=(4, 12))
         else:
             ttk.Label(row3_right, text="合约轮次:").pack(side="left")
             ttk.Spinbox(row3_right, from_=1, to=100, textvariable=self.futures_rounds_var, width=6).pack(side="left", padx=(4, 12))
@@ -2067,7 +2533,8 @@ class App(tk.Tk):
     def _on_account_list_mousewheel(self, event=None):
         if not self._pointer_in_account_list():
             return None
-        if not hasattr(self, "canvas"):
+        tree = getattr(self, "account_tree", None)
+        if tree is None:
             return None
 
         units = 0
@@ -2088,17 +2555,17 @@ class App(tk.Tk):
             return None
 
         try:
-            self.canvas.yview_scroll(units, "units")
+            tree.yview_scroll(units, "units")
             return "break"
         except Exception:
             return None
 
     def _focus_account_list_for_paste(self, _event=None):
-        canvas = getattr(self, "canvas", None)
-        if canvas is None:
+        tree = getattr(self, "account_tree", None)
+        if tree is None:
             return None
         try:
-            canvas.focus_set()
+            tree.focus_set()
         except Exception:
             return None
         return None
@@ -2389,7 +2856,7 @@ class App(tk.Tk):
             "premium_percent": trade_settings["premium_percent"],
             "bnb_fee_stop": trade_settings["bnb_fee_stop"],
             "bnb_topup_amount": trade_settings["bnb_topup_amount"],
-            "reprice_threshold_percent": trade_settings["reprice_threshold_percent"],
+            "reprice_threshold": trade_settings["reprice_threshold"],
             "spot_symbol": self.spot_symbol_var.get().strip().upper(),
             "spot_precision": spot_precision,
             "futures_symbol": str(trade_settings["futures_symbol"] or "").strip().upper(),
@@ -2480,8 +2947,8 @@ class App(tk.Tk):
             self.premium_percent_var.set(str(raw.get("premium_percent", PREMIUM_PERCENT_DEFAULT) or PREMIUM_PERCENT_DEFAULT).strip())
             self.bnb_fee_stop_var.set(str(raw.get("bnb_fee_stop", BNB_FEE_STOP_DEFAULT) or BNB_FEE_STOP_DEFAULT).strip())
             self.bnb_topup_amount_var.set(str(raw.get("bnb_topup_amount", BNB_TOPUP_AMOUNT_DEFAULT) or BNB_TOPUP_AMOUNT_DEFAULT).strip())
-            self.reprice_threshold_percent_var.set(
-                str(raw.get("reprice_threshold_percent", REPRICE_THRESHOLD_PERCENT_DEFAULT) or REPRICE_THRESHOLD_PERCENT_DEFAULT).strip()
+            self.reprice_threshold_var.set(
+                str(raw.get("reprice_threshold", raw.get("reprice_threshold_percent", REPRICE_THRESHOLD_DEFAULT)) or REPRICE_THRESHOLD_DEFAULT).strip()
             )
             self.spot_symbol_var.set(str(raw.get("spot_symbol", SPOT_SYMBOL_DEFAULT) or SPOT_SYMBOL_DEFAULT).strip().upper())
             self.spot_precision_var.set(int(raw.get("spot_precision", SPOT_PRECISION_DEFAULT)))
@@ -2597,7 +3064,7 @@ class App(tk.Tk):
                 else:
                     messagebox.showinfo("代理测试成功", log_text)
 
-            self.after(0, _update)
+            self._dispatch_ui(_update)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2624,7 +3091,7 @@ class App(tk.Tk):
                 self.ip_var.set(ip)
                 self.exchange_proxy_status_var.set(proxy_status)
                 self.exchange_proxy_exit_ip_var.set(proxy_exit_ip)
-            self.after(0, _update)
+            self._dispatch_ui(_update)
 
         threading.Thread(target=worker, daemon=True).start()
         if schedule_next:
@@ -2645,6 +3112,9 @@ class App(tk.Tk):
         self.text_log.insert("end", msg + "\n")
         self.text_log.see("end")
         self.text_log.configure(state="disabled")
+
+    def _dispatch_ui(self, callback) -> None:
+        dispatch_ui_callback(self, callback, root=self)
 
     def _set_account_manage_buttons_state(self, state):
         for name in (
@@ -2687,6 +3157,7 @@ class App(tk.Tk):
         client=None,
         symbol: str = "",
         trade_account_type: str = TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode: str = TRADE_MODE_DEFAULT,
         required_quote_amount: Decimal | None = None,
     ):
         start = time.time()
@@ -2695,10 +3166,13 @@ class App(tk.Tk):
             logger.error("wait_for_usdt 调用时没有可用的 BinanceClient")
             return False
         trade_type = self._normalize_trade_account_type(trade_account_type)
+        mode_name = self._normalize_trade_mode(trade_mode)
         if trade_type == TRADE_ACCOUNT_TYPE_FUTURES:
             quote_asset = c.get_um_futures_margin_asset(symbol) if symbol else "USDT"
+            base_asset = ""
         else:
             quote_asset = BinanceClient.get_spot_quote_asset(symbol) if symbol else "USDT"
+            base_asset = BinanceClient.get_spot_base_asset(symbol) if symbol else ""
         required_amount = Decimal(str(required_quote_amount)) if required_quote_amount is not None else Decimal("0")
 
         while time.time() - start < timeout_sec:
@@ -2706,6 +3180,7 @@ class App(tk.Tk):
                 logger.info("检测 %s 时收到停止信号，结束检测", quote_asset)
                 return False
             try:
+                base_balance_dec = Decimal("0")
                 if trade_type == TRADE_ACCOUNT_TYPE_FUTURES:
                     quote_balance_dec = Decimal(str(c.um_futures_asset_balance(quote_asset).get("availableBalance", Decimal("0"))))
                     if required_amount > 0 and quote_balance_dec < required_amount:
@@ -2727,24 +3202,45 @@ class App(tk.Tk):
                         logger.info("%s 到账检测中，当前 U本位可用 %s = %.8f", quote_asset, quote_asset, quote_balance)
                 else:
                     c.collect_funding_asset_to_spot(quote_asset)
-                    quote_balance = c.spot_balance(quote_asset)
-                    logger.info("%s 到账检测中，当前现货 %s = %.8f", quote_asset, quote_asset, quote_balance)
+                    quote_balance_dec = c.spot_asset_balance_decimal(quote_asset)
+                    quote_balance = float(quote_balance_dec)
+                    if mode_name == TRADE_MODE_LIMIT:
+                        base_balance_dec = c.spot_asset_balance_decimal(base_asset)
+                        logger.info(
+                            "%s模式余额检测中，当前现货 %s = %.8f，%s = %.8f",
+                            mode_name,
+                            quote_asset,
+                            quote_balance,
+                            base_asset,
+                            float(base_balance_dec),
+                        )
+                    else:
+                        logger.info("%s 到账检测中，当前现货 %s = %.8f", quote_asset, quote_asset, quote_balance)
             except Exception as e:
                 logger.error("检测 %s 余额失败: %s", quote_asset, e)
                 quote_balance = 0.0
+                base_balance_dec = Decimal("0")
 
             balance_ready = quote_balance > 0
+            if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+                balance_ready = Decimal(str(quote_balance)) > 0 or base_balance_dec > 0
             if trade_type == TRADE_ACCOUNT_TYPE_FUTURES and required_amount > 0:
                 balance_ready = Decimal(str(quote_balance)) >= required_amount
 
             if balance_ready:
-                logger.info("检测到 %s 已到账，开始执行后续策略", quote_asset)
+                if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+                    logger.info("检测到可挂单余额，开始执行后续策略")
+                else:
+                    logger.info("检测到 %s 已到账，开始执行后续策略", quote_asset)
                 return True
 
             delay_seconds = min(self._current_random_delay_seconds(), max(0.0, timeout_sec - (time.time() - start)))
             if delay_seconds <= 0:
                 continue
-            logger.info("%s 未到账，%.3f 秒后重试", quote_asset, delay_seconds)
+            if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+                logger.info("未检测到可挂单余额，%.3f 秒后重试", delay_seconds)
+            else:
+                logger.info("%s 未到账，%.3f 秒后重试", quote_asset, delay_seconds)
             if stop_event:
                 if stop_event.wait(delay_seconds):
                     logger.info("检测 %s 等待期间收到停止信号，结束检测", quote_asset)
@@ -2752,6 +3248,9 @@ class App(tk.Tk):
             else:
                 time.sleep(delay_seconds)
 
+        if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+            logger.error("在 %d 秒内未检测到可挂单余额，终止任务", timeout_sec)
+            return False
         logger.error("在 %d 秒内未检测到 %s 到账，终止任务", timeout_sec, quote_asset)
         return False
 
@@ -2774,7 +3273,7 @@ class App(tk.Tk):
             premium_percent_value = trade_settings["premium_percent_value"]
             bnb_fee_stop_value = trade_settings["bnb_fee_stop_value"]
             bnb_topup_amount_value = trade_settings["bnb_topup_amount_value"]
-            reprice_threshold_percent_value = trade_settings["reprice_threshold_percent_value"]
+            reprice_threshold_value = trade_settings["reprice_threshold_value"]
             futures_symbol = str(trade_settings["futures_symbol"])
             futures_rounds = int(trade_settings["futures_rounds"])
             futures_amount_value = trade_settings["futures_amount_value"]
@@ -2811,6 +3310,9 @@ class App(tk.Tk):
             if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES
             else BinanceClient.get_spot_quote_asset(trade_symbol)
         )
+        effective_reprice_threshold = None
+        if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode in {TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}:
+            effective_reprice_threshold = self.client.normalize_price_delta(spot_symbol, reprice_threshold_value, min_one_tick=True)
         required_quote_amount = None
         if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES and futures_amount_value is not None and futures_leverage > 0:
             required_quote_amount = futures_amount_value / Decimal(str(futures_leverage))
@@ -2861,7 +3363,7 @@ class App(tk.Tk):
             premium_percent=premium_percent_value,
             bnb_fee_stop_value=bnb_fee_stop_value,
             bnb_topup_amount=bnb_topup_amount_value,
-            reprice_threshold_percent=reprice_threshold_percent_value,
+            reprice_threshold_amount=reprice_threshold_value,
             futures_symbol=futures_symbol,
             futures_rounds=futures_rounds,
             futures_amount=futures_amount_value,
@@ -2875,7 +3377,7 @@ class App(tk.Tk):
                 self.progress["maximum"] = total
                 self.progress["value"] = step
                 self.status_var.set("状态：%s (%d/%d)" % (text, step, total))
-            self.after(0, _update)
+            self._dispatch_ui(_update)
 
         def worker():
             try:
@@ -2884,9 +3386,13 @@ class App(tk.Tk):
                     self.stop_event,
                     symbol=trade_symbol,
                     trade_account_type=trade_account_type,
+                    trade_mode=trade_mode,
                     required_quote_amount=required_quote_amount,
                 ):
-                    logger.info("%s 检测未通过，任务结束", quote_asset)
+                    if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                        logger.info("挂单余额检测未通过，任务结束")
+                    else:
+                        logger.info("%s 检测未通过，任务结束", quote_asset)
                     return
 
                 if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
@@ -2903,24 +3409,26 @@ class App(tk.Tk):
                     logger.info("开始执行策略：市价 %d 轮，预买BNB金额=%s", spot_rounds, bnb_topup_amount_value)
                 elif trade_mode == TRADE_MODE_LIMIT:
                     logger.info(
-                        "开始执行策略：挂单模式，预买BNB金额=%s，BNB 手续费停止值=%s，重新挂单阈值=%s%%",
+                        "开始执行策略：挂单模式，预买BNB金额=%s，BNB 手续费停止值=%s，重新挂单阈值=%s %s",
                         bnb_topup_amount_value,
                         bnb_fee_stop_value,
-                        reprice_threshold_percent_value,
+                        BinanceClient._format_decimal(effective_reprice_threshold or Decimal("0")),
+                        quote_asset,
                     )
                 else:
                     logger.info(
-                        "开始执行策略：溢价单模式，预买BNB金额=%s，溢价百分比=%s，BNB 手续费停止值=%s，重新挂单阈值=%s%%",
+                        "开始执行策略：溢价单模式，预买BNB金额=%s，溢价百分比=%s，BNB 手续费停止值=%s，重新挂单阈值=%s %s",
                         bnb_topup_amount_value,
                         premium_percent_value,
                         bnb_fee_stop_value,
-                        reprice_threshold_percent_value,
+                        BinanceClient._format_decimal(effective_reprice_threshold or Decimal("0")),
+                        quote_asset,
                     )
                 strategy.run(self.stop_event, progress_cb=progress_cb)
             except Exception as e:
                 logger.error("运行过程中出现异常: %s", e)
             finally:
-                self.after(0, self._on_worker_finished)
+                self._dispatch_ui(self._on_worker_finished)
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
         self.worker_thread.start()
@@ -2969,7 +3477,7 @@ class App(tk.Tk):
                     self.client = client
                     self.single_account_balances_var.set(balances_text)
                     logger.info("余额刷新完成")
-                self.after(0, _update)
+                self._dispatch_ui(_update)
             except Exception as e:
                 logger.error("刷新余额失败: %s", e)
 
@@ -3014,6 +3522,7 @@ class App(tk.Tk):
     def _reindex_accounts(self):
         for i, acc in enumerate(self.accounts, start=1):
             acc["index_var"].set(str(i))
+            self._refresh_account_tree_row(acc)
         self._refresh_account_list_hint()
 
     def _on_global_network_changed(self, *_):
@@ -3025,6 +3534,7 @@ class App(tk.Tk):
             acc["network"] = net
             if "network_var" in acc:
                 acc["network_var"].set(net)
+            self._refresh_account_tree_row(acc)
 
     @staticmethod
     def _account_row_color_by_status(status_text: str) -> str:
@@ -3044,40 +3554,54 @@ class App(tk.Tk):
     def _is_context_account(self, acc: dict) -> bool:
         return bool(acc is not None and acc is getattr(self, "_context_account", None))
 
-    def _apply_account_row_style(self, acc: dict):
+    def _account_row_style_tag(self, acc: dict) -> str:
         if self._is_context_account(acc):
-            bg = "#7A3FF2"
-            fg = "#FFFFFF"
-        else:
-            bg = self._account_row_color_by_status(acc.get("status_var").get())
-            fg = "#111111"
-        row_frame = acc.get("frame")
-        if row_frame is not None:
-            try:
-                row_frame.configure(bg=bg)
-            except Exception:
-                pass
-        for widget in acc.get("row_widgets", []):
-            try:
-                widget.configure(bg=bg)
-            except Exception:
-                pass
-            try:
-                widget.configure(fg=fg)
-            except Exception:
-                pass
-            try:
-                widget.configure(activebackground=bg)
-            except Exception:
-                pass
-            try:
-                widget.configure(activeforeground=fg)
-            except Exception:
-                pass
-            try:
-                widget.configure(selectcolor=bg)
-            except Exception:
-                pass
+            return "acc_context"
+        s = str(acc.get("status_var").get() if acc.get("status_var") is not None else "").strip()
+        if not s or s == "就绪":
+            return "acc_ready"
+        if "未到账" in s or any(k in s for k in ("已停止", "已请求停止")):
+            return "acc_warn"
+        if any(k in s for k in ("失败", "异常")):
+            return "acc_failed"
+        if any(k in s for k in ("成功", "完成", "总资产", "无可提", "提现额度")):
+            return "acc_success"
+        return "acc_running"
+
+    def _account_tree_values(self, acc: dict) -> tuple[str, str, str, str, str, str]:
+        checked = "✓" if bool(acc.get("selected_var").get()) else ""
+        index_text = str(acc.get("index_var").get() or "")
+        api_key = self._mask_key(str(acc.get("api_key") or ""))
+        address = self._mask_addr(str(acc.get("address") or ""))
+        network = str(acc.get("network_var").get() or acc.get("network") or "")
+        status = str(acc.get("status_var").get() or "")
+        return checked, index_text, api_key, address, network, status
+
+    def _refresh_account_tree_row(self, acc: dict) -> None:
+        tree = getattr(self, "account_tree", None)
+        if tree is None:
+            return
+        tree_id = str(acc.get("tree_id") or "").strip()
+        if not tree_id:
+            return
+        try:
+            tree.item(tree_id, values=self._account_tree_values(acc), tags=(self._account_row_style_tag(acc),))
+        except Exception:
+            pass
+
+    def _insert_account_tree_row(self, acc: dict) -> None:
+        tree = getattr(self, "account_tree", None)
+        if tree is None:
+            return
+        tree_id = tree.insert("", "end", values=self._account_tree_values(acc), tags=(self._account_row_style_tag(acc),))
+        acc["tree_id"] = tree_id
+        self._account_tree_row_to_account[tree_id] = acc
+
+    def _account_from_tree_row_id(self, row_id: str) -> dict | None:
+        return self._account_tree_row_to_account.get(str(row_id or "").strip())
+
+    def _apply_account_row_style(self, acc: dict):
+        self._refresh_account_tree_row(acc)
 
     def _set_account_status(self, acc: dict, text: str):
         acc["status_var"].set(str(text))
@@ -3114,6 +3638,38 @@ class App(tk.Tk):
             self._apply_account_row_style(previous)
         if acc is not None:
             self._apply_account_row_style(acc)
+
+    def _on_account_tree_double_click(self, event):
+        tree = getattr(self, "account_tree", None)
+        if tree is None or tree.identify("region", event.x, event.y) != "cell":
+            return None
+        row_id = tree.identify_row(event.y)
+        acc = self._account_from_tree_row_id(row_id)
+        if acc is None:
+            return None
+        try:
+            tree.focus(row_id)
+        except Exception:
+            pass
+        selected_var = acc.get("selected_var")
+        if selected_var is None:
+            return "break"
+        selected_var.set(not bool(selected_var.get()))
+        return "break"
+
+    def _on_account_tree_right_click(self, event):
+        tree = getattr(self, "account_tree", None)
+        if tree is None or tree.identify("region", event.x, event.y) != "cell":
+            return None
+        row_id = tree.identify_row(event.y)
+        acc = self._account_from_tree_row_id(row_id)
+        if acc is None:
+            return None
+        try:
+            tree.focus(row_id)
+        except Exception:
+            pass
+        return self._show_account_row_menu(event, acc)
 
     def _show_account_row_menu(self, event, acc: dict):
         self._set_context_account(acc)
@@ -3407,37 +3963,11 @@ class App(tk.Tk):
 
     def _append_account_row(self, key, secret, addr, net, selected=True):
         net = (net or "").strip() or WITHDRAW_NETWORK_DEFAULT
-
-        row_frame = tk.Frame(self.accounts_container, bg="#f7f7f7")
-        row_frame.pack(fill="x", padx=2, pady=1)
-
-        index_var = tk.StringVar()
+        index_var = tk.StringVar(value=str(len(self.accounts) + 1))
         selected_var = tk.BooleanVar(value=selected)
-        selected_var.trace_add("write", lambda *_args: self._update_toggle_select_button_text())
         network_var = tk.StringVar(value=net)
         status_var = tk.StringVar(value="就绪")
-
-        lbl_index = tk.Label(row_frame, textvariable=index_var, width=4, anchor="w", bg="#f7f7f7")
-        chk_selected = tk.Checkbutton(
-            row_frame,
-            variable=selected_var,
-            bg="#f7f7f7",
-            activebackground="#f7f7f7",
-            bd=0,
-            highlightthickness=0,
-            relief="flat",
-        )
-        lbl_key = tk.Label(row_frame, text=self._mask_key(key), width=25, anchor="w", bg="#f7f7f7")
-        lbl_addr = tk.Label(row_frame, text=self._mask_addr(addr), width=35, anchor="w", bg="#f7f7f7")
-        lbl_net = tk.Label(row_frame, textvariable=network_var, width=8, anchor="w", bg="#f7f7f7")
-        lbl_status = tk.Label(row_frame, textvariable=status_var, width=52, anchor="w", bg="#f7f7f7")
-
-        for w in (lbl_index, chk_selected, lbl_key, lbl_addr, lbl_net, lbl_status):
-            w.pack(side="left", padx=2)
-
         acc = {
-            "frame": row_frame,
-            "row_widgets": [lbl_index, chk_selected, lbl_key, lbl_addr, lbl_net, lbl_status],
             "index_var": index_var,
             "selected_var": selected_var,
             "network_var": network_var,
@@ -3448,13 +3978,11 @@ class App(tk.Tk):
             "api_secret": secret,
             "address": addr,
             "network": net,
+            "tree_id": "",
         }
-        self._apply_account_row_style(acc)
-        for widget in (row_frame, *acc["row_widgets"]):
-            widget.bind("<Button-3>", lambda event, a=acc: self._show_account_row_menu(event, a), add="+")
-            widget.bind("<Button-2>", lambda event, a=acc: self._show_account_row_menu(event, a), add="+")
-            widget.bind("<Control-Button-1>", lambda event, a=acc: self._show_account_row_menu(event, a), add="+")
+        selected_var.trace_add("write", lambda *_args, a=acc: (self._update_toggle_select_button_text(), self._refresh_account_tree_row(a)))
         self.accounts.append(acc)
+        self._insert_account_tree_row(acc)
         self._update_toggle_select_button_text()
         self._refresh_account_list_hint()
         return acc
@@ -3488,7 +4016,13 @@ class App(tk.Tk):
         keep = []
         for acc in self.accounts:
             if acc["selected_var"].get():
-                acc["frame"].destroy()
+                tree_id = str(acc.get("tree_id") or "").strip()
+                if tree_id:
+                    self._account_tree_row_to_account.pop(tree_id, None)
+                    try:
+                        self.account_tree.delete(tree_id)
+                    except Exception:
+                        pass
             else:
                 keep.append(acc)
         self.accounts = keep
@@ -3658,7 +4192,7 @@ class App(tk.Tk):
             premium_percent_value = trade_settings["premium_percent_value"]
             bnb_fee_stop_value = trade_settings["bnb_fee_stop_value"]
             bnb_topup_amount_value = trade_settings["bnb_topup_amount_value"]
-            reprice_threshold_percent_value = trade_settings["reprice_threshold_percent_value"]
+            reprice_threshold_value = trade_settings["reprice_threshold_value"]
             futures_symbol = str(trade_settings["futures_symbol"])
             futures_rounds = int(trade_settings["futures_rounds"])
             futures_amount_value = trade_settings["futures_amount_value"]
@@ -3672,7 +4206,7 @@ class App(tk.Tk):
             premium_percent_value = None
             bnb_fee_stop_value = None
             bnb_topup_amount_value = Decimal("0")
-            reprice_threshold_percent_value = Decimal(REPRICE_THRESHOLD_PERCENT_DEFAULT)
+            reprice_threshold_value = Decimal(REPRICE_THRESHOLD_DEFAULT)
             futures_symbol = self.futures_symbol_var.get().strip().upper()
             try:
                 futures_rounds = max(1, int(self.futures_rounds_var.get() or FUTURES_ROUNDS_DEFAULT))
@@ -3758,7 +4292,7 @@ class App(tk.Tk):
             def _u():
                 self.progress["value"] = curr
                 self.status_var.set(f"状态：已完成 {curr}/{total_accounts}")
-            self.after(0, _u)
+            self._dispatch_ui(_u)
 
         def worker_loop(thread_id):
             while not self.stop_event.is_set():
@@ -3770,12 +4304,12 @@ class App(tk.Tk):
                 def set_status(text, acc_ref=acc):
                     def _u():
                         self._set_account_status(acc_ref, text)
-                    self.after(0, _u)
+                    self._dispatch_ui(_u)
 
                 def progress_cb(step, total, text, acc_obj=acc):
                     def _u():
                         self._set_account_status(acc_obj, text)
-                    self.after(0, _u)
+                    self._dispatch_ui(_u)
 
                 combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
                 logger.info(f"[线程 {thread_id}] 开始处理账号 #{idx}")
@@ -3917,21 +4451,29 @@ class App(tk.Tk):
                         need_wait_usdt = not skip_usdt_wait_in_batch
 
                         if need_wait_usdt:
-                            set_status(f"检测 {quote_asset} 到账...")
+                            if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                                set_status("检测挂单余额...")
+                            else:
+                                set_status(f"检测 {quote_asset} 到账...")
                             if not self.wait_for_usdt(
                                 usdt_timeout,
                                 combined_stop,
                                 client=client,
                                 symbol=trade_symbol,
                                 trade_account_type=trade_account_type,
+                                trade_mode=trade_mode,
                                 required_quote_amount=required_quote_amount,
                             ):
                                 if combined_stop.is_set():
                                     logger.info(f"账号 #{idx} 已请求停止")
                                     finish_current_now("已停止", success=False)
                                 else:
-                                    logger.info(f"账号 #{idx} {quote_asset} 检测超时，跳过")
-                                    set_status(f"{quote_asset} 未到账")
+                                    if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                                        logger.info(f"账号 #{idx} 挂单余额检测超时，跳过")
+                                        set_status("无可挂单余额")
+                                    else:
+                                        logger.info(f"账号 #{idx} {quote_asset} 检测超时，跳过")
+                                        set_status(f"{quote_asset} 未到账")
                                     finish_current_now(success=False)
                                 continue
                         else:
@@ -3953,21 +4495,33 @@ class App(tk.Tk):
                         elif trade_mode == TRADE_MODE_MARKET:
                             logger.info("账号 #%d 开始执行市价策略：%d 轮，预买BNB金额=%s", idx, spot_rounds, bnb_topup_amount_value)
                         elif trade_mode == TRADE_MODE_LIMIT:
+                            effective_reprice_threshold = client.normalize_price_delta(
+                                spot_symbol,
+                                reprice_threshold_value,
+                                min_one_tick=True,
+                            )
                             logger.info(
-                                "账号 #%d 开始执行挂单策略：预买BNB金额=%s，BNB 手续费停止值=%s，重新挂单阈值=%s%%",
+                                "账号 #%d 开始执行挂单策略：预买BNB金额=%s，BNB 手续费停止值=%s，重新挂单阈值=%s %s",
                                 idx,
                                 bnb_topup_amount_value,
                                 bnb_fee_stop_value,
-                                reprice_threshold_percent_value,
+                                BinanceClient._format_decimal(effective_reprice_threshold),
+                                quote_asset,
                             )
                         else:
+                            effective_reprice_threshold = client.normalize_price_delta(
+                                spot_symbol,
+                                reprice_threshold_value,
+                                min_one_tick=True,
+                            )
                             logger.info(
-                                "账号 #%d 开始执行溢价单策略：预买BNB金额=%s，溢价百分比=%s，BNB 手续费停止值=%s，重新挂单阈值=%s%%",
+                                "账号 #%d 开始执行溢价单策略：预买BNB金额=%s，溢价百分比=%s，BNB 手续费停止值=%s，重新挂单阈值=%s %s",
                                 idx,
                                 bnb_topup_amount_value,
                                 premium_percent_value,
                                 bnb_fee_stop_value,
-                                reprice_threshold_percent_value,
+                                BinanceClient._format_decimal(effective_reprice_threshold),
+                                quote_asset,
                             )
 
                         def sleep_fn():
@@ -4012,7 +4566,7 @@ class App(tk.Tk):
                             premium_percent=premium_percent_value,
                             bnb_fee_stop_value=bnb_fee_stop_value,
                             bnb_topup_amount=bnb_topup_amount_value,
-                            reprice_threshold_percent=reprice_threshold_percent_value,
+                            reprice_threshold_amount=reprice_threshold_value,
                             futures_symbol=futures_symbol,
                             futures_rounds=futures_rounds,
                             futures_amount=futures_amount_value,
@@ -4068,7 +4622,7 @@ class App(tk.Tk):
                 t.join()
 
             logger.info("批量任务全部结束")
-            self.after(0, self._on_worker_finished)
+            self._dispatch_ui(self._on_worker_finished)
 
         self.worker_thread = threading.Thread(target=controller, daemon=True)
         self.worker_thread.start()
@@ -4142,7 +4696,7 @@ class App(tk.Tk):
                     return
 
                 def set_status(text, acc_ref=acc):
-                    self.after(0, lambda: self._set_account_status(acc_ref, text))
+                    self._dispatch_ui(lambda: self._set_account_status(acc_ref, text))
 
                 combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
                 op_success = False
@@ -4184,7 +4738,7 @@ class App(tk.Tk):
                     def _u():
                         self.progress["value"] = curr
                         self.status_var.set(f"批量提现进度: {curr}/{total_accounts}")
-                    self.after(0, _u)
+                    self._dispatch_ui(_u)
 
         def controller():
             threads = []
@@ -4196,7 +4750,7 @@ class App(tk.Tk):
             for t in threads:
                 t.join()
 
-            self.after(0, self._on_worker_finished)
+            self._dispatch_ui(self._on_worker_finished)
 
         self.worker_thread = threading.Thread(target=controller, daemon=True)
         self.worker_thread.start()
@@ -4234,9 +4788,16 @@ def run_selftest() -> int:
             session.close()
         checks.append("socks-support")
 
-        xray_path = ExchangeProxyRuntime.find_xray_executable()
+        try:
+            xray_path = ExchangeProxyRuntime.find_xray_executable()
+        except Exception as exc:
+            if os.name == "nt" and getattr(sys, "frozen", False):
+                raise
+            logger.warning("SELFTEST: xray 未找到，将继续使用 sing-box 作为内置 SS 代理主后端: %s", exc)
+            checks.append("xray=optional-missing")
+        else:
+            checks.append(f"xray={xray_path.name}")
         sing_box_path = ExchangeProxyRuntime.find_sing_box_executable()
-        checks.append(f"xray={xray_path.name}")
         checks.append(f"sing-box={sing_box_path.name}")
 
         logger.info("SELFTEST OK: %s", ", ".join(checks))
