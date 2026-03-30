@@ -3,38 +3,27 @@
 
 from __future__ import annotations
 
-import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import hmac
 import importlib
 import json
 import os
-import random
 import re
-import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from decimal import Decimal
 from typing import Callable
 
 import requests
 
-from core_models import AccountEntry, EvmToken
-from exchange_binance_client import BinanceClient
-
-
-class SubmissionUncertainError(RuntimeError):
-    def __init__(self, message: str, *, reference: str = ""):
-        super().__init__(message)
-        self.reference = str(reference or "")
+from core_models import EvmToken, GeneratedWalletEntry
 
 
 class EvmClient:
     _DEPENDENCY_LOCK = threading.Lock()
+    _DEPENDENCY_MODULE_CACHE: dict[str, object] = {}
     _ONCHAIN_DEPENDENCY_MODULES = {
         "eth-account": "eth_account",
         "eth-utils": "eth_utils",
@@ -79,9 +68,24 @@ class EvmClient:
         ],
     }
 
-    def __init__(self, proxy_provider: Callable[[], str] | None = None, *, allow_system_proxy: bool = True):
+    def __init__(
+        self,
+        proxy_provider: Callable[[], str] | None = None,
+        *,
+        allow_system_proxy: bool = True,
+        allow_system_proxy_provider: Callable[[], bool] | None = None,
+    ):
         self._proxy_provider = proxy_provider
         self._allow_system_proxy = bool(allow_system_proxy)
+        self._allow_system_proxy_provider = allow_system_proxy_provider
+
+    def _allow_system_proxy_now(self) -> bool:
+        if self._allow_system_proxy_provider is None:
+            return self._allow_system_proxy
+        try:
+            return bool(self._allow_system_proxy_provider())
+        except Exception as exc:
+            raise RuntimeError(f"系统代理开关读取失败：{exc}") from exc
 
     def _current_proxy_url(self) -> str:
         if self._proxy_provider is None:
@@ -95,7 +99,7 @@ class EvmClient:
     def _new_rpc_session(self) -> tuple[requests.Session, str]:
         proxy_url = self._current_proxy_url()
         session = requests.Session()
-        session.trust_env = self._allow_system_proxy and not bool(proxy_url)
+        session.trust_env = self._allow_system_proxy_now() and not bool(proxy_url)
         if proxy_url:
             session.proxies = {
                 "http": proxy_url,
@@ -134,19 +138,16 @@ class EvmClient:
             return None
 
     @classmethod
-    def _install_missing_dependencies(cls, package_names: list[str]) -> None:
-        if not package_names:
-            return
-        if getattr(sys, "frozen", False):
-            pkg_text = ", ".join(package_names)
-            raise RuntimeError(f"链上依赖缺失：{pkg_text}。当前为打包版，请在构建环境先安装后重新打包。")
+    def _dependency_install_command(cls, package_names: list[str]) -> str:
+        pkg_list = " ".join(str(name).strip() for name in package_names if str(name).strip())
+        return f'"{sys.executable}" -m pip install --user {pkg_list}'.strip()
 
-        cmd = [sys.executable, "-m", "pip", "install", "--user", *package_names]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-        except Exception as exc:
-            cmd_text = subprocess.list2cmdline(cmd)
-            raise RuntimeError(f"链上依赖自动安装失败，请手动执行：{cmd_text}") from exc
+    @classmethod
+    def _missing_dependency_error(cls, package_names: list[str]) -> RuntimeError:
+        pkg_text = ", ".join(package_names)
+        if getattr(sys, "frozen", False):
+            return RuntimeError(f"链上依赖缺失：{pkg_text}。当前为打包版，请在构建环境先安装后重新打包。")
+        return RuntimeError(f"链上依赖缺失：{pkg_text}。请先执行：{cls._dependency_install_command(package_names)}")
 
     @classmethod
     def ensure_dependencies(cls, *, require_signing: bool = True):
@@ -155,28 +156,21 @@ class EvmClient:
             required.append("eth-account")
 
         with cls._DEPENDENCY_LOCK:
+            modules: dict[str, object] = {}
             missing_packages: list[str] = []
             for package_name in required:
                 module_name = cls._ONCHAIN_DEPENDENCY_MODULES[package_name]
-                if cls._import_module(module_name) is None:
+                module = cls._DEPENDENCY_MODULE_CACHE.get(module_name)
+                if module is None:
+                    module = cls._import_module(module_name)
+                if module is None:
                     missing_packages.append(package_name)
+                    continue
+                cls._DEPENDENCY_MODULE_CACHE[module_name] = module
+                modules[module_name] = module
 
             if missing_packages:
-                cls._install_missing_dependencies(missing_packages)
-
-            missing_after_install: list[str] = []
-            modules: dict[str, object] = {}
-            for package_name in required:
-                module_name = cls._ONCHAIN_DEPENDENCY_MODULES[package_name]
-                module = cls._import_module(module_name)
-                if module is None:
-                    missing_after_install.append(package_name)
-                else:
-                    modules[module_name] = module
-
-            if missing_after_install:
-                pkg_text = ", ".join(missing_after_install)
-                raise RuntimeError(f"链上依赖仍不可用：{pkg_text}")
+                raise cls._missing_dependency_error(missing_packages)
 
             return modules
 
@@ -275,6 +269,40 @@ class EvmClient:
             return str(acct.address)
         except Exception as exc:
             raise RuntimeError(f"私钥解析失败：{exc}") from exc
+
+    def create_wallet(self) -> GeneratedWalletEntry:
+        Account = self._ensure_eth_account()
+        try:
+            acct = Account.create(os.urandom(32))
+            private_key = acct.key.hex()
+            if not re.fullmatch(r"[a-f0-9]{64}", private_key):
+                raise RuntimeError("生成的私钥格式异常")
+            derived = Account.from_key(private_key)
+            address = str(acct.address)
+            derived_address = str(derived.address)
+            if self.normalize_address(address) != self.normalize_address(derived_address):
+                raise RuntimeError("生成结果校验失败：私钥与地址不匹配")
+            return GeneratedWalletEntry(address=derived_address, private_key=private_key)
+        except Exception as exc:
+            raise RuntimeError(f"创建钱包失败：{exc}") from exc
+
+    def create_wallets(self, count: int, worker_threads: int = 1) -> list[GeneratedWalletEntry]:
+        try:
+            total = int(count)
+        except Exception as exc:
+            raise RuntimeError("创建数量格式错误") from exc
+        if total <= 0:
+            raise RuntimeError("创建数量必须大于 0")
+        if total > 2000:
+            raise RuntimeError("单次最多创建 2000 个钱包")
+        try:
+            workers = max(1, int(worker_threads))
+        except Exception as exc:
+            raise RuntimeError("执行线程数格式错误") from exc
+        if workers == 1 or total == 1:
+            return [self.create_wallet() for _ in range(total)]
+        with ThreadPoolExecutor(max_workers=min(workers, total)) as executor:
+            return list(executor.map(lambda _idx: self.create_wallet(), range(total)))
 
     def _rpc_call(self, network: str, method: str, params: list) -> object:
         info = self._network_info(network)
@@ -557,244 +585,3 @@ class EvmClient:
         raw = self._sign_transaction_hex(tx, private_key, "代币交易签名失败")
         tx_hash = self._rpc_call(network, "eth_sendRawTransaction", [raw])
         return str(tx_hash)
-
-
-class BitgetClient:
-    def __init__(self, base_url: str = "https://api.bitget.com"):
-        self.base_url = base_url.rstrip("/")
-
-    @staticmethod
-    def _sign(secret: str, prehash: str) -> str:
-        digest = hmac.new(secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
-        return base64.b64encode(digest).decode("utf-8")
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        params: dict | None = None,
-        body: dict | None = None,
-        auth: bool = False,
-        api_key: str = "",
-        api_secret: str = "",
-        passphrase: str = "",
-        non_idempotent: bool = False,
-    ) -> dict:
-        method_u = method.upper()
-        query = urllib.parse.urlencode(params or {})
-        request_path = path + (f"?{query}" if query else "")
-        body_text = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
-        data = body_text.encode("utf-8") if method_u != "GET" else None
-        url = f"{self.base_url}{request_path}"
-
-        max_attempts = 1 if non_idempotent else 3
-        for attempt in range(1, max_attempts + 1):
-            headers = {"Content-Type": "application/json", "locale": "zh-CN"}
-            if auth:
-                ts = str(int(time.time() * 1000))
-                prehash = f"{ts}{method_u}{request_path}{body_text}"
-                sign = self._sign(api_secret, prehash)
-                headers.update(
-                    {
-                        "ACCESS-KEY": api_key,
-                        "ACCESS-SIGN": sign,
-                        "ACCESS-TIMESTAMP": ts,
-                        "ACCESS-PASSPHRASE": passphrase,
-                    }
-                )
-
-            req = urllib.request.Request(url=url, data=data, method=method_u, headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    payload = resp.read().decode("utf-8")
-                    try:
-                        j = json.loads(payload) if payload else {}
-                    except json.JSONDecodeError as exc:
-                        if non_idempotent:
-                            raise SubmissionUncertainError(
-                                "提现请求结果不确定：响应无法解析，系统将自动继续确认"
-                            ) from exc
-                        raise RuntimeError("响应解析失败")
-            except urllib.error.HTTPError as exc:
-                payload = exc.read().decode("utf-8", errors="ignore")
-                retryable = exc.code in {429, 500, 502, 503, 504}
-                if non_idempotent and retryable:
-                    raise SubmissionUncertainError(
-                        f"提现请求结果不确定：HTTP {exc.code}: {payload}，系统将自动继续确认"
-                    )
-                if retryable and attempt < max_attempts:
-                    time.sleep(0.5 * attempt)
-                    continue
-                raise RuntimeError(f"HTTP {exc.code}: {payload}")
-            except urllib.error.URLError as exc:
-                if non_idempotent:
-                    raise SubmissionUncertainError(
-                        f"提现请求结果不确定：网络错误：{exc}，系统将自动继续确认"
-                    )
-                if attempt < max_attempts:
-                    time.sleep(0.5 * attempt)
-                    continue
-                raise RuntimeError(f"网络错误：{exc}")
-
-            code = str(j.get("code", ""))
-            if code and code != "00000":
-                msg = j.get("msg") or j.get("message") or ""
-                raise RuntimeError(f"code={code} msg={msg}")
-            return j
-
-        raise RuntimeError("请求失败：已达到最大重试次数")
-
-    def get_public_coins(self, coin: str = "") -> list[dict]:
-        params = {"coin": coin.strip().upper()} if coin else {}
-        j = self._request("GET", "/api/v2/spot/public/coins", params=params, auth=False)
-        data = j.get("data", []) or []
-        return data if isinstance(data, list) else []
-
-    def get_coin_networks(self, coin: str) -> list[str]:
-        coin_u = coin.strip().upper()
-        if not coin_u:
-            return []
-        data = self.get_public_coins(coin_u)
-        target = None
-        for item in data:
-            name = str(item.get("coin", "")).strip().upper()
-            if not name:
-                name = str(item.get("coinName", "")).strip().upper()
-            if name == coin_u:
-                target = item
-                break
-        if target is None and data:
-            target = data[0]
-        if target is None:
-            return []
-
-        arr: list[str] = []
-        seen: set[str] = set()
-        for c in target.get("chains", []) or []:
-            chain = str(c.get("chain", "")).strip()
-            if not chain or chain in seen:
-                continue
-            withdrawable = str(c.get("withdrawable", "true")).strip().lower() in {"true", "1"}
-            if withdrawable:
-                seen.add(chain)
-                arr.append(chain)
-        return arr
-
-    def get_withdraw_fee(self, coin: str, chain: str) -> Decimal | None:
-        coin_u = coin.strip().upper()
-        chain_u = chain.strip().upper()
-        if not coin_u:
-            return None
-        data = self.get_public_coins(coin_u)
-        target = None
-        for item in data:
-            name = str(item.get("coin", "")).strip().upper()
-            if not name:
-                name = str(item.get("coinName", "")).strip().upper()
-            if name == coin_u:
-                target = item
-                break
-        if target is None and data:
-            target = data[0]
-        if target is None:
-            return None
-
-        fallback_fee: Decimal | None = None
-        for c in target.get("chains", []) or []:
-            code = str(c.get("chain", "")).strip().upper()
-            fee_raw = c.get("withdrawFee")
-            if fee_raw in {None, ""}:
-                fee = None
-            else:
-                try:
-                    fee = Decimal(str(fee_raw))
-                except Exception:
-                    fee = None
-            if not chain_u:
-                if fallback_fee is None:
-                    fallback_fee = fee
-                continue
-            if code == chain_u:
-                return fee
-        return fallback_fee
-
-    def get_account_assets(self, api_key: str, api_secret: str, passphrase: str) -> dict[str, Decimal]:
-        j = self._request(
-            "GET",
-            "/api/v2/spot/account/assets",
-            params={},
-            auth=True,
-            api_key=api_key,
-            api_secret=api_secret,
-            passphrase=passphrase,
-        )
-        data = j.get("data", []) or []
-        totals: dict[str, Decimal] = {}
-        for item in data:
-            coin = str(item.get("coin", "")).strip().upper()
-            if not coin:
-                continue
-            available = Decimal(str(item.get("available", "0")))
-            frozen = Decimal(str(item.get("frozen", "0")))
-            locked = Decimal(str(item.get("locked", "0")))
-            total = available + frozen + locked
-            if total <= 0:
-                continue
-            totals[coin] = total
-        return totals
-
-    def get_available_balance(self, api_key: str, api_secret: str, passphrase: str, coin: str) -> Decimal:
-        coin_u = coin.strip().upper()
-        j = self._request(
-            "GET",
-            "/api/v2/spot/account/assets",
-            params={"coin": coin_u},
-            auth=True,
-            api_key=api_key,
-            api_secret=api_secret,
-            passphrase=passphrase,
-        )
-        data = j.get("data", []) or []
-        for item in data:
-            c = str(item.get("coin", "")).strip().upper()
-            if c == coin_u:
-                return Decimal(str(item.get("available", "0")))
-        return Decimal("0")
-
-    def withdraw(
-        self,
-        api_key: str,
-        api_secret: str,
-        passphrase: str,
-        coin: str,
-        address: str,
-        amount: str,
-        chain: str,
-        *,
-        client_oid: str = "",
-    ) -> dict:
-        safe_client_oid = client_oid.strip() or f"codex_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-        body = {
-            "coin": coin.strip().upper(),
-            "transferType": "on_chain",
-            "address": address.strip(),
-            "chain": chain.strip(),
-            "size": amount,
-            "clientOid": safe_client_oid,
-        }
-        j = self._request(
-            "POST",
-            "/api/v2/spot/wallet/withdrawal",
-            body=body,
-            auth=True,
-            api_key=api_key,
-            api_secret=api_secret,
-            passphrase=passphrase,
-            non_idempotent=True,
-        )
-        data = j.get("data", {}) or {}
-        return data if isinstance(data, dict) else {}
-
-    @staticmethod
-    def new_client_oid() -> str:
-        return f"codex_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"

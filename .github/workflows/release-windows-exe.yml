@@ -89,7 +89,6 @@ jobs:
             '--hidden-import', 'secret_box',
             '--hidden-import', 'table_import_utils',
             '--hidden-import', 'task_progress',
-            '--hidden-import', 'ui_dialogs',
             '--collect-all', 'requests',
             '--collect-all', 'urllib3',
             '--collect-all', 'certifi',

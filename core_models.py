@@ -44,22 +44,6 @@ class WithdrawRuntimeParams:
 
 
 @dataclass
-class BgOneToManySettings:
-    coin: str = "USDT"
-    network: str = ""
-    amount_mode: str = "固定数量"
-    amount: str = ""
-    random_min: str = ""
-    random_max: str = ""
-    delay_seconds: float = 1.0
-    worker_threads: int = 5
-    dry_run: bool = True
-    api_key: str = ""
-    api_secret: str = ""
-    passphrase: str = ""
-
-
-@dataclass
 class OnchainPairEntry:
     source: str
     target: str
@@ -71,6 +55,12 @@ class EvmToken:
     contract: str = ""
     decimals: int = 18
     is_native: bool = True
+
+
+@dataclass(frozen=True)
+class GeneratedWalletEntry:
+    address: str
+    private_key: str
 
 
 @dataclass
@@ -86,5 +76,7 @@ class OnchainSettings:
     delay_seconds: float = 1.0
     worker_threads: int = 10
     dry_run: bool = True
+    use_config_proxy: bool = False
+    proxy_url: str = ""
     one_to_many_source: str = ""
     many_to_one_target: str = ""

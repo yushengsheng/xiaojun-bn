@@ -17,9 +17,13 @@ if getattr(sys, "frozen", False):
 else:
     BUNDLE_DIR = APP_DIR
 DATA_DIR = APP_DIR / "data"
+CONFIG_BACKUP_SUFFIX = ".bak"
 DATA_FILE = DATA_DIR / "accounts.json"
 STRATEGY_CONFIG_FILE = DATA_DIR / "exchange_strategy_settings.json"
 EXCHANGE_PROXY_CONFIG_FILE = DATA_DIR / "exchange_proxy_settings.json"
-BG_DATA_FILE = DATA_DIR / "bg_one_to_many.json"
 ONCHAIN_DATA_FILE = DATA_DIR / "onchain.json"
 SECRET_KEY_FILE = DATA_DIR / ".secret.key"
+LOG_DIR = DATA_DIR / "logs"
+LOG_FILE_PATH = APP_DIR / "bot_log.txt"
+WITHDRAW_SUCCESS_FILE = DATA_DIR / "withdraw_success.txt"
+TOTAL_ASSET_RESULT_FILE = DATA_DIR / "total_asset_result.txt"

@@ -360,6 +360,22 @@ def _ui_call_is_main_thread(owner) -> bool:
     return main_thread_id is None or threading.get_ident() == main_thread_id
 
 
+def _ui_shutdown_requested(owner) -> bool:
+    if bool(getattr(owner, "_closing", False)):
+        return True
+    root = getattr(owner, "root", None)
+    if root is not None and bool(getattr(root, "_closing", False)):
+        return True
+    widget = root if root is not None else owner
+    winfo_exists = getattr(widget, "winfo_exists", None)
+    if callable(winfo_exists):
+        try:
+            return not bool(winfo_exists())
+        except Exception:
+            return True
+    return False
+
+
 def flush_queued_log_rows(owner, log_tree, max_rows: int = LOG_MAX_ROWS) -> None:
     _ensure_log_buffer_state(owner)
     with owner._log_state_lock:
@@ -382,6 +398,8 @@ def queue_log_row(
     batch_size: int | None = None,
     delay_ms: int = UI_BATCH_DELAY_MS,
 ) -> None:
+    if _ui_shutdown_requested(owner):
+        return
     _ensure_log_buffer_state(owner)
     with owner._log_state_lock:
         owner._log_buffer.append(str(text or ""))
@@ -430,6 +448,8 @@ def queue_ui_render(
     batch_size: int | None = None,
     delay_ms: int = UI_BATCH_DELAY_MS,
 ) -> None:
+    if _ui_shutdown_requested(owner):
+        return
     _ensure_ui_render_state(owner)
     with owner._ui_render_state_lock:
         owner._ui_render_callbacks.append(callback)
@@ -449,6 +469,37 @@ def dispatch_ui_callback(owner, callback, *, root=None) -> None:
     queue_ui_render(owner, callback, root=root if root is not None else getattr(owner, "root", None))
 
 
+def stop_ui_bridge(owner) -> None:
+    _ensure_ui_bridge_state(owner)
+    token = None
+    root_widget = None
+    with owner._ui_bridge_lock:
+        token = getattr(owner, "_ui_bridge_token", None)
+        root_widget = getattr(owner, "_ui_bridge_root", None)
+        owner._ui_bridge_started = False
+        owner._ui_bridge_token = None
+        owner._ui_bridge_root = None
+    after_cancel = getattr(root_widget, "after_cancel", None)
+    if token is not None and callable(after_cancel):
+        try:
+            after_cancel(token)
+        except Exception:
+            pass
+    _ensure_ui_render_state(owner)
+    with owner._ui_render_state_lock:
+        owner._ui_render_callbacks = []
+        owner._ui_render_flush_requested = False
+        owner._ui_render_timer_requested = False
+    _ensure_log_buffer_state(owner)
+    with owner._log_state_lock:
+        owner._log_buffer = []
+        owner._log_flush_requested = False
+        owner._log_timer_requested = False
+    _ensure_ui_debounce_state(owner)
+    with owner._ui_debounce_lock:
+        owner._ui_debounce_entries = {}
+
+
 def _ensure_ui_debounce_state(owner) -> None:
     if not hasattr(owner, "_ui_debounce_entries"):
         owner._ui_debounce_entries = {}
@@ -464,6 +515,8 @@ def schedule_ui_callback(
     root=None,
     delay_ms: int = UI_BATCH_DELAY_MS,
 ) -> None:
+    if _ui_shutdown_requested(owner):
+        return
     _ensure_ui_debounce_state(owner)
     callback_key = str(key or "").strip() or "_default"
     with owner._ui_debounce_lock:

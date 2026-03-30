@@ -8,16 +8,16 @@ import os
 import tempfile
 from dataclasses import asdict
 from pathlib import Path
+from typing import Callable
 
+from app_paths import CONFIG_BACKUP_SUFFIX
 from core_models import (
     AccountEntry,
-    BgOneToManySettings,
     GlobalSettings,
     OnchainPairEntry,
     OnchainSettings,
 )
 from secret_box import SECRET_BOX
-
 
 def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,6 +36,74 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> Non
         raise
 
 
+def _config_backup_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}{CONFIG_BACKUP_SUFFIX}")
+
+
+def _safe_write_backup_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    try:
+        _atomic_write_text(_config_backup_path(path), content, encoding=encoding)
+    except Exception:
+        pass
+
+
+def _atomic_write_text_with_backup(path: Path, content: str, encoding: str = "utf-8") -> None:
+    _atomic_write_text(path, content, encoding=encoding)
+    _safe_write_backup_text(path, content, encoding=encoding)
+
+
+def _atomic_write_json_with_backup(path: Path, payload: object, encoding: str = "utf-8") -> None:
+    _atomic_write_text_with_backup(path, json.dumps(payload, ensure_ascii=False, indent=2), encoding=encoding)
+
+
+def _load_json_with_backup(
+    path: Path,
+    *,
+    encoding: str = "utf-8",
+    validator: Callable[[object], None] | None = None,
+) -> tuple[object, bool]:
+    backup_path = _config_backup_path(path)
+    candidates: list[tuple[Path, bool]] = []
+    if path.exists():
+        candidates.append((path, False))
+    if backup_path.exists():
+        candidates.append((backup_path, True))
+    if not candidates:
+        raise FileNotFoundError(path)
+
+    errors: list[str] = []
+    for candidate_path, is_backup in candidates:
+        try:
+            text = candidate_path.read_text(encoding=encoding)
+            raw = json.loads(text)
+            if validator is not None:
+                validator(raw)
+            if is_backup:
+                try:
+                    _atomic_write_text(path, text, encoding=encoding)
+                except Exception:
+                    pass
+            elif not backup_path.exists():
+                _safe_write_backup_text(path, text, encoding=encoding)
+            return raw, is_backup
+        except Exception as exc:
+            source_name = "备份文件" if is_backup else "主文件"
+            errors.append(f"{source_name} {candidate_path.name}: {exc}")
+    raise RuntimeError("配置文件读取失败；" + "；".join(errors))
+
+
+def _allow_list_or_dict(raw: object) -> None:
+    if isinstance(raw, (list, dict)):
+        return
+    raise RuntimeError("配置文件结构无效")
+
+
+def _require_dict(raw: object) -> None:
+    if isinstance(raw, dict):
+        return
+    raise RuntimeError("配置文件结构无效")
+
+
 class AccountStore:
     def __init__(self, file_path: Path):
         self.file_path = file_path
@@ -44,8 +112,10 @@ class AccountStore:
         self.one_to_many_source_api_key: str = ""
         self.one_to_many_source_api_secret: str = ""
         self.settings = GlobalSettings()
+        self.last_load_notice = ""
 
     def load(self) -> None:
+        self.last_load_notice = ""
         if not self.file_path.exists():
             self.accounts = []
             self.one_to_many_addresses = []
@@ -54,7 +124,9 @@ class AccountStore:
             self.settings = GlobalSettings()
             return
 
-        raw = json.loads(self.file_path.read_text(encoding="utf-8"))
+        raw, recovered = _load_json_with_backup(self.file_path, validator=_allow_list_or_dict)
+        if recovered:
+            self.last_load_notice = f"检测到 {self.file_path.name} 损坏，已自动从备份恢复。"
 
         # 兼容旧格式：直接是账号列表
         if isinstance(raw, list):
@@ -130,7 +202,7 @@ class AccountStore:
                 "addresses": self.one_to_many_addresses,
             },
         }
-        _atomic_write_text(self.file_path, json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
 
     def upsert_many(self, items: list[AccountEntry]) -> tuple[int, int]:
         """返回 (新增数, 更新数)"""
@@ -158,76 +230,6 @@ class AccountStore:
         self.one_to_many_addresses = [a for i, a in enumerate(self.one_to_many_addresses) if i not in s]
 
 
-class BgOneToManyStore:
-    def __init__(self, file_path: Path):
-        self.file_path = file_path
-        self.addresses: list[str] = []
-        self.settings = BgOneToManySettings()
-
-    def load(self) -> None:
-        if not self.file_path.exists():
-            self.addresses = []
-            self.settings = BgOneToManySettings()
-            return
-        raw = json.loads(self.file_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise RuntimeError("Bitget 配置文件结构无效")
-
-        settings_raw = raw.get("settings", {}) or {}
-        addresses_raw = raw.get("addresses", []) or []
-        addrs: list[str] = []
-        seen: set[str] = set()
-        for x in addresses_raw:
-            s = str(x or "").strip()
-            if not s or s in seen:
-                continue
-            seen.add(s)
-            addrs.append(s)
-
-        try:
-            delay = float(settings_raw.get("delay_seconds", 1.0))
-            if delay < 0:
-                delay = 0.0
-        except Exception:
-            delay = 1.0
-        try:
-            threads = max(1, int(settings_raw.get("worker_threads", 5)))
-        except Exception:
-            threads = 5
-
-        self.addresses = addrs
-        self.settings = BgOneToManySettings(
-            coin=str(settings_raw.get("coin", "USDT") or "USDT").strip().upper(),
-            network=str(settings_raw.get("network", "") or "").strip(),
-            amount_mode=str(settings_raw.get("amount_mode", "固定数量") or "固定数量").strip(),
-            amount=str(settings_raw.get("amount", "") or "").strip(),
-            random_min=str(settings_raw.get("random_min", "") or "").strip(),
-            random_max=str(settings_raw.get("random_max", "") or "").strip(),
-            delay_seconds=delay,
-            worker_threads=threads,
-            dry_run=bool(settings_raw.get("dry_run", True)),
-            api_key=SECRET_BOX.decrypt(str(settings_raw.get("api_key", "") or "").strip()).strip(),
-            api_secret=SECRET_BOX.decrypt(str(settings_raw.get("api_secret", "") or "").strip()).strip(),
-            passphrase=SECRET_BOX.decrypt(str(settings_raw.get("passphrase", "") or "").strip()).strip(),
-        )
-
-    def save(self) -> None:
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_payload = asdict(self.settings)
-        settings_payload["api_key"] = SECRET_BOX.encrypt(self.settings.api_key)
-        settings_payload["api_secret"] = SECRET_BOX.encrypt(self.settings.api_secret)
-        settings_payload["passphrase"] = SECRET_BOX.encrypt(self.settings.passphrase)
-        payload = {
-            "settings": settings_payload,
-            "addresses": self.addresses,
-        }
-        _atomic_write_text(self.file_path, json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def delete_by_indices(self, indices: list[int]) -> None:
-        s = set(indices)
-        self.addresses = [a for i, a in enumerate(self.addresses) if i not in s]
-
-
 class OnchainStore:
     def __init__(self, file_path: Path):
         self.file_path = file_path
@@ -235,8 +237,10 @@ class OnchainStore:
         self.one_to_many_addresses: list[str] = []
         self.many_to_one_sources: list[str] = []
         self.settings = OnchainSettings()
+        self.last_load_notice = ""
 
     def load(self) -> None:
+        self.last_load_notice = ""
         if not self.file_path.exists():
             self.multi_to_multi_pairs = []
             self.one_to_many_addresses = []
@@ -244,9 +248,9 @@ class OnchainStore:
             self.settings = OnchainSettings()
             return
 
-        raw = json.loads(self.file_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise RuntimeError("链上配置文件结构无效")
+        raw, recovered = _load_json_with_backup(self.file_path, validator=_require_dict)
+        if recovered:
+            self.last_load_notice = f"检测到 {self.file_path.name} 损坏，已自动从备份恢复。"
 
         settings_raw = raw.get("settings", {}) or {}
         pairs_raw = raw.get("multi_to_multi", []) or []
@@ -317,6 +321,8 @@ class OnchainStore:
             delay_seconds=delay,
             worker_threads=threads,
             dry_run=bool(settings_raw.get("dry_run", True)),
+            use_config_proxy=bool(settings_raw.get("use_config_proxy", False)),
+            proxy_url=SECRET_BOX.decrypt(str(settings_raw.get("proxy_url", "") or "").strip()).strip(),
             one_to_many_source=SECRET_BOX.decrypt(str(source_raw or "").strip()).strip(),
             many_to_one_target=str(target_raw or "").strip(),
         )
@@ -325,6 +331,7 @@ class OnchainStore:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         settings_payload = asdict(self.settings)
         settings_payload["one_to_many_source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
+        settings_payload["proxy_url"] = SECRET_BOX.encrypt(self.settings.proxy_url)
         payload = {
             "settings": settings_payload,
             "multi_to_multi": [
@@ -343,7 +350,7 @@ class OnchainStore:
                 "sources": [SECRET_BOX.encrypt(x) for x in self.many_to_one_sources],
             },
         }
-        _atomic_write_text(self.file_path, json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
 
     def upsert_multi_to_multi(self, rows: list[OnchainPairEntry]) -> int:
         existing = {(x.source, x.target) for x in self.multi_to_multi_pairs}

@@ -105,6 +105,23 @@ class BinanceClient:
         self._server_time_synced_at = {}
         self._server_time_lock = threading.Lock()
 
+    def close(self) -> None:
+        session = getattr(self, "session", None)
+        self.session = None
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
     @staticmethod
     def _normalize_base_url(base: str) -> str:
         return str(base or "").rstrip("/")

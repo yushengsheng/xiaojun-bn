@@ -22,6 +22,7 @@ Binance 自动化工具（Tkinter GUI）。
 ### Windows
 
 ```powershell
+py -3 -m pip install requests PySocks eth-account eth-utils
 py -3 小军bn.py
 ```
 
@@ -29,13 +30,15 @@ py -3 小军bn.py
 
 - 双击：`小军bn一键启动.app`
 - 启动脚本：`launch_no_terminal.sh`
+- 启动日志：`data/logs/startup.log`
 
 ## 依赖
 
 - 基础：`requests`
 - 链上模块：`eth-account`、`eth-utils`
 
-一键启动脚本会按需自动安装依赖。
+- 源码运行前请先安装依赖
+- macOS 一键启动脚本会在启动前按需自动安装依赖
 
 ## 发布包说明
 

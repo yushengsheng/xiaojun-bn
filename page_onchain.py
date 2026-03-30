@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import queue
 import re
 import threading
@@ -13,9 +14,11 @@ import tkinter as tk
 from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, BooleanVar, DoubleVar, Frame as TkFrame, Menu, StringVar
 from tkinter import messagebox, ttk
 
+import requests
+
 from api_clients import EvmClient
 from app_paths import ONCHAIN_DATA_FILE
-from core_models import EvmToken, OnchainPairEntry, WithdrawRuntimeParams
+from core_models import EvmToken, GeneratedWalletEntry, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
 from shared_utils import (
     LOG_MAX_ROWS,
     SolidButton,
@@ -33,6 +36,7 @@ from shared_utils import (
     random_decimal_between,
     schedule_ui_callback,
     start_ui_bridge,
+    stop_ui_bridge,
     set_ui_batch_size,
 )
 from stores import OnchainStore
@@ -75,13 +79,21 @@ class OnchainTransferPage:
         "balance": 1,
     }
 
-    def __init__(self, parent, rpc_proxy_getter=None):
+    def __init__(self, parent, rpc_proxy_getter=None, proxy_text_normalizer=None):
         self.parent = parent
         self.root = parent.winfo_toplevel()
         self.store = OnchainStore(ONCHAIN_DATA_FILE)
-        self.client = EvmClient(proxy_provider=rpc_proxy_getter)
+        self._rpc_proxy_getter = rpc_proxy_getter
+        self._proxy_text_normalizer = proxy_text_normalizer
+        self.client = EvmClient(
+            proxy_provider=rpc_proxy_getter,
+            allow_system_proxy_provider=self._allow_onchain_system_proxy,
+        )
+        self._closing = False
         self.is_running = False
         self.stop_requested = threading.Event()
+        self._managed_threads_lock = threading.Lock()
+        self._managed_threads: set[threading.Thread] = set()
         self._layout_mode: str | None = None
 
         self.row_index_map: dict[str, int] = {}
@@ -114,6 +126,10 @@ class OnchainTransferPage:
         self.delay_var = DoubleVar(value=1.0)
         self.threads_var = StringVar(value="10")
         self.dry_run_var = BooleanVar(value=False)
+        self.use_config_proxy_var = BooleanVar(value=False)
+        self.onchain_proxy_var = StringVar(value="")
+        self.onchain_proxy_status_var = StringVar(value="未启用")
+        self.onchain_proxy_exit_ip_var = StringVar(value="--")
         self.source_credential_var = StringVar(value="")
         self.target_address_var = StringVar(value="")
         self.source_balance_var = StringVar(value="-")
@@ -128,6 +144,11 @@ class OnchainTransferPage:
         self._import_target = "full"
         self.m2m_import_drafts: list[dict[str, str]] = []
         self.checked_m2m_draft_rows: set[int] = set()
+        self.generated_wallets: list[GeneratedWalletEntry] = []
+        self.wallet_generator_window = None
+        self.wallet_generator_generate_btn = None
+        self.wallet_generate_count_var = StringVar(value="10")
+        self.wallet_export_format_var = StringVar(value="地址 + 私钥")
 
         self._build_ui()
         start_ui_bridge(self, root=self.root)
@@ -181,6 +202,7 @@ class OnchainTransferPage:
         self._apply_amount_layout()
 
         self.chk_dry_run = ttk.Checkbutton(setting, text="模拟执行", variable=self.dry_run_var)
+        self.chk_use_config_proxy = ttk.Checkbutton(setting, text="使用配置代理", variable=self.use_config_proxy_var)
         self.lbl_delay = ttk.Label(setting, text="执行间隔(秒)")
         self.ent_delay = ttk.Entry(setting, textvariable=self.delay_var, width=7)
         self.lbl_threads = ttk.Label(setting, text="执行线程数")
@@ -263,6 +285,7 @@ class OnchainTransferPage:
         ttk.Button(action1, text="全选/取消全选", command=self.toggle_check_all).pack(side=LEFT, padx=(8, 0))
         ttk.Button(action1, text="删除选中", command=self.delete_selected).pack(side=LEFT, padx=(8, 0))
         ttk.Button(action1, text="保存配置", command=self.save_all).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(action1, text="创建钱包", command=self.open_wallet_generator).pack(side=LEFT, padx=(8, 0))
         ttk.Label(action1, text="链上为独立模块，与交易所互不影响。", style="Subtle.TLabel").pack(side=LEFT, padx=(12, 0))
 
         action2 = ttk.Frame(main)
@@ -319,6 +342,8 @@ class OnchainTransferPage:
         self.network_var.trace_add("write", self._on_network_changed)
         self.coin_var.trace_add("write", self._on_coin_changed)
         self.amount_mode_var.trace_add("write", self._on_amount_mode_changed)
+        self.use_config_proxy_var.trace_add("write", self._on_proxy_config_changed)
+        self.onchain_proxy_var.trace_add("write", self._on_proxy_config_changed)
         self.source_credential_var.trace_add("write", self._on_source_or_target_changed)
         self.target_address_var.trace_add("write", self._on_source_or_target_changed)
 
@@ -331,6 +356,7 @@ class OnchainTransferPage:
         self.root.after_idle(self._on_root_resize)
         self.root.after_idle(self._apply_import_target_view)
         self.root.after_idle(self._update_empty_hint)
+        self.root.after_idle(self._refresh_onchain_proxy_summary)
 
     @staticmethod
     def _make_scrollbar(parent, orient, command):
@@ -396,6 +422,133 @@ class OnchainTransferPage:
     def _runtime_worker_threads(self) -> int:
         raw = self.threads_var.get() if hasattr(self, "threads_var") else 10
         return parse_worker_threads(raw, default=10)
+
+    @staticmethod
+    def _http_get_via_proxy(
+        url: str,
+        *,
+        proxies: dict[str, str] | None = None,
+        timeout: int = 10,
+        allow_system_proxy: bool = True,
+    ):
+        session = requests.Session()
+        try:
+            session.trust_env = bool(allow_system_proxy) and not bool(proxies)
+            if proxies:
+                session.proxies.update(proxies)
+            return session.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        finally:
+            session.close()
+
+    def _allow_onchain_system_proxy(self) -> bool:
+        return not bool(self.use_config_proxy_var.get()) if hasattr(self, "use_config_proxy_var") else True
+
+    def _normalize_onchain_proxy(self, proxy_text: str) -> str:
+        text = str(proxy_text or "").strip()
+        if not text:
+            return ""
+        normalizer = getattr(self, "_proxy_text_normalizer", None)
+        if callable(normalizer):
+            return str(normalizer(text))
+        lower = text.lower()
+        if "://" not in text:
+            text = f"http://{text}"
+            lower = text.lower()
+        if not lower.startswith(("http://", "https://", "socks5://", "socks5h://", "ss://")):
+            raise RuntimeError("代理地址格式不支持，请使用 http://、https://、socks5://、socks5h:// 或 ss://")
+        return text
+
+    def _onchain_proxy_map(self) -> dict[str, str]:
+        if not self.use_config_proxy_var.get():
+            return {}
+        proxy_text = self._normalize_onchain_proxy(self.onchain_proxy_var.get().strip())
+        if not proxy_text:
+            return {}
+        proxy_url = self._rpc_proxy_getter() if callable(self._rpc_proxy_getter) else proxy_text
+        proxy_url = str(proxy_url or "").strip()
+        if not proxy_url:
+            return {}
+        return {"http": proxy_url, "https": proxy_url}
+
+    @staticmethod
+    def _onchain_system_proxy_map() -> dict[str, str]:
+        try:
+            proxies = requests.utils.get_environ_proxies("https://gateway.tenderly.co/public/mainnet") or {}
+        except Exception:
+            return {}
+        result = {}
+        for key in ("http", "https"):
+            value = str(proxies.get(key) or "").strip()
+            if value:
+                result[key] = value
+        return result
+
+    def _onchain_proxy_route_text(self) -> str:
+        raw_proxy = str(self.onchain_proxy_var.get() or "").strip()
+        if not self.use_config_proxy_var.get():
+            system_proxy = self._onchain_system_proxy_map()
+            if system_proxy:
+                return f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}"
+            return "direct"
+        if not raw_proxy:
+            return "direct"
+        if raw_proxy.lower().startswith("ss://"):
+            return "builtin-ss"
+        return f"manual-proxy -> {self._normalize_onchain_proxy(raw_proxy)}"
+
+    def _fetch_onchain_public_ip(self, *, use_config_proxy: bool, allow_system_proxy: bool = True) -> str:
+        urls = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "https://ipinfo.io/ip",
+        ]
+        proxies = self._onchain_proxy_map() if use_config_proxy else None
+        for url in urls:
+            try:
+                resp = self._http_get_via_proxy(
+                    url,
+                    proxies=proxies or None,
+                    timeout=6,
+                    allow_system_proxy=allow_system_proxy,
+                )
+                resp.raise_for_status()
+                ip = (resp.text or "").strip()
+                ipaddress.ip_address(ip)
+                return ip
+            except Exception:
+                continue
+        raise RuntimeError("网络不可达或 IP 服务异常")
+
+    def _test_onchain_proxy_once(self, *, include_exit_ip: bool = True) -> tuple[str, str]:
+        use_config_proxy = bool(self.use_config_proxy_var.get())
+        raw_proxy = str(self.onchain_proxy_var.get() or "").strip()
+        system_proxy = self._onchain_system_proxy_map() if not use_config_proxy else {}
+        status = "跟随系统代理" if system_proxy else "未启用"
+        exit_ip = "--"
+        if use_config_proxy and raw_proxy:
+            status = "SS代理连接中..." if raw_proxy.lower().startswith("ss://") else "代理连接中..."
+        if use_config_proxy:
+            # 触发代理规范化/内置 SS runtime 初始化
+            self._onchain_proxy_map()
+            status = "SS代理已连接" if raw_proxy.lower().startswith("ss://") and raw_proxy else ("代理已连接" if raw_proxy else "未启用")
+            if include_exit_ip:
+                exit_ip = self._fetch_onchain_public_ip(use_config_proxy=True, allow_system_proxy=False)
+        elif system_proxy:
+            if include_exit_ip:
+                exit_ip = self._fetch_onchain_public_ip(use_config_proxy=False, allow_system_proxy=True)
+        else:
+            if include_exit_ip:
+                exit_ip = self._fetch_onchain_public_ip(use_config_proxy=False, allow_system_proxy=False)
+        return status, exit_ip
+
+    def _refresh_onchain_proxy_summary(self) -> None:
+        if self.use_config_proxy_var.get():
+            raw_proxy = str(self.onchain_proxy_var.get() or "").strip()
+            status = "待测试" if raw_proxy else "未启用"
+        else:
+            status = "跟随系统代理" if self._onchain_system_proxy_map() else "未启用"
+        self.onchain_proxy_status_var.set(status)
+        self.onchain_proxy_exit_ip_var.set("--")
 
     def _mask_credential(self, credential: str) -> str:
         s = credential.strip()
@@ -848,10 +1001,59 @@ class OnchainTransferPage:
         task_progress.refresh_if_active(self, kind, row_key)
 
     def _dispatch_ui(self, callback) -> None:
+        if self._closing or bool(getattr(self.root, "_closing", False)):
+            return
         dispatch_ui_callback(self, callback)
+
+    def _start_managed_thread(self, target, *, args=(), kwargs=None, name: str = "onchain-bg", daemon: bool = True) -> threading.Thread:
+        call_kwargs = dict(kwargs or {})
+
+        def runner():
+            try:
+                target(*args, **call_kwargs)
+            finally:
+                current = threading.current_thread()
+                with self._managed_threads_lock:
+                    self._managed_threads.discard(current)
+
+        thread = threading.Thread(target=runner, daemon=daemon, name=name)
+        with self._managed_threads_lock:
+            self._managed_threads.add(thread)
+        thread.start()
+        return thread
+
+    def _managed_threads_snapshot(self) -> list[threading.Thread]:
+        current = threading.current_thread()
+        with self._managed_threads_lock:
+            return [t for t in self._managed_threads if t is not current and t.is_alive()]
+
+    def _join_managed_threads(self, timeout_total: float = 1.0) -> None:
+        deadline = time.monotonic() + max(0.0, float(timeout_total))
+        while True:
+            alive_threads = self._managed_threads_snapshot()
+            if not alive_threads:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            per_thread = max(0.05, remaining / max(1, len(alive_threads)))
+            for thread in alive_threads:
+                thread.join(per_thread)
 
     def _schedule_tree_refresh(self) -> None:
         schedule_ui_callback(self, "tree_refresh", self._refresh_tree, root=getattr(self, "root", None))
+
+    def shutdown(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self.stop_requested.set()
+        try:
+            self._close_wallet_generator()
+        except Exception:
+            pass
+        self._join_managed_threads(timeout_total=1.0)
+        stop_ui_bridge(self)
 
     def _finish_progress(self, kind: str, success: int, failed: int):
         flush_queued_ui_renders(self)
@@ -1225,6 +1427,7 @@ class OnchainTransferPage:
             self.lbl_amount,
             self.amount_ctrl,
             self.chk_dry_run,
+            self.chk_use_config_proxy,
             self.lbl_delay,
             self.ent_delay,
             self.lbl_threads,
@@ -1259,6 +1462,7 @@ class OnchainTransferPage:
             self.lbl_amount.grid(row=0, column=6, sticky=W)
             self.amount_ctrl.grid(row=0, column=7, sticky=W, padx=(4, 10))
             self.chk_dry_run.grid(row=0, column=8, sticky=W, padx=(4, 0))
+            self.chk_use_config_proxy.grid(row=0, column=9, columnspan=3, sticky=W, padx=(10, 0))
 
             self.lbl_contract_search.grid(row=1, column=0, sticky=W, pady=(8, 0))
             self.ent_contract_search.grid(row=1, column=1, columnspan=6, sticky="ew", padx=(4, 10), pady=(8, 0))
@@ -1271,6 +1475,7 @@ class OnchainTransferPage:
             self.setting_frame.columnconfigure(3, weight=1)
             self.setting_frame.columnconfigure(5, weight=1)
             self.setting_frame.columnconfigure(6, weight=1)
+            self.setting_frame.columnconfigure(11, weight=1)
 
             row = 2
             if show_source:
@@ -1300,6 +1505,7 @@ class OnchainTransferPage:
             self.lbl_amount.grid(row=0, column=6, sticky=W)
             self.amount_ctrl.grid(row=0, column=7, sticky=W, padx=(4, 0))
             self.chk_dry_run.grid(row=0, column=8, sticky=W, padx=(10, 0))
+            self.chk_use_config_proxy.grid(row=0, column=9, columnspan=2, sticky=W, padx=(10, 0))
 
             self.lbl_contract_search.grid(row=1, column=0, sticky=W, pady=(8, 0))
             self.ent_contract_search.grid(row=1, column=1, columnspan=5, sticky="ew", padx=(4, 8), pady=(8, 0))
@@ -1363,6 +1569,8 @@ class OnchainTransferPage:
         row += 1
 
         self.chk_dry_run.grid(row=row, column=0, columnspan=2, sticky=W, pady=(8, 0))
+        row += 1
+        self.chk_use_config_proxy.grid(row=row, column=0, columnspan=2, sticky=W, pady=(8, 0))
         row += 1
 
         if show_source:
@@ -1467,6 +1675,7 @@ class OnchainTransferPage:
         self._refresh_tree()
         self._resize_tree_columns()
         self._update_empty_hint()
+        self._update_wallet_generator_import_button()
 
     def _on_network_changed(self, *_args):
         network = self.network_var.get().strip().upper()
@@ -1496,6 +1705,9 @@ class OnchainTransferPage:
         self.target_balance_var.set("-")
         self._update_balance_heading()
         self._refresh_tree()
+
+    def _on_proxy_config_changed(self, *_args):
+        self._refresh_onchain_proxy_summary()
 
     def _on_source_or_target_changed(self, *_args):
         if self._is_mode_1m():
@@ -1549,11 +1761,11 @@ class OnchainTransferPage:
                 return
             if not self._prepare_async_task():
                 return
-            threading.Thread(
-                target=self._run_query_balance_one_to_many,
+            self._start_managed_thread(
+                self._run_query_balance_one_to_many,
                 args=(network, token, source, []),
-                daemon=True,
-            ).start()
+                name="onchain-query-current-source",
+            )
         except Exception as exc:
             self.log(f"转出钱包余额查询启动失败：{exc}")
             self.is_running = False
@@ -1578,11 +1790,11 @@ class OnchainTransferPage:
             self.target_address_var.set(target)
             if not self._prepare_async_task():
                 return
-            threading.Thread(
-                target=self._run_query_balance_many_to_one,
+            self._start_managed_thread(
+                self._run_query_balance_many_to_one,
                 args=(network, token, target, []),
-                daemon=True,
-            ).start()
+                name="onchain-query-current-target",
+            )
         except Exception as exc:
             self.log(f"收款地址余额查询启动失败：{exc}")
             self.is_running = False
@@ -1699,7 +1911,11 @@ class OnchainTransferPage:
             messagebox.showerror("参数错误", "合约地址格式错误")
             return
         self.log(f"开始搜索代币合约：network={network}, contract={contract}")
-        threading.Thread(target=self._run_search_contract_token, args=(network, contract), daemon=True).start()
+        self._start_managed_thread(
+            self._run_search_contract_token,
+            args=(network, contract),
+            name="onchain-search-contract",
+        )
 
     def _run_search_contract_token(self, network: str, contract: str):
         try:
@@ -1720,6 +1936,38 @@ class OnchainTransferPage:
 
     def log(self, text: str):
         queue_log_row(self, self.log_tree, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
+
+    def test_onchain_proxy(self):
+        def worker():
+            test_ok = False
+            try:
+                status, exit_ip = self._test_onchain_proxy_once()
+                route_text = self._onchain_proxy_route_text()
+                test_ok = True
+                log_text = f"链上代理测试成功：status={status}，exit_ip={exit_ip}，route={route_text}"
+            except Exception as exc:
+                if self.use_config_proxy_var.get() and self.onchain_proxy_var.get().strip():
+                    status = "连接失败"
+                elif (not self.use_config_proxy_var.get()) and self._onchain_system_proxy_map():
+                    status = "系统代理异常"
+                else:
+                    status = "未启用"
+                exit_ip = "--"
+                route_text = self._onchain_proxy_route_text()
+                log_text = f"链上代理测试失败：{exc}，route={route_text}"
+
+            def _update():
+                self.onchain_proxy_status_var.set(status)
+                self.onchain_proxy_exit_ip_var.set(exit_ip)
+                self.log(log_text)
+                if test_ok:
+                    messagebox.showinfo("链上代理测试成功", log_text)
+                else:
+                    messagebox.showerror("链上代理测试失败", log_text)
+
+            self._dispatch_ui(_update)
+
+        self._start_managed_thread(worker, name="onchain-proxy-test")
 
     def _parse_m2m_lines(self, lines: list[str]) -> list[OnchainPairEntry]:
         result: list[OnchainPairEntry] = []
@@ -1868,6 +2116,248 @@ class OnchainTransferPage:
         except Exception as exc:
             messagebox.showerror("导出失败", str(exc))
 
+    def _wallet_export_lines(self, format_name: str) -> list[str]:
+        wallets = list(self.generated_wallets)
+        if format_name == "仅地址":
+            return [item.address for item in wallets]
+        if format_name == "仅私钥":
+            return [item.private_key for item in wallets]
+        return [f"{item.address} {item.private_key}" for item in wallets]
+
+    def _wallet_import_button_text(self) -> str:
+        mode = self._mode()
+        if mode == self.MODE_1M:
+            return "导入地址到接收列表"
+        if mode == self.MODE_M1:
+            return "导入私钥到转出列表"
+        return "导入私钥到转出列"
+
+    def _update_wallet_generator_import_button(self) -> None:
+        btn = getattr(self, "wallet_generator_import_btn", None)
+        if btn is None:
+            return
+        try:
+            btn.configure(text=self._wallet_import_button_text())
+        except Exception:
+            pass
+
+    def _close_wallet_generator(self) -> None:
+        window = getattr(self, "wallet_generator_window", None)
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception:
+                pass
+        self.wallet_generator_window = None
+        self.wallet_generator_tree = None
+        self.wallet_generator_import_btn = None
+        self.wallet_generator_generate_btn = None
+
+    def open_wallet_generator(self):
+        window = getattr(self, "wallet_generator_window", None)
+        if window is not None:
+            try:
+                if window.winfo_exists():
+                    window.deiconify()
+                    window.lift()
+                    window.focus_force()
+                    self._update_wallet_generator_import_button()
+                    self._refresh_generated_wallet_tree()
+                    return
+            except Exception:
+                self.wallet_generator_window = None
+
+        window = tk.Toplevel(self.root)
+        window.title("批量创建 EVM 钱包")
+        window.transient(self.root)
+        window.geometry("980x560")
+        window.minsize(860, 420)
+        window.protocol("WM_DELETE_WINDOW", self._close_wallet_generator)
+        self.wallet_generator_window = window
+
+        main = ttk.Frame(window, padding=12)
+        main.pack(fill=BOTH, expand=True)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(2, weight=1)
+
+        tips = ttk.LabelFrame(main, text="说明", padding=10)
+        tips.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            tips,
+            text="本地离线批量创建 EVM 钱包，默认复用当前页面“执行线程数”；结果仅在当前窗口展示，如需持久化，请导入主表后再点击“保存配置”。",
+            style="Subtle.TLabel",
+            wraplength=900,
+            justify="left",
+        ).pack(anchor="w")
+
+        ctrl = ttk.Frame(main)
+        ctrl.grid(row=1, column=0, sticky="ew", pady=(10, 10))
+        ttk.Label(ctrl, text="创建数量").pack(side=LEFT)
+        ent_count = ttk.Entry(ctrl, textvariable=self.wallet_generate_count_var, width=8)
+        ent_count.pack(side=LEFT, padx=(6, 10))
+        bind_paste_shortcuts(ent_count)
+        self.wallet_generator_generate_btn = ttk.Button(ctrl, text="立即创建", command=self.generate_wallets)
+        self.wallet_generator_generate_btn.pack(side=LEFT)
+        ttk.Label(ctrl, text="导出格式").pack(side=LEFT, padx=(16, 6))
+        fmt_box = ttk.Combobox(
+            ctrl,
+            textvariable=self.wallet_export_format_var,
+            values=["地址 + 私钥", "仅地址", "仅私钥"],
+            width=14,
+            state="readonly",
+        )
+        fmt_box.pack(side=LEFT)
+        ttk.Button(ctrl, text="复制到剪贴板", command=self.copy_generated_wallets).pack(side=LEFT, padx=(10, 0))
+        ttk.Button(ctrl, text="导出 TXT", command=self.export_generated_wallets).pack(side=LEFT, padx=(8, 0))
+        self.wallet_generator_import_btn = ttk.Button(ctrl, text=self._wallet_import_button_text(), command=self.import_generated_wallets)
+        self.wallet_generator_import_btn.pack(side=LEFT, padx=(8, 0))
+        ttk.Button(ctrl, text="关闭", command=self._close_wallet_generator).pack(side=RIGHT)
+
+        table_box = ttk.Frame(main)
+        table_box.grid(row=2, column=0, sticky="nsew")
+        table_box.columnconfigure(0, weight=1)
+        table_box.rowconfigure(0, weight=1)
+
+        tree = ttk.Treeview(table_box, columns=("idx", "address", "private_key"), show="headings", height=16)
+        tree.heading("idx", text="编号")
+        tree.heading("address", text="地址")
+        tree.heading("private_key", text="私钥")
+        tree.column("idx", width=56, anchor="center", stretch=False)
+        tree.column("address", width=330, anchor="w", stretch=True)
+        tree.column("private_key", width=520, anchor="w", stretch=True)
+        ybar = self._make_scrollbar(table_box, orient=VERTICAL, command=tree.yview)
+        xbar = self._make_scrollbar(table_box, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        self.wallet_generator_tree = tree
+
+        self._update_wallet_generator_import_button()
+        self._refresh_generated_wallet_tree()
+
+    def _set_wallet_generator_busy(self, busy: bool) -> None:
+        btn = getattr(self, "wallet_generator_generate_btn", None)
+        if btn is None:
+            return
+        try:
+            btn.configure(state="disabled" if busy else "normal")
+        except Exception:
+            pass
+
+    def _refresh_generated_wallet_tree(self) -> None:
+        tree = getattr(self, "wallet_generator_tree", None)
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        for i, item in enumerate(self.generated_wallets, start=1):
+            tree.insert("", END, iid=f"wallet_{i}", values=(i, item.address, item.private_key))
+
+    def generate_wallets(self):
+        try:
+            count = int(str(self.wallet_generate_count_var.get()).strip())
+        except Exception:
+            messagebox.showerror("创建失败", "创建数量格式错误", parent=getattr(self, "wallet_generator_window", None) or self.root)
+            return
+        workers = self._runtime_worker_threads()
+        self._set_wallet_generator_busy(True)
+        self.log(f"钱包生成器开始创建：数量={count}，执行线程数={workers}")
+        self._start_managed_thread(
+            self._run_generate_wallets,
+            args=(count, workers),
+            name="onchain-generate-wallets",
+        )
+
+    def _run_generate_wallets(self, count: int, workers: int) -> None:
+        try:
+            wallets = self.client.create_wallets(count, worker_threads=workers)
+        except Exception as exc:
+            self._dispatch_ui(
+                lambda err=str(exc): (
+                    self._set_wallet_generator_busy(False),
+                    messagebox.showerror("创建失败", err, parent=getattr(self, "wallet_generator_window", None) or self.root),
+                )
+            )
+            return
+
+        def apply_result() -> None:
+            self.generated_wallets = wallets
+            self._refresh_generated_wallet_tree()
+            self._set_wallet_generator_busy(False)
+            self.log(f"钱包生成器创建完成：新增 {len(wallets)} 个 EVM 钱包，执行线程数={workers}")
+
+        self._dispatch_ui(apply_result)
+
+    def copy_generated_wallets(self):
+        if not self.generated_wallets:
+            messagebox.showwarning("提示", "请先创建钱包", parent=getattr(self, "wallet_generator_window", None) or self.root)
+            return
+        lines = self._wallet_export_lines(self.wallet_export_format_var.get().strip())
+        text = "\n".join(lines)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+        self.log(f"钱包生成器已复制 {len(lines)} 条到剪贴板")
+
+    def export_generated_wallets(self):
+        from tkinter import filedialog
+
+        if not self.generated_wallets:
+            messagebox.showwarning("提示", "请先创建钱包", parent=getattr(self, "wallet_generator_window", None) or self.root)
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出钱包 TXT",
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt")],
+            parent=getattr(self, "wallet_generator_window", None) or self.root,
+        )
+        if not path:
+            return
+        try:
+            lines = self._wallet_export_lines(self.wallet_export_format_var.get().strip())
+            Path(path).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            self.log(f"钱包生成器 TXT 导出完成：{path}")
+            messagebox.showinfo("导出完成", f"已导出 {len(lines)} 条", parent=getattr(self, "wallet_generator_window", None) or self.root)
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc), parent=getattr(self, "wallet_generator_window", None) or self.root)
+
+    def import_generated_wallets(self):
+        if not self.generated_wallets:
+            messagebox.showwarning("提示", "请先创建钱包", parent=getattr(self, "wallet_generator_window", None) or self.root)
+            return
+
+        mode = self._mode()
+        if mode == self.MODE_1M:
+            rows = [item.address for item in self.generated_wallets]
+            created = self.store.upsert_one_to_many_addresses(rows)
+            self.checked_row_keys = set(self._active_row_keys())
+            self._refresh_tree()
+            self.log(f"钱包生成器导入完成：新增 {created} 条接收地址，已自动全选 {len(self.store.one_to_many_addresses)} 条")
+            return
+
+        if mode == self.MODE_M1:
+            rows = [item.private_key for item in self.generated_wallets]
+            created = self.store.upsert_many_to_one_sources(rows)
+            self.checked_row_keys = set(self._active_row_keys())
+            self._refresh_tree()
+            self.log(f"钱包生成器导入完成：新增 {created} 条转出钱包，已自动全选 {len(self.store.many_to_one_sources)} 条")
+            return
+
+        values = [item.private_key for item in self.generated_wallets]
+        merge_column_values(self.m2m_import_drafts, ("source", "target"), "source", values)
+        completed, created = self._promote_complete_m2m_drafts()
+        if completed:
+            self.checked_row_keys = set(self._active_row_keys())
+        self._refresh_tree()
+        parts = [f"钱包生成器导入完成：写入 {len(values)} 条转出凭证列"]
+        if completed:
+            parts.append(f"补齐 {completed} 条")
+        if created:
+            parts.append(f"新增 {created} 条")
+        if self.m2m_import_drafts:
+            parts.append(f"待补齐 {len(self.m2m_import_drafts)} 行")
+        self.log("，".join(parts))
+
     def toggle_check_all(self):
         keys = set(self._active_row_keys())
         draft_rows = set(range(len(self.m2m_import_drafts))) if self._is_mode_m2m() else set()
@@ -2002,6 +2492,14 @@ class OnchainTransferPage:
         except Exception:
             messagebox.showerror("参数错误", "执行线程数格式错误")
             return False
+        proxy_text = self.onchain_proxy_var.get().strip()
+        if self.use_config_proxy_var.get():
+            try:
+                proxy_text = self._normalize_onchain_proxy(proxy_text)
+            except Exception as exc:
+                messagebox.showerror("参数错误", str(exc))
+                return False
+        self.onchain_proxy_var.set(proxy_text)
 
         self.store.settings = OnchainSettings(
             mode=mode,
@@ -2015,6 +2513,8 @@ class OnchainTransferPage:
             delay_seconds=delay,
             worker_threads=threads,
             dry_run=bool(self.dry_run_var.get()),
+            use_config_proxy=bool(self.use_config_proxy_var.get()),
+            proxy_url=proxy_text,
             one_to_many_source=self.source_credential_var.get().strip(),
             many_to_one_target="",
         )
@@ -2048,6 +2548,7 @@ class OnchainTransferPage:
     def _load_data(self):
         try:
             self.store.load()
+            notice = str(getattr(self.store, "last_load_notice", "") or "").strip()
             st = self.store.settings
             loaded_mode = st.mode if st.mode in {self.MODE_M2M, self.MODE_1M, self.MODE_M1} else self.MODE_M2M
             self.mode_var.set(loaded_mode)
@@ -2066,6 +2567,8 @@ class OnchainTransferPage:
             self.delay_var.set(st.delay_seconds)
             self.threads_var.set(str(max(1, int(st.worker_threads or 1))))
             self.dry_run_var.set(st.dry_run)
+            self.use_config_proxy_var.set(bool(st.use_config_proxy))
+            self.onchain_proxy_var.set(st.proxy_url or "")
             self.source_credential_var.set(st.one_to_many_source or "")
             loaded_target = st.many_to_one_target or ""
             try:
@@ -2079,6 +2582,8 @@ class OnchainTransferPage:
             self.checked_row_keys = set(self._active_row_keys())
             self._on_coin_changed()
             self._on_mode_changed()
+            if notice:
+                self.log(notice)
             self.log("链上配置加载完成")
         except Exception as exc:
             messagebox.showerror("加载失败", str(exc))
@@ -2373,11 +2878,11 @@ class OnchainTransferPage:
                 self._set_query_statuses([self._one_to_many_key(t) for t in targets], "waiting")
                 self.stop_requested.clear()
                 self.is_running = True
-                threading.Thread(
-                    target=self._run_query_balance_one_to_many,
+                self._start_managed_thread(
+                    self._run_query_balance_one_to_many,
                     args=(network, token, source, targets),
-                    daemon=True,
-                ).start()
+                    name="onchain-query-one-to-many",
+                )
                 return
 
             if mode == self.MODE_M1:
@@ -2406,11 +2911,11 @@ class OnchainTransferPage:
                 self._set_query_statuses([self._many_to_one_key(s) for s in sources], "waiting")
                 self.stop_requested.clear()
                 self.is_running = True
-                threading.Thread(
-                    target=self._run_query_balance_many_to_one,
+                self._start_managed_thread(
+                    self._run_query_balance_many_to_one,
                     args=(network, token, target, sources),
-                    daemon=True,
-                ).start()
+                    name="onchain-query-many-to-one",
+                )
                 return
 
             selected_pairs = [x for x in self.store.multi_to_multi_pairs if self._m2m_key(x) in self.checked_row_keys]
@@ -2434,7 +2939,11 @@ class OnchainTransferPage:
             self._set_query_statuses([key for keys in row_keys_by_source.values() for key in keys], "waiting")
             self.stop_requested.clear()
             self.is_running = True
-            threading.Thread(target=self._run_query_balance_for_sources, args=(network, token, sources), daemon=True).start()
+            self._start_managed_thread(
+                self._run_query_balance_for_sources,
+                args=(network, token, sources),
+                name="onchain-query-multi-to-multi",
+            )
         except Exception as exc:
             self.log(f"余额查询启动失败：{exc}")
             messagebox.showerror("执行异常", str(exc))
@@ -2469,11 +2978,11 @@ class OnchainTransferPage:
                 self.is_running = True
                 self._mark_query_status_context(self._one_to_many_key(target), source)
                 self._set_query_status(self._one_to_many_key(target), "waiting")
-                threading.Thread(
-                    target=self._run_query_balance_one_to_many,
+                self._start_managed_thread(
+                    self._run_query_balance_one_to_many,
                     args=(network, token, source, [target]),
-                    daemon=True,
-                ).start()
+                    name="onchain-query-row-one-to-many",
+                )
                 return
             if mode == self.MODE_M1:
                 target_addr = target
@@ -2488,21 +2997,21 @@ class OnchainTransferPage:
                 self.is_running = True
                 self._mark_query_status_context(self._many_to_one_key(source), self._normalize_context_target(target_addr))
                 self._set_query_status(self._many_to_one_key(source), "waiting")
-                threading.Thread(
-                    target=self._run_query_balance_many_to_one,
+                self._start_managed_thread(
+                    self._run_query_balance_many_to_one,
                     args=(network, token, target_addr, [source]),
-                    daemon=True,
-                ).start()
+                    name="onchain-query-row-many-to-one",
+                )
                 return
             self._query_row_keys_by_source = {source: [_row_key]}
             self._set_query_status(_row_key, "waiting")
             self.stop_requested.clear()
             self.is_running = True
-            threading.Thread(
-                target=self._run_query_balance_for_sources,
+            self._start_managed_thread(
+                self._run_query_balance_for_sources,
                 args=(network, token, [source]),
-                daemon=True,
-            ).start()
+                name="onchain-query-row-multi-to-multi",
+            )
         except Exception as exc:
             self.log(f"当前行余额查询启动失败：{exc}")
             messagebox.showerror("执行异常", str(exc))
@@ -2578,7 +3087,11 @@ class OnchainTransferPage:
             self.log(f"已启动当前行转账任务：mode={self._mode()}，币种={token_desc}")
             self.stop_requested.clear()
             self.is_running = True
-            threading.Thread(target=self._run_batch_transfer, args=([(row_key, source, target)], params, dry_run), daemon=True).start()
+            self._start_managed_thread(
+                self._run_batch_transfer,
+                args=([(row_key, source, target)], params, dry_run),
+                name="onchain-transfer-current-row",
+            )
         except Exception as exc:
             self.log(f"当前行转账启动失败：{exc}")
             messagebox.showerror("执行异常", str(exc))
@@ -3052,7 +3565,11 @@ class OnchainTransferPage:
             self.log(f"已启动批量转账任务准备：任务={len(jobs)}，币种={token_desc}")
             self.stop_requested.clear()
             self.is_running = True
-            threading.Thread(target=self._run_batch_transfer, args=(jobs, params, dry_run), daemon=True).start()
+            self._start_managed_thread(
+                self._run_batch_transfer,
+                args=(jobs, params, dry_run),
+                name="onchain-transfer-batch",
+            )
         except Exception as exc:
             self.log(f"批量转账启动失败：{exc}")
             messagebox.showerror("执行异常", str(exc))
@@ -3112,7 +3629,11 @@ class OnchainTransferPage:
             self.log(f"开始重试失败任务：{len(jobs)}")
             self.stop_requested.clear()
             self.is_running = True
-            threading.Thread(target=self._run_batch_transfer, args=(jobs, params, dry_run), daemon=True).start()
+            self._start_managed_thread(
+                self._run_batch_transfer,
+                args=(jobs, params, dry_run),
+                name="onchain-transfer-retry-failed",
+            )
         except Exception as exc:
             self.log(f"失败重试启动异常：{exc}")
             messagebox.showerror("执行异常", str(exc))

@@ -28,10 +28,22 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from api_clients import EvmClient
-from app_paths import APP_DIR, BUNDLE_DIR, DATA_DIR, EXCHANGE_PROXY_CONFIG_FILE, STRATEGY_CONFIG_FILE
+from app_paths import (
+    APP_DIR,
+    BUNDLE_DIR,
+    CONFIG_BACKUP_SUFFIX,
+    DATA_DIR,
+    EXCHANGE_PROXY_CONFIG_FILE,
+    LOG_DIR,
+    LOG_FILE_PATH,
+    STRATEGY_CONFIG_FILE,
+    TOTAL_ASSET_RESULT_FILE,
+    WITHDRAW_SUCCESS_FILE,
+)
 from exchange_binance_client import BinanceClient
 from secret_box import SECRET_BOX
-from shared_utils import SolidButton, dispatch_ui_callback, make_scrollbar, start_ui_bridge
+from shared_utils import SolidButton, dispatch_ui_callback, make_scrollbar, start_ui_bridge, stop_ui_bridge
+from stores import _atomic_write_text, _atomic_write_text_with_backup, _load_json_with_backup
 
 try:
     from page_onchain import OnchainTransferPage
@@ -44,6 +56,7 @@ except Exception as e:
 API_KEY_DEFAULT = ""
 API_SECRET_DEFAULT = ""
 EXCHANGE_PROXY_DEFAULT = ""
+EXCHANGE_USE_CONFIG_PROXY_DEFAULT = False
 
 SPOT_SYMBOL_DEFAULT = "BNBUSDT"
 SPOT_ROUNDS_DEFAULT = 20
@@ -135,8 +148,9 @@ class ExchangeProxyRuntime:
     }
     _SING_BOX_RELEASE_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 
-    def __init__(self, work_dir: Path):
+    def __init__(self, work_dir: Path, runtime_name: str = "exchange"):
         self.work_dir = Path(work_dir)
+        self.runtime_name = str(runtime_name or "exchange").strip() or "exchange"
         self._lock = threading.RLock()
         self._proc = None
         self._raw_source = ""
@@ -526,11 +540,11 @@ class ExchangeProxyRuntime:
     def _runtime_file_path(self, prefix: str, suffix: str) -> Path:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         token = uuid.uuid4().hex[:10]
-        return self.work_dir / f"{prefix}_{os.getpid()}_{token}{suffix}"
+        return self.work_dir / f"{self.runtime_name}_{prefix}_{os.getpid()}_{token}{suffix}"
 
     def _runtime_log_path(self) -> Path:
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        return self.work_dir / f"exchange_proxy_runtime_{os.getpid()}.log"
+        return self.work_dir / f"{self.runtime_name}_proxy_runtime_{os.getpid()}.log"
 
     def _read_log_tail(self, max_chars: int = 1200) -> str:
         log_path = self._log_path
@@ -577,7 +591,7 @@ class ExchangeProxyRuntime:
 
     def _write_sing_box_config(self, ss_info: dict[str, object], listen_port: int) -> Path:
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        config_path = self._runtime_file_path("exchange_ss_proxy", ".json")
+        config_path = self._runtime_file_path("ss_proxy", ".json")
         cfg = {
             "log": {"level": "warn"},
             "inbounds": [
@@ -602,12 +616,12 @@ class ExchangeProxyRuntime:
             ],
             "route": {"final": "ss-out"},
         }
-        config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(config_path, cfg)
         return config_path
 
     def _write_xray_config(self, ss_info: dict[str, object], listen_port: int) -> Path:
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        config_path = self._runtime_file_path("exchange_ss_proxy_xray", ".json")
+        config_path = self._runtime_file_path("ss_proxy_xray", ".json")
         cfg = {
             "log": {"loglevel": "warning"},
             "inbounds": [
@@ -636,7 +650,7 @@ class ExchangeProxyRuntime:
                 }
             ],
         }
-        config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(config_path, cfg)
         return config_path
 
     def _wait_ready(self, local_proxy_url: str, timeout_sec: float = 12.0) -> None:
@@ -747,15 +761,16 @@ def http_get_via_proxy(
     allow_system_proxy: bool = True,
 ):
     session = requests.Session()
-    session.trust_env = bool(allow_system_proxy) and not bool(proxies)
-    if proxies:
-        session.proxies.update(proxies)
-    return session.get(url, timeout=timeout, headers=headers or {})
+    try:
+        session.trust_env = bool(allow_system_proxy) and not bool(proxies)
+        if proxies:
+            session.proxies.update(proxies)
+        return session.get(url, timeout=timeout, headers=headers or {})
+    finally:
+        session.close()
 
 # ====================== 日志 & 队列 ======================
 log_queue = queue.Queue()
-LOG_DIR = DATA_DIR / "logs"
-LOG_FILE_PATH = APP_DIR / "bot_log.txt"
 LOG_FILE_RUNTIME_PREFIX = "exchange_runtime"
 LOG_FILE_RETENTION_COUNT = 20
 LOG_FILE_TOTAL_SIZE_LIMIT_BYTES = 200 * 1024 * 1024
@@ -816,6 +831,45 @@ def _prune_runtime_logs(current_path: Path | None = None) -> None:
 _tk_handler = TkLogHandler()
 _tk_handler.setFormatter(_formatter)
 logger.addHandler(_tk_handler)
+
+
+def _json_dump_text(payload: object) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _read_text_snapshot(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def _restore_text_snapshot(path: Path, snapshot: str | None) -> None:
+    if snapshot is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            path.with_name(f"{path.name}{CONFIG_BACKUP_SUFFIX}").unlink()
+        except FileNotFoundError:
+            pass
+        return
+    _atomic_write_text_with_backup(path, snapshot, encoding="utf-8")
+
+
+def _atomic_write_json(path: Path, payload: object) -> None:
+    _atomic_write_text(path, _json_dump_text(payload), encoding="utf-8")
+
+
+def _atomic_write_config_json(path: Path, payload: object) -> None:
+    _atomic_write_text_with_backup(path, _json_dump_text(payload), encoding="utf-8")
+
+
+def _require_dict_payload(raw: object) -> None:
+    if isinstance(raw, dict):
+        return
+    raise RuntimeError("配置文件结构无效")
+
 
 _runtime_log_path = None
 try:
@@ -1702,7 +1756,19 @@ class App(tk.Tk):
         self.worker_thread = None
         self.stop_event = None
         self._batch_task_active = False
-        self.exchange_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent)
+        self._closing = False
+        self._close_finalized = False
+        self._close_deadline_monotonic = 0.0
+        self._close_wait_after_token = None
+        self._log_poll_after_token = None
+        self._update_ip_after_token = None
+        self._ip_refresh_inflight = False
+        self._ip_refresh_lock = threading.Lock()
+        self._result_file_lock = threading.Lock()
+        self._managed_threads_lock = threading.Lock()
+        self._managed_threads: set[threading.Thread] = set()
+        self.exchange_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="exchange")
+        self.onchain_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="onchain")
 
         self.accounts = []
         self.total_asset_results = {}
@@ -1712,13 +1778,14 @@ class App(tk.Tk):
         start_ui_bridge(self, root=self)
         self._load_strategy_config()
         self._load_exchange_proxy_config()
-        self.after(100, self._poll_log_queue)
+        self._log_poll_after_token = self.after(100, self._poll_log_queue)
         self.update_ip()
 
     def _build_ui(self):
         self.api_key_var = tk.StringVar(value=API_KEY_DEFAULT)
         self.api_secret_var = tk.StringVar(value=API_SECRET_DEFAULT)
         self.exchange_proxy_var = tk.StringVar(value=EXCHANGE_PROXY_DEFAULT)
+        self.use_exchange_config_proxy_var = tk.BooleanVar(value=EXCHANGE_USE_CONFIG_PROXY_DEFAULT)
         self.trade_account_type_var = tk.StringVar(value=TRADE_ACCOUNT_TYPE_DEFAULT)
         self.spot_rounds_var = tk.IntVar(value=SPOT_ROUNDS_DEFAULT)
         self.trade_mode_var = tk.StringVar(value=TRADE_MODE_DEFAULT)
@@ -1747,6 +1814,8 @@ class App(tk.Tk):
         self.ip_var = tk.StringVar(value="获取中...")
         self.exchange_proxy_status_var = tk.StringVar(value="未启用")
         self.exchange_proxy_exit_ip_var = tk.StringVar(value="--")
+        self.top_proxy_name_var = tk.StringVar(value="交易所代理:")
+        self.top_proxy_test_btn_text_var = tk.StringVar(value="测试交易所代理")
         self._current_main_page = "exchange"
 
         self.main_tabs = None
@@ -1786,14 +1855,18 @@ class App(tk.Tk):
         proxy_bar.grid(row=0, column=1, sticky="e")
         ttk.Label(proxy_bar, text="本机直连 IP:").grid(row=0, column=0, sticky="e")
         ttk.Label(proxy_bar, textvariable=self.ip_var).grid(row=0, column=1, sticky="w", padx=(4, 12))
-        ttk.Label(proxy_bar, text="代理:").grid(row=0, column=2, sticky="e")
-        ttk.Entry(proxy_bar, textvariable=self.exchange_proxy_var, width=24).grid(row=0, column=3, sticky="w", padx=(4, 6))
-        self.btn_test_exchange_proxy = ttk.Button(proxy_bar, text="代理测试", command=self.test_exchange_proxy)
-        self.btn_test_exchange_proxy.grid(row=0, column=4, sticky="w", padx=(0, 12))
+        self.lbl_top_proxy_name = ttk.Label(proxy_bar, textvariable=self.top_proxy_name_var)
+        self.lbl_top_proxy_name.grid(row=0, column=2, sticky="e")
+        self.ent_top_proxy = ttk.Entry(proxy_bar, textvariable=self.exchange_proxy_var, width=24)
+        self.ent_top_proxy.grid(row=0, column=3, sticky="w", padx=(4, 6))
+        self.btn_top_proxy_test = ttk.Button(proxy_bar, textvariable=self.top_proxy_test_btn_text_var, command=self.test_exchange_proxy)
+        self.btn_top_proxy_test.grid(row=0, column=4, sticky="w", padx=(0, 12))
         ttk.Label(proxy_bar, text="状态:").grid(row=0, column=5, sticky="e")
-        ttk.Label(proxy_bar, textvariable=self.exchange_proxy_status_var).grid(row=0, column=6, sticky="w", padx=(4, 12))
+        self.lbl_top_proxy_status = ttk.Label(proxy_bar, textvariable=self.exchange_proxy_status_var)
+        self.lbl_top_proxy_status.grid(row=0, column=6, sticky="w", padx=(4, 12))
         ttk.Label(proxy_bar, text="出口 IP:").grid(row=0, column=7, sticky="e")
-        ttk.Label(proxy_bar, textvariable=self.exchange_proxy_exit_ip_var).grid(row=0, column=8, sticky="w", padx=(4, 0))
+        self.lbl_top_proxy_exit_ip = ttk.Label(proxy_bar, textvariable=self.exchange_proxy_exit_ip_var)
+        self.lbl_top_proxy_exit_ip.grid(row=0, column=8, sticky="w", padx=(4, 0))
 
         self.main_content = ttk.Frame(self)
         self.main_content.pack(fill="both", expand=True, padx=8, pady=(4, 8))
@@ -1928,6 +2001,8 @@ class App(tk.Tk):
         self.skip_usdt_wait_in_batch_var = tk.BooleanVar(value=False)
         self._current_batch_summary = None
         self._last_batch_retry = None
+        self._batch_summary_lock = threading.Lock()
+        self.exchange_batch_summary_var = tk.StringVar(value="结果汇总：成功0 | 失败0 | 提现总额=- | 余额总额=-")
 
         frame_batch_opts = ttk.Frame(frame_acc)
         frame_batch_opts.pack(fill="x", padx=5, pady=(0, 5))
@@ -1953,6 +2028,7 @@ class App(tk.Tk):
             state="disabled",
         )
         self.btn_retry_failed_accounts.pack(side="left", padx=(8, 0))
+        ttk.Label(frame_batch_opts, textvariable=self.exchange_batch_summary_var, foreground="#666666").pack(side="left", padx=(12, 0))
 
         frame_log = ttk.LabelFrame(self.exchange_tab, text="运行日志")
         frame_log.pack(fill="both", expand=True, padx=10, pady=5)
@@ -1978,7 +2054,11 @@ class App(tk.Tk):
 
         if OnchainTransferPage is not None:
             try:
-                self.onchain_page = OnchainTransferPage(onchain_body, rpc_proxy_getter=self._get_exchange_proxy_url)
+                self.onchain_page = OnchainTransferPage(
+                    onchain_body,
+                    rpc_proxy_getter=self._get_onchain_proxy_url,
+                    proxy_text_normalizer=self._normalize_proxy_text,
+                )
             except Exception as exc:
                 self.onchain_page = None
                 logger.exception("链上页面初始化失败: %s", exc)
@@ -1992,6 +2072,7 @@ class App(tk.Tk):
             fail_box.pack(fill="both", expand=True, padx=12, pady=12)
             ttk.Label(fail_box, text=f"链上页面导入失败：{_ONCHAIN_IMPORT_ERROR}").pack(anchor="w", padx=8, pady=(8, 4))
             ttk.Label(fail_box, text="请检查运行依赖：eth-account、eth-utils").pack(anchor="w", padx=8, pady=(0, 8))
+        self._refresh_top_proxy_binding()
 
         # 快捷键：Ctrl+V / Cmd+V 直接触发“从剪贴板导入账号”
         self.bind_all("<Control-v>", self._on_paste_shortcut, add="+")
@@ -2014,6 +2095,23 @@ class App(tk.Tk):
                 activeforeground="#111111",
             )
 
+    def _refresh_top_proxy_binding(self):
+        page = self._current_main_page
+        if page == "onchain" and getattr(self, "onchain_page", None) is not None:
+            self.top_proxy_name_var.set("链上RPC代理:")
+            self.top_proxy_test_btn_text_var.set("测试链上代理")
+            self.ent_top_proxy.configure(textvariable=self.onchain_page.onchain_proxy_var)
+            self.btn_top_proxy_test.configure(command=self.onchain_page.test_onchain_proxy, state="normal")
+            self.lbl_top_proxy_status.configure(textvariable=self.onchain_page.onchain_proxy_status_var)
+            self.lbl_top_proxy_exit_ip.configure(textvariable=self.onchain_page.onchain_proxy_exit_ip_var)
+            return
+        self.top_proxy_name_var.set("交易所代理:")
+        self.top_proxy_test_btn_text_var.set("测试交易所代理")
+        self.ent_top_proxy.configure(textvariable=self.exchange_proxy_var)
+        self.btn_top_proxy_test.configure(command=self.test_exchange_proxy, state="normal")
+        self.lbl_top_proxy_status.configure(textvariable=self.exchange_proxy_status_var)
+        self.lbl_top_proxy_exit_ip.configure(textvariable=self.exchange_proxy_exit_ip_var)
+
     def _show_main_page(self, page_name: str):
         target = self.exchange_tab if page_name == "exchange" else self.onchain_tab
         if self._current_main_page != page_name:
@@ -2028,6 +2126,7 @@ class App(tk.Tk):
             pass
         target.pack(fill="both", expand=True)
         self._refresh_main_page_tab_buttons()
+        self._refresh_top_proxy_binding()
 
     @staticmethod
     def _clear_container_children(container):
@@ -2370,9 +2469,10 @@ class App(tk.Tk):
 
         ttk.Label(row1, text="USDT \u5230\u8d26\u8d85\u65f6(\u79d2):").grid(row=0, column=2, sticky="e", padx=(12, 0))
         ttk.Entry(row1, textvariable=self.usdt_timeout_var, width=8).grid(row=0, column=3, sticky="w", padx=(4, 12))
+        ttk.Checkbutton(row1, text="使用配置的代理", variable=self.use_exchange_config_proxy_var).grid(row=0, column=4, sticky="w", padx=(0, 12))
 
         self.btn_save_strategy_config = ttk.Button(row1, text="\u4fdd\u5b58\u914d\u7f6e", command=self.save_strategy_config)
-        self.btn_save_strategy_config.grid(row=0, column=4, sticky="w")
+        self.btn_save_strategy_config.grid(row=0, column=5, sticky="w")
 
         row2 = ttk.Frame(frame_top)
         row2.pack(fill="x", padx=5, pady=3)
@@ -2503,10 +2603,117 @@ class App(tk.Tk):
         self.after_idle(self._align_trade_mode_sections)
 
     def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._close_deadline_monotonic = time.monotonic() + 2.5
+        logger.info("收到窗口关闭请求，开始优雅停止后台任务")
+        self._cancel_after_token("_update_ip_after_token")
+        self._cancel_after_token("_log_poll_after_token")
+        try:
+            self.stop_bot()
+        except Exception:
+            pass
+        page = getattr(self, "onchain_page", None)
+        if page is not None:
+            try:
+                page.shutdown()
+            except Exception:
+                pass
+        self._complete_close_when_idle()
+
+    def _cancel_after_token(self, attr_name: str) -> None:
+        token = getattr(self, attr_name, None)
+        if token is None:
+            return
+        setattr(self, attr_name, None)
+        try:
+            self.after_cancel(token)
+        except Exception:
+            pass
+
+    def _start_managed_thread(self, target, *, args=(), kwargs=None, name: str = "app-bg", daemon: bool = True) -> threading.Thread:
+        call_kwargs = dict(kwargs or {})
+
+        def runner():
+            try:
+                target(*args, **call_kwargs)
+            finally:
+                current = threading.current_thread()
+                with self._managed_threads_lock:
+                    self._managed_threads.discard(current)
+
+        thread = threading.Thread(target=runner, daemon=daemon, name=name)
+        with self._managed_threads_lock:
+            self._managed_threads.add(thread)
+        thread.start()
+        return thread
+
+    def _managed_threads_snapshot(self) -> list[threading.Thread]:
+        current = threading.current_thread()
+        with self._managed_threads_lock:
+            return [t for t in self._managed_threads if t is not current and t.is_alive()]
+
+    def _join_managed_threads(self, timeout_total: float = 1.0) -> None:
+        deadline = time.monotonic() + max(0.0, float(timeout_total))
+        while True:
+            alive_threads = self._managed_threads_snapshot()
+            if not alive_threads:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            per_thread = max(0.05, remaining / max(1, len(alive_threads)))
+            for thread in alive_threads:
+                thread.join(per_thread)
+
+    def _background_shutdown_pending(self) -> bool:
+        if self.worker_thread and self.worker_thread.is_alive():
+            return True
+        if self._managed_threads_snapshot():
+            return True
+        page = getattr(self, "onchain_page", None)
+        if page is not None and bool(getattr(page, "is_running", False)):
+            return True
+        return False
+
+    def _complete_close_when_idle(self):
+        self._close_wait_after_token = None
+        if self._background_shutdown_pending() and time.monotonic() < self._close_deadline_monotonic:
+            try:
+                self._close_wait_after_token = self.after(100, self._complete_close_when_idle)
+                return
+            except Exception:
+                self._close_wait_after_token = None
+        self._finalize_close()
+
+    def _finalize_close(self):
+        if self._close_finalized:
+            return
+        self._close_finalized = True
+        self._cancel_after_token("_close_wait_after_token")
+        self._cancel_after_token("_update_ip_after_token")
+        self._cancel_after_token("_log_poll_after_token")
+        page = getattr(self, "onchain_page", None)
+        if page is not None:
+            try:
+                page.shutdown()
+            except Exception:
+                pass
+        try:
+            stop_ui_bridge(self)
+        except Exception:
+            pass
         try:
             self.exchange_proxy_runtime.stop()
         except Exception:
             pass
+        try:
+            self.onchain_proxy_runtime.stop()
+        except Exception:
+            pass
+        self._join_managed_threads(timeout_total=1.0)
+        self._clear_current_binance_client()
         self.destroy()
 
     def _setup_account_list_mousewheel_bindings(self):
@@ -2704,10 +2911,11 @@ class App(tk.Tk):
     def record_withdraw(self, index, api_key, address, amount):
         line = f"{index}+{api_key}+{address}+{amount:.8f}\n"
         try:
-            fname = "withdraw_success.txt"
-            with open(fname, "a", encoding="utf-8") as f:
-                f.write(line)
-            logger.info("已记录提现到 %s：%s", fname, line.strip())
+            WITHDRAW_SUCCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with self._result_file_lock:
+                with open(WITHDRAW_SUCCESS_FILE, "a", encoding="utf-8") as f:
+                    f.write(line)
+            logger.info("已记录提现到 %s：%s", WITHDRAW_SUCCESS_FILE, line.strip())
         except Exception as e:
             logger.error("写入提现记录文件失败: %s", e)
 
@@ -2716,20 +2924,21 @@ class App(tk.Tk):
         line = f"{index}+{api_key}+{total_dec:.8f}\n"
 
         try:
-            fname = "total_asset_result.txt"
-            with open(fname, "a", encoding="utf-8") as f:
-                f.write(line)
-            logger.info("已记录总资产到 %s：%s", fname, line.strip())
+            TOTAL_ASSET_RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with self._result_file_lock:
+                with open(TOTAL_ASSET_RESULT_FILE, "a", encoding="utf-8") as f:
+                    f.write(line)
+            logger.info("已记录总资产到 %s：%s", TOTAL_ASSET_RESULT_FILE, line.strip())
         except Exception as e:
             logger.error("写入总资产记录文件失败: %s", e)
-
-        self.total_asset_results[index] = {
-            "index": index,
-            "api_key": api_key,
-            "address": address,
-            "network": network,
-            "total_usdt": total_dec,
-        }
+        with self._result_file_lock:
+            self.total_asset_results[index] = {
+                "index": index,
+                "api_key": api_key,
+                "address": address,
+                "network": network,
+                "total_usdt": total_dec,
+            }
 
     def export_total_asset_csv(self):
         if not self.total_asset_results:
@@ -2766,7 +2975,7 @@ class App(tk.Tk):
             messagebox.showerror("错误", "导出总资产 CSV 失败: %s" % e)
 
     @staticmethod
-    def _normalize_exchange_proxy(proxy_text: str) -> str:
+    def _normalize_proxy_text(proxy_text: str) -> str:
         proxy = str(proxy_text or "").strip()
         if not proxy:
             return ""
@@ -2778,19 +2987,75 @@ class App(tk.Tk):
             proxy = f"http://{proxy}"
             lower = proxy.lower()
         if not lower.startswith(("http://", "https://", "socks5://", "socks5h://")):
-            raise RuntimeError("代理地址格式不支持，请使用 http://、https://、socks5:// 或 socks5h://")
+            raise RuntimeError("代理地址格式不支持，请使用 http://、https://、socks5://、socks5h:// 或 ss://")
         return proxy
+
+    def _normalize_exchange_proxy(self, proxy_text: str) -> str:
+        return self._normalize_proxy_text(proxy_text)
 
     def _get_exchange_proxy(self) -> str:
         return self._normalize_exchange_proxy(self.exchange_proxy_var.get())
 
+    def _exchange_proxy_config_payload(self) -> dict[str, object]:
+        use_proxy = bool(self.use_exchange_config_proxy_var.get())
+        raw_proxy = str(self.exchange_proxy_var.get() or "").strip()
+        if use_proxy:
+            proxy_text = self._normalize_exchange_proxy(raw_proxy)
+            self.exchange_proxy_var.set(proxy_text)
+        else:
+            proxy_text = raw_proxy
+        return {
+            "exchange_proxy_enc": self._encrypt_optional_text(proxy_text),
+            "use_exchange_config_proxy": use_proxy,
+        }
+
+    def _use_exchange_config_proxy(self) -> bool:
+        return bool(self.use_exchange_config_proxy_var.get())
+
     def _get_exchange_proxy_url(self) -> str:
+        if not self._use_exchange_config_proxy():
+            self.exchange_proxy_runtime.stop()
+            return ""
         proxy = self._get_exchange_proxy()
         if not proxy:
             self.exchange_proxy_runtime.stop()
             return ""
         if proxy.lower().startswith("ss://"):
             return self.exchange_proxy_runtime.ensure_proxy(proxy)
+        return proxy
+
+    def _get_onchain_proxy_page(self):
+        page = getattr(self, "onchain_page", None)
+        if page is None:
+            return None
+        return page
+
+    def _get_onchain_proxy(self) -> str:
+        page = self._get_onchain_proxy_page()
+        if page is None:
+            return ""
+        raw = getattr(page, "onchain_proxy_var", None)
+        if raw is None:
+            return ""
+        return self._normalize_proxy_text(raw.get())
+
+    def _use_onchain_config_proxy(self) -> bool:
+        page = self._get_onchain_proxy_page()
+        if page is None:
+            return False
+        var = getattr(page, "use_config_proxy_var", None)
+        return bool(var.get()) if var is not None else False
+
+    def _get_onchain_proxy_url(self) -> str:
+        if not self._use_onchain_config_proxy():
+            self.onchain_proxy_runtime.stop()
+            return ""
+        proxy = self._get_onchain_proxy()
+        if not proxy:
+            self.onchain_proxy_runtime.stop()
+            return ""
+        if proxy.lower().startswith("ss://"):
+            return self.onchain_proxy_runtime.ensure_proxy(proxy)
         return proxy
 
     def _requests_proxy_map(self) -> dict[str, str]:
@@ -2814,10 +3079,12 @@ class App(tk.Tk):
 
     def _exchange_proxy_route_text(self) -> str:
         raw_proxy = str(self.exchange_proxy_var.get() or "").strip()
-        if not raw_proxy:
+        if not self._use_exchange_config_proxy():
             system_proxy = self._system_proxy_map()
             if system_proxy:
                 return f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}"
+            return "direct"
+        if not raw_proxy:
             return "direct"
         if raw_proxy.lower().startswith("ss://"):
             snap = self.exchange_proxy_runtime.snapshot()
@@ -2825,6 +3092,26 @@ class App(tk.Tk):
             local_proxy = snap.get("local_proxy_url") or "pending"
             return f"builtin-ss/{backend} -> {local_proxy}"
         return f"manual-proxy -> {self._normalize_exchange_proxy(raw_proxy)}"
+
+    @staticmethod
+    def _close_binance_client_instance(client: BinanceClient | None) -> None:
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    def _replace_current_binance_client(self, client: BinanceClient | None) -> None:
+        previous = self.client
+        self.client = client
+        if previous is not None and previous is not client:
+            self._close_binance_client_instance(previous)
+
+    def _clear_current_binance_client(self) -> None:
+        previous = self.client
+        self.client = None
+        self._close_binance_client_instance(previous)
 
     def _create_binance_client(self, key: str, secret: str) -> BinanceClient:
         return BinanceClient(key, secret, proxy_url=self._get_exchange_proxy_url())
@@ -2877,9 +3164,20 @@ class App(tk.Tk):
 
     def save_strategy_config(self):
         try:
+            proxy_payload = self._exchange_proxy_config_payload()
             payload = self._strategy_config_payload()
-            STRATEGY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            STRATEGY_CONFIG_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            strategy_snapshot = _read_text_snapshot(STRATEGY_CONFIG_FILE)
+            proxy_snapshot = _read_text_snapshot(EXCHANGE_PROXY_CONFIG_FILE)
+            try:
+                _atomic_write_config_json(STRATEGY_CONFIG_FILE, payload)
+                _atomic_write_config_json(EXCHANGE_PROXY_CONFIG_FILE, proxy_payload)
+            except Exception:
+                try:
+                    _restore_text_snapshot(STRATEGY_CONFIG_FILE, strategy_snapshot)
+                    _restore_text_snapshot(EXCHANGE_PROXY_CONFIG_FILE, proxy_snapshot)
+                except Exception as rollback_exc:
+                    logger.error("保存配置回滚失败: %s", rollback_exc)
+                raise
             logger.info("策略配置已保存到：%s", STRATEGY_CONFIG_FILE)
             messagebox.showinfo("成功", f"策略配置已保存到：\n{STRATEGY_CONFIG_FILE}")
         except (ValueError, RuntimeError) as e:
@@ -2888,39 +3186,49 @@ class App(tk.Tk):
             logger.error("保存策略配置失败: %s", e)
             messagebox.showerror("错误", "保存策略配置失败: %s" % e)
 
-    def _save_exchange_proxy_config_only(self) -> None:
-        payload = {
-            "exchange_proxy_enc": self._encrypt_optional_text(self._get_exchange_proxy()),
-        }
-        EXCHANGE_PROXY_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        EXCHANGE_PROXY_CONFIG_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _save_exchange_proxy_config_only(self, payload: dict[str, object] | None = None) -> None:
+        if payload is None:
+            payload = self._exchange_proxy_config_payload()
+        _atomic_write_config_json(EXCHANGE_PROXY_CONFIG_FILE, payload)
 
-    def _proxy_text_from_config_payload(self, raw: object) -> str:
+    def _proxy_config_from_payload(self, raw: object) -> tuple[str, bool]:
         if not isinstance(raw, dict):
-            return ""
+            return "", False
         proxy_enc = str(raw.get("exchange_proxy_enc", "") or "").strip()
         legacy_proxy = str(raw.get("exchange_proxy", EXCHANGE_PROXY_DEFAULT) or EXCHANGE_PROXY_DEFAULT).strip()
         try:
-            return self._decrypt_optional_text(proxy_enc) if proxy_enc else legacy_proxy
+            proxy_text = self._decrypt_optional_text(proxy_enc) if proxy_enc else legacy_proxy
         except Exception:
-            return legacy_proxy
+            proxy_text = legacy_proxy
+        if "use_exchange_config_proxy" in raw:
+            use_proxy = bool(raw.get("use_exchange_config_proxy"))
+        else:
+            use_proxy = bool(proxy_text)
+        return proxy_text, use_proxy
 
     def _load_exchange_proxy_config(self):
         proxy_text = ""
+        use_proxy = EXCHANGE_USE_CONFIG_PROXY_DEFAULT
         if EXCHANGE_PROXY_CONFIG_FILE.exists():
             try:
-                raw = json.loads(EXCHANGE_PROXY_CONFIG_FILE.read_text(encoding="utf-8"))
-                proxy_text = self._proxy_text_from_config_payload(raw)
-                logger.info("已加载代理配置：%s", EXCHANGE_PROXY_CONFIG_FILE)
+                raw, recovered = _load_json_with_backup(EXCHANGE_PROXY_CONFIG_FILE, validator=_require_dict_payload)
+                proxy_text, use_proxy = self._proxy_config_from_payload(raw)
+                if recovered:
+                    logger.warning("交易所代理配置损坏，已自动从备份恢复：%s", EXCHANGE_PROXY_CONFIG_FILE)
+                else:
+                    logger.info("已加载代理配置：%s", EXCHANGE_PROXY_CONFIG_FILE)
             except Exception as e:
                 logger.error("加载代理配置失败: %s", e)
         elif STRATEGY_CONFIG_FILE.exists():
             try:
-                raw = json.loads(STRATEGY_CONFIG_FILE.read_text(encoding="utf-8"))
-                proxy_text = self._proxy_text_from_config_payload(raw)
+                raw, recovered = _load_json_with_backup(STRATEGY_CONFIG_FILE, validator=_require_dict_payload)
+                proxy_text, use_proxy = self._proxy_config_from_payload(raw)
+                if recovered:
+                    logger.warning("旧版策略配置损坏，已自动从备份恢复：%s", STRATEGY_CONFIG_FILE)
                 if proxy_text:
                     try:
                         self.exchange_proxy_var.set(proxy_text)
+                        self.use_exchange_config_proxy_var.set(use_proxy)
                         self._save_exchange_proxy_config_only()
                         logger.info("已迁移旧版代理配置到：%s", EXCHANGE_PROXY_CONFIG_FILE)
                     except Exception as save_exc:
@@ -2928,14 +3236,15 @@ class App(tk.Tk):
             except Exception as e:
                 logger.error("读取旧版代理配置失败: %s", e)
         self.exchange_proxy_var.set(proxy_text)
+        self.use_exchange_config_proxy_var.set(use_proxy)
 
     def _load_strategy_config(self):
         if not STRATEGY_CONFIG_FILE.exists():
             return
         try:
-            raw = json.loads(STRATEGY_CONFIG_FILE.read_text(encoding="utf-8"))
-            if not isinstance(raw, dict):
-                raise RuntimeError("配置文件结构无效")
+            raw, recovered = _load_json_with_backup(STRATEGY_CONFIG_FILE, validator=_require_dict_payload)
+            if recovered:
+                logger.warning("交易所策略配置损坏，已自动从备份恢复：%s", STRATEGY_CONFIG_FILE)
 
             self.api_key_var.set(SECRET_BOX.decrypt(str(raw.get("api_key", "") or "").strip()).strip())
             self.api_secret_var.set(SECRET_BOX.decrypt(str(raw.get("api_secret", "") or "").strip()).strip())
@@ -3006,12 +3315,13 @@ class App(tk.Tk):
     def _test_exchange_proxy_once(self, *, include_exit_ip: bool = True) -> tuple[str, str]:
         proxies = self._requests_proxy_map()
         proxy_text = self.exchange_proxy_var.get().strip()
-        system_proxy = self._system_proxy_map() if not proxy_text else {}
+        use_config_proxy = self._use_exchange_config_proxy()
+        system_proxy = self._system_proxy_map() if not use_config_proxy else {}
         proxy_status = "跟随系统代理" if system_proxy else "未启用"
         proxy_exit_ip = "--"
-        if proxy_text:
+        if use_config_proxy and proxy_text:
             proxy_status = "SS代理连接中..." if proxy_text.lower().startswith("ss://") else "代理连接中..."
-        if proxy_text:
+        if use_config_proxy and proxy_text:
             test_resp = http_get_via_proxy(
                 "https://api.binance.com/api/v3/time",
                 proxies=proxies or None,
@@ -3048,7 +3358,9 @@ class App(tk.Tk):
                 else:
                     log_text = f"{log_text}，已自动保存配置"
             except Exception as e:
-                status = "连接失败" if self.exchange_proxy_var.get().strip() else "未启用"
+                status = "连接失败" if (self._use_exchange_config_proxy() and self.exchange_proxy_var.get().strip()) else "未启用"
+                if (not self._use_exchange_config_proxy()) and self._system_proxy_map():
+                    status = "系统代理异常"
                 exit_ip = "--"
                 route_text = self._exchange_proxy_route_text()
                 log_text = f"交易所代理测试失败：{e}，route={route_text}"
@@ -3066,38 +3378,62 @@ class App(tk.Tk):
 
             self._dispatch_ui(_update)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_managed_thread(worker, name="exchange-proxy-test")
+
+    def _try_begin_ip_refresh(self) -> bool:
+        with self._ip_refresh_lock:
+            if self._closing or self._ip_refresh_inflight:
+                return False
+            self._ip_refresh_inflight = True
+            return True
+
+    def _finish_ip_refresh(self) -> None:
+        with self._ip_refresh_lock:
+            self._ip_refresh_inflight = False
 
     def update_ip(self, schedule_next: bool = True):
-        def worker():
-            proxy_status = "跟随系统代理" if self._system_proxy_map() and not self.exchange_proxy_var.get().strip() else "未启用"
-            proxy_exit_ip = "--"
+        if schedule_next and not self._closing:
+            self._cancel_after_token("_update_ip_after_token")
             try:
-                ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=False)
-                if self.exchange_proxy_var.get().strip():
-                    proxy_status, proxy_exit_ip = self._test_exchange_proxy_once(include_exit_ip=True)
-                elif self._system_proxy_map():
-                    proxy_status, proxy_exit_ip = self._test_exchange_proxy_once(include_exit_ip=True)
-                else:
-                    proxy_exit_ip = ip
-            except Exception as e:
-                ip = "获取失败: %s" % str(e)
-                if self.exchange_proxy_var.get().strip():
-                    proxy_status = "连接失败"
-                elif self._system_proxy_map():
-                    proxy_status = "系统代理异常"
+                self._update_ip_after_token = self.after(60000, self.update_ip)
+            except Exception:
+                self._update_ip_after_token = None
+        if not self._try_begin_ip_refresh():
+            return
 
-            def _update():
-                self.ip_var.set(ip)
-                self.exchange_proxy_status_var.set(proxy_status)
-                self.exchange_proxy_exit_ip_var.set(proxy_exit_ip)
-            self._dispatch_ui(_update)
+        def worker():
+            try:
+                proxy_status = "跟随系统代理" if self._system_proxy_map() and not self._use_exchange_config_proxy() else "未启用"
+                proxy_exit_ip = "--"
+                try:
+                    ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=False)
+                    if self._use_exchange_config_proxy():
+                        proxy_status, proxy_exit_ip = self._test_exchange_proxy_once(include_exit_ip=True)
+                    elif self._system_proxy_map():
+                        proxy_status, proxy_exit_ip = self._test_exchange_proxy_once(include_exit_ip=True)
+                    else:
+                        proxy_exit_ip = ip
+                except Exception as e:
+                    ip = "获取失败: %s" % str(e)
+                    if self._use_exchange_config_proxy():
+                        proxy_status = "连接失败"
+                    elif self._system_proxy_map():
+                        proxy_status = "系统代理异常"
 
-        threading.Thread(target=worker, daemon=True).start()
-        if schedule_next:
-            self.after(60000, self.update_ip)
+                def _update():
+                    self.ip_var.set(ip)
+                    self.exchange_proxy_status_var.set(proxy_status)
+                    self.exchange_proxy_exit_ip_var.set(proxy_exit_ip)
+                self._dispatch_ui(_update)
+            finally:
+                self._finish_ip_refresh()
+
+        self._start_managed_thread(worker, name="exchange-ip-refresh")
 
     def _poll_log_queue(self):
+        if self._closing:
+            self._log_poll_after_token = None
+            return
         while True:
             try:
                 msg = log_queue.get_nowait()
@@ -3105,7 +3441,10 @@ class App(tk.Tk):
                 break
             else:
                 self._append_log(msg)
-        self.after(100, self._poll_log_queue)
+        try:
+            self._log_poll_after_token = self.after(100, self._poll_log_queue)
+        except Exception:
+            self._log_poll_after_token = None
 
     def _append_log(self, msg: str):
         self.text_log.configure(state="normal")
@@ -3114,6 +3453,8 @@ class App(tk.Tk):
         self.text_log.configure(state="disabled")
 
     def _dispatch_ui(self, callback) -> None:
+        if self._closing:
+            return
         dispatch_ui_callback(self, callback, root=self)
 
     def _set_account_manage_buttons_state(self, state):
@@ -3300,22 +3641,25 @@ class App(tk.Tk):
             messagebox.showerror("错误", "开启自动提现时，请填写 提现地址 / 网络 / 币种")
             return
 
+        client = None
         try:
-            self.client = self._create_binance_client(key, secret)
+            client = self._create_binance_client(key, secret)
+            quote_asset = (
+                client.get_um_futures_margin_asset(trade_symbol)
+                if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES
+                else BinanceClient.get_spot_quote_asset(trade_symbol)
+            )
+            effective_reprice_threshold = None
+            if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode in {TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}:
+                effective_reprice_threshold = client.normalize_price_delta(spot_symbol, reprice_threshold_value, min_one_tick=True)
         except Exception as e:
-            messagebox.showerror("错误", "创建 BinanceClient 失败: %s" % e)
+            self._close_binance_client_instance(client)
+            messagebox.showerror("错误", "Binance 连接初始化失败: %s" % e)
             return
-        quote_asset = (
-            self.client.get_um_futures_margin_asset(trade_symbol)
-            if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES
-            else BinanceClient.get_spot_quote_asset(trade_symbol)
-        )
-        effective_reprice_threshold = None
-        if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode in {TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}:
-            effective_reprice_threshold = self.client.normalize_price_delta(spot_symbol, reprice_threshold_value, min_one_tick=True)
         required_quote_amount = None
         if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES and futures_amount_value is not None and futures_leverage > 0:
             required_quote_amount = futures_amount_value / Decimal(str(futures_leverage))
+        self._replace_current_binance_client(client)
 
         logger.info("交易所单账号链路：%s", self._exchange_proxy_route_text())
         self.stop_event = threading.Event()
@@ -3347,7 +3691,7 @@ class App(tk.Tk):
                 self.record_withdraw(idx, api_key, address, amount)
 
         strategy = Strategy(
-            client=self.client,
+            client=client,
             spot_rounds=spot_rounds,
             withdraw_coin=withdraw_coin,
             withdraw_address=withdraw_address,
@@ -3384,6 +3728,7 @@ class App(tk.Tk):
                 if not self.wait_for_usdt(
                     usdt_timeout,
                     self.stop_event,
+                    client=client,
                     symbol=trade_symbol,
                     trade_account_type=trade_account_type,
                     trade_mode=trade_mode,
@@ -3430,8 +3775,7 @@ class App(tk.Tk):
             finally:
                 self._dispatch_ui(self._on_worker_finished)
 
-        self.worker_thread = threading.Thread(target=worker, daemon=True)
-        self.worker_thread.start()
+        self.worker_thread = self._start_managed_thread(worker, name="exchange-single-run")
 
     def _on_worker_finished(self):
         self._batch_task_active = False
@@ -3467,24 +3811,33 @@ class App(tk.Tk):
             return
 
         def worker():
+            client = None
+            assigned_to_app = False
             try:
                 logger.info("交易所刷新余额链路：%s", self._exchange_proxy_route_text())
                 client = self._create_binance_client(key, secret)
                 spot_balances = client.spot_all_balances()
                 balances_text = self._format_spot_balances_text(spot_balances)
+                if self._closing:
+                    return
 
-                def _update():
-                    self.client = client
+                def _update(c=client):
+                    self._replace_current_binance_client(c)
                     self.single_account_balances_var.set(balances_text)
                     logger.info("余额刷新完成")
                 self._dispatch_ui(_update)
+                assigned_to_app = True
             except Exception as e:
                 logger.error("刷新余额失败: %s", e)
+            finally:
+                if client is not None and not assigned_to_app:
+                    self._close_binance_client_instance(client)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_managed_thread(worker, name="exchange-refresh-balances")
 
     def manual_withdraw(self):
-        if not self.client:
+        client = self.client
+        if not client:
             messagebox.showerror("错误", "请先使用当前 API 创建连接（点击一次开始或刷新余额）")
             return
 
@@ -3501,10 +3854,10 @@ class App(tk.Tk):
             messagebox.showerror("错误", "请填写 提现地址 / 网络 / 币种")
             return
 
-        def worker():
+        def worker(client_ref=client):
             try:
                 logger.info(f"手动触发提现 {coin}")
-                amount = self.client.withdraw_all_coin(
+                amount = client_ref.withdraw_all_coin(
                     coin=coin,
                     address=address,
                     network=network,
@@ -3513,11 +3866,11 @@ class App(tk.Tk):
                     auto_collect_to_spot=True,
                 )
                 if amount > 0:
-                    self.record_withdraw(1, self.client.key, address, amount)
+                    self.record_withdraw(1, client_ref.key, address, amount)
             except Exception as e:
                 logger.error("手动提现失败: %s", e)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._start_managed_thread(worker, name="exchange-manual-withdraw")
 
     def _reindex_accounts(self):
         for i, acc in enumerate(self.accounts, start=1):
@@ -3810,6 +4163,85 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    @classmethod
+    def _format_batch_metric_totals(cls, metrics_by_account: dict[str, tuple[Decimal, str]] | None) -> str:
+        if not metrics_by_account:
+            return "-"
+        totals: dict[str, Decimal] = {}
+        for value in metrics_by_account.values():
+            if not isinstance(value, tuple) or len(value) != 2:
+                continue
+            amount_raw, asset_raw = value
+            try:
+                amount = Decimal(str(amount_raw or "0"))
+            except Exception:
+                amount = Decimal("0")
+            asset = str(asset_raw or "").strip().upper()
+            totals[asset] = totals.get(asset, Decimal("0")) + amount
+        if not totals:
+            return "-"
+        parts = []
+        for asset in sorted(totals.keys()):
+            amount = totals.get(asset, Decimal("0"))
+            amount_text = cls._format_amount(float(amount))
+            parts.append(f"{amount_text} {asset}" if asset else amount_text)
+        return " / ".join(parts)
+
+    def _build_batch_summary_text(self, summary: dict | None = None, *, pending_as_failed: bool = False) -> str:
+        data = summary if isinstance(summary, dict) else None
+        if not data:
+            return "结果汇总：成功0 | 失败0 | 提现总额=- | 余额总额=-"
+        results = dict(data.get("results") or {})
+        success_count = sum(1 for value in results.values() if value is True)
+        failed_count = sum(
+            1
+            for value in results.values()
+            if value is False or (pending_as_failed and value is not True)
+        )
+        withdraw_text = self._format_batch_metric_totals(data.get("withdraw_by_account") or {})
+        balance_text = self._format_batch_metric_totals(data.get("balance_by_account") or {})
+        return f"结果汇总：成功{success_count} | 失败{failed_count} | 提现总额={withdraw_text} | 余额总额={balance_text}"
+
+    def _set_batch_summary_text(self, text: str) -> None:
+        var = getattr(self, "exchange_batch_summary_var", None)
+        if var is not None:
+            var.set(str(text or ""))
+
+    def _refresh_batch_summary_text(self) -> None:
+        with self._batch_summary_lock:
+            text = self._build_batch_summary_text(self._current_batch_summary)
+        self._dispatch_ui(lambda t=text: self._set_batch_summary_text(t))
+
+    def _record_batch_withdraw_metric(self, acc: dict, amount, asset: str) -> None:
+        summary_text = ""
+        with self._batch_summary_lock:
+            summary = self._current_batch_summary
+            if not summary:
+                return
+            key = self._account_batch_key(acc)
+            try:
+                amount_dec = Decimal(str(amount or "0"))
+            except Exception:
+                amount_dec = Decimal("0")
+            summary.setdefault("withdraw_by_account", {})[key] = (amount_dec, str(asset or "").strip().upper())
+            summary_text = self._build_batch_summary_text(summary)
+        self._dispatch_ui(lambda t=summary_text: self._set_batch_summary_text(t))
+
+    def _record_batch_balance_metric(self, acc: dict, amount, asset: str) -> None:
+        summary_text = ""
+        with self._batch_summary_lock:
+            summary = self._current_batch_summary
+            if not summary:
+                return
+            key = self._account_batch_key(acc)
+            try:
+                amount_dec = Decimal(str(amount or "0"))
+            except Exception:
+                amount_dec = Decimal("0")
+            summary.setdefault("balance_by_account", {})[key] = (amount_dec, str(asset or "").strip().upper())
+            summary_text = self._build_batch_summary_text(summary)
+        self._dispatch_ui(lambda t=summary_text: self._set_batch_summary_text(t))
+
     def _begin_batch_summary_tracking(
         self,
         *,
@@ -3822,29 +4254,39 @@ class App(tk.Tk):
             self._account_batch_key(acc): acc
             for acc in list(selected_accounts or [])
         }
-        self._current_batch_summary = {
-            "action_label": action_label,
-            "runner": runner,
-            "retry_kwargs": dict(retry_kwargs or {}),
-            "accounts_by_key": accounts_by_key,
-            "results": {key: None for key in accounts_by_key},
-        }
+        with self._batch_summary_lock:
+            self._current_batch_summary = {
+                "action_label": action_label,
+                "runner": runner,
+                "retry_kwargs": dict(retry_kwargs or {}),
+                "accounts_by_key": accounts_by_key,
+                "results": {key: None for key in accounts_by_key},
+                "withdraw_by_account": {},
+                "balance_by_account": {},
+            }
+            summary_text = self._build_batch_summary_text(self._current_batch_summary)
         self._last_batch_retry = None
         self._set_retry_failed_button_state()
+        self._dispatch_ui(lambda t=summary_text: self._set_batch_summary_text(t))
 
     def _mark_batch_account_result(self, acc: dict, success: bool) -> None:
-        summary = self._current_batch_summary
-        if not summary:
-            return
-        key = self._account_batch_key(acc)
-        results = summary.get("results") or {}
-        if key not in results:
-            return
-        results[key] = bool(success)
+        summary_text = ""
+        with self._batch_summary_lock:
+            summary = self._current_batch_summary
+            if not summary:
+                return
+            key = self._account_batch_key(acc)
+            results = summary.get("results") or {}
+            if key not in results:
+                return
+            results[key] = bool(success)
+            summary_text = self._build_batch_summary_text(summary)
+        self._dispatch_ui(lambda t=summary_text: self._set_batch_summary_text(t))
 
     def _finish_batch_summary_tracking(self) -> None:
-        summary = self._current_batch_summary
-        self._current_batch_summary = None
+        with self._batch_summary_lock:
+            summary = self._current_batch_summary
+            self._current_batch_summary = None
         if not summary:
             self._set_retry_failed_button_state()
             return
@@ -3868,6 +4310,7 @@ class App(tk.Tk):
             self._last_batch_retry = None
 
         self._set_retry_failed_button_state()
+        self._set_batch_summary_text(self._build_batch_summary_text(summary, pending_as_failed=True))
         self._show_batch_result_dialog(
             title=f"{summary.get('action_label', '批量任务')}完成",
             action_label=str(summary.get("action_label") or "批量任务"),
@@ -4333,6 +4776,7 @@ class App(tk.Tk):
                     continue
 
                 try:
+                    client = None
                     client = self._create_binance_client(acc["api_key"], acc["api_secret"])
                     trade_symbol = futures_symbol if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES else spot_symbol
                     quote_asset = (
@@ -4350,6 +4794,7 @@ class App(tk.Tk):
                         total_usdt, rows = client.query_total_wallet_balance("USDT")
                         asset_breakdown = client.query_asset_balances_breakdown()
                         asset_text = self._format_asset_breakdown_text(asset_breakdown)
+                        self._record_batch_balance_metric(acc, total_usdt, "USDT")
 
                         self.record_total_asset(
                             idx,
@@ -4426,6 +4871,7 @@ class App(tk.Tk):
 
                         set_status("查询BNB余额...")
                         bnb_balance = client.spot_balance("BNB")
+                        self._record_batch_balance_metric(acc, Decimal(str(bnb_balance)), "BNB")
                         logger.info("账号 #%d 当前现货 BNB = %.8f", idx, bnb_balance)
 
                         set_status("提现BNB...")
@@ -4437,6 +4883,7 @@ class App(tk.Tk):
                                 fee_buffer=withdraw_buffer,
                                 enable_withdraw=enable_withdraw,
                             )
+                            self._record_batch_withdraw_metric(acc, amount, "BNB")
                             if amount > 0:
                                 self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
                             set_status(self._format_withdraw_amount_status(amount, "BNB", enable_withdraw=enable_withdraw))
@@ -4583,9 +5030,11 @@ class App(tk.Tk):
                             final_amount = callback_amount if callback_amount is not None else result_amount
 
                             if isinstance(strategy_result, dict) and strategy_result.get("withdraw_error") and (final_amount or 0) <= 0:
+                                self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
                                 set_status(f"提现失败 {self._compact_error_text(strategy_result.get('withdraw_error', ''))}")
                                 op_success = False
                             else:
+                                self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
                                 set_status(
                                     self._format_withdraw_amount_status(
                                         float(final_amount or 0.0),
@@ -4603,6 +5052,7 @@ class App(tk.Tk):
                     set_status("异常")
                     op_success = False
                 finally:
+                    self._close_binance_client_instance(client)
                     if should_finish_in_finally:
                         self._set_account_batch_active(acc, False)
                         self._mark_batch_account_result(acc, op_success)
@@ -4624,8 +5074,7 @@ class App(tk.Tk):
             logger.info("批量任务全部结束")
             self._dispatch_ui(self._on_worker_finished)
 
-        self.worker_thread = threading.Thread(target=controller, daemon=True)
-        self.worker_thread.start()
+        self.worker_thread = self._start_managed_thread(controller, name="exchange-batch-run")
 
     def batch_manual_withdraw(self, accounts_to_run=None, *, require_confirm: bool = True):
         if self.worker_thread and self.worker_thread.is_alive():
@@ -4701,6 +5150,7 @@ class App(tk.Tk):
                 combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
                 op_success = False
                 try:
+                    client = None
                     if combined_stop.is_set():
                         set_status("已停止")
                         op_success = False
@@ -4719,6 +5169,7 @@ class App(tk.Tk):
                                 enable_withdraw=True,
                                 auto_collect_to_spot=True,
                             )
+                            self._record_batch_withdraw_metric(acc, amount, coin)
                             if amount > 0:
                                 self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
                             set_status(self._format_withdraw_amount_status(amount, coin, enable_withdraw=True))
@@ -4728,6 +5179,7 @@ class App(tk.Tk):
                     set_status("提现失败")
                     op_success = False
                 finally:
+                    self._close_binance_client_instance(client)
                     self._set_account_batch_active(acc, False)
                     self._mark_batch_account_result(acc, op_success)
                     task_queue.task_done()
@@ -4752,8 +5204,7 @@ class App(tk.Tk):
 
             self._dispatch_ui(self._on_worker_finished)
 
-        self.worker_thread = threading.Thread(target=controller, daemon=True)
-        self.worker_thread.start()
+        self.worker_thread = self._start_managed_thread(controller, name="exchange-batch-withdraw")
 
 def run_selftest() -> int:
     try:

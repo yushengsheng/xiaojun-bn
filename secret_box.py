@@ -7,10 +7,41 @@ import base64
 import hashlib
 import hmac
 import os
+import tempfile
 import threading
 from pathlib import Path
 
 from app_paths import SECRET_KEY_FILE
+
+
+def _atomic_write_secret_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        try:
+            os.chmod(tmp_name, 0o600)
+        except Exception:
+            pass
+        with os.fdopen(fd, "w", encoding=encoding) as fp:
+            fp.write(content)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp_name, path)
+        try:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        except Exception:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 class SecretBox:
@@ -77,7 +108,7 @@ class SecretBox:
 
         self.key_file.parent.mkdir(parents=True, exist_ok=True)
         key = os.urandom(32)
-        self.key_file.write_text(self._b64_encode(key), encoding="utf-8")
+        _atomic_write_secret_text(self.key_file, self._b64_encode(key), encoding="utf-8")
         try:
             os.chmod(self.key_file, 0o600)
         except Exception:

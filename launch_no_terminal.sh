@@ -2,9 +2,10 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG_DIR="$PROJECT_DIR/logs"
+LOG_DIR="$PROJECT_DIR/data/logs"
 LOG_FILE="$LOG_DIR/startup.log"
 mkdir -p "$LOG_DIR"
+: > "$LOG_FILE"
 
 # 优先使用 Homebrew Python 3.11（本机 Tkinter 更稳定）
 PYTHON_BIN="/opt/homebrew/bin/python3.11"
