@@ -212,10 +212,95 @@ def append_log_row(log_tree, text: str, max_rows: int = LOG_MAX_ROWS) -> None:
     append_log_rows(log_tree, [text], max_rows=max_rows)
 
 
+def capture_vertical_view_state(widget, *, follow_threshold: float = 0.995) -> tuple[bool, tuple[str, object] | None]:
+    yview = getattr(widget, "yview", None)
+    if not callable(yview):
+        return True, None
+    try:
+        first, last = yview()
+        last_fraction = float(last)
+    except Exception:
+        return True, None
+    follow_tail = last_fraction >= float(follow_threshold)
+    widget_class_getter = getattr(widget, "winfo_class", None)
+    widget_class = str(widget_class_getter()).strip() if callable(widget_class_getter) else ""
+    if widget_class == "Text":
+        index = getattr(widget, "index", None)
+        if callable(index):
+            try:
+                return follow_tail, ("text", str(index("@0,0")))
+            except Exception:
+                pass
+    if widget_class == "Treeview":
+        identify_row = getattr(widget, "identify_row", None)
+        if callable(identify_row):
+            try:
+                anchor = str(identify_row(0) or "").strip()
+                return follow_tail, ("tree", anchor)
+            except Exception:
+                pass
+    try:
+        first_fraction = float(first)
+    except Exception:
+        first_fraction = None
+    return follow_tail, ("fraction", first_fraction)
+
+
+def restore_vertical_view_state(widget, state: tuple[str, object] | None) -> None:
+    if state is None:
+        return
+    kind, payload = state
+    if kind == "text":
+        yview = getattr(widget, "yview", None)
+        if not callable(yview):
+            return
+        try:
+            yview(str(payload))
+        except Exception:
+            pass
+        return
+    if kind == "tree":
+        anchor = str(payload or "").strip()
+        if not anchor:
+            return
+        get_children = getattr(widget, "get_children", None)
+        see = getattr(widget, "see", None)
+        identify_row = getattr(widget, "identify_row", None)
+        yview_scroll = getattr(widget, "yview_scroll", None)
+        if not (callable(get_children) and callable(see) and callable(identify_row)):
+            return
+        try:
+            children = list(get_children())
+        except Exception:
+            return
+        if anchor not in children:
+            return
+        try:
+            see(anchor)
+            current_top = str(identify_row(0) or "").strip()
+            if current_top and current_top in children and callable(yview_scroll):
+                delta = children.index(anchor) - children.index(current_top)
+                if delta:
+                    yview_scroll(delta, "units")
+        except Exception:
+            pass
+        return
+    if kind == "fraction":
+        yview_moveto = getattr(widget, "yview_moveto", None)
+        if not callable(yview_moveto):
+            return
+        try:
+            fraction = max(0.0, min(1.0, float(payload)))
+            yview_moveto(fraction)
+        except Exception:
+            pass
+
+
 def append_log_rows(log_tree, texts: list[str], max_rows: int = LOG_MAX_ROWS) -> None:
     rows_to_add = [str(text or "") for text in texts if text is not None]
     if not rows_to_add:
         return
+    follow_tail, first_fraction = capture_vertical_view_state(log_tree)
     for text in rows_to_add:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_tree.insert("", END, values=(now, text))
@@ -225,7 +310,10 @@ def append_log_rows(log_tree, texts: list[str], max_rows: int = LOG_MAX_ROWS) ->
         log_tree.delete(*rows[:overflow])
         rows = rows[overflow:]
     if rows:
-        log_tree.see(rows[-1])
+        if follow_tail:
+            log_tree.see(rows[-1])
+        else:
+            restore_vertical_view_state(log_tree, first_fraction)
 
 
 def current_ui_batch_size(owner, batch_size: int | None = None, default: int = 1) -> int:

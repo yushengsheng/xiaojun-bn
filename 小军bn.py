@@ -32,6 +32,7 @@ from app_paths import (
     APP_DIR,
     BUNDLE_DIR,
     CONFIG_BACKUP_SUFFIX,
+    DATA_FILE,
     DATA_DIR,
     EXCHANGE_PROXY_CONFIG_FILE,
     LOG_DIR,
@@ -40,10 +41,20 @@ from app_paths import (
     TOTAL_ASSET_RESULT_FILE,
     WITHDRAW_SUCCESS_FILE,
 )
+from core_models import AccountEntry
 from exchange_binance_client import BinanceClient
 from secret_box import SECRET_BOX
-from shared_utils import SolidButton, dispatch_ui_callback, make_scrollbar, start_ui_bridge, stop_ui_bridge
-from stores import _atomic_write_text, _atomic_write_text_with_backup, _load_json_with_backup
+from shared_utils import (
+    LOG_MAX_ROWS,
+    SolidButton,
+    capture_vertical_view_state,
+    dispatch_ui_callback,
+    make_scrollbar,
+    restore_vertical_view_state,
+    start_ui_bridge,
+    stop_ui_bridge,
+)
+from stores import AccountStore, _atomic_write_text, _atomic_write_text_with_backup, _load_json_with_backup
 
 try:
     from page_onchain import OnchainTransferPage
@@ -393,6 +404,14 @@ class ExchangeProxyRuntime:
     def _extract_archive(archive_path: Path, destination: Path) -> None:
         if str(archive_path).lower().endswith(".zip"):
             with zipfile.ZipFile(archive_path) as archive:
+                base_dir = destination.resolve()
+                for member in archive.infolist():
+                    member_name = str(member.filename or "")
+                    if not member_name:
+                        continue
+                    member_path = (destination / member_name).resolve()
+                    if os.path.commonpath([str(base_dir), str(member_path)]) != str(base_dir):
+                        raise RuntimeError(f"压缩包包含非法路径：{member_name}")
                 archive.extractall(destination)
             return
         with tarfile.open(archive_path, "r:gz") as archive:
@@ -774,6 +793,7 @@ log_queue = queue.Queue()
 LOG_FILE_RUNTIME_PREFIX = "exchange_runtime"
 LOG_FILE_RETENTION_COUNT = 20
 LOG_FILE_TOTAL_SIZE_LIMIT_BYTES = 200 * 1024 * 1024
+EXCHANGE_LOG_MAX_ROWS = LOG_MAX_ROWS
 
 _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("bot")
@@ -869,6 +889,23 @@ def _require_dict_payload(raw: object) -> None:
     if isinstance(raw, dict):
         return
     raise RuntimeError("配置文件结构无效")
+
+
+def _shift_text_view_state_after_trim(state: tuple[str, object] | None, trimmed_lines: int) -> tuple[str, object] | None:
+    if trimmed_lines <= 0 or state is None:
+        return state
+    kind, payload = state
+    if kind != "text":
+        return state
+    index_text = str(payload or "").strip()
+    if not index_text:
+        return state
+    line_text, dot, col_text = index_text.partition(".")
+    try:
+        new_line = max(1, int(line_text) - int(trimmed_lines))
+    except Exception:
+        return state
+    return kind, f"{new_line}{dot or '.'}{col_text or '0'}"
 
 
 _runtime_log_path = None
@@ -1047,6 +1084,22 @@ class Strategy:
         else:
             logger.info("预买 BNB 未执行")
         return bool(bought)
+
+    @staticmethod
+    def _pause_with_stop(stop_event, seconds: float) -> bool:
+        delay = max(0.0, float(seconds))
+        if delay <= 0:
+            return bool(stop_event and stop_event.is_set())
+        if stop_event is not None:
+            try:
+                return bool(stop_event.wait(delay))
+            except Exception:
+                pass
+        time.sleep(delay)
+        try:
+            return bool(stop_event and stop_event.is_set())
+        except Exception:
+            return False
 
     @staticmethod
     def _order_price_decimal(order_data: dict, fallback_price: Decimal) -> Decimal:
@@ -1430,7 +1483,8 @@ class Strategy:
 
             except Exception as e:
                 logger.error(f"现货轮 %d 执行异常: {e}", i + 1)
-                time.sleep(3)
+                if self._pause_with_stop(stop_event, 3):
+                    return
 
             step += 1
             if progress_cb:
@@ -1481,7 +1535,8 @@ class Strategy:
                     logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
                     return
                 logger.error("%s轮 %d 执行异常: %s", mode_name, step, e)
-                time.sleep(3)
+                if self._pause_with_stop(stop_event, 3):
+                    return
 
     def _run_premium_mode(self, stop_event, progress_cb=None):
         step = 0
@@ -1520,7 +1575,8 @@ class Strategy:
                     logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
                     return
                 logger.error("%s轮 %d 执行异常: %s", mode_name, step, e)
-                time.sleep(3)
+                if self._pause_with_stop(stop_event, 3):
+                    return
 
             if progress_cb:
                 progress_cb(step, max(step, 1), f"{mode_name}轮 {step}")
@@ -1658,7 +1714,8 @@ class Strategy:
                 )
             except Exception as e:
                 logger.error("【%s失败】合约轮 %d：%s", stage_label, i + 1, e)
-                time.sleep(3)
+                if self._pause_with_stop(stop_event, 3):
+                    return
             finally:
                 self.ensure_futures_position_closed()
 
@@ -1761,14 +1818,17 @@ class App(tk.Tk):
         self._close_deadline_monotonic = 0.0
         self._close_wait_after_token = None
         self._log_poll_after_token = None
+        self._accounts_save_after_token = None
         self._update_ip_after_token = None
         self._ip_refresh_inflight = False
         self._ip_refresh_lock = threading.Lock()
         self._result_file_lock = threading.Lock()
         self._managed_threads_lock = threading.Lock()
         self._managed_threads: set[threading.Thread] = set()
+        self._loading_accounts = False
         self.exchange_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="exchange")
         self.onchain_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="onchain")
+        self.account_store = AccountStore(DATA_FILE)
 
         self.accounts = []
         self.total_asset_results = {}
@@ -1778,6 +1838,7 @@ class App(tk.Tk):
         start_ui_bridge(self, root=self)
         self._load_strategy_config()
         self._load_exchange_proxy_config()
+        self._load_accounts()
         self._log_poll_after_token = self.after(100, self._poll_log_queue)
         self.update_ip()
 
@@ -2608,6 +2669,8 @@ class App(tk.Tk):
         self._closing = True
         self._close_deadline_monotonic = time.monotonic() + 2.5
         logger.info("收到窗口关闭请求，开始优雅停止后台任务")
+        self._cancel_after_token("_accounts_save_after_token")
+        self._save_accounts_silently()
         self._cancel_after_token("_update_ip_after_token")
         self._cancel_after_token("_log_poll_after_token")
         try:
@@ -2691,6 +2754,7 @@ class App(tk.Tk):
         if self._close_finalized:
             return
         self._close_finalized = True
+        self._cancel_after_token("_accounts_save_after_token")
         self._cancel_after_token("_close_wait_after_token")
         self._cancel_after_token("_update_ip_after_token")
         self._cancel_after_token("_log_poll_after_token")
@@ -2840,7 +2904,8 @@ class App(tk.Tk):
             return [], "内容为空"
 
         normalized = raw_text.replace("\r\n", "\n").replace("\r", "\n")
-        tokens = []
+        accounts: list[tuple[str, str, str, str]] = []
+        tokens: list[str] = []
 
         for raw_line in normalized.split("\n"):
             line = raw_line.strip()
@@ -2850,7 +2915,8 @@ class App(tk.Tk):
             if "|" in line:
                 parts = [p.strip() for p in line.split("|") if p.strip()]
                 if len(parts) >= 3:
-                    tokens.extend(parts[:3])
+                    network = parts[3] if len(parts) >= 4 else ""
+                    accounts.append((parts[0], parts[1], parts[2], network))
                     continue
 
             # 支持“行尾备注/中文说明”，只提取长 token（API KEY/SECRET/地址）
@@ -2858,16 +2924,15 @@ class App(tk.Tk):
             if found:
                 tokens.extend(found)
 
-        if not tokens:
+        if not accounts and not tokens:
             return [], "没有识别到账号数据"
 
-        if len(tokens) % 3 != 0:
+        if tokens and len(tokens) % 3 != 0:
             return [], f"识别到 {len(tokens)} 条有效字段，必须按 3 条一组：APIKEY / APISECRET / 提现地址"
 
-        accounts = []
         for i in range(0, len(tokens), 3):
             key, secret, addr = tokens[i], tokens[i + 1], tokens[i + 2]
-            accounts.append((key, secret, addr))
+            accounts.append((key, secret, addr, ""))
         return accounts, ""
 
     def _import_accounts_from_text(self, raw_text, source_name):
@@ -2884,17 +2949,17 @@ class App(tk.Tk):
         seen_api_keys = set(existing_api_keys)
         deduped_accounts = []
         duplicate_count = 0
-        for key, secret, addr in parsed:
+        for key, secret, addr, network in parsed:
             api_key = str(key or "").strip()
             if api_key in seen_api_keys:
                 duplicate_count += 1
                 continue
             seen_api_keys.add(api_key)
-            deduped_accounts.append((key, secret, addr))
+            deduped_accounts.append((key, secret, addr, network))
 
         net = self.acc_network_var.get().strip() or WITHDRAW_NETWORK_DEFAULT
-        for key, secret, addr in deduped_accounts:
-            self._append_account_row(key, secret, addr, net)
+        for key, secret, addr, network in deduped_accounts:
+            self._append_account_row(key, secret, addr, network or net)
 
         self._reindex_accounts()
         self._focus_account_list_for_paste()
@@ -3238,6 +3303,127 @@ class App(tk.Tk):
         self.exchange_proxy_var.set(proxy_text)
         self.use_exchange_config_proxy_var.set(use_proxy)
 
+    @staticmethod
+    def _normalize_account_network_text(value: str, *, fallback: str = WITHDRAW_NETWORK_DEFAULT) -> str:
+        text = str(value or "").strip().upper()
+        return text or str(fallback or WITHDRAW_NETWORK_DEFAULT).strip().upper() or WITHDRAW_NETWORK_DEFAULT
+
+    def _account_network_value(self, acc: dict, *, fallback: str | None = None) -> str:
+        network_var = acc.get("network_var")
+        if network_var is not None:
+            try:
+                raw = network_var.get()
+            except Exception:
+                raw = acc.get("network")
+        else:
+            raw = acc.get("network")
+        if fallback is None:
+            fallback = self.acc_network_var.get() if hasattr(self, "acc_network_var") else WITHDRAW_NETWORK_DEFAULT
+        return self._normalize_account_network_text(raw, fallback=fallback)
+
+    def _sync_account_network_var(self, acc: dict) -> None:
+        network_var = acc.get("network_var")
+        if network_var is None:
+            acc["network"] = self._account_network_value(acc)
+            return
+        try:
+            current_value = str(network_var.get() or "").strip().upper()
+        except Exception:
+            current_value = str(acc.get("network") or "").strip().upper()
+        normalized = self._normalize_account_network_text(current_value)
+        if current_value != normalized:
+            try:
+                network_var.set(normalized)
+            except Exception:
+                acc["network"] = normalized
+            return
+        if str(acc.get("network") or "").strip().upper() != normalized:
+            acc["network"] = normalized
+        self._refresh_account_tree_row(acc)
+        if not self._loading_accounts:
+            self._schedule_accounts_save()
+
+    def _account_store_entries(self) -> list[AccountEntry]:
+        entries: list[AccountEntry] = []
+        for acc in self.accounts:
+            api_key = str(acc.get("api_key") or "").strip()
+            api_secret = str(acc.get("api_secret") or "").strip()
+            address = str(acc.get("address") or "").strip()
+            if not api_key or not api_secret or not address:
+                continue
+            entries.append(
+                AccountEntry(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    address=address,
+                    network=self._account_network_value(acc),
+                )
+            )
+        return entries
+
+    def _save_accounts_silently(self) -> bool:
+        self._accounts_save_after_token = None
+        store = getattr(self, "account_store", None)
+        if store is None:
+            return False
+        try:
+            entries = self._account_store_entries()
+            if not entries and not store.file_path.exists():
+                return False
+            store.accounts = entries
+            store.settings.network = self._normalize_account_network_text(self.acc_network_var.get())
+            store.save()
+            return True
+        except Exception:
+            logger.exception("保存交易所账号列表失败")
+            return False
+
+    def _schedule_accounts_save(self) -> None:
+        if self._loading_accounts:
+            return
+        if not self.accounts and not self.account_store.file_path.exists():
+            return
+        if self._closing:
+            self._save_accounts_silently()
+            return
+        if self._accounts_save_after_token is not None:
+            return
+        try:
+            self._accounts_save_after_token = self.after(150, self._save_accounts_silently)
+        except Exception:
+            self._accounts_save_after_token = None
+            self._save_accounts_silently()
+
+    def _load_accounts(self) -> None:
+        store = getattr(self, "account_store", None)
+        if store is None:
+            return
+        self._loading_accounts = True
+        try:
+            store.load()
+            if store.last_load_notice:
+                logger.warning(store.last_load_notice)
+            loaded_any = False
+            fallback_network = self.acc_network_var.get()
+            for item in store.accounts:
+                self._append_account_row(
+                    item.api_key,
+                    item.api_secret,
+                    item.address,
+                    self._normalize_account_network_text(item.network, fallback=fallback_network),
+                    selected=True,
+                )
+                loaded_any = True
+            if loaded_any:
+                self._reindex_accounts()
+                self._focus_account_list_for_paste()
+                logger.info("已加载交易所账号列表：%s（共 %d 个）", store.file_path, len(store.accounts))
+        except Exception as exc:
+            logger.error("加载交易所账号列表失败: %s", exc)
+            messagebox.showwarning("提示", f"交易所账号列表加载失败：{exc}")
+        finally:
+            self._loading_accounts = False
+
     def _load_strategy_config(self):
         if not STRATEGY_CONFIG_FILE.exists():
             return
@@ -3312,7 +3498,23 @@ class App(tk.Tk):
                 continue
         raise RuntimeError("网络不可达或 IP 服务异常")
 
-    def _test_exchange_proxy_once(self, *, include_exit_ip: bool = True) -> tuple[str, str]:
+    @staticmethod
+    def _test_exchange_target_connectivity(*, proxies: dict[str, str] | None, allow_system_proxy: bool) -> str:
+        test_resp = http_get_via_proxy(
+            "https://api.binance.com/api/v3/time",
+            proxies=proxies or None,
+            timeout=10,
+            allow_system_proxy=allow_system_proxy,
+        )
+        test_resp.raise_for_status()
+        data = test_resp.json()
+        try:
+            server_time = int(data.get("serverTime"))
+        except Exception as exc:
+            raise RuntimeError(f"Binance 时间接口返回异常：{data}") from exc
+        return f"Binance /api/v3/time OK (serverTime={server_time})"
+
+    def _test_exchange_proxy_once(self, *, include_exit_ip: bool = True) -> tuple[str, str, str]:
         proxies = self._requests_proxy_map()
         proxy_text = self.exchange_proxy_var.get().strip()
         use_config_proxy = self._use_exchange_config_proxy()
@@ -3321,38 +3523,38 @@ class App(tk.Tk):
         proxy_exit_ip = "--"
         if use_config_proxy and proxy_text:
             proxy_status = "SS代理连接中..." if proxy_text.lower().startswith("ss://") else "代理连接中..."
+        allow_system_proxy = bool(system_proxy) and not use_config_proxy
+        target = self._test_exchange_target_connectivity(
+            proxies=proxies or None,
+            allow_system_proxy=allow_system_proxy,
+        )
         if use_config_proxy and proxy_text:
-            test_resp = http_get_via_proxy(
-                "https://api.binance.com/api/v3/time",
-                proxies=proxies or None,
-                timeout=10,
-                allow_system_proxy=False,
-            )
-            test_resp.raise_for_status()
             proxy_status = "SS代理已连接" if proxy_text.lower().startswith("ss://") else "代理已连接"
             if include_exit_ip:
                 proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=True, allow_system_proxy=False)
         elif system_proxy:
+            proxy_status = "系统代理已连接"
             if include_exit_ip:
                 proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=True)
         else:
+            proxy_status = "直连可用"
             if include_exit_ip:
                 proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=False)
-        return proxy_status, proxy_exit_ip
+        return proxy_status, proxy_exit_ip, target
 
     def test_exchange_proxy(self):
         def worker():
             test_ok = False
             save_err = ""
             try:
-                status, exit_ip = self._test_exchange_proxy_once()
+                status, exit_ip, target = self._test_exchange_proxy_once()
                 route_text = self._exchange_proxy_route_text()
                 try:
                     self._save_exchange_proxy_config_only()
                 except Exception as e:
                     save_err = str(e)
                 test_ok = True
-                log_text = f"交易所代理测试成功：status={status}，exit_ip={exit_ip}，route={route_text}"
+                log_text = f"交易所代理测试成功：status={status}，exit_ip={exit_ip}，target={target}，route={route_text}"
                 if save_err:
                     log_text = f"{log_text}，但保存配置失败：{save_err}"
                 else:
@@ -3361,6 +3563,8 @@ class App(tk.Tk):
                 status = "连接失败" if (self._use_exchange_config_proxy() and self.exchange_proxy_var.get().strip()) else "未启用"
                 if (not self._use_exchange_config_proxy()) and self._system_proxy_map():
                     status = "系统代理异常"
+                elif not self._use_exchange_config_proxy():
+                    status = "直连异常"
                 exit_ip = "--"
                 route_text = self._exchange_proxy_route_text()
                 log_text = f"交易所代理测试失败：{e}，route={route_text}"
@@ -3408,9 +3612,9 @@ class App(tk.Tk):
                 try:
                     ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=False)
                     if self._use_exchange_config_proxy():
-                        proxy_status, proxy_exit_ip = self._test_exchange_proxy_once(include_exit_ip=True)
+                        proxy_status, proxy_exit_ip, _target = self._test_exchange_proxy_once(include_exit_ip=True)
                     elif self._system_proxy_map():
-                        proxy_status, proxy_exit_ip = self._test_exchange_proxy_once(include_exit_ip=True)
+                        proxy_status, proxy_exit_ip, _target = self._test_exchange_proxy_once(include_exit_ip=True)
                     else:
                         proxy_exit_ip = ip
                 except Exception as e:
@@ -3419,6 +3623,8 @@ class App(tk.Tk):
                         proxy_status = "连接失败"
                     elif self._system_proxy_map():
                         proxy_status = "系统代理异常"
+                    else:
+                        proxy_status = "直连异常"
 
                 def _update():
                     self.ip_var.set(ip)
@@ -3447,9 +3653,24 @@ class App(tk.Tk):
             self._log_poll_after_token = None
 
     def _append_log(self, msg: str):
+        follow_tail, view_state = capture_vertical_view_state(self.text_log)
         self.text_log.configure(state="normal")
         self.text_log.insert("end", msg + "\n")
-        self.text_log.see("end")
+        trimmed_lines = 0
+        try:
+            total_lines = max(0, int(str(self.text_log.index("end-1c")).split(".", 1)[0]) - 1)
+        except Exception:
+            total_lines = 0
+        if total_lines > EXCHANGE_LOG_MAX_ROWS:
+            trimmed_lines = total_lines - EXCHANGE_LOG_MAX_ROWS
+            try:
+                self.text_log.delete("1.0", f"{trimmed_lines + 1}.0")
+            except Exception:
+                trimmed_lines = 0
+        if follow_tail:
+            self.text_log.see("end")
+        else:
+            restore_vertical_view_state(self.text_log, _shift_text_view_state_after_trim(view_state, trimmed_lines))
         self.text_log.configure(state="disabled")
 
     def _dispatch_ui(self, callback) -> None:
@@ -3888,6 +4109,8 @@ class App(tk.Tk):
             if "network_var" in acc:
                 acc["network_var"].set(net)
             self._refresh_account_tree_row(acc)
+        if self.accounts or self.account_store.file_path.exists():
+            self._schedule_accounts_save()
 
     @staticmethod
     def _account_row_color_by_status(status_text: str) -> str:
@@ -3926,7 +4149,7 @@ class App(tk.Tk):
         index_text = str(acc.get("index_var").get() or "")
         api_key = self._mask_key(str(acc.get("api_key") or ""))
         address = self._mask_addr(str(acc.get("address") or ""))
-        network = str(acc.get("network_var").get() or acc.get("network") or "")
+        network = self._account_network_value(acc)
         status = str(acc.get("status_var").get() or "")
         return checked, index_text, api_key, address, network, status
 
@@ -4405,7 +4628,7 @@ class App(tk.Tk):
         self.run_selected_accounts(accounts_to_run=accounts_to_retry, require_confirm=False, **retry_kwargs)
 
     def _append_account_row(self, key, secret, addr, net, selected=True):
-        net = (net or "").strip() or WITHDRAW_NETWORK_DEFAULT
+        net = self._normalize_account_network_text(net)
         index_var = tk.StringVar(value=str(len(self.accounts) + 1))
         selected_var = tk.BooleanVar(value=selected)
         network_var = tk.StringVar(value=net)
@@ -4424,10 +4647,13 @@ class App(tk.Tk):
             "tree_id": "",
         }
         selected_var.trace_add("write", lambda *_args, a=acc: (self._update_toggle_select_button_text(), self._refresh_account_tree_row(a)))
+        network_var.trace_add("write", lambda *_args, a=acc: self._sync_account_network_var(a))
         self.accounts.append(acc)
         self._insert_account_tree_row(acc)
         self._update_toggle_select_button_text()
         self._refresh_account_list_hint()
+        if not self._loading_accounts:
+            self._schedule_accounts_save()
         return acc
 
     def add_account_to_list(self):
@@ -4473,6 +4699,7 @@ class App(tk.Tk):
             self._set_context_account(None)
         self._reindex_accounts()
         self._update_toggle_select_button_text()
+        self._schedule_accounts_save()
 
     def select_all_accounts(self):
         for acc in self.accounts:
@@ -4517,7 +4744,7 @@ class App(tk.Tk):
                         acc["api_key"],
                         acc["api_secret"],
                         acc["address"],
-                        acc["network"],
+                        self._account_network_value(acc),
                     ])
                     f.write(line + "\n")
             logger.info("账号列表已导出到文件：%s", path)
@@ -5206,7 +5433,15 @@ class App(tk.Tk):
 
         self.worker_thread = self._start_managed_thread(controller, name="exchange-batch-withdraw")
 
-def run_selftest() -> int:
+def _run_online_selftest_checks(client: EvmClient, checks: list[str]) -> None:
+    zero_address = "0x0000000000000000000000000000000000000000"
+    eth_balance = client.get_balance_wei("ETH", zero_address)
+    bsc_balance = client.get_balance_wei("BSC", zero_address)
+    checks.append(f"eth-rpc={eth_balance}")
+    checks.append(f"bsc-rpc={bsc_balance}")
+
+
+def run_selftest(*, include_online_checks: bool = False) -> int:
     try:
         checks: list[str] = []
 
@@ -5218,11 +5453,24 @@ def run_selftest() -> int:
         client = EvmClient()
         checks.append("evm-deps")
 
-        zero_address = "0x0000000000000000000000000000000000000000"
-        eth_balance = client.get_balance_wei("ETH", zero_address)
-        bsc_balance = client.get_balance_wei("BSC", zero_address)
-        checks.append(f"eth-rpc={eth_balance}")
-        checks.append(f"bsc-rpc={bsc_balance}")
+        wallet = client.create_wallet()
+        if not wallet.address or not wallet.private_key:
+            raise RuntimeError("钱包生成结果为空")
+        derived_address = client.address_from_private_key(wallet.private_key)
+        if client.normalize_address(wallet.address) != client.normalize_address(derived_address):
+            raise RuntimeError("钱包生成校验失败：私钥反推地址不一致")
+        zero_address = client.validate_evm_address("0x0000000000000000000000000000000000000000", "零地址")
+        checks.append("wallet-gen=ok")
+        checks.append(f"zero={zero_address}")
+        checks.append(f"eth-chain={client.get_chain_id('ETH')}")
+        checks.append(f"bsc-chain={client.get_chain_id('BSC')}")
+        checks.append(f"eth-tokens={len(client.get_default_tokens('ETH'))}")
+        checks.append(f"bsc-tokens={len(client.get_default_tokens('BSC'))}")
+        if include_online_checks:
+            _run_online_selftest_checks(client, checks)
+            checks.append("online-check=enabled")
+        else:
+            checks.append("online-check=skipped")
 
         session = requests.Session()
         session.trust_env = False
@@ -5261,16 +5509,12 @@ def run_selftest() -> int:
 # ====================== 入口 ======================
 if __name__ == "__main__":
     try:
-        if getattr(sys, 'frozen', False):
-            application_path = os.path.dirname(sys.executable)
-        else:
-            application_path = os.path.dirname(os.path.abspath(__file__))
-
-        os.chdir(application_path)
+        os.chdir(str(APP_DIR))
     except Exception as e:
         print(f"路径设置失败: {e}")
-    if "--selftest" in sys.argv:
-        raise SystemExit(run_selftest())
+    selftest_online = "--selftest-online" in sys.argv or os.environ.get("XIAOJUN_SELFTEST_ONLINE", "").strip() == "1"
+    if "--selftest" in sys.argv or "--selftest-online" in sys.argv:
+        raise SystemExit(run_selftest(include_online_checks=selftest_online))
 
     app = App()
     app.mainloop()

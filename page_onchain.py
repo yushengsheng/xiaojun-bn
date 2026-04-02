@@ -519,7 +519,33 @@ class OnchainTransferPage:
                 continue
         raise RuntimeError("网络不可达或 IP 服务异常")
 
-    def _test_onchain_proxy_once(self, *, include_exit_ip: bool = True) -> tuple[str, str]:
+    def _proxy_test_networks(self) -> list[str]:
+        selected_network = str(self.network_var.get() or "").strip().upper()
+        if selected_network in EvmClient.NETWORKS:
+            return [selected_network]
+        return list(EvmClient.NETWORKS.keys())
+
+    def _test_onchain_target_connectivity(self) -> str:
+        networks = self._proxy_test_networks()
+        details: list[str] = []
+        errors: list[str] = []
+        success_count = 0
+        for network in networks:
+            try:
+                chain_id = self.client.get_rpc_chain_id(network)
+                details.append(f"{network} RPC chainId={chain_id}")
+                success_count += 1
+            except Exception as exc:
+                errors.append(f"{network}: {exc}")
+                if len(networks) == 1:
+                    raise
+        if success_count <= 0:
+            raise RuntimeError("；".join(errors) if errors else "RPC 连通性测试失败")
+        if errors:
+            details.append("部分失败=" + " | ".join(errors))
+        return "；".join(details)
+
+    def _test_onchain_proxy_once(self, *, include_exit_ip: bool = True) -> tuple[str, str, str]:
         use_config_proxy = bool(self.use_config_proxy_var.get())
         raw_proxy = str(self.onchain_proxy_var.get() or "").strip()
         system_proxy = self._onchain_system_proxy_map() if not use_config_proxy else {}
@@ -530,7 +556,14 @@ class OnchainTransferPage:
         if use_config_proxy:
             # 触发代理规范化/内置 SS runtime 初始化
             self._onchain_proxy_map()
-            status = "SS代理已连接" if raw_proxy.lower().startswith("ss://") and raw_proxy else ("代理已连接" if raw_proxy else "未启用")
+        target = self._test_onchain_target_connectivity()
+        if use_config_proxy and raw_proxy:
+            status = "SS代理已连接" if raw_proxy.lower().startswith("ss://") else "代理已连接"
+        elif system_proxy:
+            status = "系统代理已连接"
+        else:
+            status = "直连可用"
+        if use_config_proxy:
             if include_exit_ip:
                 exit_ip = self._fetch_onchain_public_ip(use_config_proxy=True, allow_system_proxy=False)
         elif system_proxy:
@@ -539,7 +572,7 @@ class OnchainTransferPage:
         else:
             if include_exit_ip:
                 exit_ip = self._fetch_onchain_public_ip(use_config_proxy=False, allow_system_proxy=False)
-        return status, exit_ip
+        return status, exit_ip, target
 
     def _refresh_onchain_proxy_summary(self) -> None:
         if self.use_config_proxy_var.get():
@@ -1941,17 +1974,17 @@ class OnchainTransferPage:
         def worker():
             test_ok = False
             try:
-                status, exit_ip = self._test_onchain_proxy_once()
+                status, exit_ip, target = self._test_onchain_proxy_once()
                 route_text = self._onchain_proxy_route_text()
                 test_ok = True
-                log_text = f"链上代理测试成功：status={status}，exit_ip={exit_ip}，route={route_text}"
+                log_text = f"链上代理测试成功：status={status}，exit_ip={exit_ip}，target={target}，route={route_text}"
             except Exception as exc:
                 if self.use_config_proxy_var.get() and self.onchain_proxy_var.get().strip():
                     status = "连接失败"
                 elif (not self.use_config_proxy_var.get()) and self._onchain_system_proxy_map():
                     status = "系统代理异常"
                 else:
-                    status = "未启用"
+                    status = "直连异常"
                 exit_ip = "--"
                 route_text = self._onchain_proxy_route_text()
                 log_text = f"链上代理测试失败：{exc}，route={route_text}"

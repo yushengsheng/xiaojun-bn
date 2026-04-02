@@ -444,6 +444,14 @@ class EvmClient:
     def get_chain_id(self, network: str) -> int:
         return int(self._network_info(network).get("chain_id"))
 
+    def get_rpc_chain_id(self, network: str) -> int:
+        result = self._rpc_call(network, "eth_chainId", [])
+        chain_id = self._int_from_hex(result)
+        expected_chain_id = self.get_chain_id(network)
+        if expected_chain_id > 0 and chain_id != expected_chain_id:
+            raise RuntimeError(f"{network} RPC chainId 异常：返回 {chain_id}，期望 {expected_chain_id}")
+        return chain_id
+
     def get_balance_wei(self, network: str, address: str) -> int:
         if not self.is_address(address):
             raise RuntimeError(f"地址格式错误：{address}")

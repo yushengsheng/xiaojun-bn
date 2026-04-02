@@ -12,6 +12,7 @@ class AccountEntry:
     api_key: str
     api_secret: str
     address: str
+    network: str = ""
 
 
 @dataclass

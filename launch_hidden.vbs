@@ -45,24 +45,29 @@ Function FindMainScript(folderPath)
 End Function
 
 Function ResolvePythonGuiCommand()
-    Dim pyExe, pywExe
+    Dim candidate
 
-    pyExe = ResolvePyLauncherPython()
-    If pyExe <> "" Then
-        pywExe = ReplacePythonExeWithPythonw(pyExe)
-        If pywExe <> "" Then
-            ResolvePythonGuiCommand = pywExe
-            Exit Function
-        End If
-        If FileExistsSafe(pyExe) Then
-            ResolvePythonGuiCommand = pyExe
-            Exit Function
-        End If
+    candidate = PreferPythonGuiCommand(ResolvePyLauncherPython())
+    If candidate <> "" Then
+        ResolvePythonGuiCommand = candidate
+        Exit Function
     End If
 
-    pywExe = shell.ExpandEnvironmentStrings("%LocalAppData%") & "\Programs\Python\Python314\pythonw.exe"
-    If FileExistsSafe(pywExe) Then
-        ResolvePythonGuiCommand = pywExe
+    candidate = PreferPythonGuiCommand(ResolveWhereExecutable("pythonw.exe"))
+    If candidate <> "" Then
+        ResolvePythonGuiCommand = candidate
+        Exit Function
+    End If
+
+    candidate = PreferPythonGuiCommand(ResolveWhereExecutable("python.exe"))
+    If candidate <> "" Then
+        ResolvePythonGuiCommand = candidate
+        Exit Function
+    End If
+
+    candidate = ResolveLatestLocalPython()
+    If candidate <> "" Then
+        ResolvePythonGuiCommand = candidate
         Exit Function
     End If
 
@@ -91,11 +96,96 @@ Function ResolvePyLauncherPython()
 
     output = Trim(execObj.StdOut.ReadAll)
     exePath = FirstLine(output)
-    If FileExistsSafe(exePath) Then
+    If IsAcceptablePythonPath(exePath) Then
         ResolvePyLauncherPython = exePath
     Else
         ResolvePyLauncherPython = ""
     End If
+End Function
+
+Function PreferPythonGuiCommand(pyExe)
+    Dim pywExe
+    pyExe = Trim(pyExe)
+    If Not IsAcceptablePythonPath(pyExe) Then
+        PreferPythonGuiCommand = ""
+        Exit Function
+    End If
+
+    pywExe = ReplacePythonExeWithPythonw(pyExe)
+    If IsAcceptablePythonPath(pywExe) Then
+        PreferPythonGuiCommand = pywExe
+        Exit Function
+    End If
+
+    PreferPythonGuiCommand = pyExe
+End Function
+
+Function ResolveWhereExecutable(commandName)
+    Dim execObj, output, exePath
+    On Error Resume Next
+    Set execObj = shell.Exec("cmd /c where " & commandName)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ResolveWhereExecutable = ""
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    Do While execObj.Status = 0
+        WScript.Sleep 50
+    Loop
+
+    If execObj.ExitCode <> 0 Then
+        ResolveWhereExecutable = ""
+        Exit Function
+    End If
+
+    output = Trim(execObj.StdOut.ReadAll)
+    exePath = FirstLine(output)
+    If IsAcceptablePythonPath(exePath) Then
+        ResolveWhereExecutable = exePath
+    Else
+        ResolveWhereExecutable = ""
+    End If
+End Function
+
+Function ResolveLatestLocalPython()
+    Dim rootPath, rootFolder, subFolder, candidate, bestPath, bestDigits, digits, folderName
+    rootPath = shell.ExpandEnvironmentStrings("%LocalAppData%") & "\Programs\Python"
+    If Not fso.FolderExists(rootPath) Then
+        ResolveLatestLocalPython = ""
+        Exit Function
+    End If
+
+    On Error Resume Next
+    Set rootFolder = fso.GetFolder(rootPath)
+    If Err.Number <> 0 Then
+        Err.Clear
+        ResolveLatestLocalPython = ""
+        Exit Function
+    End If
+    On Error GoTo 0
+
+    bestPath = ""
+    bestDigits = ""
+    For Each subFolder In rootFolder.SubFolders
+        folderName = UCase(subFolder.Name)
+        digits = DigitsOnly(subFolder.Name)
+        If Left(folderName, 6) = "PYTHON" And digits <> "" Then
+            candidate = PreferPythonGuiCommand(fso.BuildPath(subFolder.Path, "python.exe"))
+            If candidate = "" Then
+                candidate = PreferPythonGuiCommand(fso.BuildPath(subFolder.Path, "pythonw.exe"))
+            End If
+            If candidate <> "" Then
+                If bestDigits = "" Or CompareDigitText(digits, bestDigits) > 0 Then
+                    bestDigits = digits
+                    bestPath = candidate
+                End If
+            End If
+        End If
+    Next
+
+    ResolveLatestLocalPython = bestPath
 End Function
 
 Function ReplacePythonExeWithPythonw(pyExe)
@@ -111,6 +201,29 @@ Function ReplacePythonExeWithPythonw(pyExe)
     Else
         ReplacePythonExeWithPythonw = ""
     End If
+End Function
+
+Function IsWindowsAppsAlias(pathText)
+    Dim normalized
+    normalized = LCase(Trim(CStr(pathText)))
+    If normalized = "" Then
+        IsWindowsAppsAlias = False
+        Exit Function
+    End If
+    IsWindowsAppsAlias = (InStr(normalized, "\microsoft\windowsapps\") > 0)
+End Function
+
+Function IsAcceptablePythonPath(pathText)
+    pathText = Trim(CStr(pathText))
+    If pathText = "" Then
+        IsAcceptablePythonPath = False
+        Exit Function
+    End If
+    If IsWindowsAppsAlias(pathText) Then
+        IsAcceptablePythonPath = False
+        Exit Function
+    End If
+    IsAcceptablePythonPath = FileExistsSafe(pathText)
 End Function
 
 Function FileExistsSafe(pathText)
@@ -132,6 +245,38 @@ Function FirstLine(text)
         FirstLine = Trim(lines(0))
     Else
         FirstLine = ""
+    End If
+End Function
+
+Function DigitsOnly(text)
+    Dim i, ch, result
+    result = ""
+    For i = 1 To Len(text)
+        ch = Mid(text, i, 1)
+        If ch >= "0" And ch <= "9" Then
+            result = result & ch
+        End If
+    Next
+    DigitsOnly = result
+End Function
+
+Function CompareDigitText(leftText, rightText)
+    leftText = CStr(leftText)
+    rightText = CStr(rightText)
+    If Len(leftText) > Len(rightText) Then
+        CompareDigitText = 1
+        Exit Function
+    End If
+    If Len(leftText) < Len(rightText) Then
+        CompareDigitText = -1
+        Exit Function
+    End If
+    If leftText > rightText Then
+        CompareDigitText = 1
+    ElseIf leftText < rightText Then
+        CompareDigitText = -1
+    Else
+        CompareDigitText = 0
     End If
 End Function
 

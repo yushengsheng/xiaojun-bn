@@ -15,9 +15,9 @@ withdraw_success.txt
 # local launcher artifacts (macOS)
 *.app/
 *.applescript
+.DS_Store
 
 build/
 dist/
 release/
 *.spec
-

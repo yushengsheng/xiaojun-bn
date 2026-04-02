@@ -26,6 +26,16 @@ py -3 -m pip install requests PySocks eth-account eth-utils
 py -3 小军bn.py
 ```
 
+可选自检：
+
+```powershell
+py -3 小军bn.py --selftest
+py -3 小军bn.py --selftest-online
+```
+
+- `--selftest`：离线完整性自检，适合本地排查或发布冒烟验证
+- `--selftest-online`：额外验证 ETH/BSC 公网 RPC 可达性，适合手动联机排查
+
 ### macOS（本地一键启动，无终端窗口）
 
 - 双击：`小军bn一键启动.app`
@@ -46,6 +56,7 @@ py -3 小军bn.py
 - `windows-x64-portable.zip`：便携目录版，适合长期放在固定目录运行
 - GitHub Release 构建会一并打包交易所、代理、链上、UI 所需运行依赖
 - Release 会附带页面内置 SS 代理所需的 `xray` 与 `sing-box` 运行文件，无需目标电脑额外安装 v2rayN 或单独拷贝代理内核
+- Release 冒烟默认使用离线 `--selftest`；联机链上连通性需要时再额外执行 `--selftest-online`
 
 ## 账号导入格式（交易所批量页）
 

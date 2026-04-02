@@ -19,6 +19,22 @@ from core_models import (
 )
 from secret_box import SECRET_BOX
 
+def _fsync_parent_dir(path: Path) -> None:
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except Exception:
+        return
+    try:
+        os.fsync(dir_fd)
+    except Exception:
+        pass
+    finally:
+        try:
+            os.close(dir_fd)
+        except Exception:
+            pass
+
+
 def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -28,6 +44,7 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> Non
             fp.flush()
             os.fsync(fp.fileno())
         os.replace(tmp_name, path)
+        _fsync_parent_dir(path)
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -145,8 +162,9 @@ class AccountStore:
             api_key = SECRET_BOX.decrypt(str(item.get("api_key") or "").strip()).strip()
             api_secret = SECRET_BOX.decrypt(str(item.get("api_secret") or "").strip()).strip()
             address = (item.get("address") or "").strip()
+            network = str(item.get("network") or settings_raw.get("network") or "").strip().upper()
             if api_key and api_secret and address:
-                loaded.append(AccountEntry(api_key=api_key, api_secret=api_secret, address=address))
+                loaded.append(AccountEntry(api_key=api_key, api_secret=api_secret, address=address, network=network))
 
         self.accounts = loaded
         addrs: list[str] = []
@@ -192,6 +210,7 @@ class AccountStore:
                     "api_key": SECRET_BOX.encrypt(a.api_key),
                     "api_secret": SECRET_BOX.encrypt(a.api_secret),
                     "address": a.address,
+                    "network": str(a.network or "").strip().upper(),
                 }
                 for a in self.accounts
             ],

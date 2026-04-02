@@ -9,6 +9,12 @@ on:
 permissions:
   contents: write
 
+env:
+  XRAY_TAG: v26.3.27
+  XRAY_ASSET: Xray-windows-64.zip
+  SING_BOX_TAG: v1.13.5
+  SING_BOX_ASSET: sing-box-1.13.5-windows-amd64.zip
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -39,17 +45,16 @@ jobs:
           New-Item -ItemType Directory -Path $xrayDir -Force | Out-Null
           New-Item -ItemType Directory -Path $singBoxDir -Force | Out-Null
 
-          $xrayRelease = gh release view --repo XTLS/Xray-core --json tagName | ConvertFrom-Json
-          $xrayTag = $xrayRelease.tagName
-          $xrayAsset = "Xray-windows-64.zip"
+          $xrayTag = "${{ env.XRAY_TAG }}"
+          $xrayAsset = "${{ env.XRAY_ASSET }}"
+          Write-Host "Using pinned xray runtime: $xrayTag ($xrayAsset)"
           gh release download $xrayTag --repo XTLS/Xray-core --pattern $xrayAsset --dir $proxyRoot
           Expand-Archive -Path (Join-Path $proxyRoot $xrayAsset) -DestinationPath $xrayDir -Force
           Remove-Item (Join-Path $proxyRoot $xrayAsset) -Force
 
-          $singBoxRelease = gh release view --repo SagerNet/sing-box --json tagName | ConvertFrom-Json
-          $singBoxTag = $singBoxRelease.tagName
-          $singBoxVersion = $singBoxTag.TrimStart("v")
-          $singBoxAsset = "sing-box-$singBoxVersion-windows-amd64.zip"
+          $singBoxTag = "${{ env.SING_BOX_TAG }}"
+          $singBoxAsset = "${{ env.SING_BOX_ASSET }}"
+          Write-Host "Using pinned sing-box runtime: $singBoxTag ($singBoxAsset)"
           gh release download $singBoxTag --repo SagerNet/sing-box --pattern $singBoxAsset --dir $proxyRoot
           Expand-Archive -Path (Join-Path $proxyRoot $singBoxAsset) -DestinationPath $singBoxDir -Force
           Remove-Item (Join-Path $proxyRoot $singBoxAsset) -Force
