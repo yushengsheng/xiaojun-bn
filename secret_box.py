@@ -11,6 +11,11 @@ import tempfile
 import threading
 from pathlib import Path
 
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except Exception:
+    AESGCM = None
+
 from app_paths import SECRET_KEY_FILE
 
 
@@ -50,7 +55,8 @@ class SecretBox:
     支持兼容旧明文（未加密值会直接返回）。
     """
 
-    PREFIX = "enc::v1::"
+    PREFIX_V1 = "enc::v1::"
+    PREFIX_V2 = "enc::v2::"
     ENV_KEY = "WITHDRAW_SECRET_KEY"
     KEY_FILE = SECRET_KEY_FILE
 
@@ -76,7 +82,8 @@ class SecretBox:
 
     @classmethod
     def is_encrypted(cls, text: str) -> bool:
-        return str(text or "").startswith(cls.PREFIX)
+        raw = str(text or "")
+        return raw.startswith(cls.PREFIX_V1) or raw.startswith(cls.PREFIX_V2)
 
     @staticmethod
     def _xor_bytes(a: bytes, b: bytes) -> bytes:
@@ -121,30 +128,28 @@ class SecretBox:
                 self._key_cache = self._load_or_create_key()
             return self._key_cache
 
-    def encrypt(self, plain_text: str) -> str:
-        text = str(plain_text or "")
-        if not text:
-            return ""
-        if self.is_encrypted(text):
-            return text
+    @staticmethod
+    def modern_encryption_available() -> bool:
+        return AESGCM is not None
 
+    @staticmethod
+    def _require_aesgcm():
+        if AESGCM is None:
+            raise RuntimeError('检测到新版密文，但当前环境缺少 "cryptography" 依赖')
+        return AESGCM
+
+    def _encrypt_v1(self, text: str) -> str:
         key = self._key()
         nonce = os.urandom(16)
         plain = text.encode("utf-8")
         stream = self._build_keystream(key, nonce, len(plain))
         cipher = self._xor_bytes(plain, stream)
         mac = hmac.new(key, b"auth-v1|" + nonce + cipher, hashlib.sha256).digest()
-        return f"{self.PREFIX}{self._b64_encode(nonce)}.{self._b64_encode(cipher)}.{self._b64_encode(mac)}"
+        return f"{self.PREFIX_V1}{self._b64_encode(nonce)}.{self._b64_encode(cipher)}.{self._b64_encode(mac)}"
 
-    def decrypt(self, maybe_cipher_text: str) -> str:
-        text = str(maybe_cipher_text or "")
-        if not text:
-            return ""
-        if not self.is_encrypted(text):
-            return text
-
+    def _decrypt_v1(self, text: str) -> str:
         key = self._key()
-        body = text[len(self.PREFIX) :]
+        body = text[len(self.PREFIX_V1) :]
         parts = body.split(".")
         if len(parts) != 3:
             raise RuntimeError("密文格式错误")
@@ -160,6 +165,53 @@ class SecretBox:
             return plain.decode("utf-8")
         except Exception as exc:
             raise RuntimeError("密文解码失败") from exc
+
+    def _encrypt_v2(self, text: str) -> str:
+        aesgcm_cls = self._require_aesgcm()
+        key = self._key()
+        nonce = os.urandom(12)
+        cipher = aesgcm_cls(key).encrypt(nonce, text.encode("utf-8"), b"secret-box-v2")
+        return f"{self.PREFIX_V2}{self._b64_encode(nonce)}.{self._b64_encode(cipher)}"
+
+    def _decrypt_v2(self, text: str) -> str:
+        aesgcm_cls = self._require_aesgcm()
+        key = self._key()
+        body = text[len(self.PREFIX_V2) :]
+        parts = body.split(".")
+        if len(parts) != 2:
+            raise RuntimeError("密文格式错误")
+        nonce = self._b64_decode(parts[0])
+        cipher = self._b64_decode(parts[1])
+        try:
+            plain = aesgcm_cls(key).decrypt(nonce, cipher, b"secret-box-v2")
+        except Exception as exc:
+            raise RuntimeError("密文校验失败（密钥不匹配或文件损坏）") from exc
+        try:
+            return plain.decode("utf-8")
+        except Exception as exc:
+            raise RuntimeError("密文解码失败") from exc
+
+    def encrypt(self, plain_text: str) -> str:
+        text = str(plain_text or "")
+        if not text:
+            return ""
+        if self.is_encrypted(text):
+            return text
+        if self.modern_encryption_available():
+            return self._encrypt_v2(text)
+        return self._encrypt_v1(text)
+
+    def decrypt(self, maybe_cipher_text: str) -> str:
+        text = str(maybe_cipher_text or "")
+        if not text:
+            return ""
+        if not self.is_encrypted(text):
+            return text
+        if text.startswith(self.PREFIX_V2):
+            return self._decrypt_v2(text)
+        if text.startswith(self.PREFIX_V1):
+            return self._decrypt_v1(text)
+        raise RuntimeError("不支持的密文版本")
 
 
 SECRET_BOX = SecretBox()

@@ -1086,6 +1086,10 @@ class OnchainTransferPage:
         except Exception:
             pass
         self._join_managed_threads(timeout_total=1.0)
+        try:
+            self.client.close()
+        except Exception:
+            pass
         stop_ui_bridge(self)
 
     def _finish_progress(self, kind: str, success: int, failed: int):

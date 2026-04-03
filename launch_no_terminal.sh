@@ -25,12 +25,12 @@ fi
 cd "$PROJECT_DIR"
 
 # 自动补齐运行依赖（按需安装）
-if ! "$PYTHON_BIN" -c 'import requests, eth_account, eth_utils, socks' >/dev/null 2>&1; then
-  if ! "$PYTHON_BIN" -m pip install --user requests PySocks eth-account eth-utils >>"$LOG_FILE" 2>&1; then
+if ! "$PYTHON_BIN" -c 'import requests, eth_account, eth_utils, socks, cryptography' >/dev/null 2>&1; then
+  if ! "$PYTHON_BIN" -m pip install --user requests PySocks cryptography eth-account eth-utils >>"$LOG_FILE" 2>&1; then
     osascript -e "display alert \"启动失败\" message \"自动安装运行依赖失败，请查看日志：$LOG_FILE\" as critical"
     exit 1
   fi
-  if ! "$PYTHON_BIN" -c 'import requests, eth_account, eth_utils, socks' >/dev/null 2>&1; then
+  if ! "$PYTHON_BIN" -c 'import requests, eth_account, eth_utils, socks, cryptography' >/dev/null 2>&1; then
     osascript -e "display alert \"启动失败\" message \"运行依赖校验失败，请查看日志：$LOG_FILE\" as critical"
     exit 1
   fi

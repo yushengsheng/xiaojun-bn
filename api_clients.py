@@ -30,6 +30,8 @@ class EvmClient:
     }
     NATIVE_GAS_LIMIT = 21000
     ERC20_DEFAULT_GAS_LIMIT = 70000
+    RPC_CONNECT_TIMEOUT = 6
+    RPC_READ_TIMEOUT = 20
     NETWORKS = {
         "ETH": {
             "chain_id": 1,
@@ -78,6 +80,11 @@ class EvmClient:
         self._proxy_provider = proxy_provider
         self._allow_system_proxy = bool(allow_system_proxy)
         self._allow_system_proxy_provider = allow_system_proxy_provider
+        self._rpc_session_local = threading.local()
+        self._rpc_sessions_lock = threading.Lock()
+        self._rpc_sessions: dict[int, requests.Session] = {}
+        self._preferred_rpc_urls_lock = threading.Lock()
+        self._preferred_rpc_urls: dict[str, str] = {}
 
     def _allow_system_proxy_now(self) -> bool:
         if self._allow_system_proxy_provider is None:
@@ -96,15 +103,70 @@ class EvmClient:
             raise RuntimeError(f"RPC 代理初始化失败：{exc}") from exc
         return str(value or "").strip()
 
-    def _new_rpc_session(self) -> tuple[requests.Session, str]:
-        proxy_url = self._current_proxy_url()
+    @staticmethod
+    def _rpc_session_signature(proxy_url: str, allow_system_proxy: bool) -> tuple[str, bool]:
+        return (str(proxy_url or "").strip(), bool(allow_system_proxy))
+
+    @staticmethod
+    def _build_rpc_session(proxy_url: str, allow_system_proxy: bool) -> requests.Session:
         session = requests.Session()
-        session.trust_env = self._allow_system_proxy_now() and not bool(proxy_url)
+        session.trust_env = bool(allow_system_proxy)
         if proxy_url:
             session.proxies = {
                 "http": proxy_url,
                 "https": proxy_url,
             }
+        return session
+
+    def _close_thread_rpc_session(self, session: requests.Session | None = None) -> None:
+        local = self._rpc_session_local
+        cached_session = getattr(local, "session", None)
+        if session is not None and cached_session is not session:
+            return
+        if cached_session is None:
+            return
+        local.session = None
+        local.signature = None
+        ident = threading.get_ident()
+        with self._rpc_sessions_lock:
+            if self._rpc_sessions.get(ident) is cached_session:
+                self._rpc_sessions.pop(ident, None)
+        try:
+            cached_session.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        self._close_thread_rpc_session()
+        with self._rpc_sessions_lock:
+            sessions = list(self._rpc_sessions.values())
+            self._rpc_sessions.clear()
+        seen_ids: set[int] = set()
+        for session in sessions:
+            session_id = id(session)
+            if session_id in seen_ids:
+                continue
+            seen_ids.add(session_id)
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _rpc_session(self) -> tuple[requests.Session, str]:
+        proxy_url = self._current_proxy_url()
+        allow_system_proxy = self._allow_system_proxy_now() and not bool(proxy_url)
+        signature = self._rpc_session_signature(proxy_url, allow_system_proxy)
+        local = self._rpc_session_local
+        session = getattr(local, "session", None)
+        cached_signature = getattr(local, "signature", None)
+        if session is not None and cached_signature == signature:
+            return session, proxy_url
+        self._close_thread_rpc_session()
+        session = self._build_rpc_session(proxy_url, allow_system_proxy)
+        local.session = session
+        local.signature = signature
+        with self._rpc_sessions_lock:
+            self._rpc_sessions[threading.get_ident()] = session
         return session, proxy_url
 
     def _network_info(self, network: str) -> dict:
@@ -124,6 +186,26 @@ class EvmClient:
                 return cfg
         cfg["rpc_urls"] = urls
         return cfg
+
+    def _ordered_rpc_urls(self, network: str, urls: list[str]) -> list[str]:
+        ordered = list(urls)
+        net = str(network or "").strip().upper()
+        if not ordered or not net:
+            return ordered
+        with self._preferred_rpc_urls_lock:
+            preferred_url = str(self._preferred_rpc_urls.get(net) or "").strip()
+        if preferred_url and preferred_url in ordered:
+            ordered.remove(preferred_url)
+            ordered.insert(0, preferred_url)
+        return ordered
+
+    def _remember_preferred_rpc_url(self, network: str, url: str) -> None:
+        net = str(network or "").strip().upper()
+        normalized_url = str(url or "").strip()
+        if not net or not normalized_url:
+            return
+        with self._preferred_rpc_urls_lock:
+            self._preferred_rpc_urls[net] = normalized_url
 
     def get_default_tokens(self, network: str) -> list[EvmToken]:
         net = network.strip().upper()
@@ -316,17 +398,18 @@ class EvmClient:
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
         last_err = ""
-        for url in info["rpc_urls"]:
+        rpc_urls = self._ordered_rpc_urls(network, list(info["rpc_urls"]))
+        for url in rpc_urls:
             for attempt in range(1, max_attempts + 1):
                 session = None
                 proxy_url = ""
                 try:
-                    session, proxy_url = self._new_rpc_session()
+                    session, proxy_url = self._rpc_session()
                     resp = session.post(
                         url,
                         data=body,
                         headers={"Content-Type": "application/json"},
-                        timeout=20,
+                        timeout=(self.RPC_CONNECT_TIMEOUT, self.RPC_READ_TIMEOUT),
                     )
                     text = resp.text
                     if resp.status_code >= 400:
@@ -340,9 +423,12 @@ class EvmClient:
                         code = err.get("code")
                         msg = err.get("message")
                         raise RuntimeError(f"RPC({url}) code={code} msg={msg}")
+                    self._remember_preferred_rpc_url(network, url)
                     return j.get("result")
                 except Exception as exc:
                     err_text = str(exc)
+                    if session is not None and isinstance(exc, requests.exceptions.RequestException):
+                        self._close_thread_rpc_session(session)
                     if proxy_url and "Missing dependencies for SOCKS support" in err_text:
                         err_text = f"当前代理为 SOCKS，但运行环境缺少 PySocks：{proxy_url}"
                     last_err = err_text
@@ -350,9 +436,6 @@ class EvmClient:
                         time.sleep(0.4 * attempt)
                         continue
                     break
-                finally:
-                    if session is not None:
-                        session.close()
         raise RuntimeError(f"{network} RPC 请求失败：{last_err}")
 
     @staticmethod

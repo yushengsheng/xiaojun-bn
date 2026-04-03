@@ -51,6 +51,7 @@ from shared_utils import (
     dispatch_ui_callback,
     make_scrollbar,
     restore_vertical_view_state,
+    schedule_ui_callback,
     start_ui_bridge,
     stop_ui_bridge,
 )
@@ -157,6 +158,15 @@ class ExchangeProxyRuntime:
         "Accept": "application/vnd.github+json",
         "User-Agent": "xiaojun-bn/1.0",
     }
+    _RUNTIME_READY_HEADERS = {
+        "User-Agent": "xiaojun-bn/1.0",
+    }
+    _READY_CHECK_URLS = (
+        "https://api.binance.com/api/v3/time",
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://ipinfo.io/ip",
+    )
     _SING_BOX_RELEASE_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 
     def __init__(self, work_dir: Path, runtime_name: str = "exchange"):
@@ -677,13 +687,19 @@ class ExchangeProxyRuntime:
         proxies = {"http": local_proxy_url, "https": local_proxy_url}
         last_err = ""
         while time.time() < deadline:
-            try:
-                resp = http_get_via_proxy("https://api.ipify.org", proxies=proxies, timeout=4)
-                resp.raise_for_status()
-                return
-            except Exception as exc:
-                last_err = str(exc)
-                time.sleep(0.4)
+            for url in self._READY_CHECK_URLS:
+                try:
+                    resp = http_get_via_proxy(
+                        url,
+                        headers=self._RUNTIME_READY_HEADERS,
+                        proxies=proxies,
+                        timeout=4,
+                    )
+                    resp.raise_for_status()
+                    return
+                except Exception as exc:
+                    last_err = f"{url}: {exc}"
+            time.sleep(0.4)
         raise RuntimeError(f"SS 代理启动失败：{last_err or '本地代理未就绪'}")
 
     def ensure_proxy(self, ss_uri: str) -> str:
@@ -3640,22 +3656,30 @@ class App(tk.Tk):
         if self._closing:
             self._log_poll_after_token = None
             return
+        pending_logs: list[str] = []
         while True:
             try:
                 msg = log_queue.get_nowait()
             except queue.Empty:
                 break
             else:
-                self._append_log(msg)
+                pending_logs.append(str(msg))
+        if pending_logs:
+            self._append_log_batch(pending_logs)
         try:
             self._log_poll_after_token = self.after(100, self._poll_log_queue)
         except Exception:
             self._log_poll_after_token = None
 
     def _append_log(self, msg: str):
+        self._append_log_batch([msg])
+
+    def _append_log_batch(self, messages: list[str]):
+        if not messages:
+            return
         follow_tail, view_state = capture_vertical_view_state(self.text_log)
         self.text_log.configure(state="normal")
-        self.text_log.insert("end", msg + "\n")
+        self.text_log.insert("end", "\n".join(str(msg) for msg in messages) + "\n")
         trimmed_lines = 0
         try:
             total_lines = max(0, int(str(self.text_log.index("end-1c")).split(".", 1)[0]) - 1)
@@ -3736,6 +3760,26 @@ class App(tk.Tk):
             quote_asset = BinanceClient.get_spot_quote_asset(symbol) if symbol else "USDT"
             base_asset = BinanceClient.get_spot_base_asset(symbol) if symbol else ""
         required_amount = Decimal(str(required_quote_amount)) if required_quote_amount is not None else Decimal("0")
+        progress_log_times: dict[str, float] = {}
+        error_log_times: dict[str, float] = {}
+        progress_log_interval = 5.0
+        error_log_interval = 5.0
+
+        def log_progress_throttled(key: str, message: str, *args) -> None:
+            now = time.monotonic()
+            last_time = progress_log_times.get(key)
+            if last_time is not None and (now - last_time) < progress_log_interval:
+                return
+            progress_log_times[key] = now
+            logger.info(message, *args)
+
+        def log_error_throttled(key: str, message: str, *args) -> None:
+            now = time.monotonic()
+            last_time = error_log_times.get(key)
+            if last_time is not None and (now - last_time) < error_log_interval:
+                return
+            error_log_times[key] = now
+            logger.error(message, *args)
 
         while time.time() - start < timeout_sec:
             if stop_event and stop_event.is_set():
@@ -3753,7 +3797,8 @@ class App(tk.Tk):
                             )
                     quote_balance = float(quote_balance_dec)
                     if required_amount > 0:
-                        logger.info(
+                        log_progress_throttled(
+                            "futures-balance-required",
                             "%s 到账检测中，当前 U本位可用 %s = %.8f，目标至少 %.8f",
                             quote_asset,
                             quote_asset,
@@ -3761,14 +3806,21 @@ class App(tk.Tk):
                             float(required_amount),
                         )
                     else:
-                        logger.info("%s 到账检测中，当前 U本位可用 %s = %.8f", quote_asset, quote_asset, quote_balance)
+                        log_progress_throttled(
+                            "futures-balance",
+                            "%s 到账检测中，当前 U本位可用 %s = %.8f",
+                            quote_asset,
+                            quote_asset,
+                            quote_balance,
+                        )
                 else:
                     c.collect_funding_asset_to_spot(quote_asset)
                     quote_balance_dec = c.spot_asset_balance_decimal(quote_asset)
                     quote_balance = float(quote_balance_dec)
                     if mode_name == TRADE_MODE_LIMIT:
                         base_balance_dec = c.spot_asset_balance_decimal(base_asset)
-                        logger.info(
+                        log_progress_throttled(
+                            "spot-balance-limit",
                             "%s模式余额检测中，当前现货 %s = %.8f，%s = %.8f",
                             mode_name,
                             quote_asset,
@@ -3777,9 +3829,20 @@ class App(tk.Tk):
                             float(base_balance_dec),
                         )
                     else:
-                        logger.info("%s 到账检测中，当前现货 %s = %.8f", quote_asset, quote_asset, quote_balance)
+                        log_progress_throttled(
+                            "spot-balance",
+                            "%s 到账检测中，当前现货 %s = %.8f",
+                            quote_asset,
+                            quote_asset,
+                            quote_balance,
+                        )
             except Exception as e:
-                logger.error("检测 %s 余额失败: %s", quote_asset, e)
+                log_error_throttled(
+                    f"balance-error:{type(e).__name__}:{e}",
+                    "检测 %s 余额失败: %s",
+                    quote_asset,
+                    e,
+                )
                 quote_balance = 0.0
                 base_balance_dec = Decimal("0")
 
@@ -3800,9 +3863,9 @@ class App(tk.Tk):
             if delay_seconds <= 0:
                 continue
             if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
-                logger.info("未检测到可挂单余额，%.3f 秒后重试", delay_seconds)
+                log_progress_throttled("retry-limit", "未检测到可挂单余额，%.3f 秒后重试", delay_seconds)
             else:
-                logger.info("%s 未到账，%.3f 秒后重试", quote_asset, delay_seconds)
+                log_progress_throttled("retry-balance", "%s 未到账，%.3f 秒后重试", quote_asset, delay_seconds)
             if stop_event:
                 if stop_event.wait(delay_seconds):
                     logger.info("检测 %s 等待期间收到停止信号，结束检测", quote_asset)
@@ -4180,8 +4243,38 @@ class App(tk.Tk):
         self._refresh_account_tree_row(acc)
 
     def _set_account_status(self, acc: dict, text: str):
-        acc["status_var"].set(str(text))
+        status_text = str(text)
+        status_var = acc.get("status_var")
+        if status_var is None:
+            return
+        try:
+            current = str(status_var.get() or "")
+        except Exception:
+            current = ""
+        if current == status_text:
+            return
+        status_var.set(status_text)
         self._apply_account_row_style(acc)
+
+    def _schedule_account_status(self, acc: dict, text: str) -> None:
+        if self._closing:
+            return
+        schedule_ui_callback(
+            self,
+            f"account-status:{id(acc)}",
+            lambda acc_ref=acc, status_text=str(text): self._set_account_status(acc_ref, status_text),
+            root=self,
+        )
+
+    def _schedule_batch_summary_text(self, text: str) -> None:
+        if self._closing:
+            return
+        schedule_ui_callback(
+            self,
+            "exchange-batch-summary",
+            lambda value=str(text): self._set_batch_summary_text(value),
+            root=self,
+        )
 
     def _get_account_stop_event(self, acc: dict):
         stop_event = acc.get("stop_event")
@@ -4448,7 +4541,7 @@ class App(tk.Tk):
                 amount_dec = Decimal("0")
             summary.setdefault("withdraw_by_account", {})[key] = (amount_dec, str(asset or "").strip().upper())
             summary_text = self._build_batch_summary_text(summary)
-        self._dispatch_ui(lambda t=summary_text: self._set_batch_summary_text(t))
+        self._schedule_batch_summary_text(summary_text)
 
     def _record_batch_balance_metric(self, acc: dict, amount, asset: str) -> None:
         summary_text = ""
@@ -4463,7 +4556,7 @@ class App(tk.Tk):
                 amount_dec = Decimal("0")
             summary.setdefault("balance_by_account", {})[key] = (amount_dec, str(asset or "").strip().upper())
             summary_text = self._build_batch_summary_text(summary)
-        self._dispatch_ui(lambda t=summary_text: self._set_batch_summary_text(t))
+        self._schedule_batch_summary_text(summary_text)
 
     def _begin_batch_summary_tracking(
         self,
@@ -4490,7 +4583,7 @@ class App(tk.Tk):
             summary_text = self._build_batch_summary_text(self._current_batch_summary)
         self._last_batch_retry = None
         self._set_retry_failed_button_state()
-        self._dispatch_ui(lambda t=summary_text: self._set_batch_summary_text(t))
+        self._schedule_batch_summary_text(summary_text)
 
     def _mark_batch_account_result(self, acc: dict, success: bool) -> None:
         summary_text = ""
@@ -4504,7 +4597,7 @@ class App(tk.Tk):
                 return
             results[key] = bool(success)
             summary_text = self._build_batch_summary_text(summary)
-        self._dispatch_ui(lambda t=summary_text: self._set_batch_summary_text(t))
+        self._schedule_batch_summary_text(summary_text)
 
     def _finish_batch_summary_tracking(self) -> None:
         with self._batch_summary_lock:
@@ -4972,14 +5065,10 @@ class App(tk.Tk):
                     return
 
                 def set_status(text, acc_ref=acc):
-                    def _u():
-                        self._set_account_status(acc_ref, text)
-                    self._dispatch_ui(_u)
+                    self._schedule_account_status(acc_ref, text)
 
                 def progress_cb(step, total, text, acc_obj=acc):
-                    def _u():
-                        self._set_account_status(acc_obj, text)
-                    self._dispatch_ui(_u)
+                    self._schedule_account_status(acc_obj, text)
 
                 combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
                 logger.info(f"[线程 {thread_id}] 开始处理账号 #{idx}")
@@ -5372,7 +5461,7 @@ class App(tk.Tk):
                     return
 
                 def set_status(text, acc_ref=acc):
-                    self._dispatch_ui(lambda: self._set_account_status(acc_ref, text))
+                    self._schedule_account_status(acc_ref, text)
 
                 combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
                 op_success = False
@@ -5441,7 +5530,16 @@ def _run_online_selftest_checks(client: EvmClient, checks: list[str]) -> None:
     checks.append(f"bsc-rpc={bsc_balance}")
 
 
+def _emit_selftest_console(message: str, *, error: bool = False) -> None:
+    stream = sys.stderr if error else sys.stdout
+    try:
+        print(message, file=stream, flush=True)
+    except Exception:
+        pass
+
+
 def run_selftest(*, include_online_checks: bool = False) -> int:
+    client = None
     try:
         checks: list[str] = []
 
@@ -5499,11 +5597,23 @@ def run_selftest(*, include_online_checks: bool = False) -> int:
         sing_box_path = ExchangeProxyRuntime.find_sing_box_executable()
         checks.append(f"sing-box={sing_box_path.name}")
 
-        logger.info("SELFTEST OK: %s", ", ".join(checks))
+        summary = ", ".join(checks)
+        logger.info("SELFTEST OK: %s", summary)
+        _emit_selftest_console(f"SELFTEST OK: {summary}")
         return 0
     except Exception as exc:
         logger.exception("SELFTEST FAILED: %s", exc)
+        _emit_selftest_console(f"SELFTEST FAILED: {exc}", error=True)
+        if _runtime_log_path is not None:
+            _emit_selftest_console(f"Runtime log: {_runtime_log_path}", error=True)
+        _emit_selftest_console(f"Compat log: {LOG_FILE_PATH}", error=True)
         return 1
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 # ====================== 入口 ======================

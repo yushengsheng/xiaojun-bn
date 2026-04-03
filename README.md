@@ -22,7 +22,7 @@ Binance 自动化工具（Tkinter GUI）。
 ### Windows
 
 ```powershell
-py -3 -m pip install requests PySocks eth-account eth-utils
+py -3 -m pip install requests PySocks cryptography eth-account eth-utils
 py -3 小军bn.py
 ```
 
@@ -45,6 +45,7 @@ py -3 小军bn.py --selftest-online
 ## 依赖
 
 - 基础：`requests`
+- 安全存储：`cryptography`
 - 链上模块：`eth-account`、`eth-utils`
 
 - 源码运行前请先安装依赖
