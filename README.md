@@ -36,9 +36,10 @@ py -3 小军bn.py --selftest-online
 - `--selftest`：离线完整性自检，适合本地排查或发布冒烟验证
 - `--selftest-online`：额外验证 ETH/BSC 公网 RPC 可达性，适合手动联机排查
 
-### macOS（本地一键启动，无终端窗口）
+### macOS（本地启动）
 
-- 双击：`小军bn一键启动.app`
+- 无终端窗口：`小军bn一键启动.app`
+- 备用脚本：`一键启动.command`
 - 启动脚本：`launch_no_terminal.sh`
 - 启动日志：`data/logs/startup.log`
 

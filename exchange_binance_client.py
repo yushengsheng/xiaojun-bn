@@ -1242,7 +1242,7 @@ class BinanceClient:
         logger.info("现货市价买入 %s，使用 %s 金额 %.8f", symbol, quote_asset, amount)
         return True
 
-    # -------- 现货卖出（全部基础币，精度由参数决定） --------
+    # -------- 现货卖出（全部基础币；precision 参数仅为兼容旧配置保留） --------
     def spot_sell_all_base(self, symbol: str, precision: int):
         base = self.get_spot_base_asset(symbol)
         balance = self.spot_balance(base)
@@ -1250,28 +1250,8 @@ class BinanceClient:
         if balance <= 0:
             return False
 
-        qty = Decimal(str(balance)) * Decimal("0.999")
-        if precision < 0:
-            precision = 0
-        step = Decimal("1").scaleb(-precision)
-        qty = qty.quantize(step, rounding=ROUND_DOWN)
-
-        if qty <= step:
-            return False
-
-        self.request(
-            self.spot,
-            "POST",
-            "/api/v3/order",
-            {
-                "symbol": symbol,
-                "side": "SELL",
-                "type": "MARKET",
-                "quantity": str(qty),
-            },
-        )
-        logger.info("现货市价卖出 %s 数量 %s（基础币 %s）", symbol, qty, base)
-        return True
+        # 现货市价卖出按交易所 stepSize 取整，避免高价币因手填精度或额外预留被截到低于最小下单额。
+        return self.sell_asset_market(symbol, balance, reserve_ratio=Decimal("1"))
 
     # -------- 提现 --------
     def withdraw_all_coin(
