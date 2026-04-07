@@ -15,6 +15,10 @@ try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 except Exception:
     AESGCM = None
+try:
+    from Crypto.Cipher import AES as CRYPTO_AES
+except Exception:
+    CRYPTO_AES = None
 
 from app_paths import SECRET_KEY_FILE
 
@@ -130,13 +134,24 @@ class SecretBox:
 
     @staticmethod
     def modern_encryption_available() -> bool:
-        return AESGCM is not None
+        return SecretBox.modern_encryption_backend_name() != "missing"
 
     @staticmethod
-    def _require_aesgcm():
-        if AESGCM is None:
-            raise RuntimeError('检测到新版密文，但当前环境缺少 "cryptography" 依赖')
-        return AESGCM
+    def modern_encryption_backend_name() -> str:
+        if AESGCM is not None:
+            return "cryptography"
+        if CRYPTO_AES is not None:
+            return "pycryptodome"
+        return "missing"
+
+    @staticmethod
+    def _require_modern_cipher():
+        backend = SecretBox.modern_encryption_backend_name()
+        if backend == "cryptography":
+            return backend, AESGCM
+        if backend == "pycryptodome":
+            return backend, CRYPTO_AES
+        raise RuntimeError('检测到新版密文，但当前环境缺少 "cryptography" 或 "pycryptodome" 依赖')
 
     def _encrypt_v1(self, text: str) -> str:
         key = self._key()
@@ -167,14 +182,21 @@ class SecretBox:
             raise RuntimeError("密文解码失败") from exc
 
     def _encrypt_v2(self, text: str) -> str:
-        aesgcm_cls = self._require_aesgcm()
+        backend, cipher_impl = self._require_modern_cipher()
         key = self._key()
         nonce = os.urandom(12)
-        cipher = aesgcm_cls(key).encrypt(nonce, text.encode("utf-8"), b"secret-box-v2")
+        plain = text.encode("utf-8")
+        if backend == "cryptography":
+            cipher = cipher_impl(key).encrypt(nonce, plain, b"secret-box-v2")
+        else:
+            aes = cipher_impl.new(key, cipher_impl.MODE_GCM, nonce=nonce)
+            aes.update(b"secret-box-v2")
+            encrypted, tag = aes.encrypt_and_digest(plain)
+            cipher = encrypted + tag
         return f"{self.PREFIX_V2}{self._b64_encode(nonce)}.{self._b64_encode(cipher)}"
 
     def _decrypt_v2(self, text: str) -> str:
-        aesgcm_cls = self._require_aesgcm()
+        backend, cipher_impl = self._require_modern_cipher()
         key = self._key()
         body = text[len(self.PREFIX_V2) :]
         parts = body.split(".")
@@ -183,7 +205,16 @@ class SecretBox:
         nonce = self._b64_decode(parts[0])
         cipher = self._b64_decode(parts[1])
         try:
-            plain = aesgcm_cls(key).decrypt(nonce, cipher, b"secret-box-v2")
+            if backend == "cryptography":
+                plain = cipher_impl(key).decrypt(nonce, cipher, b"secret-box-v2")
+            else:
+                if len(cipher) < 16:
+                    raise RuntimeError("密文格式错误")
+                encrypted = cipher[:-16]
+                tag = cipher[-16:]
+                aes = cipher_impl.new(key, cipher_impl.MODE_GCM, nonce=nonce)
+                aes.update(b"secret-box-v2")
+                plain = aes.decrypt_and_verify(encrypted, tag)
         except Exception as exc:
             raise RuntimeError("密文校验失败（密钥不匹配或文件损坏）") from exc
         try:

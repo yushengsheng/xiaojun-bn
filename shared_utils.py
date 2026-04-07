@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import threading
 import time
@@ -14,6 +15,7 @@ from tkinter import END, Scrollbar
 
 LOG_MAX_ROWS = 500
 UI_BATCH_DELAY_MS = 50
+logger = logging.getLogger(__name__)
 
 
 def _parse_hex_color(value: str) -> tuple[int, int, int] | None:
@@ -384,7 +386,7 @@ def _drain_scheduled_ui_callbacks(owner) -> None:
         try:
             callback()
         except Exception:
-            pass
+            logger.exception("UI render callback failed")
 
 
 def _run_ui_bridge_tick(owner) -> None:
@@ -455,6 +457,11 @@ def _ui_shutdown_requested(owner) -> bool:
     if root is not None and bool(getattr(root, "_closing", False)):
         return True
     widget = root if root is not None else owner
+    if not _ui_call_is_main_thread(owner):
+        # Background workers must not touch Tk widget methods directly.
+        # We rely on the `_closing` flags above and let the main-thread UI bridge
+        # determine final widget liveness.
+        return False
     winfo_exists = getattr(widget, "winfo_exists", None)
     if callable(winfo_exists):
         try:
@@ -525,7 +532,7 @@ def flush_queued_ui_renders(owner) -> None:
         try:
             callback()
         except Exception:
-            pass
+            logger.exception("UI render callback failed")
 
 
 def queue_ui_render(

@@ -7,6 +7,7 @@ import threading
 import time
 from decimal import Decimal
 
+from exchange_binance_client import BinanceClient
 from exchange_constants import *
 from exchange_logging import logger
 

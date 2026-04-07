@@ -113,6 +113,10 @@ class OnchainTransferPageBase:
         self.custom_tokens_by_network: dict[str, dict[str, EvmToken]] = {"ETH": {}, "BSC": {}}
         self._query_row_keys_by_source: dict[str, list[str]] = {}
         self.wallet_cache_lock = threading.Lock()
+        self._onchain_proxy_state_lock = threading.Lock()
+        self._onchain_proxy_state = {"use_config_proxy": False, "raw_proxy": ""}
+        self._runtime_state_lock = threading.Lock()
+        self._runtime_state = {"threads_raw": "10"}
 
         self.mode_var = StringVar(value=self.MODE_M2M)
         self.network_var = StringVar(value="")
@@ -149,6 +153,8 @@ class OnchainTransferPageBase:
         self.wallet_generator_generate_btn = None
         self.wallet_generate_count_var = StringVar(value="10")
         self.wallet_export_format_var = StringVar(value="地址 + 私钥")
+        self._sync_onchain_proxy_state()
+        self._sync_runtime_state()
 
         self._build_ui()
         start_ui_bridge(self, root=self.root)
@@ -356,6 +362,7 @@ class OnchainTransferPageBase:
         self.network_var.trace_add("write", self._on_network_changed)
         self.coin_var.trace_add("write", self._on_coin_changed)
         self.amount_mode_var.trace_add("write", self._on_amount_mode_changed)
+        self.threads_var.trace_add("write", self._on_runtime_settings_changed)
         self.use_config_proxy_var.trace_add("write", self._on_proxy_config_changed)
         self.onchain_proxy_var.trace_add("write", self._on_proxy_config_changed)
         self.source_credential_var.trace_add("write", self._on_source_or_target_changed)
@@ -394,7 +401,7 @@ class OnchainTransferPageBase:
         return decimal_to_text(v)
     @staticmethod
     def _factor_by_decimals(decimals: int) -> Decimal:
-        if decimals < 0 or decimals > OnchainTransferPage.MAX_TOKEN_DECIMALS:
+        if decimals < 0 or decimals > OnchainTransferPageBase.MAX_TOKEN_DECIMALS:
             raise RuntimeError(f"代币精度超出范围：{decimals}")
         return Decimal(10) ** decimals
     @classmethod
@@ -425,8 +432,18 @@ class OnchainTransferPageBase:
     def _token_amount_text(self, symbol: str, amount: Decimal) -> str:
         return f"{self._decimal_to_text(amount)} {symbol.strip().upper()}"
     def _runtime_worker_threads(self) -> int:
-        raw = self.threads_var.get() if hasattr(self, "threads_var") else 10
+        raw = self._runtime_state_snapshot().get("threads_raw", 10)
         return parse_worker_threads(raw, default=10)
+    def _sync_runtime_state(self) -> None:
+        threads_var = getattr(self, "threads_var", None)
+        threads_raw = str(threads_var.get() if threads_var is not None else "10")
+        with self._runtime_state_lock:
+            self._runtime_state = {"threads_raw": threads_raw}
+    def _runtime_state_snapshot(self) -> dict[str, object]:
+        with self._runtime_state_lock:
+            return dict(self._runtime_state)
+    def _on_runtime_settings_changed(self, *_args) -> None:
+        self._sync_runtime_state()
     @staticmethod
     def _http_get_via_proxy(
         url: str,
@@ -444,7 +461,18 @@ class OnchainTransferPageBase:
         finally:
             session.close()
     def _allow_onchain_system_proxy(self) -> bool:
-        return not bool(self.use_config_proxy_var.get()) if hasattr(self, "use_config_proxy_var") else True
+        state = self._onchain_proxy_state_snapshot()
+        return not bool(state.get("use_config_proxy"))
+    def _sync_onchain_proxy_state(self) -> None:
+        use_var = getattr(self, "use_config_proxy_var", None)
+        proxy_var = getattr(self, "onchain_proxy_var", None)
+        use_proxy = bool(use_var.get()) if use_var is not None else False
+        raw_proxy = str(proxy_var.get() or "").strip() if proxy_var is not None else ""
+        with self._onchain_proxy_state_lock:
+            self._onchain_proxy_state = {"use_config_proxy": use_proxy, "raw_proxy": raw_proxy}
+    def _onchain_proxy_state_snapshot(self) -> dict[str, object]:
+        with self._onchain_proxy_state_lock:
+            return dict(self._onchain_proxy_state)
     def _normalize_onchain_proxy(self, proxy_text: str) -> str:
         text = str(proxy_text or "").strip()
         if not text:
@@ -459,13 +487,21 @@ class OnchainTransferPageBase:
         if not lower.startswith(("http://", "https://", "socks5://", "socks5h://", "ss://")):
             raise RuntimeError("代理地址格式不支持，请使用 http://、https://、socks5://、socks5h:// 或 ss://")
         return text
-    def _onchain_proxy_map(self) -> dict[str, str]:
-        if not self.use_config_proxy_var.get():
+    def _onchain_proxy_map(self, state: dict[str, object] | None = None) -> dict[str, str]:
+        snapshot = dict(state or self._onchain_proxy_state_snapshot())
+        use_config_proxy = bool(snapshot.get("use_config_proxy"))
+        if not use_config_proxy:
             return {}
-        proxy_text = self._normalize_onchain_proxy(self.onchain_proxy_var.get().strip())
+        proxy_text = self._normalize_onchain_proxy(snapshot.get("raw_proxy") or "")
         if not proxy_text:
             return {}
-        proxy_url = self._rpc_proxy_getter() if callable(self._rpc_proxy_getter) else proxy_text
+        if callable(self._rpc_proxy_getter):
+            try:
+                proxy_url = self._rpc_proxy_getter(proxy_text=proxy_text, use_config_proxy=use_config_proxy)
+            except TypeError:
+                proxy_url = self._rpc_proxy_getter()
+        else:
+            proxy_url = proxy_text
         proxy_url = str(proxy_url or "").strip()
         if not proxy_url:
             return {}
@@ -482,9 +518,11 @@ class OnchainTransferPageBase:
             if value:
                 result[key] = value
         return result
-    def _onchain_proxy_route_text(self) -> str:
-        raw_proxy = str(self.onchain_proxy_var.get() or "").strip()
-        if not self.use_config_proxy_var.get():
+    def _onchain_proxy_route_text(self, state: dict[str, object] | None = None) -> str:
+        snapshot = dict(state or self._onchain_proxy_state_snapshot())
+        raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
+        use_config_proxy = bool(snapshot.get("use_config_proxy"))
+        if not use_config_proxy:
             system_proxy = self._onchain_system_proxy_map()
             if system_proxy:
                 return f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}"
@@ -494,13 +532,19 @@ class OnchainTransferPageBase:
         if raw_proxy.lower().startswith("ss://"):
             return "builtin-ss"
         return f"manual-proxy -> {self._normalize_onchain_proxy(raw_proxy)}"
-    def _fetch_onchain_public_ip(self, *, use_config_proxy: bool, allow_system_proxy: bool = True) -> str:
+    def _fetch_onchain_public_ip(
+        self,
+        *,
+        use_config_proxy: bool,
+        allow_system_proxy: bool = True,
+        state: dict[str, object] | None = None,
+    ) -> str:
         urls = [
             "https://api.ipify.org",
             "https://ifconfig.me/ip",
             "https://ipinfo.io/ip",
         ]
-        proxies = self._onchain_proxy_map() if use_config_proxy else None
+        proxies = self._onchain_proxy_map(state=state) if use_config_proxy else None
         for url in urls:
             try:
                 resp = self._http_get_via_proxy(
@@ -516,13 +560,13 @@ class OnchainTransferPageBase:
             except Exception:
                 continue
         raise RuntimeError("网络不可达或 IP 服务异常")
-    def _proxy_test_networks(self) -> list[str]:
-        selected_network = str(self.network_var.get() or "").strip().upper()
+    def _proxy_test_networks(self, selected_network: str = "") -> list[str]:
+        selected_network = str(selected_network or self.network_var.get() or "").strip().upper()
         if selected_network in EvmClient.NETWORKS:
             return [selected_network]
         return list(EvmClient.NETWORKS.keys())
-    def _test_onchain_target_connectivity(self) -> str:
-        networks = self._proxy_test_networks()
+    def _test_onchain_target_connectivity(self, selected_network: str = "") -> str:
+        networks = self._proxy_test_networks(selected_network)
         details: list[str] = []
         errors: list[str] = []
         success_count = 0
@@ -540,9 +584,16 @@ class OnchainTransferPageBase:
         if errors:
             details.append("部分失败=" + " | ".join(errors))
         return "；".join(details)
-    def _test_onchain_proxy_once(self, *, include_exit_ip: bool = True) -> tuple[str, str, str]:
-        use_config_proxy = bool(self.use_config_proxy_var.get())
-        raw_proxy = str(self.onchain_proxy_var.get() or "").strip()
+    def _test_onchain_proxy_once(
+        self,
+        *,
+        include_exit_ip: bool = True,
+        state: dict[str, object] | None = None,
+        selected_network: str = "",
+    ) -> tuple[str, str, str]:
+        snapshot = dict(state or self._onchain_proxy_state_snapshot())
+        use_config_proxy = bool(snapshot.get("use_config_proxy"))
+        raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
         system_proxy = self._onchain_system_proxy_map() if not use_config_proxy else {}
         status = "跟随系统代理" if system_proxy else "未启用"
         exit_ip = "--"
@@ -550,8 +601,8 @@ class OnchainTransferPageBase:
             status = "SS代理连接中..." if raw_proxy.lower().startswith("ss://") else "代理连接中..."
         if use_config_proxy:
             # 触发代理规范化/内置 SS runtime 初始化
-            self._onchain_proxy_map()
-        target = self._test_onchain_target_connectivity()
+            self._onchain_proxy_map(state=snapshot)
+        target = self._test_onchain_target_connectivity(selected_network)
         if use_config_proxy and raw_proxy:
             status = "SS代理已连接" if raw_proxy.lower().startswith("ss://") else "代理已连接"
         elif system_proxy:
@@ -560,7 +611,7 @@ class OnchainTransferPageBase:
             status = "直连可用"
         if use_config_proxy:
             if include_exit_ip:
-                exit_ip = self._fetch_onchain_public_ip(use_config_proxy=True, allow_system_proxy=False)
+                exit_ip = self._fetch_onchain_public_ip(use_config_proxy=True, allow_system_proxy=False, state=snapshot)
         elif system_proxy:
             if include_exit_ip:
                 exit_ip = self._fetch_onchain_public_ip(use_config_proxy=False, allow_system_proxy=True)
@@ -1685,6 +1736,7 @@ class OnchainTransferPageBase:
         self._update_balance_heading()
         self._refresh_tree()
     def _on_proxy_config_changed(self, *_args):
+        self._sync_onchain_proxy_state()
         self._refresh_onchain_proxy_summary()
     def _on_source_or_target_changed(self, *_args):
         if self._is_mode_1m():
@@ -1714,22 +1766,26 @@ class OnchainTransferPageBase:
     def log(self, text: str):
         queue_log_row(self, self.log_tree, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
     def test_onchain_proxy(self):
+        snapshot = self._onchain_proxy_state_snapshot()
+        route_text = self._onchain_proxy_route_text(state=snapshot)
+        selected_network = str(self.network_var.get() or "").strip().upper()
+
         def worker():
             test_ok = False
             try:
-                status, exit_ip, target = self._test_onchain_proxy_once()
-                route_text = self._onchain_proxy_route_text()
+                status, exit_ip, target = self._test_onchain_proxy_once(state=snapshot, selected_network=selected_network)
                 test_ok = True
                 log_text = f"链上代理测试成功：status={status}，exit_ip={exit_ip}，target={target}，route={route_text}"
             except Exception as exc:
-                if self.use_config_proxy_var.get() and self.onchain_proxy_var.get().strip():
+                use_config_proxy = bool(snapshot.get("use_config_proxy"))
+                raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
+                if use_config_proxy and raw_proxy:
                     status = "连接失败"
-                elif (not self.use_config_proxy_var.get()) and self._onchain_system_proxy_map():
+                elif (not use_config_proxy) and self._onchain_system_proxy_map():
                     status = "系统代理异常"
                 else:
                     status = "直连异常"
                 exit_ip = "--"
-                route_text = self._onchain_proxy_route_text()
                 log_text = f"链上代理测试失败：{exc}，route={route_text}"
 
             def _update():

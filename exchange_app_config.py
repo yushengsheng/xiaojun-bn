@@ -4,6 +4,13 @@
 from __future__ import annotations
 
 from exchange_app_base import *  # noqa: F401,F403
+from exchange_app_base import (
+    _atomic_write_config_json,
+    _load_json_with_backup,
+    _read_text_snapshot,
+    _require_dict_payload,
+    _restore_text_snapshot,
+)
 
 
 class ExchangeAppConfigMixin(object):
@@ -24,14 +31,37 @@ class ExchangeAppConfigMixin(object):
         return proxy
     def _normalize_exchange_proxy(self, proxy_text: str) -> str:
         return self._normalize_proxy_text(proxy_text)
+    def _on_exchange_proxy_config_changed(self, *_args) -> None:
+        self._sync_exchange_proxy_state()
+    def _sync_exchange_proxy_state(self) -> None:
+        use_var = getattr(self, "use_exchange_config_proxy_var", None)
+        proxy_var = getattr(self, "exchange_proxy_var", None)
+        use_proxy = bool(use_var.get()) if use_var is not None else False
+        raw_proxy = str(proxy_var.get() or "").strip() if proxy_var is not None else ""
+        lock = getattr(self, "_exchange_proxy_state_lock", None)
+        if lock is None:
+            self._exchange_proxy_state = {"use_config_proxy": use_proxy, "raw_proxy": raw_proxy}
+            return
+        with lock:
+            self._exchange_proxy_state = {"use_config_proxy": use_proxy, "raw_proxy": raw_proxy}
+    def _exchange_proxy_state_snapshot(self) -> dict[str, object]:
+        lock = getattr(self, "_exchange_proxy_state_lock", None)
+        if lock is None:
+            return dict(getattr(self, "_exchange_proxy_state", {}) or {})
+        with lock:
+            return dict(getattr(self, "_exchange_proxy_state", {}) or {})
     def _get_exchange_proxy(self) -> str:
-        return self._normalize_exchange_proxy(self.exchange_proxy_var.get())
-    def _exchange_proxy_config_payload(self) -> dict[str, object]:
-        use_proxy = bool(self.use_exchange_config_proxy_var.get())
-        raw_proxy = str(self.exchange_proxy_var.get() or "").strip()
+        state = self._exchange_proxy_state_snapshot()
+        return self._normalize_exchange_proxy(state.get("raw_proxy") or "")
+    def _exchange_proxy_config_payload(self, state: dict[str, object] | None = None) -> dict[str, object]:
+        snapshot = dict(state or self._exchange_proxy_state_snapshot())
+        use_proxy = bool(snapshot.get("use_config_proxy"))
+        raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
         if use_proxy:
             proxy_text = self._normalize_exchange_proxy(raw_proxy)
-            self.exchange_proxy_var.set(proxy_text)
+            if state is None:
+                self.exchange_proxy_var.set(proxy_text)
+                self._sync_exchange_proxy_state()
         else:
             proxy_text = raw_proxy
         return {
@@ -39,12 +69,19 @@ class ExchangeAppConfigMixin(object):
             "use_exchange_config_proxy": use_proxy,
         }
     def _use_exchange_config_proxy(self) -> bool:
-        return bool(self.use_exchange_config_proxy_var.get())
-    def _get_exchange_proxy_url(self) -> str:
-        if not self._use_exchange_config_proxy():
+        state = self._exchange_proxy_state_snapshot()
+        return bool(state.get("use_config_proxy"))
+    def _get_exchange_proxy_url(self, *, proxy_text: str | None = None, use_config_proxy: bool | None = None) -> str:
+        if proxy_text is None or use_config_proxy is None:
+            state = self._exchange_proxy_state_snapshot()
+            if proxy_text is None:
+                proxy_text = str(state.get("raw_proxy") or "")
+            if use_config_proxy is None:
+                use_config_proxy = bool(state.get("use_config_proxy"))
+        if not use_config_proxy:
             self.exchange_proxy_runtime.stop()
             return ""
-        proxy = self._get_exchange_proxy()
+        proxy = self._normalize_exchange_proxy(proxy_text)
         if not proxy:
             self.exchange_proxy_runtime.stop()
             return ""
@@ -57,35 +94,59 @@ class ExchangeAppConfigMixin(object):
             return None
         return page
     def _get_onchain_proxy(self) -> str:
+        state = self._get_onchain_proxy_state()
+        return self._normalize_proxy_text(state.get("raw_proxy") or "")
+    def _get_onchain_proxy_state(self) -> dict[str, object]:
         page = self._get_onchain_proxy_page()
         if page is None:
-            return ""
+            return {"use_config_proxy": False, "raw_proxy": ""}
+        snapshotter = getattr(page, "_onchain_proxy_state_snapshot", None)
+        if callable(snapshotter):
+            try:
+                state = dict(snapshotter() or {})
+            except Exception:
+                state = {}
+            return {
+                "use_config_proxy": bool(state.get("use_config_proxy")),
+                "raw_proxy": str(state.get("raw_proxy") or ""),
+            }
         raw = getattr(page, "onchain_proxy_var", None)
-        if raw is None:
-            return ""
-        return self._normalize_proxy_text(raw.get())
+        use_var = getattr(page, "use_config_proxy_var", None)
+        return {
+            "use_config_proxy": bool(use_var.get()) if use_var is not None else False,
+            "raw_proxy": str(raw.get() or "") if raw is not None else "",
+        }
     def _use_onchain_config_proxy(self) -> bool:
-        page = self._get_onchain_proxy_page()
-        if page is None:
-            return False
-        var = getattr(page, "use_config_proxy_var", None)
-        return bool(var.get()) if var is not None else False
-    def _get_onchain_proxy_url(self) -> str:
-        if not self._use_onchain_config_proxy():
+        state = self._get_onchain_proxy_state()
+        return bool(state.get("use_config_proxy"))
+    def _get_onchain_proxy_url(self, *, proxy_text: str | None = None, use_config_proxy: bool | None = None) -> str:
+        if proxy_text is None or use_config_proxy is None:
+            state = self._get_onchain_proxy_state()
+            if proxy_text is None:
+                proxy_text = str(state.get("raw_proxy") or "")
+            if use_config_proxy is None:
+                use_config_proxy = bool(state.get("use_config_proxy"))
+        if not use_config_proxy:
             self.onchain_proxy_runtime.stop()
             return ""
-        proxy = self._get_onchain_proxy()
+        proxy = self._normalize_proxy_text(proxy_text)
         if not proxy:
             self.onchain_proxy_runtime.stop()
             return ""
         if proxy.lower().startswith("ss://"):
             return self.onchain_proxy_runtime.ensure_proxy(proxy)
         return proxy
-    def _requests_proxy_map(self) -> dict[str, str]:
-        proxy = self._get_exchange_proxy_url()
+    def _requests_proxy_map_from_state(self, state: dict[str, object] | None = None) -> dict[str, str]:
+        snapshot = dict(state or self._exchange_proxy_state_snapshot())
+        proxy = self._get_exchange_proxy_url(
+            proxy_text=str(snapshot.get("raw_proxy") or ""),
+            use_config_proxy=bool(snapshot.get("use_config_proxy")),
+        )
         if not proxy:
             return {}
         return {"http": proxy, "https": proxy}
+    def _requests_proxy_map(self) -> dict[str, str]:
+        return self._requests_proxy_map_from_state()
     @staticmethod
     def _system_proxy_map() -> dict[str, str]:
         try:
@@ -98,9 +159,11 @@ class ExchangeAppConfigMixin(object):
             if value:
                 result[key] = value
         return result
-    def _exchange_proxy_route_text(self) -> str:
-        raw_proxy = str(self.exchange_proxy_var.get() or "").strip()
-        if not self._use_exchange_config_proxy():
+    def _exchange_proxy_route_text_from_state(self, state: dict[str, object] | None = None) -> str:
+        snapshot = dict(state or self._exchange_proxy_state_snapshot())
+        raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
+        use_config_proxy = bool(snapshot.get("use_config_proxy"))
+        if not use_config_proxy:
             system_proxy = self._system_proxy_map()
             if system_proxy:
                 return f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}"
@@ -113,6 +176,8 @@ class ExchangeAppConfigMixin(object):
             local_proxy = snap.get("local_proxy_url") or "pending"
             return f"builtin-ss/{backend} -> {local_proxy}"
         return f"manual-proxy -> {self._normalize_exchange_proxy(raw_proxy)}"
+    def _exchange_proxy_route_text(self) -> str:
+        return self._exchange_proxy_route_text_from_state()
     @staticmethod
     def _close_binance_client_instance(client: BinanceClient | None) -> None:
         if client is None:
@@ -132,6 +197,7 @@ class ExchangeAppConfigMixin(object):
         self._close_binance_client_instance(previous)
     def _create_binance_client(self, key: str, secret: str) -> BinanceClient:
         return BinanceClient(key, secret, proxy_url=self._get_exchange_proxy_url())
+    @staticmethod
     def _ensure_trade_symbol_supported(
         client: BinanceClient,
         trade_account_type: str,
@@ -208,9 +274,14 @@ class ExchangeAppConfigMixin(object):
         except Exception as e:
             logger.error("保存策略配置失败: %s", e)
             messagebox.showerror("错误", "保存策略配置失败: %s" % e)
-    def _save_exchange_proxy_config_only(self, payload: dict[str, object] | None = None) -> None:
+    def _save_exchange_proxy_config_only(
+        self,
+        payload: dict[str, object] | None = None,
+        *,
+        state: dict[str, object] | None = None,
+    ) -> None:
         if payload is None:
-            payload = self._exchange_proxy_config_payload()
+            payload = self._exchange_proxy_config_payload(state=state)
         _atomic_write_config_json(EXCHANGE_PROXY_CONFIG_FILE, payload)
     def _proxy_config_from_payload(self, raw: object) -> tuple[str, bool]:
         if not isinstance(raw, dict):

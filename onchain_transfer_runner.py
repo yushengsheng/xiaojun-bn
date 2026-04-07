@@ -433,9 +433,9 @@ class OnchainTransferRunnerMixin(object):
             self.log(f"失败重试启动异常：{exc}")
             messagebox.showerror("执行异常", str(exc))
     def _run_batch_transfer(self, jobs_data: list[tuple[str, str, str]], params: WithdrawRuntimeParams, dry_run: bool):
+        dispatch_ui = self._dispatch_ui
         try:
             set_ui_batch_size(self, params.threads)
-            dispatch_ui = self._dispatch_ui
             def job_prefix(index: int) -> str:
                 return f"[{index}/{len(jobs_data)}]"
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import ipaddress
+import json
 import os
 import platform
 import shutil
@@ -25,6 +26,15 @@ import requests
 
 from app_paths import APP_DIR, BUNDLE_DIR, DATA_DIR
 from exchange_logging import logger
+from stores import _atomic_write_text
+
+
+def _json_dump_text(payload: object) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _atomic_write_json(path: Path, payload: object) -> None:
+    _atomic_write_text(path, _json_dump_text(payload), encoding="utf-8")
 
 class ExchangeProxyRuntime:
     _RUNTIME_PREPARE_LOCK = threading.Lock()

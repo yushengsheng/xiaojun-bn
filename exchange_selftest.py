@@ -17,6 +17,7 @@ from core_models import OnchainPairEntry
 from exchange_binance_client import BinanceClient
 from exchange_logging import logger, runtime_log_path
 from exchange_proxy_runtime import ExchangeProxyRuntime
+from secret_box import SECRET_BOX
 from shared_utils import decimal_to_text, random_decimal_between
 from stores import OnchainStore
 
@@ -37,6 +38,20 @@ def _run_online_selftest_checks(client: EvmClient, checks: list[str]) -> None:
     checks.append(f"bsc-rpc={bsc_balance}")
 
 def _run_offline_business_selftest_checks(checks: list[str]) -> None:
+    secret_backend = SECRET_BOX.modern_encryption_backend_name()
+    if secret_backend == "missing":
+        raise RuntimeError("安全存储新版密文后端不可用：缺少 cryptography / pycryptodome")
+    probe_text = "selftest-secret-box"
+    v2_cipher = SECRET_BOX.encrypt(probe_text)
+    if not str(v2_cipher).startswith(SECRET_BOX.PREFIX_V2):
+        raise RuntimeError("安全存储自检失败：未生成新版密文")
+    if SECRET_BOX.decrypt(v2_cipher) != probe_text:
+        raise RuntimeError("安全存储自检失败：新版密文回读不一致")
+    v1_cipher = SECRET_BOX._encrypt_v1(probe_text)
+    if SECRET_BOX.decrypt(v1_cipher) != probe_text:
+        raise RuntimeError("安全存储自检失败：旧版密文兼容回读失败")
+    checks.append(f"secret-box={secret_backend}")
+
     with tempfile.TemporaryDirectory(prefix="xiaojun-selftest-") as tmpdir:
         store_path = Path(tmpdir) / "onchain.json"
         store = OnchainStore(store_path)

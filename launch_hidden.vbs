@@ -19,6 +19,14 @@ If pythonCmd = "" Then
     WScript.Quit 1
 End If
 
+If Not EnsureRuntimeDependencies(pythonCmd) Then
+    MsgBox "Auto-installing runtime dependencies failed." & vbCrLf & _
+           "Please run:" & vbCrLf & _
+           CliPythonCommand(pythonCmd) & " -m pip install --user requests PySocks cryptography eth-account eth-utils", _
+           vbCritical, "Launch Failed"
+    WScript.Quit 1
+End If
+
 shell.CurrentDirectory = scriptDir
 launchCmd = Quote(pythonCmd) & " " & Quote(targetScript)
 shell.Run launchCmd, 0, False
@@ -118,6 +126,59 @@ Function PreferPythonGuiCommand(pyExe)
     End If
 
     PreferPythonGuiCommand = pyExe
+End Function
+
+Function CliPythonCommand(pyExe)
+    Dim folderPath, candidate
+    pyExe = Trim(pyExe)
+    If pyExe = "" Then
+        CliPythonCommand = ""
+        Exit Function
+    End If
+    If LCase(Right(pyExe, 11)) = "pythonw.exe" Then
+        folderPath = fso.GetParentFolderName(pyExe)
+        candidate = fso.BuildPath(folderPath, "python.exe")
+        If FileExistsSafe(candidate) Then
+            CliPythonCommand = candidate
+            Exit Function
+        End If
+    End If
+    CliPythonCommand = pyExe
+End Function
+
+Function EnsureRuntimeDependencies(pyExe)
+    Dim cliPy, checkCmd, installCmd, rc
+    cliPy = CliPythonCommand(pyExe)
+    If cliPy = "" Then
+        EnsureRuntimeDependencies = False
+        Exit Function
+    End If
+
+    checkCmd = Quote(cliPy) & " -c " & Quote("import importlib.util, sys; required=['requests','socks','eth_account','eth_utils']; modern_ok=importlib.util.find_spec('cryptography') is not None or importlib.util.find_spec('Crypto') is not None; sys.exit(0 if (all(importlib.util.find_spec(m) for m in required) and modern_ok) else 1)")
+    rc = RunHiddenAndWait(checkCmd)
+    If rc = 0 Then
+        EnsureRuntimeDependencies = True
+        Exit Function
+    End If
+
+    installCmd = Quote(cliPy) & " -m pip install --user requests PySocks cryptography eth-account eth-utils"
+    rc = RunHiddenAndWait(installCmd)
+    If rc <> 0 Then
+        EnsureRuntimeDependencies = False
+        Exit Function
+    End If
+
+    EnsureRuntimeDependencies = (RunHiddenAndWait(checkCmd) = 0)
+End Function
+
+Function RunHiddenAndWait(commandText)
+    On Error Resume Next
+    RunHiddenAndWait = shell.Run(commandText, 0, True)
+    If Err.Number <> 0 Then
+        Err.Clear
+        RunHiddenAndWait = -1
+    End If
+    On Error GoTo 0
 End Function
 
 Function ResolveWhereExecutable(commandName)

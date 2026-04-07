@@ -471,9 +471,9 @@ class OnchainQueryMixin(object):
             self.log(f"当前行余额查询启动失败：{exc}")
             messagebox.showerror("执行异常", str(exc))
     def _run_query_balance_for_sources(self, network: str, token: EvmToken, sources: list[str]):
+        dispatch_ui = self._dispatch_ui
         try:
             set_ui_batch_size(self, self._runtime_worker_threads())
-            dispatch_ui = self._dispatch_ui
             symbol = token.symbol
             token_desc = symbol if token.is_native else f"{symbol}({self._short_contract(token.contract)})"
             row_keys_by_source = {k: list(v) for k, v in getattr(self, "_query_row_keys_by_source", {}).items()}
@@ -561,9 +561,9 @@ class OnchainQueryMixin(object):
             self._query_row_keys_by_source = {}
             self.is_running = False
     def _run_query_balance_one_to_many(self, network: str, token: EvmToken, source: str, targets: list[str]):
+        dispatch_ui = self._dispatch_ui
         try:
             set_ui_batch_size(self, self._runtime_worker_threads())
-            dispatch_ui = self._dispatch_ui
             symbol = token.symbol
             token_desc = self._token_desc(token)
             src_count = 1 if source else 0
@@ -685,9 +685,9 @@ class OnchainQueryMixin(object):
         finally:
             self.is_running = False
     def _run_query_balance_many_to_one(self, network: str, token: EvmToken, target: str, sources: list[str]):
+        dispatch_ui = self._dispatch_ui
         try:
             set_ui_batch_size(self, self._runtime_worker_threads())
-            dispatch_ui = self._dispatch_ui
             symbol = token.symbol
             token_desc = self._token_desc(token)
             target_count = 1 if target else 0

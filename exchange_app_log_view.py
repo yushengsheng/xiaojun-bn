@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from exchange_app_base import *  # noqa: F401,F403
+from exchange_app_base import _shift_text_view_state_after_trim
 
 
 class ExchangeAppLogViewMixin(object):
@@ -46,10 +47,16 @@ class ExchangeAppLogViewMixin(object):
         except Exception as exc:
             raise RuntimeError(f"Binance 时间接口返回异常：{data}") from exc
         return f"Binance /api/v3/time OK (serverTime={server_time})"
-    def _test_exchange_proxy_once(self, *, include_exit_ip: bool = True) -> tuple[str, str, str]:
-        proxies = self._requests_proxy_map()
-        proxy_text = self.exchange_proxy_var.get().strip()
-        use_config_proxy = self._use_exchange_config_proxy()
+    def _test_exchange_proxy_once(
+        self,
+        *,
+        include_exit_ip: bool = True,
+        state: dict[str, object] | None = None,
+    ) -> tuple[str, str, str]:
+        snapshot = dict(state or self._exchange_proxy_state_snapshot())
+        proxies = self._requests_proxy_map_from_state(snapshot)
+        proxy_text = str(snapshot.get("raw_proxy") or "").strip()
+        use_config_proxy = bool(snapshot.get("use_config_proxy"))
         system_proxy = self._system_proxy_map() if not use_config_proxy else {}
         proxy_status = "跟随系统代理" if system_proxy else "未启用"
         proxy_exit_ip = "--"
@@ -74,14 +81,16 @@ class ExchangeAppLogViewMixin(object):
                 proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=False)
         return proxy_status, proxy_exit_ip, target
     def test_exchange_proxy(self):
+        snapshot = self._exchange_proxy_state_snapshot()
+        route_text = self._exchange_proxy_route_text_from_state(snapshot)
+
         def worker():
             test_ok = False
             save_err = ""
             try:
-                status, exit_ip, target = self._test_exchange_proxy_once()
-                route_text = self._exchange_proxy_route_text()
+                status, exit_ip, target = self._test_exchange_proxy_once(state=snapshot)
                 try:
-                    self._save_exchange_proxy_config_only()
+                    self._save_exchange_proxy_config_only(state=snapshot)
                 except Exception as e:
                     save_err = str(e)
                 test_ok = True
@@ -91,13 +100,14 @@ class ExchangeAppLogViewMixin(object):
                 else:
                     log_text = f"{log_text}，已自动保存配置"
             except Exception as e:
-                status = "连接失败" if (self._use_exchange_config_proxy() and self.exchange_proxy_var.get().strip()) else "未启用"
-                if (not self._use_exchange_config_proxy()) and self._system_proxy_map():
+                use_config_proxy = bool(snapshot.get("use_config_proxy"))
+                raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
+                status = "连接失败" if (use_config_proxy and raw_proxy) else "未启用"
+                if (not use_config_proxy) and self._system_proxy_map():
                     status = "系统代理异常"
-                elif not self._use_exchange_config_proxy():
+                elif not use_config_proxy:
                     status = "直连异常"
                 exit_ip = "--"
-                route_text = self._exchange_proxy_route_text()
                 log_text = f"交易所代理测试失败：{e}，route={route_text}"
 
             def _update():
@@ -133,21 +143,24 @@ class ExchangeAppLogViewMixin(object):
         if not self._try_begin_ip_refresh():
             return
 
+        snapshot = self._exchange_proxy_state_snapshot()
+
         def worker():
             try:
-                proxy_status = "跟随系统代理" if self._system_proxy_map() and not self._use_exchange_config_proxy() else "未启用"
+                use_config_proxy = bool(snapshot.get("use_config_proxy"))
+                proxy_status = "跟随系统代理" if self._system_proxy_map() and not use_config_proxy else "未启用"
                 proxy_exit_ip = "--"
                 try:
                     ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=False)
-                    if self._use_exchange_config_proxy():
-                        proxy_status, proxy_exit_ip, _target = self._test_exchange_proxy_once(include_exit_ip=True)
+                    if use_config_proxy:
+                        proxy_status, proxy_exit_ip, _target = self._test_exchange_proxy_once(include_exit_ip=True, state=snapshot)
                     elif self._system_proxy_map():
-                        proxy_status, proxy_exit_ip, _target = self._test_exchange_proxy_once(include_exit_ip=True)
+                        proxy_status, proxy_exit_ip, _target = self._test_exchange_proxy_once(include_exit_ip=True, state=snapshot)
                     else:
                         proxy_exit_ip = ip
                 except Exception as e:
                     ip = "获取失败: %s" % str(e)
-                    if self._use_exchange_config_proxy():
+                    if use_config_proxy:
                         proxy_status = "连接失败"
                     elif self._system_proxy_map():
                         proxy_status = "系统代理异常"

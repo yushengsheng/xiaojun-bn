@@ -133,6 +133,11 @@ class ExchangeAppBase(tk.Tk):
         self._result_file_lock = threading.Lock()
         self._managed_threads_lock = threading.Lock()
         self._managed_threads: set[threading.Thread] = set()
+        self._exchange_proxy_state_lock = threading.Lock()
+        self._exchange_proxy_state = {
+            "use_config_proxy": bool(EXCHANGE_USE_CONFIG_PROXY_DEFAULT),
+            "raw_proxy": str(EXCHANGE_PROXY_DEFAULT or "").strip(),
+        }
         self._loading_accounts = False
         self.exchange_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="exchange")
         self.onchain_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="onchain")
@@ -143,6 +148,7 @@ class ExchangeAppBase(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
+        self._sync_exchange_proxy_state()
         start_ui_bridge(self, root=self)
         self._load_strategy_config()
         self._load_exchange_proxy_config()
@@ -154,6 +160,8 @@ class ExchangeAppBase(tk.Tk):
         self.api_secret_var = tk.StringVar(value=API_SECRET_DEFAULT)
         self.exchange_proxy_var = tk.StringVar(value=EXCHANGE_PROXY_DEFAULT)
         self.use_exchange_config_proxy_var = tk.BooleanVar(value=EXCHANGE_USE_CONFIG_PROXY_DEFAULT)
+        self.exchange_proxy_var.trace_add("write", self._on_exchange_proxy_config_changed)
+        self.use_exchange_config_proxy_var.trace_add("write", self._on_exchange_proxy_config_changed)
         self.trade_account_type_var = tk.StringVar(value=TRADE_ACCOUNT_TYPE_DEFAULT)
         self.spot_rounds_var = tk.IntVar(value=SPOT_ROUNDS_DEFAULT)
         self.trade_mode_var = tk.StringVar(value=TRADE_MODE_DEFAULT)
@@ -607,7 +615,7 @@ class ExchangeAppBase(tk.Tk):
         return FUTURES_MARGIN_TYPE_LABEL_TO_VALUE.get(text, FUTURES_MARGIN_TYPE_DEFAULT)
     @staticmethod
     def _futures_margin_type_label(value) -> str:
-        normalized = App._normalize_futures_margin_type(value)
+        normalized = ExchangeAppBase._normalize_futures_margin_type(value)
         return FUTURES_MARGIN_TYPE_VALUE_TO_LABEL.get(normalized, FUTURES_MARGIN_TYPE_LABEL_CROSSED)
     def _refresh_strategy_panel_layout(self):
         frame_top = getattr(self, "exchange_strategy_frame", None)
