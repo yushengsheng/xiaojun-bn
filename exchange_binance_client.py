@@ -72,6 +72,9 @@ def retry_request(max_retries=3, delay=2):
 class BinanceClient:
     SERVER_TIME_CACHE_TTL_SECONDS = 30.0
     DEFAULT_RECV_WINDOW_MS = 10000
+    _shared_convert_exchange_info_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    _shared_convert_asset_info_cache: dict[str, int] | None = None
+    _shared_convert_cache_lock = threading.Lock()
 
     def __init__(self, key: str, secret: str, proxy_url: str = ""):
         if not key or not secret:
@@ -326,17 +329,39 @@ class BinanceClient:
         for suffix in SUPPORTED_QUOTE_ASSET_SUFFIXES:
             if symbol_u.endswith(suffix) and len(symbol_u) > len(suffix):
                 return symbol_u[:-len(suffix)], suffix
-        return "BTC", "USDT"
+        return "", ""
+
+    @classmethod
+    def _validated_spot_symbol_parts(cls, symbol: str) -> tuple[str, str, str]:
+        symbol_u = str(symbol or "").strip().upper()
+        if not symbol_u:
+            raise RuntimeError("现货交易对不能为空")
+        base_asset, quote_asset = cls.split_spot_symbol(symbol_u)
+        if not base_asset or not quote_asset:
+            raise RuntimeError(f"现货交易对格式不正确：{symbol_u}")
+        return symbol_u, base_asset, quote_asset
 
     @classmethod
     def get_spot_base_asset(cls, symbol: str) -> str:
-        base_asset, _quote_asset = cls.split_spot_symbol(symbol)
+        _symbol_u, base_asset, _quote_asset = cls._validated_spot_symbol_parts(symbol)
         return base_asset
 
     @classmethod
     def get_spot_quote_asset(cls, symbol: str) -> str:
-        _base_asset, quote_asset = cls.split_spot_symbol(symbol)
+        _symbol_u, _base_asset, quote_asset = cls._validated_spot_symbol_parts(symbol)
         return quote_asset
+
+    def ensure_spot_symbol_supported(self, symbol: str) -> tuple[str, str]:
+        symbol_u, base_asset, quote_asset = self._validated_spot_symbol_parts(symbol)
+        try:
+            info = self.get_exchange_info(symbol_u)
+        except Exception as exc:
+            raise RuntimeError(f"现货交易对校验失败：{symbol_u}") from exc
+        if not info:
+            raise RuntimeError(f"找不到现货交易对：{symbol_u}")
+        if str(info.get("status") or "").strip().upper() != "TRADING":
+            raise RuntimeError(f"现货交易对不可交易：{symbol_u}")
+        return base_asset, quote_asset
 
     # -------- 公共行情 / 交易规则 --------
     def get_exchange_info(self, symbol: str):
@@ -360,6 +385,270 @@ class BinanceClient:
             return price
         except Exception:
             return None
+
+    @staticmethod
+    def _quantize_to_fraction(value: Decimal | str | float | int, fraction: int) -> Decimal:
+        fraction_i = max(0, int(fraction or 0))
+        step = Decimal("1").scaleb(-fraction_i)
+        return Decimal(str(value)).quantize(step, rounding=ROUND_DOWN)
+
+    def get_convert_pairs(self, from_asset: str | None = None, to_asset: str | None = None) -> list[dict[str, Any]]:
+        from_asset_u = str(from_asset or "").strip().upper()
+        to_asset_u = str(to_asset or "").strip().upper()
+        cache_key = (from_asset_u, to_asset_u)
+        params: dict[str, str] = {}
+        if from_asset_u:
+            params["fromAsset"] = from_asset_u
+        if to_asset_u:
+            params["toAsset"] = to_asset_u
+
+        with self._shared_convert_cache_lock:
+            if cache_key in self._shared_convert_exchange_info_cache:
+                return list(self._shared_convert_exchange_info_cache[cache_key])
+            data = self.public_get(self.spot, "/sapi/v1/convert/exchangeInfo", params)
+            rows = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+
+            normalized: list[dict[str, Any]] = []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                normalized.append(
+                    {
+                        "fromAsset": str(item.get("fromAsset") or "").strip().upper(),
+                        "toAsset": str(item.get("toAsset") or "").strip().upper(),
+                        "fromAssetMinAmount": self._decimal_from_str(item.get("fromAssetMinAmount", "0"), "0"),
+                        "fromAssetMaxAmount": self._decimal_from_str(item.get("fromAssetMaxAmount", "0"), "0"),
+                        "toAssetMinAmount": self._decimal_from_str(item.get("toAssetMinAmount", "0"), "0"),
+                        "toAssetMaxAmount": self._decimal_from_str(item.get("toAssetMaxAmount", "0"), "0"),
+                    }
+                )
+            self._shared_convert_exchange_info_cache[cache_key] = list(normalized)
+            return list(normalized)
+
+    def get_convert_pair_info(self, from_asset: str, to_asset: str) -> dict[str, Any] | None:
+        from_asset_u = str(from_asset or "").strip().upper()
+        to_asset_u = str(to_asset or "").strip().upper()
+        if not from_asset_u or not to_asset_u:
+            return None
+        for item in self.get_convert_pairs(from_asset_u, to_asset_u):
+            if item.get("fromAsset") == from_asset_u and item.get("toAsset") == to_asset_u:
+                return item
+        return None
+
+    def ensure_convert_symbol_supported(self, symbol: str) -> tuple[str, str]:
+        base_asset, quote_asset = self.ensure_spot_symbol_supported(symbol)
+        if not self.get_convert_pair_info(quote_asset, base_asset):
+            raise RuntimeError(f"闪兑不支持 {quote_asset} -> {base_asset}")
+        if not self.get_convert_pair_info(base_asset, quote_asset):
+            raise RuntimeError(f"闪兑不支持 {base_asset} -> {quote_asset}")
+        return base_asset, quote_asset
+
+    def get_convert_asset_info(self) -> dict[str, int]:
+        with self._shared_convert_cache_lock:
+            cached = self._shared_convert_asset_info_cache
+            if isinstance(cached, dict) and cached:
+                return dict(cached)
+            data = self.request(self.spot, "GET", "/sapi/v1/convert/assetInfo", {})
+            rows = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+            result: dict[str, int] = {}
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                asset = str(item.get("asset") or "").strip().upper()
+                if not asset:
+                    continue
+                try:
+                    result[asset] = max(0, int(item.get("fraction", 8) or 8))
+                except Exception:
+                    result[asset] = 8
+            self._shared_convert_asset_info_cache = dict(result)
+            return dict(result)
+
+    def get_convert_asset_fraction(self, asset: str) -> int:
+        asset_u = str(asset or "").strip().upper()
+        if not asset_u:
+            return 8
+        return int(self.get_convert_asset_info().get(asset_u, 8) or 8)
+
+    def _normalize_convert_from_amount(self, from_asset: str, amount: Decimal | str | float | int) -> Decimal:
+        amount_dec = Decimal(str(amount))
+        if amount_dec <= 0:
+            return Decimal("0")
+        fraction = self.get_convert_asset_fraction(from_asset)
+        return self._quantize_to_fraction(amount_dec, fraction)
+
+    def _validate_convert_from_amount(
+        self,
+        from_asset: str,
+        to_asset: str,
+        amount: Decimal | str | float | int,
+    ) -> tuple[Decimal, dict[str, Any]]:
+        pair_info = self.get_convert_pair_info(from_asset, to_asset)
+        if not pair_info:
+            raise RuntimeError(f"闪兑不支持 {str(from_asset or '').upper()} -> {str(to_asset or '').upper()}")
+
+        amount_dec = self._normalize_convert_from_amount(from_asset, amount)
+        min_amount = Decimal(str(pair_info.get("fromAssetMinAmount", "0") or "0"))
+        max_amount = Decimal(str(pair_info.get("fromAssetMaxAmount", "0") or "0"))
+
+        if amount_dec <= 0:
+            return Decimal("0"), pair_info
+        if min_amount > 0 and amount_dec < min_amount:
+            return Decimal("0"), pair_info
+        if max_amount > 0 and amount_dec > max_amount:
+            raise RuntimeError(
+                f"闪兑 {str(from_asset or '').upper()} -> {str(to_asset or '').upper()} 金额过大："
+                f"{self._format_decimal(amount_dec)} > 最大 {self._format_decimal(max_amount)}"
+            )
+        return amount_dec, pair_info
+
+    def get_convert_quote(
+        self,
+        from_asset: str,
+        to_asset: str,
+        *,
+        from_amount: Decimal | str | float | int | None = None,
+        to_amount: Decimal | str | float | int | None = None,
+        wallet_type: str = "SPOT",
+        valid_time: str = "10s",
+    ) -> dict[str, Any]:
+        from_asset_u = str(from_asset or "").strip().upper()
+        to_asset_u = str(to_asset or "").strip().upper()
+        params: dict[str, Any] = {
+            "fromAsset": from_asset_u,
+            "toAsset": to_asset_u,
+            "walletType": str(wallet_type or "SPOT").strip().upper(),
+            "validTime": str(valid_time or "10s").strip(),
+        }
+        if from_amount is not None:
+            params["fromAmount"] = self._format_decimal(Decimal(str(from_amount)))
+        elif to_amount is not None:
+            params["toAmount"] = self._format_decimal(Decimal(str(to_amount)))
+        else:
+            raise RuntimeError("闪兑报价必须指定 fromAmount 或 toAmount")
+        return self.request(self.spot, "POST", "/sapi/v1/convert/getQuote", params)
+
+    def accept_convert_quote(self, quote_id: str) -> dict[str, Any]:
+        quote_id_text = str(quote_id or "").strip()
+        if not quote_id_text:
+            raise RuntimeError("闪兑 quoteId 为空")
+        return self.request(
+            self.spot,
+            "POST",
+            "/sapi/v1/convert/acceptQuote",
+            {"quoteId": quote_id_text},
+        )
+
+    def get_convert_order_status(self, *, order_id: str | int | None = None, quote_id: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if order_id is not None and str(order_id).strip():
+            params["orderId"] = str(order_id).strip()
+        if quote_id is not None and str(quote_id).strip():
+            params["quoteId"] = str(quote_id).strip()
+        if not params:
+            raise RuntimeError("闪兑订单状态查询必须提供 orderId 或 quoteId")
+        return self.request(self.spot, "GET", "/sapi/v1/convert/orderStatus", params)
+
+    def wait_convert_order_success(
+        self,
+        *,
+        order_id: str | int | None = None,
+        quote_id: str | None = None,
+        timeout_sec: float = 15.0,
+        poll_interval: float = 0.4,
+    ) -> dict[str, Any]:
+        deadline = time.time() + max(1.0, float(timeout_sec))
+        last_status = ""
+        while time.time() < deadline:
+            data = self.get_convert_order_status(order_id=order_id, quote_id=quote_id)
+            status = str(data.get("orderStatus") or "").strip().upper()
+            if status == "SUCCESS":
+                return data
+            if status in {"FAIL", "FAILED", "EXPIRED", "REJECTED", "CANCELED", "CANCELLED"}:
+                raise RuntimeError(f"闪兑订单失败，状态={status}")
+            last_status = status
+            time.sleep(max(0.2, float(poll_interval)))
+        if last_status:
+            raise RuntimeError(f"闪兑订单等待超时，当前状态={last_status}")
+        raise RuntimeError("闪兑订单等待超时")
+
+    def convert_with_from_amount(
+        self,
+        from_asset: str,
+        to_asset: str,
+        from_amount: Decimal | str | float | int,
+        *,
+        wallet_type: str = "SPOT",
+        valid_time: str = "10s",
+    ) -> dict[str, Any] | None:
+        from_asset_u = str(from_asset or "").strip().upper()
+        to_asset_u = str(to_asset or "").strip().upper()
+        amount_dec, pair_info = self._validate_convert_from_amount(from_asset_u, to_asset_u, from_amount)
+        if amount_dec <= 0:
+            min_amount = Decimal(str(pair_info.get("fromAssetMinAmount", "0") or "0"))
+            logger.info(
+                "闪兑 %s -> %s 金额过小，跳过：%s < 最小 %s",
+                from_asset_u,
+                to_asset_u,
+                self._format_decimal(self._normalize_convert_from_amount(from_asset_u, from_amount)),
+                self._format_decimal(min_amount),
+            )
+            return None
+
+        quote = self.get_convert_quote(
+            from_asset_u,
+            to_asset_u,
+            from_amount=amount_dec,
+            wallet_type=wallet_type,
+            valid_time=valid_time,
+        )
+        quote_id = str(quote.get("quoteId") or "").strip()
+        if not quote_id:
+            raise RuntimeError(f"闪兑报价返回异常：{quote}")
+
+        self.accept_convert_quote(quote_id)
+        order = self.wait_convert_order_success(quote_id=quote_id)
+        logger.info(
+            "闪兑完成 %s -> %s：支出=%s 到账=%s",
+            from_asset_u,
+            to_asset_u,
+            self._format_decimal(self._decimal_from_str(order.get("fromAmount", amount_dec), "0")),
+            self._format_decimal(self._decimal_from_str(order.get("toAmount", quote.get("toAmount", "0")), "0")),
+        )
+        return order
+
+    def convert_quote_to_base_all(self, symbol: str, buffer=0.2) -> dict[str, Any] | None:
+        symbol_u = str(symbol or "").strip().upper()
+        base_asset = self.get_spot_base_asset(symbol_u)
+        quote_asset = self.get_spot_quote_asset(symbol_u)
+        self.ensure_convert_symbol_supported(symbol_u)
+        self.collect_funding_asset_to_spot(quote_asset)
+
+        quote_balance = self.spot_asset_balance_decimal(quote_asset)
+        buffer_dec = Decimal(str(buffer or "0"))
+        amount = quote_balance - buffer_dec
+        if amount <= 0:
+            logger.info(
+                "闪兑买入跳过：现货 %s 余额 %s <= 预留 %s",
+                quote_asset,
+                self._format_decimal(quote_balance),
+                self._format_decimal(buffer_dec),
+            )
+            return None
+        return self.convert_with_from_amount(quote_asset, base_asset, amount)
+
+    def convert_base_to_quote_all(self, symbol: str) -> dict[str, Any] | None:
+        symbol_u = str(symbol or "").strip().upper()
+        base_asset = self.get_spot_base_asset(symbol_u)
+        quote_asset = self.get_spot_quote_asset(symbol_u)
+        self.ensure_convert_symbol_supported(symbol_u)
+        self.collect_funding_asset_to_spot(base_asset)
+
+        base_balance = self.spot_asset_balance_decimal(base_asset)
+        if base_balance <= 0:
+            logger.info("闪兑卖出跳过：现货 %s 余额为 0", base_asset)
+            return None
+        return self.convert_with_from_amount(base_asset, quote_asset, base_balance)
 
     @staticmethod
     def _extract_filter(symbol_info: dict, filter_type: str):
@@ -479,6 +768,17 @@ class BinanceClient:
         self._um_futures_exchange_info_cache[symbol_u] = info
         return info
 
+    def ensure_um_futures_symbol_supported(self, symbol: str) -> dict[str, Any]:
+        symbol_u = str(symbol or "").strip().upper()
+        if not symbol_u:
+            raise RuntimeError("合约交易对不能为空")
+        info = self.get_um_futures_exchange_info(symbol_u)
+        if not info:
+            raise RuntimeError(f"找不到合约交易对：{symbol_u}")
+        if str(info.get("status") or "").strip().upper() != "TRADING":
+            raise RuntimeError(f"合约交易对不可交易：{symbol_u}")
+        return info
+
     def get_um_futures_symbol_price(self, symbol: str) -> Optional[Decimal]:
         symbol_u = str(symbol or "").strip().upper()
         if not symbol_u:
@@ -536,10 +836,12 @@ class BinanceClient:
         }
 
     def get_um_futures_margin_asset(self, symbol: str) -> str:
-        rules = self.get_um_futures_trade_rules(symbol)
-        if not rules:
-            return "USDT"
-        return str(rules.get("marginAsset") or rules.get("quoteAsset") or "USDT").strip().upper()
+        symbol_u = str(symbol or "").strip().upper()
+        info = self.ensure_um_futures_symbol_supported(symbol_u)
+        margin_asset = str(info.get("marginAsset") or info.get("quoteAsset") or "").strip().upper()
+        if not margin_asset:
+            raise RuntimeError(f"合约交易对保证金币种无效：{symbol_u}")
+        return margin_asset
 
     def get_um_futures_book_ticker(self, symbol: str) -> dict[str, Decimal]:
         symbol_u = str(symbol or "").strip().upper()
@@ -1094,8 +1396,34 @@ class BinanceClient:
         if quote_asset_u == "BNB":
             logger.info("后置币种为 BNB，无需预买 BNB")
             return False
-        symbol = f"BNB{quote_asset_u}"
-        return self.spot_buy_quote_amount(symbol, amount)
+
+        amount_dec = Decimal(str(amount or "0"))
+        if amount_dec <= 0:
+            logger.info("预买 BNB 金额 <= 0，跳过")
+            return False
+
+        self.collect_funding_asset_to_spot(quote_asset_u)
+        quote_balance = self.spot_asset_balance_decimal(quote_asset_u)
+        if quote_balance < amount_dec:
+            raise RuntimeError(
+                f"现货 {quote_asset_u} 余额不足：需要 {self._format_decimal(amount_dec)}，当前 {self._format_decimal(quote_balance)}"
+            )
+
+        order = self.convert_with_from_amount(quote_asset_u, "BNB", amount_dec)
+        if not order:
+            logger.info(
+                "闪兑预买 BNB 未执行：%s 金额 %s",
+                quote_asset_u,
+                self._format_decimal(amount_dec),
+            )
+            return False
+
+        logger.info(
+            "已通过闪兑预买 BNB：使用 %s 金额 %s",
+            quote_asset_u,
+            self._format_decimal(amount_dec),
+        )
+        return True
 
     def spot_limit_sell_all_base(self, symbol: str, price: Decimal, reserve_ratio: Decimal = Decimal("1")):
         rules = self.get_symbol_trade_rules(symbol)
@@ -1134,7 +1462,7 @@ class BinanceClient:
             return self._ceil_to_step(price, tick_size)
         return normalized
 
-    def sell_asset_market(self, symbol: str, free_balance: float, reserve_ratio=Decimal("0.999")) -> bool:
+    def sell_asset_market(self, symbol: str, free_balance: Decimal | str | float | int, reserve_ratio=Decimal("0.999")) -> bool:
         rules = self.get_symbol_trade_rules(symbol)
         if not rules:
             logger.info("找不到交易对规则，跳过卖出 %s", symbol)
@@ -1157,8 +1485,12 @@ class BinanceClient:
         if price:
             notional = qty * price
             if rules["minNotional"] > 0 and notional < rules["minNotional"]:
-                logger.info("交易对 %s 名义价值 %.8f 小于最小下单额 %.8f，跳过",
-                            symbol, float(notional), float(rules["minNotional"]))
+                logger.info(
+                    "交易对 %s 名义价值 %s 小于最小下单额 %s，跳过",
+                    symbol,
+                    self._format_decimal(notional),
+                    self._format_decimal(rules["minNotional"]),
+                )
                 return False
 
         self.request(
@@ -1216,36 +1548,31 @@ class BinanceClient:
 
     # -------- 现货买入（全部 USDT） --------
     def spot_buy_all_usdt(self, buffer=0.2, symbol="BTCUSDT"):
-        quote_asset = self.get_spot_quote_asset(symbol)
+        symbol_u = str(symbol or "").strip().upper()
+        quote_asset = self.get_spot_quote_asset(symbol_u)
         self.collect_funding_asset_to_spot(quote_asset)
-        quote_balance = self.spot_balance(quote_asset)
-        if quote_balance <= buffer:
-            logger.info("现货 %s %.8f <= buffer %.8f，跳过买入", quote_asset, quote_balance, buffer)
+        quote_balance = self.spot_asset_balance_decimal(quote_asset)
+        buffer_dec = Decimal(str(buffer or "0"))
+        if quote_balance <= buffer_dec:
+            logger.info(
+                "现货 %s %s <= buffer %s，跳过买入",
+                quote_asset,
+                self._format_decimal(quote_balance),
+                self._format_decimal(buffer_dec),
+            )
             return False
 
-        amount = (quote_balance - buffer) * 0.999
+        amount = (quote_balance - buffer_dec) * Decimal("0.999")
         if amount <= 0:
             logger.info("可用 %s 金额太小，跳过买入", quote_asset)
             return False
 
-        self.request(
-            self.spot,
-            "POST",
-            "/api/v3/order",
-            {
-                "symbol": symbol,
-                "side": "BUY",
-                "type": "MARKET",
-                "quoteOrderQty": f"{amount:.8f}",
-            },
-        )
-        logger.info("现货市价买入 %s，使用 %s 金额 %.8f", symbol, quote_asset, amount)
-        return True
+        return self.spot_buy_quote_amount(symbol_u, amount)
 
-    # -------- 现货卖出（全部基础币；precision 参数仅为兼容旧配置保留） --------
-    def spot_sell_all_base(self, symbol: str, precision: int):
+    # -------- 现货卖出（全部基础币） --------
+    def spot_sell_all_base(self, symbol: str):
         base = self.get_spot_base_asset(symbol)
-        balance = self.spot_balance(base)
+        balance = self.spot_asset_balance_decimal(base)
 
         if balance <= 0:
             return False
@@ -1272,17 +1599,23 @@ class BinanceClient:
                     time.sleep(0.5)
             except Exception as e:
                 logger.warning("提现前归集 %s 到现货失败: %s", coin, e)
-        balance = self.spot_balance(coin)
-        amount = balance - fee_buffer
+        balance = self.spot_asset_balance_decimal(coin)
+        fee_buffer_dec = Decimal(str(fee_buffer or "0"))
+        amount = balance - fee_buffer_dec
         if amount <= 0:
-            logger.info("%s 余额 %.8f 不足以提现（需 > buffer %.8f）", coin, balance, fee_buffer)
+            logger.info(
+                "%s 余额 %s 不足以提现（需 > buffer %s）",
+                coin,
+                self._format_decimal(balance),
+                self._format_decimal(fee_buffer_dec),
+            )
             return 0.0
 
         params = {
             "coin": coin,
             "address": address,
             "network": network,
-            "amount": f"{amount:.8f}",
+            "amount": self._format_decimal(amount),
         }
 
         if enable_withdraw:
@@ -1292,8 +1625,14 @@ class BinanceClient:
                 "/sapi/v1/capital/withdraw/apply",
                 params,
             )
-            logger.info("已提交提现 %.8f %s → %s (%s)", amount, coin, address, network)
-            return amount
+            logger.info(
+                "已提交提现 %s %s → %s (%s)",
+                self._format_decimal(amount),
+                coin,
+                address,
+                network,
+            )
+            return float(amount)
         else:
             logger.info("提现开关关闭，仅打印参数: %s", params)
             return 0.0

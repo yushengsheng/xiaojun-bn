@@ -675,10 +675,12 @@ def bind_paste_shortcuts(widget) -> None:
 
 
 def random_decimal_between(low: Decimal, high: Decimal, unit: Decimal = Decimal("0.01")) -> Decimal:
+    if unit <= 0:
+        raise RuntimeError("随机金额最小精度必须大于 0")
     low_i = int((low / unit).to_integral_value(rounding=ROUND_CEILING))
     high_i = int((high / unit).to_integral_value(rounding=ROUND_FLOOR))
     if low_i > high_i:
-        raise RuntimeError("随机金额范围至少要包含 0.01")
+        raise RuntimeError(f"随机金额范围至少要包含 1 个最小精度单位（{decimal_to_text(unit)}）")
     return (unit * Decimal(random.randint(low_i, high_i))).quantize(unit)
 
 

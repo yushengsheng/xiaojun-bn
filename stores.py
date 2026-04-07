@@ -253,15 +253,48 @@ class OnchainStore:
     def __init__(self, file_path: Path):
         self.file_path = file_path
         self.multi_to_multi_pairs: list[OnchainPairEntry] = []
+        self.multi_to_multi_drafts: list[dict[str, str]] = []
         self.one_to_many_addresses: list[str] = []
         self.many_to_one_sources: list[str] = []
         self.settings = OnchainSettings()
         self.last_load_notice = ""
 
+    def _build_settings_payload(self) -> dict:
+        settings_payload = asdict(self.settings)
+        settings_payload["one_to_many_source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
+        settings_payload["proxy_url"] = SECRET_BOX.encrypt(self.settings.proxy_url)
+        return settings_payload
+
+    def _build_transfer_rows_payload(self) -> dict:
+        return {
+            "multi_to_multi": [
+                {
+                    "source": SECRET_BOX.encrypt(x.source),
+                    "target": x.target,
+                }
+                for x in self.multi_to_multi_pairs
+            ],
+            "multi_to_multi_drafts": [
+                {
+                    "source": SECRET_BOX.encrypt(str(item.get("source", "") or "").strip()),
+                    "target": str(item.get("target", "") or "").strip(),
+                }
+                for item in self.multi_to_multi_drafts
+                if str(item.get("source", "") or "").strip() or str(item.get("target", "") or "").strip()
+            ],
+            "one_to_many": {
+                "addresses": list(self.one_to_many_addresses),
+            },
+            "many_to_one": {
+                "sources": [SECRET_BOX.encrypt(x) for x in self.many_to_one_sources],
+            },
+        }
+
     def load(self) -> None:
         self.last_load_notice = ""
         if not self.file_path.exists():
             self.multi_to_multi_pairs = []
+            self.multi_to_multi_drafts = []
             self.one_to_many_addresses = []
             self.many_to_one_sources = []
             self.settings = OnchainSettings()
@@ -273,6 +306,7 @@ class OnchainStore:
 
         settings_raw = raw.get("settings", {}) or {}
         pairs_raw = raw.get("multi_to_multi", []) or []
+        drafts_raw = raw.get("multi_to_multi_drafts", []) or []
         one_many_raw = raw.get("one_to_many", {}) or {}
         many_one_raw = raw.get("many_to_one", {}) or {}
 
@@ -288,6 +322,19 @@ class OnchainStore:
                 continue
             pair_seen.add(key)
             pairs.append(OnchainPairEntry(source=source, target=target))
+
+        drafts: list[dict[str, str]] = []
+        for item in drafts_raw:
+            if not isinstance(item, dict):
+                continue
+            source = SECRET_BOX.decrypt(str(item.get("source", "") or "").strip()).strip()
+            target = str(item.get("target", "") or "").strip()
+            if not source and not target:
+                continue
+            drafts.append({
+                "source": source,
+                "target": target,
+            })
 
         one_many_list: list[str] = []
         one_many_seen: set[str] = set()
@@ -319,6 +366,7 @@ class OnchainStore:
             threads = 10
 
         self.multi_to_multi_pairs = pairs
+        self.multi_to_multi_drafts = drafts
         self.one_to_many_addresses = one_many_list
         self.many_to_one_sources = many_one_list
         source_raw = one_many_raw.get("source", "")
@@ -348,27 +396,44 @@ class OnchainStore:
 
     def save(self) -> None:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_payload = asdict(self.settings)
-        settings_payload["one_to_many_source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
-        settings_payload["proxy_url"] = SECRET_BOX.encrypt(self.settings.proxy_url)
         payload = {
-            "settings": settings_payload,
-            "multi_to_multi": [
-                {
-                    "source": SECRET_BOX.encrypt(x.source),
-                    "target": x.target,
-                }
-                for x in self.multi_to_multi_pairs
-            ],
-            "one_to_many": {
-                "source": SECRET_BOX.encrypt(self.settings.one_to_many_source),
-                "addresses": self.one_to_many_addresses,
-            },
-            "many_to_one": {
-                "target": self.settings.many_to_one_target,
-                "sources": [SECRET_BOX.encrypt(x) for x in self.many_to_one_sources],
-            },
+            "settings": self._build_settings_payload(),
         }
+        payload.update(self._build_transfer_rows_payload())
+        payload["one_to_many"]["source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
+        payload["many_to_one"]["target"] = self.settings.many_to_one_target
+        _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
+
+    def save_settings_only(self) -> None:
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            raw, _recovered = _load_json_with_backup(self.file_path, validator=_require_dict)
+            payload = dict(raw) if isinstance(raw, dict) else {}
+        except FileNotFoundError:
+            payload = {}
+
+        payload["settings"] = self._build_settings_payload()
+        payload.setdefault("multi_to_multi", [])
+        payload.setdefault("one_to_many", {})
+        payload.setdefault("many_to_one", {})
+        _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
+
+    def save_transfer_lists_only(self) -> None:
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            raw, _recovered = _load_json_with_backup(self.file_path, validator=_require_dict)
+            payload = dict(raw) if isinstance(raw, dict) else {}
+        except FileNotFoundError:
+            payload = {"settings": self._build_settings_payload()}
+
+        rows_payload = self._build_transfer_rows_payload()
+        payload.setdefault("settings", self._build_settings_payload())
+        payload["multi_to_multi"] = rows_payload["multi_to_multi"]
+        payload["multi_to_multi_drafts"] = rows_payload["multi_to_multi_drafts"]
+        payload["one_to_many"] = dict(payload.get("one_to_many") or {})
+        payload["one_to_many"]["addresses"] = rows_payload["one_to_many"]["addresses"]
+        payload["many_to_one"] = dict(payload.get("many_to_one") or {})
+        payload["many_to_one"]["sources"] = rows_payload["many_to_one"]["sources"]
         _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
 
     def upsert_multi_to_multi(self, rows: list[OnchainPairEntry]) -> int:
