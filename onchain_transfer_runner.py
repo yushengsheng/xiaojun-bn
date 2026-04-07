@@ -538,12 +538,15 @@ class OnchainTransferRunnerMixin(object):
                 timeout_msg = f"{prefix} 确认中超过 {submitted_timeout_seconds:g} 秒，自动判定失败"
 
                 def timeout_worker():
-                    if submitted_timeout_seconds > 0:
-                        time.sleep(submitted_timeout_seconds)
+                    if submitted_timeout_seconds > 0 and self.stop_requested.wait(submitted_timeout_seconds):
+                        return
+                    if self.stop_requested.is_set() or self._closing or bool(getattr(self.root, "_closing", False)):
+                        return
                     finalize_job(row_key, "failed", timeout_msg)
 
                 if submitted_timeout_seconds > 0:
-                    threading.Thread(target=timeout_worker, daemon=True).start()
+                    timeout_name = f"onchain-submitted-timeout-{str(row_key or '')[-8:] or 'job'}"
+                    self._start_managed_thread(timeout_worker, name=timeout_name)
                 else:
                     timeout_worker()
 

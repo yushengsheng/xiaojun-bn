@@ -195,8 +195,34 @@ class BinanceClient:
             self.secret, urlencode(params, True).encode(), hashlib.sha256
         ).hexdigest()
 
-    @retry_request(max_retries=3, delay=1)
-    def request(self, base, method, path, params=None):
+    def _run_request_with_retry(self, request_fn, *, max_retries: int, delay: float):
+        last_exception = None
+        retry_count = max(1, int(max_retries or 1))
+        retry_delay = max(0.0, float(delay or 0))
+        for i in range(retry_count):
+            try:
+                return request_fn()
+            except (requests.exceptions.RequestException, ConnectionError, TimeoutError) as e:
+                last_exception = e
+                if i + 1 >= retry_count:
+                    break
+                logger.warning(f"网络请求失败 ({i + 1}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
+                time.sleep(retry_delay)
+            except BinanceAPIError as e:
+                last_exception = e
+                if e.code in [-1001, -1003]:
+                    if i + 1 >= retry_count:
+                        break
+                    logger.warning(f"Binance 系统繁忙 ({i + 1}/{retry_count}): {e}，重试中...")
+                    time.sleep(retry_delay)
+                    continue
+                raise e
+        logger.error(f"重试 {retry_count} 次后仍然失败。")
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("未知错误：重试失败")
+
+    def _request_impl(self, base, method, path, params=None, *, timeout: float = 15):
         url = base + path
         last_error = None
 
@@ -204,9 +230,9 @@ class BinanceClient:
             signed_params = self._signed_params(base, params, force_time_sync=(attempt > 0))
 
             if method == "GET":
-                r = self.session.get(url, params=signed_params, timeout=15)
+                r = self.session.get(url, params=signed_params, timeout=timeout)
             else:
-                r = self.session.request(method, url, data=signed_params, timeout=15)
+                r = self.session.request(method, url, data=signed_params, timeout=timeout)
 
             try:
                 data = r.json()
@@ -231,13 +257,36 @@ class BinanceClient:
             raise last_error
         raise RuntimeError("签名请求失败")
 
-    @retry_request(max_retries=3, delay=1)
+    def request(self, base, method, path, params=None):
+        return self._run_request_with_retry(
+            lambda: self._request_impl(base, method, path, params, timeout=15),
+            max_retries=3,
+            delay=1,
+        )
+
+    def request_query(self, base, method, path, params=None, *, timeout: float = 6, max_retries: int = 1):
+        return self._run_request_with_retry(
+            lambda: self._request_impl(base, method, path, params, timeout=timeout),
+            max_retries=max_retries,
+            delay=0.5,
+        )
+
     def public_get(self, base, path, params=None):
+        return self.public_get_query(base, path, params, timeout=15, max_retries=3, delay=1)
+
+    def _public_get_impl(self, base, path, params=None, *, timeout: float = 15):
         params = params or {}
         url = base + path
-        r = self.session.get(url, params=params, timeout=15)
+        r = self.session.get(url, params=params, timeout=timeout)
         r.raise_for_status()
         return r.json()
+
+    def public_get_query(self, base, path, params=None, *, timeout: float = 6, max_retries: int = 1, delay: float = 0.5):
+        return self._run_request_with_retry(
+            lambda: self._public_get_impl(base, path, params, timeout=timeout),
+            max_retries=max_retries,
+            delay=delay,
+        )
 
     # -------- 余额 --------
     def spot_balance(self, asset: str) -> float:
@@ -247,8 +296,9 @@ class BinanceClient:
                 return float(b.get("free", 0))
         return 0.0
 
-    def spot_all_balances(self):
-        data = self.request(self.spot, "GET", "/api/v3/account")
+    def spot_all_balances(self, *, fast: bool = False):
+        requester = self.request_query if fast else self.request
+        data = requester(self.spot, "GET", "/api/v3/account", {}, timeout=6, max_retries=1) if fast else requester(self.spot, "GET", "/api/v3/account")
         result = []
         for b in data.get("balances", []):
             free_amt = float(b.get("free", 0) or 0)
@@ -263,12 +313,15 @@ class BinanceClient:
                 })
         return result
 
-    def query_total_wallet_balance(self, quote_asset="USDT"):
-        data = self.request(
+    def query_total_wallet_balance(self, quote_asset="USDT", *, fast: bool = False):
+        requester = self.request_query if fast else self.request
+        request_kwargs = {"timeout": 8, "max_retries": 2} if fast else {}
+        data = requester(
             self.spot,
             "GET",
             "/sapi/v1/asset/wallet/balance",
             {"quoteAsset": quote_asset},
+            **request_kwargs,
         )
         total = Decimal("0")
         rows = []
@@ -284,7 +337,7 @@ class BinanceClient:
             total += bal
         return total, rows
 
-    def query_asset_balances_breakdown(self) -> dict[str, Decimal]:
+    def query_asset_balances_breakdown(self, *, fast: bool = False) -> dict[str, Decimal]:
         totals: dict[str, Decimal] = {}
 
         def add_amount(asset: str, amount) -> None:
@@ -297,25 +350,25 @@ class BinanceClient:
             totals[asset_u] = totals.get(asset_u, Decimal("0")) + amount_dec
 
         try:
-            for item in self.spot_all_balances():
+            for item in self.spot_all_balances(fast=fast):
                 add_amount(item.get("asset", ""), item.get("total", 0))
         except Exception as e:
             logger.warning("查询现货资产明细失败: %s", e)
 
         try:
-            for item in self.funding_positive_assets():
+            for item in self.funding_positive_assets(fast=fast):
                 add_amount(item.get("asset", ""), item.get("free", 0))
         except Exception as e:
             logger.warning("查询资金账户资产明细失败: %s", e)
 
         try:
-            for item in self.um_futures_transferable_assets():
+            for item in self.um_futures_transferable_assets(fast=fast):
                 add_amount(item.get("asset", ""), item.get("amount", 0))
         except Exception as e:
             logger.warning("查询 U本位资产明细失败: %s", e)
 
         try:
-            for item in self.cm_futures_transferable_assets():
+            for item in self.cm_futures_transferable_assets(fast=fast):
                 add_amount(item.get("asset", ""), item.get("amount", 0))
         except Exception as e:
             logger.warning("查询 币本位资产明细失败: %s", e)
@@ -686,6 +739,14 @@ class BinanceClient:
             return "0"
         return text
 
+    @staticmethod
+    def _positive_int(value, default: int = 8) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            return int(default)
+        return parsed if parsed >= 0 else int(default)
+
     def get_symbol_trade_rules(self, symbol: str):
         info = self.get_exchange_info(symbol)
         if not info:
@@ -709,6 +770,17 @@ class BinanceClient:
         elif notional:
             min_notional_val = self._decimal_from_str(notional.get("minNotional", "0"), "0")
 
+        quote_precision_candidates = []
+        for key in ("quoteAssetPrecision", "quotePrecision"):
+            raw_value = info.get(key)
+            try:
+                parsed = int(raw_value)
+            except Exception:
+                continue
+            if parsed >= 0:
+                quote_precision_candidates.append(parsed)
+        quote_order_qty_fraction = min(quote_precision_candidates) if quote_precision_candidates else 8
+
         return {
             "stepSize": step_size,
             "minQty": min_qty,
@@ -720,6 +792,7 @@ class BinanceClient:
             "status": info.get("status"),
             "quoteAsset": info.get("quoteAsset"),
             "baseAsset": info.get("baseAsset"),
+            "quoteOrderQtyFraction": self._positive_int(quote_order_qty_fraction, 8),
         }
 
     def get_symbol_tick_size(self, symbol: str) -> Decimal:
@@ -1364,11 +1437,17 @@ class BinanceClient:
 
         quote_asset = self.get_spot_quote_asset(symbol_u)
         self.collect_funding_asset_to_spot(quote_asset)
-        quote_balance = Decimal(str(self.spot_balance(quote_asset)))
+        quote_balance = self.spot_asset_balance_decimal(quote_asset)
+        quote_order_qty_fraction = int(rules.get("quoteOrderQtyFraction", 8) or 8)
+        amount = self._quantize_to_fraction(amount, quote_order_qty_fraction)
+        quote_balance = self._quantize_to_fraction(quote_balance, quote_order_qty_fraction)
         if quote_balance < amount:
             raise RuntimeError(
                 f"现货 {quote_asset} 余额不足：需要 {self._format_decimal(amount)}，当前 {self._format_decimal(quote_balance)}"
             )
+        if amount <= 0:
+            logger.info("买入金额按精度截断后 <= 0，跳过买入 %s", symbol_u)
+            return False
 
         if rules["minNotional"] > 0 and amount < rules["minNotional"]:
             raise RuntimeError(
@@ -1656,16 +1735,19 @@ class BinanceClient:
         return result
 
     # -------- 资金账户正余额资产 --------
-    def funding_positive_assets(self):
-        data = self.request(
+    def funding_positive_assets(self, *, fast: bool = False):
+        requester = self.request_query if fast else self.request
+        request_kwargs = {"timeout": 5, "max_retries": 1} if fast else {}
+        data = requester(
             self.spot,
             "POST",
             "/sapi/v1/asset/get-funding-asset",
             {"needBtcValuation": "false"},
+            **request_kwargs,
         )
         result = []
         for item in data:
-            free_amt = float(item.get("free", 0) or 0)
+            free_amt = self._decimal_from_str(item.get("free", "0"), "0")
             if free_amt > 0:
                 result.append({
                     "asset": item.get("asset"),
@@ -1757,16 +1839,19 @@ class BinanceClient:
             logger.warning("现货划转到 U本位失败 %s %s: %s", asset_u, self._format_decimal(transfer_amount), e)
             return Decimal("0")
 
-    def um_futures_transferable_assets(self):
-        data = self.request(
+    def um_futures_transferable_assets(self, *, fast: bool = False):
+        requester = self.request_query if fast else self.request
+        request_kwargs = {"timeout": 5, "max_retries": 1} if fast else {}
+        data = requester(
             self.um_futures,
             "GET",
             "/fapi/v2/balance",
             {},
+            **request_kwargs,
         )
         result = []
         for item in data:
-            amt = float(item.get("maxWithdrawAmount", 0) or 0)
+            amt = self._decimal_from_str(item.get("maxWithdrawAmount", "0"), "0")
             if amt > 0:
                 result.append({
                     "asset": item.get("asset"),
@@ -1775,16 +1860,19 @@ class BinanceClient:
         return result
 
     # -------- 币本位合约可转出余额 --------
-    def cm_futures_transferable_assets(self):
-        data = self.request(
+    def cm_futures_transferable_assets(self, *, fast: bool = False):
+        requester = self.request_query if fast else self.request
+        request_kwargs = {"timeout": 5, "max_retries": 1} if fast else {}
+        data = requester(
             self.cm_futures,
             "GET",
             "/dapi/v1/balance",
             {},
+            **request_kwargs,
         )
         result = []
         for item in data:
-            amt = float(item.get("withdrawAvailable", 0) or 0)
+            amt = self._decimal_from_str(item.get("withdrawAvailable", "0"), "0")
             if amt > 0:
                 result.append({
                     "asset": item.get("asset"),
@@ -1793,10 +1881,7 @@ class BinanceClient:
         return result
 
     # -------- 通用划转 --------
-    def universal_transfer(self, transfer_type: str, asset: str, amount: float):
-        if amount <= 0:
-            return False
-
+    def universal_transfer(self, transfer_type: str, asset: str, amount: Decimal | str | float | int):
         amount_dec = Decimal(str(amount))
         if amount_dec <= 0:
             return False
@@ -1830,14 +1915,19 @@ class BinanceClient:
             for item in items:
                 if str(item.get("asset") or "").strip().upper() != asset_u:
                     continue
-                amount = float(item.get("amount", 0) or 0)
+                amount = self._decimal_from_str(item.get("amount", "0"), "0")
                 if amount <= 0:
                     continue
                 try:
                     self.universal_transfer("UMFUTURE_MAIN", asset_u, amount)
                     total_count += 1
                 except Exception as e:
-                    logger.warning("提现前 U本位划转失败 %s %.8f: %s", asset_u, amount, e)
+                    logger.warning(
+                        "提现前 U本位划转失败 %s %s: %s",
+                        asset_u,
+                        self._format_decimal(amount),
+                        e,
+                    )
         except Exception as e:
             logger.warning("提现前查询 U本位 %s 余额失败: %s", asset_u, e)
 
@@ -1846,14 +1936,19 @@ class BinanceClient:
             for item in items:
                 if str(item.get("asset") or "").strip().upper() != asset_u:
                     continue
-                amount = float(item.get("amount", 0) or 0)
+                amount = self._decimal_from_str(item.get("amount", "0"), "0")
                 if amount <= 0:
                     continue
                 try:
                     self.universal_transfer("CMFUTURE_MAIN", asset_u, amount)
                     total_count += 1
                 except Exception as e:
-                    logger.warning("提现前 币本位划转失败 %s %.8f: %s", asset_u, amount, e)
+                    logger.warning(
+                        "提现前 币本位划转失败 %s %s: %s",
+                        asset_u,
+                        self._format_decimal(amount),
+                        e,
+                    )
         except Exception as e:
             logger.warning("提现前查询 币本位 %s 余额失败: %s", asset_u, e)
 
@@ -1862,14 +1957,19 @@ class BinanceClient:
             for item in items:
                 if str(item.get("asset") or "").strip().upper() != asset_u:
                     continue
-                amount = float(item.get("free", 0) or 0)
+                amount = self._decimal_from_str(item.get("free", "0"), "0")
                 if amount <= 0:
                     continue
                 try:
                     self.universal_transfer("FUNDING_MAIN", asset_u, amount)
                     total_count += 1
                 except Exception as e:
-                    logger.warning("提现前 资金账户划转失败 %s %.8f: %s", asset_u, amount, e)
+                    logger.warning(
+                        "提现前 资金账户划转失败 %s %s: %s",
+                        asset_u,
+                        self._format_decimal(amount),
+                        e,
+                    )
         except Exception as e:
             logger.warning("提现前查询 资金账户 %s 余额失败: %s", asset_u, e)
 
@@ -1887,12 +1987,12 @@ class BinanceClient:
                 logger.info("检测到 U本位可划转资产 %d 项", len(items))
             for item in items:
                 asset = item["asset"]
-                amount = item["amount"]
+                amount = self._decimal_from_str(item.get("amount", "0"), "0")
                 try:
                     self.universal_transfer("UMFUTURE_MAIN", asset, amount)
                     total_count += 1
                 except Exception as e:
-                    logger.warning("U本位划转失败 %s %.8f: %s", asset, amount, e)
+                    logger.warning("U本位划转失败 %s %s: %s", asset, self._format_decimal(amount), e)
         except Exception as e:
             logger.warning("查询 U本位合约余额失败: %s", e)
 
@@ -1902,12 +2002,12 @@ class BinanceClient:
                 logger.info("检测到 币本位可划转资产 %d 项", len(items))
             for item in items:
                 asset = item["asset"]
-                amount = item["amount"]
+                amount = self._decimal_from_str(item.get("amount", "0"), "0")
                 try:
                     self.universal_transfer("CMFUTURE_MAIN", asset, amount)
                     total_count += 1
                 except Exception as e:
-                    logger.warning("币本位划转失败 %s %.8f: %s", asset, amount, e)
+                    logger.warning("币本位划转失败 %s %s: %s", asset, self._format_decimal(amount), e)
         except Exception as e:
             logger.warning("查询 币本位合约余额失败: %s", e)
 
@@ -1917,12 +2017,12 @@ class BinanceClient:
                 logger.info("检测到 资金账户可划转资产 %d 项", len(items))
             for item in items:
                 asset = item["asset"]
-                amount = item["free"]
+                amount = self._decimal_from_str(item.get("free", "0"), "0")
                 try:
                     self.universal_transfer("FUNDING_MAIN", asset, amount)
                     total_count += 1
                 except Exception as e:
-                    logger.warning("资金账户划转失败 %s %.8f: %s", asset, amount, e)
+                    logger.warning("资金账户划转失败 %s %s: %s", asset, self._format_decimal(amount), e)
         except Exception as e:
             logger.warning("查询资金账户余额失败: %s", e)
 

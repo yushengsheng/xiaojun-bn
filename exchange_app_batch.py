@@ -459,7 +459,7 @@ class ExchangeAppBatchMixin(object):
             try:
                 logger.info("交易所刷新余额链路：%s", self._exchange_proxy_route_text())
                 client = self._create_binance_client(key, secret)
-                spot_balances = client.spot_all_balances()
+                spot_balances = client.spot_all_balances(fast=True)
                 balances_text = self._format_spot_balances_text(spot_balances)
                 if self._closing:
                     return
@@ -914,6 +914,7 @@ class ExchangeAppBatchMixin(object):
         withdraw_coin: str,
         withdraw_network: str,
         enable_withdraw: bool,
+        bnb_topup_amount: Decimal | None = None,
     ) -> list[str]:
         lines = [f"批量账号数：{int(account_count)}"]
         lines.append(f"交易类型：{trade_account_type}")
@@ -924,6 +925,10 @@ class ExchangeAppBatchMixin(object):
             lines.append(f"交易模式：{trade_mode}")
             lines.append(f"交易对：{str(spot_symbol or '').strip().upper() or '-'}")
             lines.append(f"轮次：{int(spot_rounds)}")
+            if trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}:
+                lines.append(
+                    "预购买BNB金额：%s" % BinanceClient._format_decimal(Decimal(str(bnb_topup_amount or "0")))
+                )
         lines.append(f"随机延迟：{int(min_delay)} - {int(max_delay)} 毫秒")
         lines.append(f"提现币种：{str(withdraw_coin or '').strip().upper() or WITHDRAW_COIN_DEFAULT}")
         lines.append(f"提现网络：{str(withdraw_network or '').strip().upper() or WITHDRAW_NETWORK_DEFAULT}")
@@ -944,15 +949,23 @@ class ExchangeAppBatchMixin(object):
         withdraw_coin: str,
         withdraw_network: str,
         enable_withdraw: bool,
-    ) -> tuple[bool, bool]:
+        bnb_topup_amount: Decimal | None = None,
+        enable_bnb_topup: bool = False,
+        show_bnb_topup_option: bool = False,
+    ) -> tuple[bool, bool, bool]:
         dialog = tk.Toplevel(self)
         dialog.title("确认批量执行")
         dialog.transient(self)
         dialog.resizable(False, False)
         dialog.grab_set()
 
-        result = {"confirmed": False, "enable_withdraw": bool(enable_withdraw)}
+        result = {
+            "confirmed": False,
+            "enable_withdraw": bool(enable_withdraw),
+            "enable_bnb_topup": bool(enable_bnb_topup),
+        }
         enable_var = tk.BooleanVar(value=bool(enable_withdraw))
+        enable_bnb_topup_var = tk.BooleanVar(value=bool(enable_bnb_topup))
 
         body = ttk.Frame(dialog, padding=16)
         body.pack(fill="both", expand=True)
@@ -974,10 +987,27 @@ class ExchangeAppBatchMixin(object):
             withdraw_coin=withdraw_coin,
             withdraw_network=withdraw_network,
             enable_withdraw=enable_withdraw,
+            bnb_topup_amount=bnb_topup_amount,
         ):
             ttk.Label(summary, text=line, foreground="#444444").pack(anchor="w", pady=(0, 2))
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", pady=(12, 10))
+
+        if show_bnb_topup_option:
+            tk.Checkbutton(
+                body,
+                text="本次批量执行启用预购买BNB",
+                variable=enable_bnb_topup_var,
+                fg="#C62828",
+                activeforeground="#C62828",
+                selectcolor="#FFFFFF",
+                anchor="w",
+            ).pack(anchor="w")
+            ttk.Label(
+                body,
+                text="使用当前配置的预购买BNB金额，仅对本次批量执行生效。",
+                foreground="#666666",
+            ).pack(anchor="w", pady=(6, 0))
 
         tk.Checkbutton(
             body,
@@ -996,6 +1026,7 @@ class ExchangeAppBatchMixin(object):
         def on_confirm():
             result["confirmed"] = True
             result["enable_withdraw"] = bool(enable_var.get())
+            result["enable_bnb_topup"] = bool(enable_bnb_topup_var.get())
             dialog.destroy()
 
         def on_cancel():
@@ -1021,7 +1052,11 @@ class ExchangeAppBatchMixin(object):
             pass
         dialog.focus_set()
         self.wait_window(dialog)
-        return bool(result["confirmed"]), bool(result["enable_withdraw"])
+        return (
+            bool(result["confirmed"]),
+            bool(result["enable_withdraw"]),
+            bool(result["enable_bnb_topup"]),
+        )
     def retry_last_failed_batch_operation(self):
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("提示", "已有任务在运行中，请先停止当前任务")
@@ -1088,6 +1123,7 @@ class ExchangeAppBatchMixin(object):
         batch_collect_bnb_mode: bool = False,
         batch_sell_large_spot_to_bnb: bool = False,
         batch_enable_withdraw_override: bool | None = None,
+        batch_enable_bnb_topup_override: bool | None = None,
         require_confirm: bool = True,
     ):
         if self.worker_thread and self.worker_thread.is_alive():
@@ -1164,8 +1200,19 @@ class ExchangeAppBatchMixin(object):
             futures_margin_type = self._normalize_futures_margin_type(self.futures_margin_type_var.get())
             futures_side = str(self.futures_side_var.get() or FUTURES_SIDE_DEFAULT).strip()
 
+        configured_bnb_topup_amount_value = Decimal(str(bnb_topup_amount_value or "0"))
+        show_bnb_topup_option = (
+            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
+            and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}
+        )
+        enable_bnb_topup = (
+            bool(batch_enable_bnb_topup_override)
+            if batch_enable_bnb_topup_override is not None
+            else bool(configured_bnb_topup_amount_value > 0)
+        )
+
         if require_confirm and not batch_total_asset_only and not batch_collect_bnb_mode:
-            confirmed, batch_enable_withdraw = self._show_batch_execute_confirm_dialog(
+            confirmed, batch_enable_withdraw, batch_enable_bnb_topup = self._show_batch_execute_confirm_dialog(
                 account_count=len(selected),
                 trade_account_type=trade_account_type,
                 trade_mode=trade_mode,
@@ -1178,11 +1225,21 @@ class ExchangeAppBatchMixin(object):
                 withdraw_coin=withdraw_coin,
                 withdraw_network=self.withdraw_net_var.get().strip(),
                 enable_withdraw=enable_withdraw,
+                bnb_topup_amount=configured_bnb_topup_amount_value,
+                enable_bnb_topup=enable_bnb_topup,
+                show_bnb_topup_option=show_bnb_topup_option,
             )
             if not confirmed:
                 return
             enable_withdraw = bool(batch_enable_withdraw)
             batch_enable_withdraw_override = enable_withdraw
+            enable_bnb_topup = bool(batch_enable_bnb_topup)
+            batch_enable_bnb_topup_override = enable_bnb_topup
+
+        if not (show_bnb_topup_option and enable_bnb_topup):
+            bnb_topup_amount_value = Decimal("0")
+        else:
+            bnb_topup_amount_value = configured_bnb_topup_amount_value
 
         if trade_settings:
             validate_client = None
@@ -1227,6 +1284,11 @@ class ExchangeAppBatchMixin(object):
                 "batch_collect_bnb_mode": bool(batch_collect_bnb_mode),
                 "batch_sell_large_spot_to_bnb": bool(batch_sell_large_spot_to_bnb),
                 "batch_enable_withdraw_override": enable_withdraw if (not batch_total_asset_only and not batch_collect_bnb_mode) else None,
+                "batch_enable_bnb_topup_override": (
+                    bool(enable_bnb_topup)
+                    if (not batch_total_asset_only and not batch_collect_bnb_mode and show_bnb_topup_option)
+                    else None
+                ),
             },
             selected_accounts=selected,
         )
@@ -1326,8 +1388,8 @@ class ExchangeAppBatchMixin(object):
                     # 1) 只查询总资产
                     if batch_total_asset_only:
                         set_status("查询总资产...")
-                        total_usdt, rows = client.query_total_wallet_balance("USDT")
-                        asset_breakdown = client.query_asset_balances_breakdown()
+                        total_usdt, rows = client.query_total_wallet_balance("USDT", fast=True)
+                        asset_breakdown = client.query_asset_balances_breakdown(fast=True)
                         asset_text = self._format_asset_breakdown_text(asset_breakdown)
                         self._record_batch_balance_metric(acc, total_usdt, "USDT")
 
@@ -1392,22 +1454,30 @@ class ExchangeAppBatchMixin(object):
 
                             time.sleep(1)
 
-                            set_status("USDT买入BNB...")
+                            set_status("USDT闪兑BNB...")
                             try:
-                                buy_ok = client.spot_buy_all_usdt(buffer=0.0, symbol="BNBUSDT")
-                                if buy_ok:
-                                    logger.info("账号 #%d 已将现货 USDT 买入为 BNB", idx)
+                                usdt_balance = client.spot_asset_balance_decimal("USDT")
+                                if usdt_balance > 0:
+                                    buy_ok = client.buy_bnb_with_quote_amount("USDT", usdt_balance)
                                 else:
-                                    logger.info("账号 #%d 无可用 USDT 买入 BNB", idx)
+                                    buy_ok = False
+                                if buy_ok:
+                                    logger.info("账号 #%d 已将现货 USDT 闪兑为 BNB", idx)
+                                else:
+                                    logger.info("账号 #%d 无可用 USDT 闪兑 BNB", idx)
                             except Exception as e:
-                                logger.warning(f"账号 #{idx} 用 USDT 买 BNB 失败: {e}")
+                                logger.warning(f"账号 #{idx} 用 USDT 闪兑 BNB 失败: {e}")
 
                             time.sleep(1)
 
                         set_status("查询BNB余额...")
-                        bnb_balance = client.spot_balance("BNB")
-                        self._record_batch_balance_metric(acc, Decimal(str(bnb_balance)), "BNB")
-                        logger.info("账号 #%d 当前现货 BNB = %.8f", idx, bnb_balance)
+                        bnb_balance = client.spot_asset_balance_decimal("BNB")
+                        self._record_batch_balance_metric(acc, bnb_balance, "BNB")
+                        logger.info(
+                            "账号 #%d 当前现货 BNB = %s",
+                            idx,
+                            BinanceClient._format_decimal(bnb_balance),
+                        )
 
                         set_status("提现BNB...")
                         try:

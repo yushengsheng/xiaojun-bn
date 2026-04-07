@@ -195,6 +195,95 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         sell_client.close()
     checks.append("spot-sell=ok")
 
+    class _SelftestBuyClient(BinanceClient):
+        def __init__(self):
+            super().__init__("selftest-key", "selftest-secret")
+            self.last_order_params: dict[str, str] | None = None
+
+        def request(self, base, method, path, params=None):
+            if method == "GET" and path == "/api/v3/account":
+                return {
+                    "balances": [
+                        {
+                            "asset": "USDT",
+                            "free": "10.998375",
+                            "locked": "0",
+                        }
+                    ]
+                }
+            if method == "POST" and path == "/api/v3/order":
+                self.last_order_params = dict(params or {})
+                return {
+                    "symbol": "XAUTUSDT",
+                    "status": "FILLED",
+                }
+            raise RuntimeError(f"现货买入自检遇到未知请求：{method} {path}")
+
+        def get_exchange_info(self, symbol: str):
+            symbol_u = str(symbol or "").strip().upper()
+            if symbol_u != "XAUTUSDT":
+                return None
+            return {
+                "symbol": symbol_u,
+                "status": "TRADING",
+                "baseAsset": "XAUT",
+                "quoteAsset": "USDT",
+                "quoteAssetPrecision": 8,
+                "quotePrecision": 8,
+                "filters": [
+                    {"filterType": "LOT_SIZE", "stepSize": "0.0001", "minQty": "0.0001", "maxQty": "999999"},
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01", "minPrice": "0.01", "maxPrice": "999999"},
+                    {"filterType": "MIN_NOTIONAL", "minNotional": "10"},
+                ],
+            }
+
+    buy_client = _SelftestBuyClient()
+    try:
+        if not buy_client.spot_buy_quote_amount("XAUTUSDT", Decimal("10.987376625")):
+            raise RuntimeError("现货买入自检失败：买入未执行")
+        order_params = buy_client.last_order_params or {}
+        if str(order_params.get("quoteOrderQty") or "") != "10.98737662":
+            raise RuntimeError(
+                f"现货买入自检失败：quoteOrderQty 精度异常（{order_params.get('quoteOrderQty')}）"
+            )
+    finally:
+        buy_client.close()
+    checks.append("spot-buy-precision=ok")
+
+    class _SelftestCollectClient(BinanceClient):
+        def __init__(self):
+            super().__init__("selftest-key", "selftest-secret")
+            self.transfers: list[tuple[str, str, Decimal]] = []
+
+        def um_futures_transferable_assets(self, *, fast: bool = False):
+            return [{"asset": "USDT", "amount": Decimal("0.123456789123")}]
+
+        def cm_futures_transferable_assets(self, *, fast: bool = False):
+            return [{"asset": "USDT", "amount": Decimal("0.987654321987")}]
+
+        def funding_positive_assets(self, *, fast: bool = False):
+            return [{"asset": "USDT", "free": Decimal("0.000000001234")}]
+
+        def universal_transfer(self, transfer_type: str, asset: str, amount):
+            self.transfers.append((transfer_type, str(asset or "").strip().upper(), Decimal(str(amount))))
+            return True
+
+    collect_client = _SelftestCollectClient()
+    try:
+        collected = collect_client.collect_asset_to_spot("USDT")
+        expected_transfers = [
+            ("UMFUTURE_MAIN", "USDT", Decimal("0.123456789123")),
+            ("CMFUTURE_MAIN", "USDT", Decimal("0.987654321987")),
+            ("FUNDING_MAIN", "USDT", Decimal("0.000000001234")),
+        ]
+        if collected != 3:
+            raise RuntimeError(f"归集精度自检失败：处理数量异常（{collected}）")
+        if collect_client.transfers != expected_transfers:
+            raise RuntimeError(f"归集精度自检失败：划转金额异常（{collect_client.transfers}）")
+    finally:
+        collect_client.close()
+    checks.append("collect-precision=ok")
+
 def _emit_selftest_console(message: str, *, error: bool = False) -> None:
     stream = sys.stderr if error else sys.stdout
     try:
