@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import logging
 import random
+import re
 import threading
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
@@ -34,11 +35,111 @@ SUPPORTED_QUOTE_ASSET_SUFFIXES = (
 
 logger = logging.getLogger("bot")
 
+def explain_binance_api_error(code: int, msg: str) -> str:
+    message_text = str(msg or "").strip()
+    message_lower = message_text.lower()
+
+    if code == -9000 and (
+        "rw00508" in message_lower
+        or "face recognition" in message_lower
+        or "re-login" in message_lower
+        or "account may be at risk" in message_lower
+    ):
+        return "账号被交易所风控，需重新登录 Binance 并完成人脸验证后再尝试资金操作。若仍无法处理，请联系 Binance 客服。"
+    if code == -1021:
+        return "请求时间戳与 Binance 服务器时间不一致，或代理链路过慢导致请求到达过晚。"
+    if code == -1001:
+        return "Binance 服务暂时不可用，或当前代理/网络链路不稳定。"
+    if code == -1003:
+        return "请求过于频繁，或 Binance 当前触发限流/繁忙保护。"
+    if code == -2015:
+        return "API Key / Secret 可能无效，或权限、IP 白名单、账号限制与当前请求不匹配。"
+    if code == -2010:
+        if "insufficient balance" in message_lower:
+            return "余额不足，无法完成当前下单、划转或提现操作。"
+        if "filter failure" in message_lower:
+            return "下单数量、价格精度或最小成交额不满足交易所规则。"
+        return "订单或资金操作被交易所拒绝，请检查余额、交易对规则和账号权限。"
+    if "face recognition" in message_lower:
+        return "交易所要求重新登录并完成人脸验证后才能继续当前操作。"
+    if "insufficient balance" in message_lower:
+        return "余额不足，无法完成当前操作。"
+    if "filter failure" in message_lower:
+        return "数量、价格精度或最小成交额不满足交易所规则。"
+    return ""
+
+def short_binance_api_error(code: int, msg: str) -> str:
+    message_text = str(msg or "").strip()
+    message_lower = message_text.lower()
+
+    if code == -9000 and (
+        "rw00508" in message_lower
+        or "face recognition" in message_lower
+        or "re-login" in message_lower
+        or "account may be at risk" in message_lower
+    ):
+        return "交易所风控/需人脸验证"
+    if code == -1021:
+        return "时间戳不一致/链路慢"
+    if code == -1001:
+        return "服务不可用/网络不稳"
+    if code == -1003:
+        return "限流/系统繁忙"
+    if code == -2015:
+        return "API权限/IP白名单问题"
+    if code == -2010:
+        if "insufficient balance" in message_lower:
+            return "余额不足"
+        if "filter failure" in message_lower:
+            return "交易规则不满足"
+        return "交易所拒绝请求"
+    return ""
+
+def summarize_exchange_exception(exc: object, *, fallback: str = "异常", max_len: int = 24) -> str:
+    if isinstance(exc, BinanceAPIError):
+        short_text = short_binance_api_error(exc.code, exc.msg)
+        if short_text:
+            return short_text
+
+    text = str(exc or "").strip().replace("\n", " ")
+    if not text:
+        return fallback
+
+    code_match = re.search(r"Binance API error\s+(-?\d+)", text, flags=re.IGNORECASE)
+    if code_match:
+        try:
+            short_text = short_binance_api_error(int(code_match.group(1)), text)
+        except Exception:
+            short_text = ""
+        if short_text:
+            return short_text
+
+    lower_text = text.lower()
+    if "read timed out" in lower_text or "connect timeout" in lower_text or "timed out" in lower_text:
+        return "网络超时/代理慢"
+    if "proxyerror" in lower_text or "socks" in lower_text:
+        return "代理连接异常"
+    if "face recognition" in lower_text or "rw00508" in lower_text:
+        return "交易所风控/需人脸验证"
+    if "insufficient balance" in lower_text:
+        return "余额不足"
+    if "filter failure" in lower_text:
+        return "交易规则不满足"
+
+    return text if len(text) <= max_len else (text[: max_len - 1] + "…")
+
 class BinanceAPIError(Exception):
     def __init__(self, code: int, msg: str):
         self.code = code
         self.msg = msg
         super().__init__(f"Binance API error {code}: {msg}")
+
+    def __str__(self) -> str:
+        base_text = f"Binance API error {self.code}: {self.msg}"
+        explanation = explain_binance_api_error(self.code, self.msg)
+        if not explanation:
+            return base_text
+        return f"{base_text} | 中文说明: {explanation}"
 
 
 def retry_request(max_retries=3, delay=2):
@@ -71,10 +172,13 @@ def retry_request(max_retries=3, delay=2):
 # ====================== Binance 客户端 ======================
 class BinanceClient:
     SERVER_TIME_CACHE_TTL_SECONDS = 30.0
-    DEFAULT_RECV_WINDOW_MS = 10000
+    DEFAULT_RECV_WINDOW_MS = 20000
     _shared_convert_exchange_info_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     _shared_convert_asset_info_cache: dict[str, int] | None = None
     _shared_convert_cache_lock = threading.Lock()
+    _shared_server_time_offset_ms: dict[str, int] = {}
+    _shared_server_time_synced_at: dict[str, float] = {}
+    _shared_server_time_lock = threading.Lock()
 
     def __init__(self, key: str, secret: str, proxy_url: str = ""):
         if not key or not secret:
@@ -104,10 +208,6 @@ class BinanceClient:
         self._price_cache = {}
         self._um_futures_exchange_info_cache = {}
         self._um_futures_price_cache = {}
-        self._server_time_offset_ms = {}
-        self._server_time_synced_at = {}
-        self._server_time_lock = threading.Lock()
-
     def close(self) -> None:
         session = getattr(self, "session", None)
         self.session = None
@@ -159,16 +259,17 @@ class BinanceClient:
     def _sync_server_time_offset(self, base: str, *, force: bool = False) -> int:
         base_n = self._normalize_base_url(base)
         now_mono = time.monotonic()
-        with self._server_time_lock:
-            cached_offset = self._server_time_offset_ms.get(base_n)
-            synced_at = self._server_time_synced_at.get(base_n, 0.0)
+        cache_lock = type(self)._shared_server_time_lock
+        with cache_lock:
+            cached_offset = type(self)._shared_server_time_offset_ms.get(base_n)
+            synced_at = type(self)._shared_server_time_synced_at.get(base_n, 0.0)
             if (not force) and cached_offset is not None and (now_mono - synced_at) < self.SERVER_TIME_CACHE_TTL_SECONDS:
                 return int(cached_offset)
 
         offset_ms = self._fetch_server_time_ms(base_n)
-        with self._server_time_lock:
-            self._server_time_offset_ms[base_n] = int(offset_ms)
-            self._server_time_synced_at[base_n] = time.monotonic()
+        with cache_lock:
+            type(self)._shared_server_time_offset_ms[base_n] = int(offset_ms)
+            type(self)._shared_server_time_synced_at[base_n] = time.monotonic()
         return int(offset_ms)
 
     def _signed_params(self, base: str, params=None, *, force_time_sync: bool = False) -> dict[str, Any]:
@@ -180,8 +281,8 @@ class BinanceClient:
             if force_time_sync:
                 raise
             base_n = self._normalize_base_url(base)
-            with self._server_time_lock:
-                cached_offset = self._server_time_offset_ms.get(base_n)
+            with type(self)._shared_server_time_lock:
+                cached_offset = type(self)._shared_server_time_offset_ms.get(base_n)
             if cached_offset is not None:
                 offset_ms = int(cached_offset)
 
@@ -199,6 +300,13 @@ class BinanceClient:
         last_exception = None
         retry_count = max(1, int(max_retries or 1))
         retry_delay = max(0.0, float(delay or 0))
+
+        def sleep_before_retry() -> None:
+            if retry_delay <= 0:
+                return
+            jitter = min(0.35, retry_delay * 0.5)
+            time.sleep(retry_delay + random.uniform(0.0, jitter))
+
         for i in range(retry_count):
             try:
                 return request_fn()
@@ -207,14 +315,14 @@ class BinanceClient:
                 if i + 1 >= retry_count:
                     break
                 logger.warning(f"网络请求失败 ({i + 1}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
-                time.sleep(retry_delay)
+                sleep_before_retry()
             except BinanceAPIError as e:
                 last_exception = e
                 if e.code in [-1001, -1003]:
                     if i + 1 >= retry_count:
                         break
                     logger.warning(f"Binance 系统繁忙 ({i + 1}/{retry_count}): {e}，重试中...")
-                    time.sleep(retry_delay)
+                    sleep_before_retry()
                     continue
                 raise e
         logger.error(f"重试 {retry_count} 次后仍然失败。")
@@ -1468,7 +1576,14 @@ class BinanceClient:
         logger.info("现货市价买入 %s，使用 %s 金额 %s", symbol_u, quote_asset, self._format_decimal(amount))
         return True
 
-    def buy_bnb_with_quote_amount(self, quote_asset: str, amount: Decimal | str | float | int):
+    def buy_bnb_with_quote_amount(
+        self,
+        quote_asset: str,
+        amount: Decimal | str | float | int,
+        *,
+        assume_spot_funds_ready: bool = False,
+        spot_balance_snapshot: Decimal | str | float | int | None = None,
+    ):
         quote_asset_u = str(quote_asset or "").strip().upper()
         if not quote_asset_u:
             raise RuntimeError("后置币种为空，无法预买 BNB")
@@ -1481,8 +1596,12 @@ class BinanceClient:
             logger.info("预买 BNB 金额 <= 0，跳过")
             return False
 
-        self.collect_funding_asset_to_spot(quote_asset_u)
-        quote_balance = self.spot_asset_balance_decimal(quote_asset_u)
+        if not assume_spot_funds_ready:
+            self.collect_funding_asset_to_spot(quote_asset_u)
+        if spot_balance_snapshot is None:
+            quote_balance = self.spot_asset_balance_decimal(quote_asset_u)
+        else:
+            quote_balance = Decimal(str(spot_balance_snapshot or "0"))
         if quote_balance < amount_dec:
             raise RuntimeError(
                 f"现货 {quote_asset_u} 余额不足：需要 {self._format_decimal(amount_dec)}，当前 {self._format_decimal(quote_balance)}"
@@ -2069,4 +2188,11 @@ class BinanceClient:
 
 # ====================== 策略 ======================
 
-__all__ = ["BinanceAPIError", "retry_request", "BinanceClient"]
+__all__ = [
+    "BinanceAPIError",
+    "retry_request",
+    "BinanceClient",
+    "explain_binance_api_error",
+    "short_binance_api_error",
+    "summarize_exchange_exception",
+]

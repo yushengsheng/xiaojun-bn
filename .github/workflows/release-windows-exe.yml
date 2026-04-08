@@ -146,13 +146,13 @@ jobs:
         run: |
           $appName = "xiaojun-bn-${{ github.ref_name }}-windows-x64"
           $portableName = "xiaojun-bn-${{ github.ref_name }}-windows-x64-portable"
-          function Invoke-Selftest($exePath, $workingDir, $label) {
+          function Invoke-Selftest($exePath, $workingDir, $label, $arguments) {
             $logPath = Join-Path $workingDir "bot_log.txt"
             if (Test-Path $logPath) {
               Remove-Item $logPath -Force
             }
 
-            $proc = Start-Process -FilePath $exePath -ArgumentList '--selftest' -WorkingDirectory $workingDir -PassThru -Wait
+            $proc = Start-Process -FilePath $exePath -ArgumentList $arguments -WorkingDirectory $workingDir -PassThru -Wait
             if ($proc.ExitCode -ne 0) {
               if (Test-Path $logPath) {
                 Write-Host "===== $label bot_log.txt ====="
@@ -162,8 +162,8 @@ jobs:
             }
           }
 
-          Invoke-Selftest (Resolve-Path "dist/$appName.exe") (Resolve-Path "dist") "Onefile"
-          Invoke-Selftest (Resolve-Path "dist/$portableName/$portableName.exe") (Resolve-Path "dist/$portableName") "Portable"
+          Invoke-Selftest (Resolve-Path "dist/$appName.exe") (Resolve-Path "dist") "Onefile" @('--selftest', '--selftest-gui')
+          Invoke-Selftest (Resolve-Path "dist/$portableName/$portableName.exe") (Resolve-Path "dist/$portableName") "Portable" @('--selftest', '--selftest-gui')
 
       - name: Package release assets
         shell: pwsh

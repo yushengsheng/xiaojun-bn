@@ -10,10 +10,16 @@ Rules:
   - Python runtime dependencies collected by PyInstaller
   - pinned proxy runtimes downloaded during CI (`xray`, `sing-box`)
   - both onefile and portable onedir packages
-- Smoke test both packaged apps with `--selftest` before publishing release assets.
+- Smoke test both packaged apps with `--selftest --selftest-gui` before publishing release assets.
   - `--selftest` should stay offline-friendly and focus on packaged integrity.
+  - `--selftest-gui` should cover GUI startup, page loading, config save, and wallet generation.
   - If you need to verify outbound EVM RPC reachability manually, use `--selftest-online`.
 - When bumping bundled proxy runtimes, update workflow env vars `XRAY_TAG` / `XRAY_ASSET` / `SING_BOX_TAG` / `SING_BOX_ASSET` intentionally in the same commit.
+- Every Windows release must remain a complete bundle for a clean target machine:
+  - include all Python runtime dependencies required by exchange, proxy, onchain, crypto, and GUI paths
+  - include hidden imports for newly added internal modules when PyInstaller cannot discover them automatically
+  - include pinned proxy runtime binaries and any required supporting files
+  - ensure both onefile and portable packages pass smoke tests before publishing
 
 Current release asset naming:
 - `xiaojun-bn-<tag>-windows-x64.exe`

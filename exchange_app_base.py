@@ -33,7 +33,7 @@ from app_paths import (
     WITHDRAW_SUCCESS_FILE,
 )
 from core_models import AccountEntry
-from exchange_binance_client import BinanceClient
+from exchange_binance_client import BinanceClient, summarize_exchange_exception
 from exchange_constants import *
 from exchange_logging import EXCHANGE_LOG_MAX_ROWS, log_queue, logger
 from exchange_proxy_runtime import ExchangeProxyRuntime, http_get_via_proxy
@@ -1141,3 +1141,30 @@ class ExchangeAppBase(tk.Tk):
         if self._closing:
             return
         dispatch_ui_callback(self, callback, root=self)
+
+
+_STAR_EXPORT_NAMES = {
+    "_atomic_write_config_json",
+    "_atomic_write_json",
+    "_atomic_write_text",
+    "_atomic_write_text_with_backup",
+    "_load_json_with_backup",
+    "_read_text_snapshot",
+    "_require_dict_payload",
+    "_restore_text_snapshot",
+    "_shift_text_view_state_after_trim",
+}
+
+
+def _build_module_star_exports() -> list[str]:
+    exports: list[str] = []
+    for name in globals():
+        if name.startswith("__"):
+            continue
+        if name.startswith("_") and name not in _STAR_EXPORT_NAMES:
+            continue
+        exports.append(name)
+    return exports
+
+
+__all__ = _build_module_star_exports()

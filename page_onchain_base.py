@@ -1800,3 +1800,10 @@ class OnchainTransferPageBase:
             self._dispatch_ui(_update)
 
         self._start_managed_thread(worker, name="onchain-proxy-test")
+
+
+def _build_module_star_exports() -> list[str]:
+    return [name for name in globals() if not name.startswith("_") and not name.startswith("__")]
+
+
+__all__ = _build_module_star_exports()

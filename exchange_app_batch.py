@@ -689,6 +689,13 @@ class ExchangeAppBatchMixin(object):
             return "未知错误"
         return s if len(s) <= max_len else (s[: max_len - 1] + "…")
     @staticmethod
+    def _exchange_error_status_text(prefix: str, err: object, *, fallback: str = "异常") -> str:
+        prefix_text = str(prefix or "").strip() or str(fallback or "异常").strip() or "异常"
+        reason_text = summarize_exchange_exception(err, fallback=fallback, max_len=22)
+        if not reason_text:
+            return prefix_text
+        return f"{prefix_text}: {reason_text}"
+    @staticmethod
     def _account_batch_key(acc: dict) -> str:
         key = str((acc or {}).get("api_key") or "").strip()
         return key or f"account:{id(acc)}"
@@ -1092,11 +1099,11 @@ class ExchangeAppBatchMixin(object):
             return
         self.run_selected_accounts(accounts_to_run=accounts_to_retry, require_confirm=False, **retry_kwargs)
     def run_query_total_assets_for_all_accounts(self):
-        all_accounts = list(self.accounts)
-        if not all_accounts:
-            messagebox.showinfo("提示", "当前没有可查询的账号")
+        selected_accounts = self._get_selected_accounts()
+        if not selected_accounts:
+            messagebox.showinfo("提示", "请至少勾选一个账号")
             return
-        self.run_selected_accounts(accounts_to_run=all_accounts, batch_total_asset_only=True, require_confirm=False)
+        self.run_selected_accounts(accounts_to_run=selected_accounts, batch_total_asset_only=True, require_confirm=False)
     def run_batch_collect_bnb_with_confirm(self, accounts_to_run=None):
         selected = list(accounts_to_run) if accounts_to_run is not None else self._get_selected_accounts()
         if not selected:
@@ -1458,7 +1465,12 @@ class ExchangeAppBatchMixin(object):
                             try:
                                 usdt_balance = client.spot_asset_balance_decimal("USDT")
                                 if usdt_balance > 0:
-                                    buy_ok = client.buy_bnb_with_quote_amount("USDT", usdt_balance)
+                                    buy_ok = client.buy_bnb_with_quote_amount(
+                                        "USDT",
+                                        usdt_balance,
+                                        assume_spot_funds_ready=True,
+                                        spot_balance_snapshot=usdt_balance,
+                                    )
                                 else:
                                     buy_ok = False
                                 if buy_ok:
@@ -1495,7 +1507,7 @@ class ExchangeAppBatchMixin(object):
                             op_success = True
                         except Exception as e:
                             logger.error(f"账号 #{idx} BNB提现失败: {e}")
-                            set_status("BNB提现失败")
+                            set_status(self._exchange_error_status_text("BNB提现失败", e, fallback="BNB提现失败"))
                             op_success = False
 
                     # 3) 原批量现货策略
@@ -1661,7 +1673,13 @@ class ExchangeAppBatchMixin(object):
 
                             if isinstance(strategy_result, dict) and strategy_result.get("withdraw_error") and (final_amount or 0) <= 0:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
-                                set_status(f"提现失败 {self._compact_error_text(strategy_result.get('withdraw_error', ''))}")
+                                set_status(
+                                    self._exchange_error_status_text(
+                                        "提现失败",
+                                        strategy_result.get("withdraw_error", ""),
+                                        fallback="提现失败",
+                                    )
+                                )
                                 op_success = False
                             else:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
@@ -1679,7 +1697,7 @@ class ExchangeAppBatchMixin(object):
 
                 except Exception as e:
                     logger.error(f"账号 #{idx} 执行异常: {e}")
-                    set_status("异常")
+                    set_status(self._exchange_error_status_text("异常", e))
                     op_success = False
                 finally:
                     self._close_binance_client_instance(client)
@@ -1805,7 +1823,7 @@ class ExchangeAppBatchMixin(object):
                             op_success = True
                 except Exception as e:
                     logger.error(f"账号 #{idx} 提现失败: {e}")
-                    set_status("提现失败")
+                    set_status(self._exchange_error_status_text("提现失败", e, fallback="提现失败"))
                     op_success = False
                 finally:
                     self._close_binance_client_instance(client)

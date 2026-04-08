@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import tempfile
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -291,7 +293,127 @@ def _emit_selftest_console(message: str, *, error: bool = False) -> None:
     except Exception:
         pass
 
-def run_selftest(*, include_online_checks: bool = False) -> int:
+
+@contextlib.contextmanager
+def _temporary_attr_overrides(patches: list[tuple[object, str, object]]):
+    sentinel = object()
+    previous: list[tuple[object, str, object]] = []
+    try:
+        for owner, attr_name, value in patches:
+            before = getattr(owner, attr_name, sentinel)
+            previous.append((owner, attr_name, before))
+            setattr(owner, attr_name, value)
+        yield
+    finally:
+        for owner, attr_name, before in reversed(previous):
+            if before is sentinel:
+                try:
+                    delattr(owner, attr_name)
+                except Exception:
+                    pass
+            else:
+                setattr(owner, attr_name, before)
+
+
+def _pump_tk_events(app, *, timeout: float = 20.0, predicate=None) -> None:
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    while time.monotonic() < deadline:
+        app.update_idletasks()
+        app.update()
+        if predicate is None or predicate():
+            return
+        time.sleep(0.05)
+    if predicate is not None and not predicate():
+        raise RuntimeError("GUI 自检超时")
+
+
+def _run_gui_selftest_checks(checks: list[str]) -> None:
+    from tkinter import messagebox
+
+    import exchange_app_base
+    import exchange_app_config
+    import onchain_imports
+    import page_onchain_base
+    from exchange_app import App
+
+    dialogs: list[tuple[str, str, str]] = []
+
+    def _dialog_stub(kind: str):
+        def _inner(title, message, **_kwargs):
+            dialogs.append((kind, str(title), str(message)))
+            return True
+        return _inner
+
+    with tempfile.TemporaryDirectory(prefix="xiaojun-selftest-gui-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        strategy_path = tmp_root / "exchange_strategy_settings.json"
+        proxy_path = tmp_root / "exchange_proxy_settings.json"
+        onchain_path = tmp_root / "onchain.json"
+        patches = [
+            (exchange_app_base.ExchangeAppBase, "update_ip", lambda self, schedule_next=True: None),
+            (exchange_app_base, "STRATEGY_CONFIG_FILE", strategy_path),
+            (exchange_app_base, "EXCHANGE_PROXY_CONFIG_FILE", proxy_path),
+            (exchange_app_config, "STRATEGY_CONFIG_FILE", strategy_path),
+            (exchange_app_config, "EXCHANGE_PROXY_CONFIG_FILE", proxy_path),
+            (page_onchain_base, "ONCHAIN_DATA_FILE", onchain_path),
+            (onchain_imports, "ONCHAIN_DATA_FILE", onchain_path),
+            (messagebox, "showinfo", _dialog_stub("info")),
+            (messagebox, "showwarning", _dialog_stub("warning")),
+            (messagebox, "showerror", _dialog_stub("error")),
+            (messagebox, "askyesno", lambda *_args, **_kwargs: True),
+        ]
+        with _temporary_attr_overrides(patches):
+            app = None
+            try:
+                app = App()
+                app.withdraw()
+                _pump_tk_events(app, timeout=5.0)
+
+                app.save_strategy_config()
+                if not strategy_path.exists():
+                    raise RuntimeError("GUI 自检失败：未生成交易所策略配置文件")
+                if not proxy_path.exists():
+                    raise RuntimeError("GUI 自检失败：未生成交易所代理配置文件")
+
+                app._show_main_page("onchain")
+                _pump_tk_events(app, timeout=5.0, predicate=lambda: getattr(app, "onchain_page", None) is not None)
+                page = app.onchain_page
+                if page is None:
+                    raise RuntimeError("GUI 自检失败：链上页面未成功加载")
+
+                page.network_var.set("BSC")
+                page.amount_mode_var.set(page.AMOUNT_MODE_FIXED)
+                page.amount_var.set("0.01")
+                page.save_all()
+                if not onchain_path.exists():
+                    raise RuntimeError("GUI 自检失败：未生成链上配置文件")
+
+                page.open_wallet_generator()
+                _pump_tk_events(app, timeout=5.0)
+                page.wallet_generate_count_var.set("2")
+                page.generate_wallets()
+                _pump_tk_events(
+                    app,
+                    timeout=20.0,
+                    predicate=lambda: len(getattr(page, "generated_wallets", [])) >= 2
+                    and not any(t.is_alive() for t in page._managed_threads_snapshot()),
+                )
+                if len(page.generated_wallets) != 2:
+                    raise RuntimeError("GUI 自检失败：钱包生成数量异常")
+                error_dialogs = [item for item in dialogs if item[0] == "error"]
+                if error_dialogs:
+                    raise RuntimeError(f"GUI 自检失败：出现错误弹窗 {error_dialogs[0][2]}")
+            finally:
+                if app is not None:
+                    try:
+                        app.destroy()
+                    except Exception:
+                        pass
+
+    checks.append("gui-smoke=ok")
+
+
+def run_selftest(*, include_online_checks: bool = False, include_gui_checks: bool = False) -> int:
     client = None
     try:
         checks: list[str] = []
@@ -319,6 +441,11 @@ def run_selftest(*, include_online_checks: bool = False) -> int:
         checks.append(f"eth-tokens={len(client.get_default_tokens('ETH'))}")
         checks.append(f"bsc-tokens={len(client.get_default_tokens('BSC'))}")
         _run_offline_business_selftest_checks(checks)
+        if include_gui_checks:
+            _run_gui_selftest_checks(checks)
+            checks.append("gui-check=enabled")
+        else:
+            checks.append("gui-check=skipped")
         if include_online_checks:
             _run_online_selftest_checks(client, checks)
             checks.append("online-check=enabled")
