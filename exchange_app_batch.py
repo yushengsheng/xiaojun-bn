@@ -422,7 +422,7 @@ class ExchangeAppBatchMixin(object):
                 self._dispatch_ui(self._on_worker_finished)
 
         self.worker_thread = self._start_managed_thread(worker, name="exchange-single-run")
-    def _on_worker_finished(self):
+    def _restore_batch_ui_to_idle(self, *, status_text: str, finish_summary: bool) -> None:
         self._batch_task_active = False
         self._clear_account_batch_runtime()
         self.btn_start.config(state="normal")
@@ -433,12 +433,16 @@ class ExchangeAppBatchMixin(object):
         self.btn_batch_withdraw.config(state="normal")
         self.btn_refresh.config(state="normal")
         self.btn_withdraw.config(state="normal")
-        self._finish_batch_summary_tracking()
         self._set_account_manage_buttons_state("normal")
         self._set_combo_states_for_run(False)
-        self.status_var.set("状态：已完成/已停止")
+        if finish_summary:
+            self._finish_batch_summary_tracking()
+        else:
+            self.after(80, self._set_retry_failed_button_state)
+        self.status_var.set(str(status_text or "状态：已完成/已停止"))
         self.progress["value"] = 0
-
+    def _on_worker_finished(self):
+        self._restore_batch_ui_to_idle(status_text="状态：已完成/已停止", finish_summary=True)
         if self.api_key_var.get().strip() and self.api_secret_var.get().strip():
             self.refresh_balances(silent=True)
     def stop_bot(self):
@@ -1248,24 +1252,6 @@ class ExchangeAppBatchMixin(object):
         else:
             bnb_topup_amount_value = configured_bnb_topup_amount_value
 
-        if trade_settings:
-            validate_client = None
-            try:
-                sample_acc = selected[0]
-                validate_client = self._create_binance_client(sample_acc["api_key"], sample_acc["api_secret"])
-                self._ensure_trade_symbol_supported(
-                    validate_client,
-                    trade_account_type,
-                    trade_mode,
-                    spot_symbol,
-                    futures_symbol,
-                )
-            except Exception as e:
-                self._close_binance_client_instance(validate_client)
-                messagebox.showerror("错误", "Binance 连接初始化失败: %s" % e)
-                return
-            self._close_binance_client_instance(validate_client)
-
         skip_usdt_wait_in_batch = bool(self.skip_usdt_wait_in_batch_var.get())
 
         if batch_total_asset_only:
@@ -1279,27 +1265,30 @@ class ExchangeAppBatchMixin(object):
             batch_action_label = "归集BNB"
         else:
             batch_action_label = "批量执行"
+        preflight_required = bool(trade_settings)
+        validated_quote_asset = None
 
         logger.info("交易所批量链路：%s", self._exchange_proxy_route_text())
         self.stop_event = threading.Event()
         self._batch_task_active = True
-        self._begin_batch_summary_tracking(
-            action_label=batch_action_label,
-            runner="run_selected_accounts",
-            retry_kwargs={
-                "batch_total_asset_only": bool(batch_total_asset_only),
-                "batch_collect_bnb_mode": bool(batch_collect_bnb_mode),
-                "batch_sell_large_spot_to_bnb": bool(batch_sell_large_spot_to_bnb),
-                "batch_enable_withdraw_override": enable_withdraw if (not batch_total_asset_only and not batch_collect_bnb_mode) else None,
-                "batch_enable_bnb_topup_override": (
-                    bool(enable_bnb_topup)
-                    if (not batch_total_asset_only and not batch_collect_bnb_mode and show_bnb_topup_option)
-                    else None
-                ),
-            },
-            selected_accounts=selected,
-        )
-        self._prepare_accounts_for_batch(selected)
+        if not preflight_required:
+            self._begin_batch_summary_tracking(
+                action_label=batch_action_label,
+                runner="run_selected_accounts",
+                retry_kwargs={
+                    "batch_total_asset_only": bool(batch_total_asset_only),
+                    "batch_collect_bnb_mode": bool(batch_collect_bnb_mode),
+                    "batch_sell_large_spot_to_bnb": bool(batch_sell_large_spot_to_bnb),
+                    "batch_enable_withdraw_override": enable_withdraw if (not batch_total_asset_only and not batch_collect_bnb_mode) else None,
+                    "batch_enable_bnb_topup_override": (
+                        bool(enable_bnb_topup)
+                        if (not batch_total_asset_only and not batch_collect_bnb_mode and show_bnb_topup_option)
+                        else None
+                    ),
+                },
+                selected_accounts=selected,
+            )
+            self._prepare_accounts_for_batch(selected)
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.btn_run_accounts.config(state="disabled")
@@ -1312,7 +1301,9 @@ class ExchangeAppBatchMixin(object):
         self._set_account_manage_buttons_state("disabled")
         self._set_combo_states_for_run(True)
 
-        if batch_total_asset_only:
+        if preflight_required:
+            self.status_var.set("状态：初始化连接/校验交易对中...")
+        elif batch_total_asset_only:
             self.status_var.set(f"状态：查询全部总资产中 (并发 {max_threads} 线程)...")
         elif batch_collect_bnb_mode and batch_sell_large_spot_to_bnb:
             self.status_var.set(f"状态：归集并买BNB中 (并发 {max_threads} 线程)...")
@@ -1381,13 +1372,15 @@ class ExchangeAppBatchMixin(object):
                     client = None
                     client = self._create_binance_client(acc["api_key"], acc["api_secret"])
                     trade_symbol = futures_symbol if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES else spot_symbol
-                    quote_asset = self._ensure_trade_symbol_supported(
-                        client,
-                        trade_account_type,
-                        trade_mode,
-                        spot_symbol,
-                        futures_symbol,
-                    )
+                    quote_asset = str(validated_quote_asset or "").strip().upper()
+                    if not quote_asset:
+                        quote_asset = self._ensure_trade_symbol_supported(
+                            client,
+                            trade_account_type,
+                            trade_mode,
+                            spot_symbol,
+                            futures_symbol,
+                        )
                     required_quote_amount = None
                     if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES and futures_amount_value is not None and futures_leverage > 0:
                         required_quote_amount = futures_amount_value / Decimal(str(futures_leverage))
@@ -1709,6 +1702,60 @@ class ExchangeAppBatchMixin(object):
                         logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
 
         def controller():
+            nonlocal validated_quote_asset
+            if preflight_required:
+                validate_client = None
+                try:
+                    sample_acc = selected[0]
+                    validate_client = self._create_binance_client(sample_acc["api_key"], sample_acc["api_secret"])
+                    validated_quote_asset = self._ensure_trade_symbol_supported(
+                        validate_client,
+                        trade_account_type,
+                        trade_mode,
+                        spot_symbol,
+                        futures_symbol,
+                    )
+                    self._begin_batch_summary_tracking(
+                        action_label=batch_action_label,
+                        runner="run_selected_accounts",
+                        retry_kwargs={
+                            "batch_total_asset_only": bool(batch_total_asset_only),
+                            "batch_collect_bnb_mode": bool(batch_collect_bnb_mode),
+                            "batch_sell_large_spot_to_bnb": bool(batch_sell_large_spot_to_bnb),
+                            "batch_enable_withdraw_override": enable_withdraw if (not batch_total_asset_only and not batch_collect_bnb_mode) else None,
+                            "batch_enable_bnb_topup_override": (
+                                bool(enable_bnb_topup)
+                                if (not batch_total_asset_only and not batch_collect_bnb_mode and show_bnb_topup_option)
+                                else None
+                            ),
+                        },
+                        selected_accounts=selected,
+                    )
+                    self._prepare_accounts_for_batch(selected)
+
+                    def _set_running_status():
+                        self._set_retry_failed_button_state()
+                        if batch_total_asset_only:
+                            self.status_var.set(f"状态：查询全部总资产中 (并发 {max_threads} 线程)...")
+                        elif batch_collect_bnb_mode and batch_sell_large_spot_to_bnb:
+                            self.status_var.set(f"状态：归集并买BNB中 (并发 {max_threads} 线程)...")
+                        elif batch_collect_bnb_mode:
+                            self.status_var.set(f"状态：批量归集BNB模式运行中 (并发 {max_threads} 线程)...")
+                        else:
+                            self.status_var.set(f"状态：批量执行中 (并发 {max_threads} 线程)...")
+
+                    self._dispatch_ui(_set_running_status)
+                except Exception as e:
+                    logger.error("批量执行启动校验失败: %s", e)
+
+                    def _handle_start_failure(err=e):
+                        messagebox.showerror("错误", "Binance 连接初始化失败: %s" % err)
+                        self._restore_batch_ui_to_idle(status_text="状态：启动失败", finish_summary=False)
+
+                    self._dispatch_ui(_handle_start_failure)
+                    return
+                finally:
+                    self._close_binance_client_instance(validate_client)
             threads = []
             logger.info(f"启动 {max_threads} 个工作线程处理 {total_accounts} 个账号")
             for i in range(max_threads):
