@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import hashlib
 import hmac
 import importlib
@@ -19,6 +20,21 @@ from typing import Callable
 import requests
 
 from core_models import EvmToken, GeneratedWalletEntry
+
+
+@dataclass(frozen=True)
+class PreparedSignedTransaction:
+    tx: dict
+    raw_transaction: str
+    tx_hash: str
+
+
+@dataclass(frozen=True)
+class SubmittedTransaction:
+    tx_hash: str
+    acknowledged: bool = True
+    recovered: bool = False
+    recovery_reason: str = ""
 
 
 class EvmClient:
@@ -570,6 +586,17 @@ class EvmClient:
         result = self._rpc_call(network, "eth_getTransactionCount", [address, "pending"])
         return self._int_from_hex(result)
 
+    def get_transaction_receipt(self, network: str, tx_hash: str) -> dict | None:
+        txid = self._ensure_hex_prefixed(str(tx_hash or "").strip())
+        if not re.fullmatch(r"0x[a-fA-F0-9]{64}", txid):
+            raise RuntimeError(f"交易哈希格式错误：{tx_hash}")
+        result = self._rpc_call(network, "eth_getTransactionReceipt", [txid])
+        if result is None:
+            return None
+        if not isinstance(result, dict):
+            raise RuntimeError(f"交易回执格式异常：{result}")
+        return dict(result)
+
     def get_gas_price_wei(self, network: str) -> int:
         result = self._rpc_call(network, "eth_gasPrice", [])
         val = self._int_from_hex(result)
@@ -611,16 +638,285 @@ class EvmClient:
             return EvmClient._ensure_hex_prefixed(bytes(raw).hex())
         return EvmClient._ensure_hex_prefixed(str(raw))
 
-    def _sign_transaction_hex(self, tx: dict, private_key: str, error_prefix: str) -> str:
+    @staticmethod
+    def _signed_transaction_hash_hex(signed_tx) -> str:
+        tx_hash = getattr(signed_tx, "hash", None)
+        if tx_hash is None:
+            tx_hash = getattr(signed_tx, "transactionHash", None)
+        if tx_hash is not None:
+            if hasattr(tx_hash, "hex"):
+                try:
+                    return EvmClient._ensure_hex_prefixed(tx_hash.hex())
+                except Exception:
+                    pass
+            if isinstance(tx_hash, (bytes, bytearray)):
+                return EvmClient._ensure_hex_prefixed(bytes(tx_hash).hex())
+            return EvmClient._ensure_hex_prefixed(str(tx_hash))
+        raw_hex = EvmClient._signed_raw_transaction_hex(signed_tx)
+        eth_utils = EvmClient._ensure_eth_utils()
+        raw_hash = eth_utils.keccak(hexstr=raw_hex)
+        if hasattr(raw_hash, "hex"):
+            return EvmClient._ensure_hex_prefixed(raw_hash.hex())
+        return EvmClient._ensure_hex_prefixed(bytes(raw_hash).hex())
+
+    def _sign_transaction(self, tx: dict, private_key: str, error_prefix: str) -> PreparedSignedTransaction:
         Account = self._ensure_eth_account()
         try:
             signed = Account.sign_transaction(tx, private_key=private_key)
         except Exception as exc:
             raise RuntimeError(f"{error_prefix}：{exc}") from exc
         try:
-            return self._signed_raw_transaction_hex(signed)
+            return PreparedSignedTransaction(
+                tx=dict(tx),
+                raw_transaction=self._signed_raw_transaction_hex(signed),
+                tx_hash=self._signed_transaction_hash_hex(signed),
+            )
         except Exception as exc:
             raise RuntimeError(f"{error_prefix}结果解析失败：{exc}") from exc
+
+    def _sign_transaction_hex(self, tx: dict, private_key: str, error_prefix: str) -> str:
+        prepared = self._sign_transaction(tx, private_key, error_prefix)
+        return prepared.raw_transaction
+
+    def get_transaction_by_hash(self, network: str, tx_hash: str) -> dict | None:
+        txid = self._ensure_hex_prefixed(str(tx_hash or "").strip())
+        if not re.fullmatch(r"0x[a-fA-F0-9]{64}", txid):
+            raise RuntimeError(f"交易哈希格式错误：{tx_hash}")
+        result = self._rpc_call(network, "eth_getTransactionByHash", [txid])
+        if result is None:
+            return None
+        if not isinstance(result, dict):
+            raise RuntimeError(f"交易详情格式异常：{result}")
+        return dict(result)
+
+    def send_raw_transaction(self, network: str, raw_transaction_hex: str) -> str:
+        raw = self._ensure_hex_prefixed(str(raw_transaction_hex or "").strip())
+        if not re.fullmatch(r"0x[a-fA-F0-9]+", raw):
+            raise RuntimeError("原始交易格式错误")
+        tx_hash = self._rpc_call(network, "eth_sendRawTransaction", [raw])
+        return self._ensure_hex_prefixed(str(tx_hash or "").strip())
+
+    def _recover_submitted_transaction(
+        self,
+        network: str,
+        tx_hash: str,
+        *,
+        source_address: str = "",
+        nonce: int | None = None,
+        recovery_timeout_seconds: float = 8.0,
+    ) -> tuple[bool, str]:
+        deadline = time.time() + max(0.5, float(recovery_timeout_seconds))
+        source_addr = str(source_address or "").strip()
+        while True:
+            try:
+                receipt = self.get_transaction_receipt(network, tx_hash)
+                if receipt is not None:
+                    return True, "receipt"
+            except Exception:
+                pass
+            try:
+                tx = self.get_transaction_by_hash(network, tx_hash)
+                if tx is not None:
+                    return True, "tx-hash"
+            except Exception:
+                pass
+            if source_addr and nonce is not None:
+                try:
+                    pending_nonce = self.get_nonce(network, source_addr)
+                    if pending_nonce > int(nonce):
+                        return True, "source-nonce"
+                except Exception:
+                    pass
+            if time.time() >= deadline:
+                return False, ""
+            time.sleep(1.0)
+
+    def submit_prepared_transaction(
+        self,
+        network: str,
+        prepared: PreparedSignedTransaction,
+        *,
+        source_address: str = "",
+        nonce: int | None = None,
+        recovery_timeout_seconds: float = 8.0,
+    ) -> SubmittedTransaction:
+        expected_tx_hash = self._ensure_hex_prefixed(str(prepared.tx_hash or "").strip())
+        try:
+            returned_tx_hash = self.send_raw_transaction(network, prepared.raw_transaction)
+            normalized_returned = self._ensure_hex_prefixed(str(returned_tx_hash or "").strip())
+            return SubmittedTransaction(
+                tx_hash=normalized_returned or expected_tx_hash,
+                acknowledged=True,
+                recovered=False,
+                recovery_reason="rpc-ack",
+            )
+        except Exception as exc:
+            recovered, reason = self._recover_submitted_transaction(
+                network,
+                expected_tx_hash,
+                source_address=source_address,
+                nonce=nonce,
+                recovery_timeout_seconds=recovery_timeout_seconds,
+            )
+            if recovered:
+                return SubmittedTransaction(
+                    tx_hash=expected_tx_hash,
+                    acknowledged=False,
+                    recovered=True,
+                    recovery_reason=reason,
+                )
+            raise RuntimeError(str(exc)) from exc
+
+    def _build_native_transfer_tx(
+        self,
+        network: str,
+        *,
+        to_address: str,
+        value_wei: int,
+        nonce: int,
+        gas_price_wei: int,
+        gas_limit: int = 21000,
+    ) -> dict:
+        if value_wei <= 0:
+            raise RuntimeError("转账金额必须大于 0")
+        safe_to_address = self.validate_evm_address(to_address, "接收地址")
+        return {
+            "nonce": int(nonce),
+            "to": safe_to_address,
+            "value": int(value_wei),
+            "gas": int(gas_limit),
+            "gasPrice": int(gas_price_wei),
+            "chainId": self.get_chain_id(network),
+        }
+
+    def _build_erc20_transfer_tx(
+        self,
+        network: str,
+        *,
+        token_contract: str,
+        to_address: str,
+        amount_units: int,
+        nonce: int,
+        gas_price_wei: int,
+        gas_limit: int,
+    ) -> dict:
+        if amount_units <= 0:
+            raise RuntimeError("代币转账数量必须大于 0")
+        safe_to_address = self.validate_evm_address(to_address, "接收地址")
+        data = "0xa9059cbb" + self._abi_encode_address(safe_to_address) + self._abi_encode_uint(amount_units)
+        return {
+            "nonce": int(nonce),
+            "to": self.to_checksum_address(token_contract),
+            "value": 0,
+            "data": self._ensure_hex_prefixed(data),
+            "gas": int(gas_limit),
+            "gasPrice": int(gas_price_wei),
+            "chainId": self.get_chain_id(network),
+        }
+
+    def prepare_native_transfer(
+        self,
+        network: str,
+        private_key: str,
+        to_address: str,
+        value_wei: int,
+        nonce: int,
+        gas_price_wei: int,
+        gas_limit: int = 21000,
+    ) -> PreparedSignedTransaction:
+        tx = self._build_native_transfer_tx(
+            network,
+            to_address=to_address,
+            value_wei=value_wei,
+            nonce=nonce,
+            gas_price_wei=gas_price_wei,
+            gas_limit=gas_limit,
+        )
+        return self._sign_transaction(tx, private_key, "交易签名失败")
+
+    def prepare_erc20_transfer(
+        self,
+        network: str,
+        private_key: str,
+        token_contract: str,
+        to_address: str,
+        amount_units: int,
+        nonce: int,
+        gas_price_wei: int,
+        gas_limit: int,
+    ) -> PreparedSignedTransaction:
+        tx = self._build_erc20_transfer_tx(
+            network,
+            token_contract=token_contract,
+            to_address=to_address,
+            amount_units=amount_units,
+            nonce=nonce,
+            gas_price_wei=gas_price_wei,
+            gas_limit=gas_limit,
+        )
+        return self._sign_transaction(tx, private_key, "代币交易签名失败")
+
+    def submit_native_transfer_reliably(
+        self,
+        network: str,
+        private_key: str,
+        to_address: str,
+        value_wei: int,
+        nonce: int,
+        gas_price_wei: int,
+        gas_limit: int = 21000,
+        *,
+        source_address: str = "",
+        recovery_timeout_seconds: float = 8.0,
+    ) -> SubmittedTransaction:
+        prepared = self.prepare_native_transfer(
+            network=network,
+            private_key=private_key,
+            to_address=to_address,
+            value_wei=value_wei,
+            nonce=nonce,
+            gas_price_wei=gas_price_wei,
+            gas_limit=gas_limit,
+        )
+        return self.submit_prepared_transaction(
+            network,
+            prepared,
+            source_address=source_address,
+            nonce=nonce,
+            recovery_timeout_seconds=recovery_timeout_seconds,
+        )
+
+    def submit_erc20_transfer_reliably(
+        self,
+        network: str,
+        private_key: str,
+        token_contract: str,
+        to_address: str,
+        amount_units: int,
+        nonce: int,
+        gas_price_wei: int,
+        gas_limit: int,
+        *,
+        source_address: str = "",
+        recovery_timeout_seconds: float = 8.0,
+    ) -> SubmittedTransaction:
+        prepared = self.prepare_erc20_transfer(
+            network=network,
+            private_key=private_key,
+            token_contract=token_contract,
+            to_address=to_address,
+            amount_units=amount_units,
+            nonce=nonce,
+            gas_price_wei=gas_price_wei,
+            gas_limit=gas_limit,
+        )
+        return self.submit_prepared_transaction(
+            network,
+            prepared,
+            source_address=source_address,
+            nonce=nonce,
+            recovery_timeout_seconds=recovery_timeout_seconds,
+        )
 
     def send_native_transfer(
         self,
@@ -632,20 +928,16 @@ class EvmClient:
         gas_price_wei: int,
         gas_limit: int = 21000,
     ) -> str:
-        if value_wei <= 0:
-            raise RuntimeError("转账金额必须大于 0")
-        safe_to_address = self.validate_evm_address(to_address, "接收地址")
-
-        tx = {
-            "nonce": int(nonce),
-            "to": safe_to_address,
-            "value": int(value_wei),
-            "gas": int(gas_limit),
-            "gasPrice": int(gas_price_wei),
-            "chainId": self.get_chain_id(network),
-        }
-        raw = self._sign_transaction_hex(tx, private_key, "交易签名失败")
-        tx_hash = self._rpc_call(network, "eth_sendRawTransaction", [raw])
+        prepared = self.prepare_native_transfer(
+            network=network,
+            private_key=private_key,
+            to_address=to_address,
+            value_wei=value_wei,
+            nonce=nonce,
+            gas_price_wei=gas_price_wei,
+            gas_limit=gas_limit,
+        )
+        tx_hash = self.send_raw_transaction(network, prepared.raw_transaction)
         return str(tx_hash)
 
     def send_erc20_transfer(
@@ -659,20 +951,15 @@ class EvmClient:
         gas_price_wei: int,
         gas_limit: int,
     ) -> str:
-        if amount_units <= 0:
-            raise RuntimeError("代币转账数量必须大于 0")
-        safe_to_address = self.validate_evm_address(to_address, "接收地址")
-
-        data = "0xa9059cbb" + self._abi_encode_address(safe_to_address) + self._abi_encode_uint(amount_units)
-        tx = {
-            "nonce": int(nonce),
-            "to": self.to_checksum_address(token_contract),
-            "value": 0,
-            "data": self._ensure_hex_prefixed(data),
-            "gas": int(gas_limit),
-            "gasPrice": int(gas_price_wei),
-            "chainId": self.get_chain_id(network),
-        }
-        raw = self._sign_transaction_hex(tx, private_key, "代币交易签名失败")
-        tx_hash = self._rpc_call(network, "eth_sendRawTransaction", [raw])
+        prepared = self.prepare_erc20_transfer(
+            network=network,
+            private_key=private_key,
+            token_contract=token_contract,
+            to_address=to_address,
+            amount_units=amount_units,
+            nonce=nonce,
+            gas_price_wei=gas_price_wei,
+            gas_limit=gas_limit,
+        )
+        tx_hash = self.send_raw_transaction(network, prepared.raw_transaction)
         return str(tx_hash)

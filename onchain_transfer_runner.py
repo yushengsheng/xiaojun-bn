@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from onchain_relay_runner import run_relay_batch, run_relay_fee_recovery
 from page_onchain_base import *  # noqa: F401,F403
 
 
@@ -86,6 +87,14 @@ class OnchainTransferRunnerMixin(object):
         except Exception:
             messagebox.showerror("参数错误", "执行线程数格式错误")
             return None
+        try:
+            confirm_timeout_seconds = float(str(self.confirm_timeout_var.get()).strip())
+        except Exception:
+            messagebox.showerror("参数错误", "确认超时格式错误")
+            return None
+        if confirm_timeout_seconds <= 0:
+            messagebox.showerror("参数错误", "确认超时必须大于 0")
+            return None
 
         if hasattr(self, "mode_var") and self._is_mode_m1():
             target = self.target_address_var.get().strip()
@@ -99,18 +108,44 @@ class OnchainTransferRunnerMixin(object):
                 return None
             self.target_address_var.set(safe_target)
 
+        relay_enabled = False
+        relay_fee_reserve: Decimal | None = None
+        if hasattr(self, "mode_var") and self._is_mode_1m() and getattr(self, "_relay_enabled", None):
+            relay_enabled = bool(self._relay_enabled())
+        if relay_enabled:
+            if amount_mode == self.AMOUNT_MODE_ALL:
+                messagebox.showerror("参数错误", "启用中转时仅支持固定数量或随机数量，暂不支持“全部”")
+                return None
+            reserve_raw = self.relay_fee_reserve_var.get().strip()
+            if not reserve_raw:
+                messagebox.showerror("参数错误", "启用中转后必须填写预留原生币手续费")
+                return None
+            try:
+                relay_fee_reserve = Decimal(reserve_raw)
+            except Exception:
+                messagebox.showerror("参数错误", "预留原生币手续费格式错误")
+                return None
+            if relay_fee_reserve <= 0:
+                messagebox.showerror("参数错误", "预留原生币手续费必须大于 0")
+                return None
+
         return WithdrawRuntimeParams(
             coin=coin,
             amount=amount,
             network=network,
             delay=delay,
             threads=threads,
+            confirm_timeout_seconds=confirm_timeout_seconds,
             random_enabled=random_enabled,
             random_min=random_min,
             random_max=random_max,
             token_contract=token.contract if not token.is_native else "",
             token_decimals=decimals,
             token_is_native=bool(token.is_native),
+            relay_enabled=relay_enabled,
+            relay_fee_reserve=relay_fee_reserve,
+            relay_sweep_enabled=False,
+            relay_sweep_target="",
         )
     def _resolve_wallet(self, source: str) -> tuple[str, str]:
         source_key = source.strip()
@@ -206,6 +241,14 @@ class OnchainTransferRunnerMixin(object):
                 amount_text = params.amount
                 if params.random_enabled and params.random_min is not None and params.random_max is not None:
                     amount_text = self._random_amount_range_text(params.random_min, params.random_max)
+                relay_text = ""
+                if params.relay_enabled:
+                    relay_text = (
+                        f"中转：已启用\n"
+                        f"预留手续费：{self._decimal_to_text(params.relay_fee_reserve or Decimal('0'))} {self._network_fee_symbol(params.network)}\n"
+                        "手续费回收：主流程结束后手动触发，默认回收到源钱包\n"
+                        f"中转钱包文件：{self.relay_wallet_store.file_path.name}\n"
+                    )
                 text = (
                     f"即将执行链上当前行真实转账：\n"
                     f"模式：{self._mode()}\n"
@@ -214,7 +257,9 @@ class OnchainTransferRunnerMixin(object):
                     f"币种：{token_desc}\n"
                     f"数量：{amount_text}\n"
                     f"执行间隔：{params.delay} 秒\n"
-                    f"执行线程数：{params.threads}\n\n"
+                    f"执行线程数：{params.threads}\n"
+                    f"确认超时：{params.confirm_timeout_seconds:g} 秒\n"
+                    f"{relay_text}\n"
                     "确认继续？"
                 )
                 if not messagebox.askyesno("高风险确认", text):
@@ -306,6 +351,128 @@ class OnchainTransferRunnerMixin(object):
         if native_balance_units < gas_cost:
             raise RuntimeError("原生币余额不足，无法支付 gas")
         return value_units, gas_price, gas_limit, amount_text
+    def _launch_retry_jobs(
+        self,
+        jobs: list[tuple[str, str, str]],
+        params: WithdrawRuntimeParams,
+        dry_run: bool,
+        *,
+        confirm: bool,
+    ) -> bool:
+        if self.is_running:
+            messagebox.showwarning("提示", "已有任务在运行")
+            return False
+        if not jobs:
+            return False
+        if not dry_run:
+            try:
+                self.client._ensure_eth_account()
+            except Exception as exc:
+                messagebox.showerror("依赖缺失", str(exc))
+                return False
+            try:
+                self._ensure_signing_sources([source for _row_key, source, _target in jobs])
+            except Exception as exc:
+                messagebox.showerror("参数错误", str(exc))
+                return False
+        if params.amount == self.AMOUNT_ALL_LABEL:
+            source_counter: dict[str, int] = {}
+            for _k, source, _target in jobs:
+                source_counter[source] = source_counter.get(source, 0) + 1
+            duplicated = [s for s, c in source_counter.items() if c > 1]
+            if duplicated:
+                messagebox.showerror("参数错误", "重试模式下，数量为“全部”时同一个转出钱包只能处理 1 条失败任务")
+                return False
+        if confirm and not dry_run:
+            token_desc = self._token_desc_from_params(params)
+            amount_text = params.amount
+            if params.random_enabled and params.random_min is not None and params.random_max is not None:
+                amount_text = self._random_amount_range_text(params.random_min, params.random_max)
+            text = (
+                f"即将重试链上失败转账：\n"
+                f"模式：{self._mode()}\n"
+                f"失败任务数：{len(jobs)}\n"
+                f"网络：{params.network}\n"
+                f"币种：{token_desc}\n"
+                f"数量：{amount_text}\n"
+                f"执行间隔：{params.delay} 秒\n"
+                f"执行线程数：{params.threads}\n\n"
+                f"确认超时：{params.confirm_timeout_seconds:g} 秒\n\n"
+                "确认继续？"
+            )
+            if not messagebox.askyesno("重试确认", text):
+                self.log("用户取消了失败重试")
+                return False
+        self.log(f"开始失败重试：{len(jobs)}")
+        self.stop_requested.clear()
+        self.is_running = True
+        self._start_managed_thread(
+            self._run_batch_transfer,
+            args=(jobs, params, dry_run),
+            name="onchain-transfer-retry-failed",
+        )
+        return True
+    def _launch_relay_fee_recovery(
+        self,
+        *,
+        dry_run: bool,
+        batch_ids: set[str] | None = None,
+        confirm: bool,
+        show_dialog: bool = True,
+        run_label: str = "manual",
+    ) -> bool:
+        if self.is_running:
+            messagebox.showwarning("提示", "已有任务在运行")
+            return False
+        records = self.relay_wallet_store.load_records()
+        batch_filter = {str(value or "").strip() for value in (batch_ids or set()) if str(value or "").strip()}
+        if batch_filter:
+            records = [record for record in records if str(getattr(record, "batch_id", "") or "").strip() in batch_filter]
+        if not records:
+            messagebox.showinfo("提示", "中转钱包.txt 中没有可处理记录")
+            return False
+        if not dry_run:
+            try:
+                self.client._ensure_eth_account()
+            except Exception as exc:
+                messagebox.showerror("依赖缺失", str(exc))
+                return False
+        worker_threads = max(1, int(self._runtime_worker_threads()))
+        if confirm:
+            scope_text = f"本次批量 {len(batch_filter)} 个批次" if batch_filter else "全部历史记录"
+            text = (
+                f"即将扫描 {scope_text} 中的 {len(records)} 条中转记录，\n"
+                "检测并回收中转钱包中的 BNB / USDT / USDC 余额。\n"
+                "第二跳未确认成功的记录会自动跳过，避免误操作。\n\n"
+                f"当前模式：{'模拟执行' if dry_run else '真实执行'}\n"
+                f"回收线程数：{worker_threads}\n\n"
+                "确认继续？"
+            )
+            if not messagebox.askyesno("中转手续费回收确认", text):
+                self.log("用户取消了中转手续费回收")
+                return False
+        self.log(f"开始中转手续费回收：扫描 {len(records)} 条记录，线程数={worker_threads}")
+        self.stop_requested.clear()
+        self.is_running = True
+        self._start_managed_thread(
+            run_relay_fee_recovery,
+            args=(self, dry_run),
+            kwargs={
+                "batch_ids": batch_filter if batch_filter else None,
+                "show_dialog": show_dialog,
+                "run_label": run_label,
+            },
+            name="onchain-relay-fee-recovery",
+        )
+        return True
+    def start_batch_relay_fee_recovery(self, batch_ids: set[str]) -> bool:
+        return self._launch_relay_fee_recovery(
+            dry_run=bool(self.dry_run_var.get()),
+            batch_ids=batch_ids,
+            confirm=False,
+            show_dialog=True,
+            run_label="batch-dialog",
+        )
     def start_batch_transfer(self):
         try:
             if self.is_running:
@@ -343,6 +510,14 @@ class OnchainTransferRunnerMixin(object):
                 amount_text = params.amount
                 if params.random_enabled and params.random_min is not None and params.random_max is not None:
                     amount_text = self._random_amount_range_text(params.random_min, params.random_max)
+                relay_text = ""
+                if params.relay_enabled:
+                    relay_text = (
+                        f"中转：已启用\n"
+                        f"预留手续费：{self._decimal_to_text(params.relay_fee_reserve or Decimal('0'))} {self._network_fee_symbol(params.network)}\n"
+                        "手续费回收：主流程结束后手动触发，默认回收到源钱包\n"
+                        f"中转钱包文件：{self.relay_wallet_store.file_path.name}\n"
+                    )
                 text = (
                     f"即将执行链上真实转账：\n"
                     f"模式：{self._mode()}\n"
@@ -351,7 +526,9 @@ class OnchainTransferRunnerMixin(object):
                     f"币种：{token_desc}\n"
                     f"数量：{amount_text}\n"
                     f"执行间隔：{params.delay} 秒\n"
-                    f"执行线程数：{params.threads}\n\n"
+                    f"执行线程数：{params.threads}\n"
+                    f"确认超时：{params.confirm_timeout_seconds:g} 秒\n"
+                    f"{relay_text}\n"
                     "确认继续？"
                 )
                 if not messagebox.askyesno("高风险确认", text):
@@ -381,58 +558,29 @@ class OnchainTransferRunnerMixin(object):
             if not jobs:
                 return
             dry_run = bool(self.dry_run_var.get())
-            if not dry_run:
-                try:
-                    self.client._ensure_eth_account()
-                except Exception as exc:
-                    messagebox.showerror("依赖缺失", str(exc))
-                    return
-                try:
-                    self._ensure_signing_sources([source for _row_key, source, _target in jobs])
-                except Exception as exc:
-                    messagebox.showerror("参数错误", str(exc))
-                    return
-            if params.amount == self.AMOUNT_ALL_LABEL:
-                source_counter: dict[str, int] = {}
-                for _k, source, _target in jobs:
-                    source_counter[source] = source_counter.get(source, 0) + 1
-                duplicated = [s for s, c in source_counter.items() if c > 1]
-                if duplicated:
-                    messagebox.showerror("参数错误", "重试模式下，数量为“全部”时同一个转出钱包只能处理 1 条失败任务")
-                    return
-
-            token_desc = self._token_desc_from_params(params)
-            if not dry_run:
-                amount_text = params.amount
-                if params.random_enabled and params.random_min is not None and params.random_max is not None:
-                    amount_text = self._random_amount_range_text(params.random_min, params.random_max)
-                text = (
-                    f"即将重试链上失败转账：\n"
-                    f"模式：{self._mode()}\n"
-                    f"失败任务数：{len(jobs)}\n"
-                    f"网络：{params.network}\n"
-                    f"币种：{token_desc}\n"
-                    f"数量：{amount_text}\n"
-                    f"执行间隔：{params.delay} 秒\n"
-                    f"执行线程数：{params.threads}\n\n"
-                    "确认继续？"
-                )
-                if not messagebox.askyesno("重试确认", text):
-                    self.log("用户取消了失败重试")
-                    return
-
-            self.log(f"开始重试失败任务：{len(jobs)}")
-            self.stop_requested.clear()
-            self.is_running = True
-            self._start_managed_thread(
-                self._run_batch_transfer,
-                args=(jobs, params, dry_run),
-                name="onchain-transfer-retry-failed",
-            )
+            self._launch_retry_jobs(jobs, params, dry_run, confirm=True)
         except Exception as exc:
             self.log(f"失败重试启动异常：{exc}")
             messagebox.showerror("执行异常", str(exc))
+    def start_relay_fee_recovery(self):
+        try:
+            if self.is_running:
+                messagebox.showwarning("提示", "已有任务在运行")
+                return
+            dry_run = bool(self.dry_run_var.get())
+            self._launch_relay_fee_recovery(
+                dry_run=dry_run,
+                confirm=True,
+                show_dialog=True,
+                run_label="manual",
+            )
+        except Exception as exc:
+            self.log(f"中转手续费回收启动异常：{exc}")
+            messagebox.showerror("执行异常", str(exc))
     def _run_batch_transfer(self, jobs_data: list[tuple[str, str, str]], params: WithdrawRuntimeParams, dry_run: bool):
+        if params.relay_enabled:
+            run_relay_batch(self, jobs_data, params, dry_run)
+            return
         dispatch_ui = self._dispatch_ui
         try:
             set_ui_batch_size(self, params.threads)
@@ -550,6 +698,52 @@ class OnchainTransferRunnerMixin(object):
                 else:
                     timeout_worker()
 
+            def schedule_submitted_confirmation(
+                row_key: str,
+                prefix: str,
+                submitted_timeout_seconds: float,
+                txid: str,
+                amount_text: str,
+                gas_fee_wei: int,
+            ):
+                tx_hash = str(txid or "").strip()
+                if not tx_hash:
+                    schedule_submitted_timeout(row_key, prefix, submitted_timeout_seconds)
+                    return
+
+                def confirm_worker():
+                    deadline = time.time() + max(0.1, float(submitted_timeout_seconds))
+                    last_error = ""
+                    while True:
+                        if self.stop_requested.is_set() or self._closing or bool(getattr(self.root, "_closing", False)):
+                            return
+                        try:
+                            receipt = self.client.get_transaction_receipt(params.network, tx_hash)
+                            if receipt is not None:
+                                status_raw = receipt.get("status")
+                                if status_raw is not None and self.client._int_from_hex(status_raw) != 1:
+                                    finalize_job(row_key, "failed", f"{prefix} 交易确认失败：链上执行状态异常，txid={tx_hash}")
+                                else:
+                                    finalize_job(
+                                        row_key,
+                                        "success",
+                                        f"{prefix} 转账确认完成：txid={tx_hash}",
+                                        amount_text=amount_text,
+                                        gas_fee_wei=gas_fee_wei,
+                                    )
+                                return
+                        except Exception as exc:
+                            last_error = str(exc)
+                        if time.time() >= deadline:
+                            detail = f"，最后错误：{last_error}" if last_error else ""
+                            finalize_job(row_key, "failed", f"{prefix} 确认中超过 {submitted_timeout_seconds:g} 秒，txid={tx_hash}{detail}")
+                            return
+                        if self.stop_requested.wait(2.0):
+                            return
+
+                timeout_name = f"onchain-submitted-confirm-{str(row_key or '')[-8:] or 'job'}"
+                self._start_managed_thread(confirm_worker, name=timeout_name)
+
             def worker():
                 total = len(jobs_data)
                 while True:
@@ -570,7 +764,7 @@ class OnchainTransferRunnerMixin(object):
                     txid = ""
                     self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                     dispatch_ui(lambda k=row_key: self._set_status(k, "running"))
-                    submitted_timeout_seconds = max(0.0, float(getattr(self, "submitted_timeout_seconds", SUBMITTED_TIMEOUT_SECONDS)))
+                    submitted_timeout_seconds = max(0.0, float(params.confirm_timeout_seconds))
                     prefix = job_prefix(i)
                     try:
                         if dry_run:
@@ -599,8 +793,9 @@ class OnchainTransferRunnerMixin(object):
                             )
                             nonce = alloc_nonce(source_addr)
                             used_nonce = nonce
+                            recovery_timeout_seconds = min(max(6.0, float(params.confirm_timeout_seconds) / 3.0), 20.0)
                             if params.token_is_native:
-                                txid = self.client.send_native_transfer(
+                                submission = self.client.submit_native_transfer_reliably(
                                     network=params.network,
                                     private_key=private_key,
                                     to_address=target,
@@ -608,9 +803,11 @@ class OnchainTransferRunnerMixin(object):
                                     nonce=nonce,
                                     gas_price_wei=gas_price_wei,
                                     gas_limit=gas_limit,
+                                    source_address=source_addr,
+                                    recovery_timeout_seconds=recovery_timeout_seconds,
                                 )
                             else:
-                                txid = self.client.send_erc20_transfer(
+                                submission = self.client.submit_erc20_transfer_reliably(
                                     network=params.network,
                                     private_key=private_key,
                                     token_contract=params.token_contract,
@@ -619,16 +816,36 @@ class OnchainTransferRunnerMixin(object):
                                     nonce=nonce,
                                     gas_price_wei=gas_price_wei,
                                     gas_limit=gas_limit,
+                                    source_address=source_addr,
+                                    recovery_timeout_seconds=recovery_timeout_seconds,
                                 )
+                            txid = submission.tx_hash
                             tx_sent = True
                             if txid:
                                 gas_fee_wei = max(0, int(gas_limit)) * max(0, int(gas_price_wei))
                                 gas_text = self._gas_fee_amount_text(params.network, gas_fee_wei)
-                                msg = (
-                                    f"{prefix} 金额={params.coin} {amount_text}，预估gas={gas_text}，"
-                                    f"from={source_addr}，to={target}，txid={txid}"
-                                )
-                                result_status = "success"
+                                if submission.recovered and submission.recovery_reason == "receipt":
+                                    msg = (
+                                        f"{prefix} 金额={params.coin} {amount_text}，预估gas={gas_text}，"
+                                        f"from={source_addr}，to={target}，txid={txid}，广播异常但链上已确认"
+                                    )
+                                    result_status = "success"
+                                elif submission.recovered:
+                                    recover_reason = {
+                                        "tx-hash": "已按 tx hash 找到交易",
+                                        "source-nonce": "已按源地址 nonce 发现交易占用",
+                                    }.get(submission.recovery_reason, "已进入链上确认")
+                                    msg = (
+                                        f"{prefix} 转账广播结果待确认：金额={params.coin} {amount_text}，预估gas={gas_text}，"
+                                        f"from={source_addr}，to={target}，txid={txid}，{recover_reason}"
+                                    )
+                                    result_status = "submitted"
+                                else:
+                                    msg = (
+                                        f"{prefix} 金额={params.coin} {amount_text}，预估gas={gas_text}，"
+                                        f"from={source_addr}，to={target}，txid={txid}"
+                                    )
+                                    result_status = "success"
                             else:
                                 msg = (
                                     f"{prefix} 转账确认中：未拿到 txid，"
@@ -646,7 +863,7 @@ class OnchainTransferRunnerMixin(object):
                         dispatch_ui(lambda m=msg: self.log(m))
                         self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                         dispatch_ui(lambda k=row_key: self._set_status(k, "submitted"))
-                        schedule_submitted_timeout(row_key, prefix, submitted_timeout_seconds)
+                        schedule_submitted_confirmation(row_key, prefix, submitted_timeout_seconds, txid, amount_text, gas_fee_wei)
                     else:
                         finalize_job(row_key, result_status, msg, amount_text=amount_text, gas_fee_wei=gas_fee_wei)
                     if params.delay > 0:
@@ -672,7 +889,7 @@ class OnchainTransferRunnerMixin(object):
                 dispatch_ui(lambda: self.log("链上转账任务已停止"))
             batch_finalize_timeout_seconds = max(
                 0.2,
-                max(0.0, float(getattr(self, "submitted_timeout_seconds", SUBMITTED_TIMEOUT_SECONDS))) + 1.0,
+                max(0.0, float(params.confirm_timeout_seconds)) + 1.0,
             )
             if len(jobs_data) == 0:
                 resolved_event.set()

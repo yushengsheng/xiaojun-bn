@@ -15,9 +15,10 @@ import requests
 
 from api_clients import EvmClient
 from app_paths import LOG_FILE_PATH
-from core_models import OnchainPairEntry
+from core_models import EvmToken, OnchainPairEntry, OnchainSettings
 from exchange_binance_client import BinanceClient
 from exchange_logging import logger, runtime_log_path
+from onchain_relay_wallets import RelayWalletFileStore
 from exchange_proxy_runtime import ExchangeProxyRuntime
 from secret_box import SECRET_BOX
 from shared_utils import decimal_to_text, random_decimal_between
@@ -82,6 +83,83 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         if loaded_store.multi_to_multi_drafts != store.multi_to_multi_drafts:
             raise RuntimeError("链上导入列表自检失败：待补齐草稿未恢复")
     checks.append("onchain-drafts=ok")
+
+    with tempfile.TemporaryDirectory(prefix="xiaojun-relay-selftest-") as tmpdir:
+        relay_root = Path(tmpdir)
+        relay_file = relay_root / "\u4e2d\u8f6c\u94b1\u5305.txt"
+        relay_store = RelayWalletFileStore(relay_file)
+        relay_client = EvmClient()
+        try:
+            relay_wallet = relay_client.create_wallets(1)[0]
+            relay_token = EvmToken(
+                symbol="USDT",
+                contract="0x55d398326f99059ff775485246999027b3197955",
+                decimals=18,
+                is_native=False,
+            )
+            relay_record = relay_store.build_record(
+                batch_id="relay-selftest",
+                network="BSC",
+                source_address="0x0000000000000000000000000000000000000001",
+                target_address="0x0000000000000000000000000000000000000002",
+                relay_wallet=relay_wallet,
+                token=relay_token,
+                relay_fee_reserve=Decimal("0.0012"),
+                sweep_enabled=True,
+                sweep_target="0x0000000000000000000000000000000000000003",
+            )
+            relay_store.append_records([relay_record])
+            loaded_relay_records = relay_store.load_records()
+            if len(loaded_relay_records) != 1:
+                raise RuntimeError("中转钱包自检失败：明文 TXT 记录数量异常")
+            updated_relay_record = relay_store.update_record(
+                relay_wallet.address,
+                batch_id="relay-selftest",
+                status="forwarded",
+                transfer_amount="1.23",
+                transfer_units="1230000000000000000",
+                token_forward_txid="0x" + "1" * 64,
+            )
+            if updated_relay_record.status != "forwarded":
+                raise RuntimeError("中转钱包自检失败：状态更新未生效")
+            if updated_relay_record.transfer_amount != "1.23":
+                raise RuntimeError("中转钱包自检失败：金额更新未生效")
+            completed_relay_record = relay_store.update_record(
+                relay_wallet.address,
+                batch_id="relay-selftest",
+                status="completed",
+                sweep_resolution="manual_empty",
+            )
+            if completed_relay_record.sweep_resolution != "manual_empty":
+                raise RuntimeError("中转钱包自检失败：手动清空终态未恢复")
+
+            relay_store_path = relay_root / "onchain-relay.json"
+            relay_onchain_store = OnchainStore(relay_store_path)
+            relay_onchain_store.settings = OnchainSettings(
+                mode="1对多",
+                network="BSC",
+                token_symbol="USDT",
+                token_contract=relay_token.contract,
+                amount_mode="固定数量",
+                amount="1",
+                confirm_timeout_seconds=240.0,
+                relay_enabled=True,
+                relay_fee_reserve="0.0012",
+                relay_sweep_enabled=True,
+                relay_sweep_target="0x0000000000000000000000000000000000000003",
+            )
+            relay_onchain_store.save_settings_only()
+            relay_loaded_store = OnchainStore(relay_store_path)
+            relay_loaded_store.load()
+            if not relay_loaded_store.settings.relay_enabled:
+                raise RuntimeError("中转钱包自检失败：配置中的中转开关未恢复")
+            if relay_loaded_store.settings.relay_fee_reserve != "0.0012":
+                raise RuntimeError("中转钱包自检失败：配置中的手续费预留未恢复")
+            if abs(float(relay_loaded_store.settings.confirm_timeout_seconds) - 240.0) > 0.0001:
+                raise RuntimeError("中转钱包自检失败：配置中的确认超时未恢复")
+        finally:
+            relay_client.close()
+    checks.append("relay-wallets=ok")
 
     random_value = random_decimal_between(Decimal("0.00001"), Decimal("0.00003"), Decimal("0.00001"))
     if random_value < Decimal("0.00001") or random_value > Decimal("0.00003"):

@@ -300,6 +300,13 @@ class OnchainImportMixin(object):
         except Exception:
             messagebox.showerror("参数错误", "执行线程数格式错误")
             return False
+        try:
+            confirm_timeout_seconds = float(str(self.confirm_timeout_var.get()).strip())
+            if confirm_timeout_seconds <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("参数错误", "确认超时必须是大于 0 的数字")
+            return False
         proxy_text = self.onchain_proxy_var.get().strip()
         if self.use_config_proxy_var.get():
             try:
@@ -308,7 +315,23 @@ class OnchainImportMixin(object):
                 messagebox.showerror("参数错误", str(exc))
                 return False
         self.onchain_proxy_var.set(proxy_text)
-
+        relay_enabled = bool(self.relay_enabled_var.get()) if mode == self.MODE_1M else False
+        relay_fee_reserve = self.relay_fee_reserve_var.get().strip()
+        if relay_enabled and amount_mode == self.AMOUNT_MODE_ALL:
+            messagebox.showerror("参数错误", "启用中转时仅支持固定数量或随机数量，暂不支持“全部”")
+            return False
+        if relay_fee_reserve:
+            try:
+                relay_fee_reserve_value = Decimal(relay_fee_reserve)
+                if relay_fee_reserve_value <= 0:
+                    raise InvalidOperation
+                relay_fee_reserve = self._decimal_to_text(relay_fee_reserve_value)
+            except Exception:
+                messagebox.showerror("参数错误", "预留原生币手续费必须是大于 0 的数字")
+                return False
+        elif relay_enabled:
+            messagebox.showerror("参数错误", "启用中转后必须填写预留原生币手续费")
+            return False
         self.store.settings = OnchainSettings(
             mode=mode,
             network=network,
@@ -320,11 +343,16 @@ class OnchainImportMixin(object):
             random_max=random_max,
             delay_seconds=delay,
             worker_threads=threads,
+            confirm_timeout_seconds=confirm_timeout_seconds,
             dry_run=bool(self.dry_run_var.get()),
             use_config_proxy=bool(self.use_config_proxy_var.get()),
             proxy_url=proxy_text,
             one_to_many_source=self.source_credential_var.get().strip(),
             many_to_one_target="",
+            relay_enabled=relay_enabled,
+            relay_fee_reserve=relay_fee_reserve,
+            relay_sweep_enabled=False,
+            relay_sweep_target="",
         )
         target = self.target_address_var.get().strip()
         if target:
@@ -374,10 +402,13 @@ class OnchainImportMixin(object):
             self.random_max_var.set(st.random_max or "")
             self.delay_var.set(st.delay_seconds)
             self.threads_var.set(str(max(1, int(st.worker_threads or 1))))
+            self.confirm_timeout_var.set(self._decimal_to_text(Decimal(str(st.confirm_timeout_seconds or 180.0))))
             self.dry_run_var.set(st.dry_run)
             self.use_config_proxy_var.set(bool(st.use_config_proxy))
             self.onchain_proxy_var.set(st.proxy_url or "")
             self.source_credential_var.set(st.one_to_many_source or "")
+            self.relay_enabled_var.set(bool(st.relay_enabled))
+            self.relay_fee_reserve_var.set(st.relay_fee_reserve or "")
             loaded_target = st.many_to_one_target or ""
             try:
                 loaded_target = self._try_validate_recipient_address(loaded_target, "收款地址") or loaded_target

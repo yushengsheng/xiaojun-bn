@@ -21,3 +21,6 @@ build/
 dist/
 release/
 *.spec
+中转钱包_待人工处理.txt
+中转钱包_失败账号.txt
+中转钱包.txt

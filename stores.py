@@ -364,6 +364,12 @@ class OnchainStore:
             threads = max(1, int(settings_raw.get("worker_threads", 10)))
         except Exception:
             threads = 10
+        try:
+            confirm_timeout_seconds = float(settings_raw.get("confirm_timeout_seconds", 180.0))
+            if confirm_timeout_seconds <= 0:
+                confirm_timeout_seconds = 180.0
+        except Exception:
+            confirm_timeout_seconds = 180.0
 
         self.multi_to_multi_pairs = pairs
         self.multi_to_multi_drafts = drafts
@@ -387,11 +393,16 @@ class OnchainStore:
             random_max=str(settings_raw.get("random_max", "") or "").strip(),
             delay_seconds=delay,
             worker_threads=threads,
+            confirm_timeout_seconds=confirm_timeout_seconds,
             dry_run=bool(settings_raw.get("dry_run", True)),
             use_config_proxy=bool(settings_raw.get("use_config_proxy", False)),
             proxy_url=SECRET_BOX.decrypt(str(settings_raw.get("proxy_url", "") or "").strip()).strip(),
             one_to_many_source=SECRET_BOX.decrypt(str(source_raw or "").strip()).strip(),
             many_to_one_target=str(target_raw or "").strip(),
+            relay_enabled=bool(settings_raw.get("relay_enabled", False)),
+            relay_fee_reserve=str(settings_raw.get("relay_fee_reserve", "") or "").strip(),
+            relay_sweep_enabled=bool(settings_raw.get("relay_sweep_enabled", True)),
+            relay_sweep_target=str(settings_raw.get("relay_sweep_target", "") or "").strip(),
         )
 
     def save(self) -> None:

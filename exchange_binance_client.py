@@ -1660,7 +1660,14 @@ class BinanceClient:
             return self._ceil_to_step(price, tick_size)
         return normalized
 
-    def sell_asset_market(self, symbol: str, free_balance: Decimal | str | float | int, reserve_ratio=Decimal("0.999")) -> bool:
+    def sell_asset_market(
+        self,
+        symbol: str,
+        free_balance: Decimal | str | float | int,
+        reserve_ratio=Decimal("0.999"),
+        *,
+        small_qty_log_text: str | None = None,
+    ) -> bool:
         rules = self.get_symbol_trade_rules(symbol)
         if not rules:
             logger.info("找不到交易对规则，跳过卖出 %s", symbol)
@@ -1673,7 +1680,10 @@ class BinanceClient:
         qty = self._floor_to_step(qty, rules["stepSize"])
 
         if qty <= 0 or qty < rules["minQty"]:
-            logger.info("交易对 %s 数量过小，跳过卖出", symbol)
+            if small_qty_log_text:
+                logger.info("%s", small_qty_log_text)
+            else:
+                logger.info("交易对 %s 数量过小，跳过卖出", symbol)
             return False
 
         if qty > rules["maxQty"]:
@@ -1768,7 +1778,7 @@ class BinanceClient:
         return self.spot_buy_quote_amount(symbol_u, amount)
 
     # -------- 现货卖出（全部基础币） --------
-    def spot_sell_all_base(self, symbol: str):
+    def spot_sell_all_base(self, symbol: str, *, small_qty_log_text: str | None = None):
         base = self.get_spot_base_asset(symbol)
         balance = self.spot_asset_balance_decimal(base)
 
@@ -1776,7 +1786,12 @@ class BinanceClient:
             return False
 
         # 现货市价卖出按交易所 stepSize 取整，避免高价币因手填精度或额外预留被截到低于最小下单额。
-        return self.sell_asset_market(symbol, balance, reserve_ratio=Decimal("1"))
+        return self.sell_asset_market(
+            symbol,
+            balance,
+            reserve_ratio=Decimal("1"),
+            small_qty_log_text=small_qty_log_text,
+        )
 
     # -------- 提现 --------
     def withdraw_all_coin(

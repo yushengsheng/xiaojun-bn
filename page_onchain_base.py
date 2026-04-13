@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import queue
 import re
 import threading
@@ -17,8 +18,14 @@ from tkinter import messagebox, ttk
 import requests
 
 from api_clients import EvmClient
-from app_paths import ONCHAIN_DATA_FILE
+from app_paths import (
+    ONCHAIN_DATA_FILE,
+    RELAY_FAILED_EXPORT_FILE,
+    RELAY_MANUAL_EXPORT_FILE,
+    RELAY_WALLET_FILE,
+)
 from core_models import EvmToken, GeneratedWalletEntry, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
+from onchain_relay_wallets import RelayWalletFileStore
 from shared_utils import (
     LOG_MAX_ROWS,
     SolidButton,
@@ -50,7 +57,7 @@ from table_import_utils import (
 )
 import task_progress
 
-SUBMITTED_TIMEOUT_SECONDS = 10.0
+SUBMITTED_TIMEOUT_SECONDS = 180.0
 
 class OnchainTransferPageBase:
     MODE_M2M = "多对多"
@@ -67,7 +74,8 @@ class OnchainTransferPageBase:
         "idx": 42,
         "source": 330,
         "target": 420,
-        "status": 96,
+        "status": 110,
+        "recovery": 96,
         "balance": 80,
     }
     TREE_COL_WEIGHTS = {
@@ -76,6 +84,7 @@ class OnchainTransferPageBase:
         "source": 5,
         "target": 7,
         "status": 2,
+        "recovery": 2,
         "balance": 1,
     }
 
@@ -89,6 +98,7 @@ class OnchainTransferPageBase:
             proxy_provider=rpc_proxy_getter,
             allow_system_proxy_provider=self._allow_onchain_system_proxy,
         )
+        self.relay_wallet_store = RelayWalletFileStore(RELAY_WALLET_FILE)
         self._closing = False
         self.is_running = False
         self.stop_requested = threading.Event()
@@ -103,6 +113,9 @@ class OnchainTransferPageBase:
         self.row_status: dict[str, str] = {}
         self.row_status_text_map: dict[str, str] = {}
         self.row_status_context: dict[str, str] = {}
+        self.row_recovery_status: dict[str, str] = {}
+        self.row_recovery_text_map: dict[str, str] = {}
+        self.row_recovery_context: dict[str, str] = {}
         self.query_row_status: dict[str, str] = {}
         self.query_row_status_context: dict[str, str] = {}
         self.source_balance_cache: dict[str, Decimal] = {}
@@ -129,6 +142,7 @@ class OnchainTransferPageBase:
         self.random_max_var = StringVar(value="")
         self.delay_var = DoubleVar(value=1.0)
         self.threads_var = StringVar(value="10")
+        self.confirm_timeout_var = StringVar(value="180")
         self.dry_run_var = BooleanVar(value=False)
         self.use_config_proxy_var = BooleanVar(value=False)
         self.onchain_proxy_var = StringVar(value="")
@@ -136,6 +150,8 @@ class OnchainTransferPageBase:
         self.onchain_proxy_exit_ip_var = StringVar(value="--")
         self.source_credential_var = StringVar(value="")
         self.target_address_var = StringVar(value="")
+        self.relay_enabled_var = BooleanVar(value=False)
+        self.relay_fee_reserve_var = StringVar(value="")
         self.source_balance_var = StringVar(value="-")
         self.target_balance_var = StringVar(value="-")
         self.progress_var = StringVar(value=task_progress.idle_text("转账总额"))
@@ -228,12 +244,24 @@ class OnchainTransferPageBase:
         self.ent_delay = ttk.Entry(setting, textvariable=self.delay_var, width=7)
         self.lbl_threads = ttk.Label(setting, text="执行线程数")
         self.spin_threads = ttk.Spinbox(setting, from_=1, to=64, textvariable=self.threads_var, width=6)
+        self.lbl_confirm_timeout = ttk.Label(setting, text="确认超时(秒)")
+        self.ent_confirm_timeout = ttk.Entry(setting, textvariable=self.confirm_timeout_var, width=7)
 
         self.lbl_source_credential = ttk.Label(setting, text="转出钱包私钥/助记词*")
         self.ent_source_credential = ttk.Entry(setting, textvariable=self.source_credential_var, width=34)
         self.btn_query_source_balance = ttk.Button(setting, text="查询", command=self.query_current_source_balance)
         self.lbl_source_balance_title = ttk.Label(setting, text="转出钱包余额")
         self.lbl_source_balance_val = ttk.Label(setting, textvariable=self.source_balance_var, style="Value.TLabel")
+        self.chk_relay_enabled = ttk.Checkbutton(setting, text="启用中转", variable=self.relay_enabled_var)
+        self.lbl_relay_fee_reserve = ttk.Label(setting, text="预留原生币手续费")
+        self.ent_relay_fee_reserve = ttk.Entry(setting, textvariable=self.relay_fee_reserve_var, width=12)
+        self.lbl_relay_wallet_file = ttk.Label(
+            setting,
+            text=f"中转钱包明文保存在：{RELAY_WALLET_FILE.name}；仅清理超过 72 小时且余额已清空的钱包。",
+            style="Subtle.TLabel",
+            justify="left",
+            wraplength=920,
+        )
         self.lbl_target_address = ttk.Label(setting, text="收款地址*")
         self.ent_target_address = ttk.Entry(setting, textvariable=self.target_address_var, width=34)
         self.btn_query_target_balance = ttk.Button(setting, text="查询", command=self.query_current_target_balance)
@@ -242,13 +270,14 @@ class OnchainTransferPageBase:
         self.lbl_target_balance_title = ttk.Label(setting, text="收款地址余额")
         self.lbl_target_balance_val = ttk.Label(setting, textvariable=self.target_balance_var, style="Value.TLabel")
         self._apply_setting_layout("wide")
+        self._refresh_relay_controls()
 
         self.table_wrap = ttk.Frame(main)
         self.table_wrap.pack(fill=BOTH, expand=True)
         self.table_wrap.columnconfigure(0, weight=1)
         self.table_wrap.rowconfigure(0, weight=1)
 
-        cols = ("checked", "idx", "source", "target", "status", "balance")
+        cols = ("checked", "idx", "source", "target", "status", "recovery", "balance")
         self.tree = ttk.Treeview(self.table_wrap, columns=cols, show="headings", selectmode="extended", height=16)
         self._tree_column_ids = cols
         self._tree_heading_base_texts = {
@@ -257,6 +286,7 @@ class OnchainTransferPageBase:
             "source": "转出凭证",
             "target": "接收地址",
             "status": "执行状态",
+            "recovery": "回收状态",
             "balance": "余额",
         }
         for column, text in self._tree_heading_base_texts.items():
@@ -267,6 +297,7 @@ class OnchainTransferPageBase:
         self.tree.column("source", width=360, anchor="w")
         self.tree.column("target", width=420, anchor="w")
         self.tree.column("status", width=110, anchor="center")
+        self.tree.column("recovery", width=96, anchor="center")
         self.tree.column("balance", width=100, anchor="w")
         self.tree.tag_configure("st_waiting", foreground="#8a6d3b", background="#fff7e0")
         self.tree.tag_configure("st_running", foreground="#1d5fbf", background="#eaf2ff")
@@ -306,6 +337,8 @@ class OnchainTransferPageBase:
         ttk.Button(action1, text="全选/取消全选", command=self.toggle_check_all).pack(side=LEFT, padx=(8, 0))
         ttk.Button(action1, text="删除选中", command=self.delete_selected).pack(side=LEFT, padx=(8, 0))
         ttk.Button(action1, text="创建钱包", style="WalletAction.TButton", command=self.open_wallet_generator).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(action1, text="打开待人工", command=self.open_relay_manual_export_file).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(action1, text="打开失败账号", command=self.open_relay_failed_export_file).pack(side=LEFT, padx=(8, 0))
         ttk.Label(action1, text="链上为独立模块，与交易所互不影响。", style="Subtle.TLabel").pack(side=LEFT, padx=(12, 0))
 
         action2 = ttk.Frame(main)
@@ -339,6 +372,7 @@ class OnchainTransferPageBase:
             pady=2,
         )
         self.btn_batch_transfer.pack(side=RIGHT)
+        ttk.Button(action2, text="中转手续费回收", style="Action.TButton", command=self.start_relay_fee_recovery).pack(side=RIGHT, padx=(8, 0))
         ttk.Button(action2, text="失败重试", style="Action.TButton", command=self.start_retry_failed).pack(side=RIGHT, padx=(8, 0))
 
         self.log_box = ttk.LabelFrame(main, text="执行日志", padding=8)
@@ -367,6 +401,7 @@ class OnchainTransferPageBase:
         self.onchain_proxy_var.trace_add("write", self._on_proxy_config_changed)
         self.source_credential_var.trace_add("write", self._on_source_or_target_changed)
         self.target_address_var.trace_add("write", self._on_source_or_target_changed)
+        self.relay_enabled_var.trace_add("write", self._on_relay_settings_changed)
 
         self.table_wrap.bind("<Configure>", self._on_table_resize)
         self.log_box.bind("<Configure>", self._on_log_resize)
@@ -393,6 +428,20 @@ class OnchainTransferPageBase:
         return self._mode() == self.MODE_1M
     def _is_mode_m1(self) -> bool:
         return self._mode() == self.MODE_M1
+    def _relay_controls_visible(self) -> bool:
+        return self._is_mode_1m()
+    def _relay_enabled(self) -> bool:
+        return self._relay_controls_visible() and bool(self.relay_enabled_var.get())
+    def _refresh_relay_controls(self) -> None:
+        enabled = self._relay_enabled()
+        try:
+            self.ent_relay_fee_reserve.configure(state="normal" if enabled else "disabled")
+        except Exception:
+            pass
+    def _on_relay_settings_changed(self, *_args) -> None:
+        self._refresh_relay_controls()
+        width = self.root.winfo_width() if hasattr(self, "root") and hasattr(self.root, "winfo_width") else 1500
+        self._apply_setting_layout(self._layout_mode_for_width(width))
     @staticmethod
     def _mask(value: str, head: int = 6, tail: int = 4) -> str:
         return mask_text(value, head=head, tail=tail)
@@ -646,11 +695,13 @@ class OnchainTransferPageBase:
         if status == "running":
             return "进行中"
         if status == "success":
-            return "完成"
+            return "✅"
         if status == "failed":
-            return "失败"
+            return "❌"
         if status == "submitted":
             return "确认中"
+        if status == "incomplete":
+            return "待处理"
         return "-"
     @staticmethod
     def _status_tag(status: str) -> str:
@@ -664,21 +715,27 @@ class OnchainTransferPageBase:
             return "st_failed"
         if status == "submitted":
             return "st_submitted"
+        if status == "incomplete":
+            return "st_incomplete"
         return ""
     @staticmethod
     def _success_status_text(coin: str, amount_text: str) -> str:
         amount = str(amount_text or "").strip()
-        coin_u = str(coin or "").strip().upper()
+        coin_text = str(coin or "").strip().lower()
         if not amount:
-            return "完成"
-        if coin_u:
-            return f"已转 {amount} {coin_u}"
-        return f"已转 {amount}"
+            return "✅"
+        if coin_text:
+            return f"✅{amount}{coin_text}"
+        return f"✅{amount}"
     def _status_text_for_row(self, row_key: str, status: str) -> str:
-        if status == "success":
-            custom = str(getattr(self, "row_status_text_map", {}).get(row_key, "") or "").strip()
-            if custom and self._context_matches(row_key, getattr(self, "row_status_context", {})):
-                return custom
+        custom = str(getattr(self, "row_status_text_map", {}).get(row_key, "") or "").strip()
+        if custom and self._context_matches(row_key, getattr(self, "row_status_context", {})):
+            return custom
+        return self._status_text(status)
+    def _recovery_status_text_for_row(self, row_key: str, status: str) -> str:
+        custom = str(getattr(self, "row_recovery_text_map", {}).get(row_key, "") or "").strip()
+        if custom and self._context_matches(row_key, getattr(self, "row_recovery_context", {})):
+            return custom
         return self._status_text(status)
     @staticmethod
     def _m2m_key(item: OnchainPairEntry) -> str:
@@ -721,6 +778,10 @@ class OnchainTransferPageBase:
             return query_status.get(row_key, "")
         if self._context_matches(row_key, getattr(self, "row_status_context", {})):
             return getattr(self, "row_status", {}).get(row_key, "")
+        return ""
+    def _display_recovery_status(self, row_key: str) -> str:
+        if self._context_matches(row_key, getattr(self, "row_recovery_context", {})):
+            return getattr(self, "row_recovery_status", {}).get(row_key, "")
         return ""
     def _available_import_targets(self) -> dict[str, str]:
         mode = self._mode()
@@ -828,6 +889,14 @@ class OnchainTransferPageBase:
             self.row_status_context.pop(key, None)
             return
         self.row_status_context[key] = str(context_sig or "")
+    def _mark_recovery_status_context(self, row_key: str, context_sig: str) -> None:
+        key = str(row_key or "").strip()
+        if not hasattr(self, "row_recovery_context"):
+            self.row_recovery_context = {}
+        if key.startswith("m2m:"):
+            self.row_recovery_context.pop(key, None)
+            return
+        self.row_recovery_context[key] = str(context_sig or "")
     def _mark_query_status_context(self, row_key: str, context_sig: str) -> None:
         key = str(row_key or "").strip()
         if not hasattr(self, "query_row_status_context"):
@@ -971,6 +1040,7 @@ class OnchainTransferPageBase:
         idx = self.row_index_map[row_id]
         checked = "✓" if row_key in self.checked_row_keys else ""
         status = self._display_status(row_key)
+        recovery_status = self._display_recovery_status(row_key)
         mode = self._mode()
 
         if mode == self.MODE_M2M:
@@ -983,6 +1053,7 @@ class OnchainTransferPageBase:
                 self._display_credential(item.source),
                 item.target,
                 self._status_text_for_row(row_key, status),
+                self._recovery_status_text_for_row(row_key, recovery_status),
                 self._balance_text_for_source(item.source),
             )
         elif mode == self.MODE_1M:
@@ -996,6 +1067,7 @@ class OnchainTransferPageBase:
                 self._display_credential(source),
                 target,
                 self._status_text_for_row(row_key, status),
+                self._recovery_status_text_for_row(row_key, recovery_status),
                 self._balance_text_for_target(target),
             )
         else:
@@ -1009,12 +1081,13 @@ class OnchainTransferPageBase:
                 self._display_credential(source),
                 target if target else "-",
                 self._status_text_for_row(row_key, status),
+                self._recovery_status_text_for_row(row_key, recovery_status),
                 self._balance_text_for_source(source),
             )
 
         self.tree.item(row_id, values=values)
         tag = self._status_tag(status)
-        self.tree.item(row_id, tags=(tag,) if tag else ())
+        self.tree.item(row_id, tags=((tag,) if tag else ()))
     def _update_rows_view(self, row_keys: list[str]):
         for row_key in row_keys:
             self._update_row_view(row_key)
@@ -1024,6 +1097,8 @@ class OnchainTransferPageBase:
     def _progress_store(self, kind: str) -> dict[str, str]:
         if kind == "query":
             return self._ensure_query_status_store()
+        if kind == "recovery":
+            return self.row_recovery_status
         return self.row_status
     def _begin_progress(self, kind: str, row_keys: list[str]):
         task_progress.begin(self, kind, row_keys, amount_label="转账总额")
@@ -1101,6 +1176,9 @@ class OnchainTransferPageBase:
         success: int,
         failed: int,
         detail_text: str = "",
+        action_buttons: list[tuple[str, object, bool]] | None = None,
+        success_label: str = "成功",
+        failed_label: str = "失败",
     ) -> None:
         parent = getattr(self, "root", None) or self.parent
         dialog = tk.Toplevel(parent)
@@ -1116,9 +1194,9 @@ class OnchainTransferPageBase:
 
         counts = ttk.Frame(body)
         counts.pack(anchor="w", pady=(10, 0))
-        ttk.Label(counts, text="成功：").pack(side=LEFT)
+        ttk.Label(counts, text=f"{str(success_label or '成功')}：").pack(side=LEFT)
         tk.Label(counts, text=str(int(success)), fg="#1E8449").pack(side=LEFT)
-        ttk.Label(counts, text="   失败：").pack(side=LEFT)
+        ttk.Label(counts, text=f"   {str(failed_label or '失败')}：").pack(side=LEFT)
         tk.Label(counts, text=str(int(failed)), fg="#C62828").pack(side=LEFT)
 
         detail = str(detail_text or "").strip()
@@ -1127,6 +1205,21 @@ class OnchainTransferPageBase:
 
         btn_row = ttk.Frame(body)
         btn_row.pack(fill="x", pady=(14, 0))
+        for label, callback, enabled in list(action_buttons or []):
+            def _run_action(cb=callback):
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
+                if callable(cb):
+                    cb()
+
+            ttk.Button(
+                btn_row,
+                text=str(label or "操作"),
+                command=_run_action,
+                state=("normal" if enabled else "disabled"),
+            ).pack(side=RIGHT, padx=(8, 0))
         ttk.Button(btn_row, text="确定", command=dialog.destroy).pack(side=RIGHT)
 
         dialog.update_idletasks()
@@ -1154,16 +1247,22 @@ class OnchainTransferPageBase:
     def _set_status(self, row_key: str, status: str, status_text: str = ""):
         self._ensure_query_status_store().pop(row_key, None)
         self.row_status[row_key] = status
-        if status == "success":
-            text = str(status_text or "").strip()
-            if text:
-                self.row_status_text_map[row_key] = text
-            else:
-                self.row_status_text_map.pop(row_key, None)
+        text = str(status_text or "").strip()
+        if text:
+            self.row_status_text_map[row_key] = text
         else:
             self.row_status_text_map.pop(row_key, None)
         queue_ui_render(self, lambda k=row_key: self._update_row_view(k), root=getattr(self, "root", None))
         self._refresh_progress_if_active("transfer", row_key)
+    def _set_recovery_status(self, row_key: str, status: str, status_text: str = ""):
+        self.row_recovery_status[row_key] = status
+        text = str(status_text or "").strip()
+        if text:
+            self.row_recovery_text_map[row_key] = text
+        else:
+            self.row_recovery_text_map.pop(row_key, None)
+        queue_ui_render(self, lambda k=row_key: self._update_row_view(k), root=getattr(self, "root", None))
+        self._refresh_progress_if_active("recovery", row_key)
     def _set_query_status(self, row_key: str, status: str):
         self._ensure_query_status_store()[row_key] = status
         queue_ui_render(self, lambda k=row_key: self._update_row_view(k), root=getattr(self, "root", None))
@@ -1202,6 +1301,9 @@ class OnchainTransferPageBase:
         self.row_status = {k: v for k, v in self.row_status.items() if k in active}
         self.row_status_text_map = {k: v for k, v in self.row_status_text_map.items() if k in active}
         self.row_status_context = {k: v for k, v in self.row_status_context.items() if k in active}
+        self.row_recovery_status = {k: v for k, v in self.row_recovery_status.items() if k in active}
+        self.row_recovery_text_map = {k: v for k, v in self.row_recovery_text_map.items() if k in active}
+        self.row_recovery_context = {k: v for k, v in self.row_recovery_context.items() if k in active}
         self.query_row_status = {k: v for k, v in self._ensure_query_status_store().items() if k in active}
         self.query_row_status_context = {k: v for k, v in self.query_row_status_context.items() if k in active}
 
@@ -1226,9 +1328,10 @@ class OnchainTransferPageBase:
                         self._display_credential(item.source),
                         item.target,
                         self._status_text_for_row(key, st),
+                        self._recovery_status_text_for_row(key, self._display_recovery_status(key)),
                         self._balance_text_for_source(item.source),
                     ),
-                    tags=(tag,) if tag else (),
+                    tags=((tag,) if tag else ()),
                 )
             start_index = len(self.store.multi_to_multi_pairs) + 1
             for i, row in enumerate(self.m2m_import_drafts, start=start_index):
@@ -1245,6 +1348,7 @@ class OnchainTransferPageBase:
                         self._display_credential(row.get("source", "")),
                         row.get("target", "") or "-",
                         "待补齐",
+                        "-",
                         "-",
                     ),
                     tags=("st_incomplete",),
@@ -1274,10 +1378,11 @@ class OnchainTransferPageBase:
                         self._display_credential(source),
                         target,
                         self._status_text_for_row(key, st),
+                        self._recovery_status_text_for_row(key, self._display_recovery_status(key)),
                         self._balance_text_for_target(target),
-                ),
-                tags=(tag,) if tag else (),
-            )
+                    ),
+                    tags=((tag,) if tag else ()),
+                )
             self._apply_import_target_view()
             self._update_empty_hint()
             return
@@ -1302,9 +1407,10 @@ class OnchainTransferPageBase:
                     self._display_credential(source),
                     target if target else "-",
                     self._status_text_for_row(key, st),
+                    self._recovery_status_text_for_row(key, self._display_recovery_status(key)),
                     self._balance_text_for_source(source),
                 ),
-                tags=(tag,) if tag else (),
+                tags=((tag,) if tag else ()),
             )
         self._apply_import_target_view()
         self._update_empty_hint()
@@ -1466,11 +1572,17 @@ class OnchainTransferPageBase:
             self.ent_delay,
             self.lbl_threads,
             self.spin_threads,
+            self.lbl_confirm_timeout,
+            self.ent_confirm_timeout,
             self.lbl_source_credential,
             self.ent_source_credential,
             self.btn_query_source_balance,
             self.lbl_source_balance_title,
             self.lbl_source_balance_val,
+            self.chk_relay_enabled,
+            self.lbl_relay_fee_reserve,
+            self.ent_relay_fee_reserve,
+            self.lbl_relay_wallet_file,
             self.lbl_target_address,
             self.ent_target_address,
             self.btn_query_target_balance,
@@ -1480,11 +1592,12 @@ class OnchainTransferPageBase:
         for w in widgets:
             w.grid_forget()
 
-        for c in range(12):
+        for c in range(14):
             self.setting_frame.columnconfigure(c, weight=0)
 
         show_source = self._is_mode_1m()
         show_target = self._is_mode_m1()
+        show_relay = show_source
 
         if layout_mode == "wide":
             self.lbl_mode.grid(row=0, column=0, sticky=W)
@@ -1506,11 +1619,16 @@ class OnchainTransferPageBase:
             self.ent_delay.grid(row=1, column=9, sticky=W, padx=(4, 10), pady=(8, 0))
             self.lbl_threads.grid(row=1, column=10, sticky=W, pady=(8, 0))
             self.spin_threads.grid(row=1, column=11, sticky=W, padx=(4, 0), pady=(8, 0))
+            if not show_relay:
+                self.lbl_confirm_timeout.grid(row=1, column=12, sticky=W, pady=(8, 0))
+                self.ent_confirm_timeout.grid(row=1, column=13, sticky=W, padx=(4, 0), pady=(8, 0))
             self.setting_frame.columnconfigure(1, weight=1)
             self.setting_frame.columnconfigure(3, weight=1)
             self.setting_frame.columnconfigure(5, weight=1)
             self.setting_frame.columnconfigure(6, weight=1)
             self.setting_frame.columnconfigure(11, weight=1)
+            if not show_relay:
+                self.setting_frame.columnconfigure(13, weight=1)
 
             row = 2
             if show_source:
@@ -1519,6 +1637,16 @@ class OnchainTransferPageBase:
                 self.btn_query_source_balance.grid(row=row, column=5, sticky=W, padx=(0, 8), pady=(8, 0))
                 self.lbl_source_balance_title.grid(row=row, column=6, sticky=W, pady=(8, 0))
                 self.lbl_source_balance_val.grid(row=row, column=7, columnspan=3, sticky=W, padx=(4, 0), pady=(8, 0))
+                row += 1
+
+            if show_relay:
+                self.chk_relay_enabled.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                self.lbl_relay_fee_reserve.grid(row=row, column=1, sticky=W, pady=(8, 0))
+                self.ent_relay_fee_reserve.grid(row=row, column=2, sticky=W, padx=(4, 10), pady=(8, 0))
+                self.lbl_confirm_timeout.grid(row=row, column=3, sticky=W, pady=(8, 0))
+                self.ent_confirm_timeout.grid(row=row, column=4, sticky=W, padx=(4, 10), pady=(8, 0))
+                row += 1
+                self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=11, sticky=W, pady=(6, 0))
                 row += 1
 
             if show_target:
@@ -1550,8 +1678,11 @@ class OnchainTransferPageBase:
             self.ent_delay.grid(row=1, column=8, sticky=W, padx=(4, 10), pady=(8, 0))
             self.lbl_threads.grid(row=1, column=9, sticky=W, pady=(8, 0))
             self.spin_threads.grid(row=1, column=10, sticky=W, padx=(4, 0), pady=(8, 0))
-
             row = 2
+            if not show_relay:
+                self.lbl_confirm_timeout.grid(row=row, column=7, sticky=W, padx=(10, 0), pady=(8, 0))
+                self.ent_confirm_timeout.grid(row=row, column=8, sticky=W, padx=(4, 10), pady=(8, 0))
+                row += 1
 
             if show_source:
                 self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
@@ -1559,6 +1690,16 @@ class OnchainTransferPageBase:
                 self.btn_query_source_balance.grid(row=row, column=4, sticky=W, padx=(0, 8), pady=(8, 0))
                 self.lbl_source_balance_title.grid(row=row, column=5, sticky=W, pady=(8, 0))
                 self.lbl_source_balance_val.grid(row=row, column=6, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
+                row += 1
+
+            if show_relay:
+                self.chk_relay_enabled.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                self.lbl_relay_fee_reserve.grid(row=row, column=1, sticky=W, pady=(8, 0))
+                self.ent_relay_fee_reserve.grid(row=row, column=2, sticky=W, padx=(4, 8), pady=(8, 0))
+                self.lbl_confirm_timeout.grid(row=row, column=3, sticky=W, pady=(8, 0))
+                self.ent_confirm_timeout.grid(row=row, column=4, sticky=W, padx=(4, 8), pady=(8, 0))
+                row += 1
+                self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=10, sticky=W, pady=(6, 0))
                 row += 1
 
             if show_target:
@@ -1603,6 +1744,10 @@ class OnchainTransferPageBase:
         self.lbl_threads.grid(row=row, column=0, sticky=W, pady=(8, 0))
         self.spin_threads.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
         row += 1
+        if not show_relay:
+            self.lbl_confirm_timeout.grid(row=row, column=0, sticky=W, pady=(8, 0))
+            self.ent_confirm_timeout.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+            row += 1
 
         self.chk_dry_run.grid(row=row, column=0, columnspan=2, sticky=W, pady=(8, 0))
         row += 1
@@ -1616,6 +1761,17 @@ class OnchainTransferPageBase:
             self.btn_query_source_balance.grid(row=row, column=2, sticky=W, padx=(0, 6), pady=(8, 0))
             self.lbl_source_balance_title.grid(row=row, column=3, sticky=W, pady=(8, 0))
             self.lbl_source_balance_val.grid(row=row, column=4, sticky=W, padx=(4, 0), pady=(8, 0))
+            row += 1
+
+        if show_relay:
+            self.chk_relay_enabled.grid(row=row, column=0, columnspan=2, sticky=W, pady=(8, 0))
+            self.lbl_relay_fee_reserve.grid(row=row, column=2, sticky=W, padx=(10, 0), pady=(8, 0))
+            self.ent_relay_fee_reserve.grid(row=row, column=3, sticky="ew", padx=(4, 0), pady=(8, 0))
+            row += 1
+            self.lbl_confirm_timeout.grid(row=row, column=0, sticky=W, pady=(8, 0))
+            self.ent_confirm_timeout.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+            row += 1
+            self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=5, sticky=W, pady=(6, 0))
             row += 1
 
         if show_target:
@@ -1644,7 +1800,7 @@ class OnchainTransferPageBase:
     def _resize_tree_columns(self):
         if not hasattr(self, "tree"):
             return
-        cols = ("checked", "idx", "source", "target", "status", "balance")
+        cols = ("checked", "idx", "source", "target", "status", "recovery", "balance")
         width = self.tree.winfo_width()
         if width <= 1 and hasattr(self, "table_wrap"):
             width = self.table_wrap.winfo_width() - 20
@@ -1654,14 +1810,14 @@ class OnchainTransferPageBase:
         min_widths = dict(self.TREE_COL_MIN_WIDTHS)
         weights = dict(self.TREE_COL_WEIGHTS)
         if width < 820:
-            min_widths.update({"source": 150, "target": 220, "status": 84, "balance": 68})
-            weights.update({"source": 3, "target": 6, "status": 2, "balance": 1})
+            min_widths.update({"source": 150, "target": 220, "status": 92, "recovery": 84, "balance": 68})
+            weights.update({"source": 3, "target": 6, "status": 2, "recovery": 2, "balance": 1})
         elif width < 980:
-            min_widths.update({"source": 170, "target": 250, "status": 86, "balance": 72})
-            weights.update({"source": 3, "target": 6, "status": 2, "balance": 1})
+            min_widths.update({"source": 170, "target": 250, "status": 96, "recovery": 86, "balance": 72})
+            weights.update({"source": 3, "target": 6, "status": 2, "recovery": 2, "balance": 1})
         elif width < 1220:
-            min_widths.update({"source": 210, "target": 300, "status": 90, "balance": 76})
-            weights.update({"source": 4, "target": 6, "status": 2, "balance": 1})
+            min_widths.update({"source": 210, "target": 300, "status": 100, "recovery": 90, "balance": 76})
+            weights.update({"source": 4, "target": 6, "status": 2, "recovery": 2, "balance": 1})
 
         total_min = sum(min_widths[c] for c in cols)
 
@@ -1691,6 +1847,7 @@ class OnchainTransferPageBase:
     def _on_mode_changed(self, *_args):
         mode = self._mode()
         self._set_import_target("full")
+        self._refresh_relay_controls()
         if mode == self.MODE_M2M:
             self.source_balance_var.set("-")
             self.target_balance_var.set("-")
@@ -1763,6 +1920,23 @@ class OnchainTransferPageBase:
         if len(s) <= 12:
             return s
         return f"{s[:8]}...{s[-6:]}"
+    def _open_export_file(self, path: Path, label: str) -> None:
+        target = Path(path)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.touch()
+            if hasattr(os, "startfile"):
+                os.startfile(str(target))
+                self.log(f"{label}：已打开 {target.name}")
+                return
+            messagebox.showinfo("文件路径", f"{label}：{target}")
+        except Exception as exc:
+            messagebox.showerror("打开失败", f"{label} 打开失败：{exc}")
+    def open_relay_manual_export_file(self) -> None:
+        self._open_export_file(RELAY_MANUAL_EXPORT_FILE, "待人工处理文件")
+    def open_relay_failed_export_file(self) -> None:
+        self._open_export_file(RELAY_FAILED_EXPORT_FILE, "失败账号文件")
     def log(self, text: str):
         queue_log_row(self, self.log_tree, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
     def test_onchain_proxy(self):

@@ -11,6 +11,8 @@ def _task_title(kind: str, finished: bool) -> str:
         return "查询完成" if finished else "查询进度"
     if kind == "transfer":
         return "转账完成" if finished else "转账进度"
+    if kind == "recovery":
+        return "回收完成" if finished else "回收进度"
     if kind == "withdraw":
         return "提现完成" if finished else "提现进度"
     return "任务完成" if finished else "任务进度"

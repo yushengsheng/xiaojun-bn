@@ -88,7 +88,9 @@ class Strategy:
             if self._is_convert_mode():
                 sold = self.c.convert_base_to_quote_all(self.spot_symbol)
             else:
-                sold = self.c.spot_sell_all_base(self.spot_symbol)
+                base_asset = self.c.get_spot_base_asset(self.spot_symbol)
+                small_qty_log_text = "残留BNB数量过小，跳过补救卖出" if base_asset == "BNB" else None
+                sold = self.c.spot_sell_all_base(self.spot_symbol, small_qty_log_text=small_qty_log_text)
             if sold:
                 logger.info("【补救措施】检测到残留基础币，已执行补充卖出。")
         except Exception as e:

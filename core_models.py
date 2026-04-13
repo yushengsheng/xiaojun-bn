@@ -36,12 +36,17 @@ class WithdrawRuntimeParams:
     network: str
     delay: float
     threads: int
+    confirm_timeout_seconds: float = 180.0
     random_enabled: bool = False
     random_min: Decimal | None = None
     random_max: Decimal | None = None
     token_contract: str = ""
     token_decimals: int = 18
     token_is_native: bool = True
+    relay_enabled: bool = False
+    relay_fee_reserve: Decimal | None = None
+    relay_sweep_enabled: bool = False
+    relay_sweep_target: str = ""
 
 
 @dataclass
@@ -76,8 +81,13 @@ class OnchainSettings:
     random_max: str = ""
     delay_seconds: float = 1.0
     worker_threads: int = 10
+    confirm_timeout_seconds: float = 180.0
     dry_run: bool = True
     use_config_proxy: bool = False
     proxy_url: str = ""
     one_to_many_source: str = ""
     many_to_one_target: str = ""
+    relay_enabled: bool = False
+    relay_fee_reserve: str = ""
+    relay_sweep_enabled: bool = True
+    relay_sweep_target: str = ""
