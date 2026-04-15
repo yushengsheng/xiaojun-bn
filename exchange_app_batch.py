@@ -552,6 +552,24 @@ class ExchangeAppBatchMixin(object):
             self._apply_account_row_style(previous)
         if acc is not None:
             self._apply_account_row_style(acc)
+    def _on_account_tree_selection_changed(self, _event=None):
+        tree = getattr(self, "account_tree", None)
+        if tree is None:
+            return None
+        current_context = getattr(self, "_context_account", None)
+        if current_context is None:
+            return None
+        try:
+            selected = tree.selection()
+        except Exception:
+            selected = ()
+        if not selected:
+            self._set_context_account(None)
+            return None
+        selected_acc = self._account_from_tree_row_id(selected[0])
+        if selected_acc is not current_context:
+            self._set_context_account(None)
+        return None
     def _on_account_tree_double_click(self, event):
         tree = getattr(self, "account_tree", None)
         if tree is None or tree.identify("region", event.x, event.y) != "cell":
@@ -578,6 +596,7 @@ class ExchangeAppBatchMixin(object):
         if acc is None:
             return None
         try:
+            tree.selection_set(row_id)
             tree.focus(row_id)
         except Exception:
             pass
@@ -678,14 +697,22 @@ class ExchangeAppBatchMixin(object):
             return "--"
         items.sort(key=lambda item: (-item[1], item[0]))
         return " | ".join(f"{asset} {cls._format_amount(float(amount_dec))}" for asset, amount_dec in items)
+    @staticmethod
+    def _exchange_success_status_text(text: str, *, fallback: str = "成功") -> str:
+        body = str(text or "").strip() or str(fallback or "成功").strip() or "成功"
+        return body if body.startswith("✔") else f"✔{body}"
+    @staticmethod
+    def _exchange_failed_status_text(text: str, *, fallback: str = "失败") -> str:
+        body = str(text or "").strip() or str(fallback or "失败").strip() or "失败"
+        return body if body.startswith("×") else f"×{body}"
     @classmethod
-    def _format_withdraw_amount_status(cls, amount: float, coin: str, *, enable_withdraw: bool) -> str:
+    def _format_withdraw_amount_status(cls, amount: float, coin: str, *, enable_withdraw: bool) -> tuple[str, bool]:
         coin_u = str(coin or "").strip().upper()
         if amount > 0:
-            return f"提现额度 {cls._format_amount(amount)} {coin_u}"
+            return cls._exchange_success_status_text(f"提现{cls._format_amount(amount)} {coin_u}"), True
         if not enable_withdraw:
-            return f"提现额度 0 {coin_u}（自动提现已关闭）"
-        return f"提现额度 0 {coin_u}（可提余额不足/预留过高）"
+            return cls._exchange_success_status_text("自动提现已关闭"), True
+        return cls._exchange_failed_status_text("提现失败：可提余额不足/预留过高"), False
     @staticmethod
     def _compact_error_text(err_text: str, max_len: int = 28) -> str:
         s = str(err_text or "").strip().replace("\n", " ")
@@ -697,8 +724,8 @@ class ExchangeAppBatchMixin(object):
         prefix_text = str(prefix or "").strip() or str(fallback or "异常").strip() or "异常"
         reason_text = summarize_exchange_exception(err, fallback=fallback, max_len=22)
         if not reason_text:
-            return prefix_text
-        return f"{prefix_text}: {reason_text}"
+            return ExchangeAppBatchMixin._exchange_failed_status_text(prefix_text, fallback=fallback)
+        return ExchangeAppBatchMixin._exchange_failed_status_text(f"{prefix_text}: {reason_text}", fallback=fallback)
     @staticmethod
     def _account_batch_key(acc: dict) -> str:
         key = str((acc or {}).get("api_key") or "").strip()
@@ -1412,7 +1439,11 @@ class ExchangeAppBatchMixin(object):
                             asset_text if asset_text != "--" else "无币种资产",
                         )
 
-                        set_status(asset_text if asset_text != "--" else f"总资产 {Decimal(str(total_usdt)):.4f} USDT")
+                        set_status(
+                            self._exchange_success_status_text(
+                                asset_text if asset_text != "--" else f"总资产 {Decimal(str(total_usdt)):.4f} USDT"
+                            )
+                        )
                         op_success = True
 
                     # 2) 批量归集BNB模式
@@ -1496,8 +1527,13 @@ class ExchangeAppBatchMixin(object):
                             self._record_batch_withdraw_metric(acc, amount, "BNB")
                             if amount > 0:
                                 self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
-                            set_status(self._format_withdraw_amount_status(amount, "BNB", enable_withdraw=enable_withdraw))
-                            op_success = True
+                            status_text, withdraw_success = self._format_withdraw_amount_status(
+                                amount,
+                                "BNB",
+                                enable_withdraw=enable_withdraw,
+                            )
+                            set_status(status_text)
+                            op_success = withdraw_success
                         except Exception as e:
                             logger.error(f"账号 #{idx} BNB提现失败: {e}")
                             set_status(self._exchange_error_status_text("BNB提现失败", e, fallback="BNB提现失败"))
@@ -1527,10 +1563,10 @@ class ExchangeAppBatchMixin(object):
                                 else:
                                     if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
                                         logger.info(f"账号 #{idx} 挂单余额检测超时，跳过")
-                                        set_status("无可挂单余额")
+                                        set_status(self._exchange_failed_status_text("无可挂单余额"))
                                     else:
                                         logger.info(f"账号 #{idx} {quote_asset} 检测超时，跳过")
-                                        set_status(f"{quote_asset} 未到账")
+                                        set_status(self._exchange_failed_status_text(f"{quote_asset} 未到账"))
                                     finish_current_now(success=False)
                                 continue
                         else:
@@ -1676,14 +1712,13 @@ class ExchangeAppBatchMixin(object):
                                 op_success = False
                             else:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
-                                set_status(
-                                    self._format_withdraw_amount_status(
-                                        float(final_amount or 0.0),
-                                        withdraw_coin,
-                                        enable_withdraw=enable_withdraw,
-                                    )
+                                status_text, withdraw_success = self._format_withdraw_amount_status(
+                                    float(final_amount or 0.0),
+                                    withdraw_coin,
+                                    enable_withdraw=enable_withdraw,
                                 )
-                                op_success = True
+                                set_status(status_text)
+                                op_success = withdraw_success
                         else:
                             set_status("已停止")
                             op_success = False
@@ -1866,8 +1901,13 @@ class ExchangeAppBatchMixin(object):
                             self._record_batch_withdraw_metric(acc, amount, coin)
                             if amount > 0:
                                 self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
-                            set_status(self._format_withdraw_amount_status(amount, coin, enable_withdraw=True))
-                            op_success = True
+                            status_text, withdraw_success = self._format_withdraw_amount_status(
+                                amount,
+                                coin,
+                                enable_withdraw=True,
+                            )
+                            set_status(status_text)
+                            op_success = withdraw_success
                 except Exception as e:
                     logger.error(f"账号 #{idx} 提现失败: {e}")
                     set_status(self._exchange_error_status_text("提现失败", e, fallback="提现失败"))

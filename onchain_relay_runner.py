@@ -1888,12 +1888,18 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
         batch_scope_ids: set[str] = set()
         if not dry_run:
             source_private_key, source_addr = owner._resolve_wallet(jobs_data[0][1])
+            cleanup_worker_threads = max(1, int(owner._runtime_worker_threads()))
             checked, removed, kept = owner.relay_wallet_store.cleanup_expired_empty_records(
                 owner.client,
                 log=lambda message: dispatch_ui(lambda m=message: owner.log(m)),
+                worker_threads=cleanup_worker_threads,
             )
             if checked > 0:
-                dispatch_ui(lambda: owner.log(f"中转钱包过期清理完成：检查 {checked}，移除 {removed}，保留 {kept}"))
+                dispatch_ui(
+                    lambda: owner.log(
+                        f"中转钱包过期清理完成：检查 {checked}，移除 {removed}，保留 {kept}，线程数={cleanup_worker_threads}"
+                    )
+                )
             existing_records = owner.relay_wallet_store.load_records()
             resume_candidates_by_target: dict[str, list[RelayWalletRecord]] = {}
             for record in existing_records:

@@ -390,9 +390,9 @@ class ExchangeAppAccountsMixin(object):
             return "#ffe3b8"
         if any(k in s for k in ("已停止", "已请求停止")):
             return "#ffe3b8"
-        if any(k in s for k in ("失败", "异常")):
+        if s.startswith("×") or any(k in s for k in ("失败", "异常")):
             return "#f8c7c7"
-        if any(k in s for k in ("成功", "完成", "总资产", "无可提", "提现额度")):
+        if s.startswith("✔") or any(k in s for k in ("成功", "完成", "总资产", "无可提", "提现额度")):
             return "#cfeecf"
         return "#cfe3ff"
     def _is_context_account(self, acc: dict) -> bool:
@@ -405,9 +405,9 @@ class ExchangeAppAccountsMixin(object):
             return "acc_ready"
         if "未到账" in s or any(k in s for k in ("已停止", "已请求停止")):
             return "acc_warn"
-        if any(k in s for k in ("失败", "异常")):
+        if s.startswith("×") or any(k in s for k in ("失败", "异常")):
             return "acc_failed"
-        if any(k in s for k in ("成功", "完成", "总资产", "无可提", "提现额度")):
+        if s.startswith("✔") or any(k in s for k in ("成功", "完成", "总资产", "无可提", "提现额度")):
             return "acc_success"
         return "acc_running"
     def _account_tree_values(self, acc: dict) -> tuple[str, str, str, str, str, str]:
@@ -509,6 +509,7 @@ class ExchangeAppAccountsMixin(object):
         self.acc_withdraw_addr_var.set("")
     def delete_selected_accounts(self):
         selected_count = sum(1 for acc in self.accounts if acc["selected_var"].get())
+        logger.info("当前选中账号 %d 个，准备删除", selected_count)
         if selected_count <= 0:
             messagebox.showinfo("提示", "请至少勾选一个账号")
             return
@@ -533,14 +534,19 @@ class ExchangeAppAccountsMixin(object):
         self._reindex_accounts()
         self._update_toggle_select_button_text()
         self._schedule_accounts_save()
+        logger.info("已删除选中账号 %d 个，当前剩余 %d 个", selected_count, len(self.accounts))
     def select_all_accounts(self):
+        total_count = len(self.accounts)
         for acc in self.accounts:
             acc["selected_var"].set(True)
         self._update_toggle_select_button_text()
+        logger.info("已选中账号 %d 个", total_count)
     def deselect_all_accounts(self):
+        selected_count = sum(1 for acc in self.accounts if acc["selected_var"].get())
         for acc in self.accounts:
             acc["selected_var"].set(False)
         self._update_toggle_select_button_text()
+        logger.info("已取消选中账号 %d 个", selected_count)
     def toggle_select_all_accounts(self):
         if self.accounts and all(acc["selected_var"].get() for acc in self.accounts):
             self.deselect_all_accounts()

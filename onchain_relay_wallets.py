@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import tempfile
@@ -248,7 +249,7 @@ class RelayWalletFileStore:
             sweep_target=str(sweep_target or "").strip(),
         )
 
-    def cleanup_expired_empty_records(self, client, *, log=None) -> tuple[int, int, int]:
+    def cleanup_expired_empty_records(self, client, *, log=None, worker_threads: int = 1) -> tuple[int, int, int]:
         removed = 0
         kept = 0
         checked = 0
@@ -256,31 +257,73 @@ class RelayWalletFileStore:
         with self._lock:
             records = self._load_records_locked()
             remain: list[RelayWalletRecord] = []
+            expired_records: list[RelayWalletRecord] = []
             for record in records:
                 expires_at = _parse_utc_text(record.expires_at)
                 if expires_at is None or expires_at > now:
                     remain.append(record)
                     continue
-                checked += 1
+                expired_records.append(record)
+
+            checked = len(expired_records)
+            if not expired_records:
+                return checked, removed, kept
+
+            tracked_contracts_by_network: dict[str, list[str]] = {}
+            for record in expired_records:
+                network = str(record.network or "").strip().upper()
+                if network in tracked_contracts_by_network:
+                    continue
+                contracts: list[str] = []
+                for token in client.get_default_tokens(network):
+                    if bool(getattr(token, "is_native", False)):
+                        continue
+                    symbol = str(getattr(token, "symbol", "") or "").strip().upper()
+                    if symbol not in RELAY_TRACKED_BALANCE_SYMBOLS:
+                        continue
+                    contract = str(getattr(token, "contract", "") or "").strip()
+                    if contract:
+                        contracts.append(contract)
+                tracked_contracts_by_network[network] = contracts
+
+            def inspect_record(record: RelayWalletRecord) -> tuple[bool, list[int] | Exception]:
                 try:
                     balances: list[int] = [int(client.get_balance_wei(record.network, record.relay_address))]
-                    for token in client.get_default_tokens(record.network):
-                        if bool(getattr(token, "is_native", False)):
-                            continue
-                        symbol = str(getattr(token, "symbol", "") or "").strip().upper()
-                        if symbol not in RELAY_TRACKED_BALANCE_SYMBOLS:
-                            continue
-                        contract = str(getattr(token, "contract", "") or "").strip()
-                        if not contract:
-                            continue
+                    for contract in tracked_contracts_by_network.get(str(record.network or "").strip().upper(), []):
                         balances.append(int(client.get_erc20_balance(record.network, contract, record.relay_address)))
+                    return True, balances
                 except Exception as exc:
+                    return False, exc
+
+            result_by_key: dict[tuple[str, str], tuple[bool, list[int] | Exception]] = {}
+            worker_count = max(1, min(int(worker_threads or 1), len(expired_records)))
+            if worker_count == 1:
+                for record in expired_records:
+                    record_key = (str(record.batch_id or "").strip(), str(record.relay_address or "").strip())
+                    result_by_key[record_key] = inspect_record(record)
+            else:
+                with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="relay-retention") as executor:
+                    future_map = {
+                        executor.submit(inspect_record, record): (
+                            str(record.batch_id or "").strip(),
+                            str(record.relay_address or "").strip(),
+                        )
+                        for record in expired_records
+                    }
+                    for future in as_completed(future_map):
+                        result_by_key[future_map[future]] = future.result()
+
+            for record in expired_records:
+                record_key = (str(record.batch_id or "").strip(), str(record.relay_address or "").strip())
+                ok, payload = result_by_key.get(record_key, (False, RuntimeError("cleanup result missing")))
+                if not ok:
                     kept += 1
                     remain.append(record)
                     if callable(log):
-                        log(f"中转钱包过期清理跳过：{record.relay_address} 查询失败：{exc}")
+                        log(f"中转钱包过期清理跳过：{record.relay_address} 查询失败：{payload}")
                     continue
 
+                balances = payload
                 if all(int(value) == 0 for value in balances):
                     removed += 1
                     if callable(log):

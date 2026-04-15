@@ -280,12 +280,22 @@ class ExchangeAppBase(tk.Tk):
         self.frame_list_canvas.rowconfigure(0, weight=1)
 
         tree_cols = ("checked", "idx", "api_key", "address", "network", "status")
+        try:
+            account_tree_style = ttk.Style(self)
+            account_tree_style.map(
+                "ExchangeAccounts.Treeview",
+                background=[("selected", "#0A64AD")],
+                foreground=[("selected", "#FFFFFF")],
+            )
+        except Exception:
+            pass
         self.account_tree = ttk.Treeview(
             self.frame_list_canvas,
             columns=tree_cols,
             show="headings",
             selectmode="browse",
             height=9,
+            style="ExchangeAccounts.Treeview",
         )
         self._account_tree_row_to_account = {}
         self.account_tree.heading("checked", text="勾选")
@@ -303,9 +313,9 @@ class ExchangeAppBase(tk.Tk):
         self.account_tree.tag_configure("acc_ready", foreground="#111111", background="#F2F2F2")
         self.account_tree.tag_configure("acc_running", foreground="#111111", background="#CFE3FF")
         self.account_tree.tag_configure("acc_warn", foreground="#111111", background="#FFE3B8")
-        self.account_tree.tag_configure("acc_failed", foreground="#111111", background="#F8C7C7")
-        self.account_tree.tag_configure("acc_success", foreground="#111111", background="#CFEECF")
-        self.account_tree.tag_configure("acc_context", foreground="#FFFFFF", background="#7A3FF2")
+        self.account_tree.tag_configure("acc_failed", foreground="#C62828", background="#FDECEC")
+        self.account_tree.tag_configure("acc_success", foreground="#1E8449", background="#E8F5E9")
+        self.account_tree.tag_configure("acc_context", foreground="#FFFFFF", background="#0A64AD")
 
         self.account_tree_ybar = make_scrollbar(self.frame_list_canvas, orient="vertical", command=self.account_tree.yview)
         self.account_tree_xbar = make_scrollbar(self.frame_list_canvas, orient="horizontal", command=self.account_tree.xview)
@@ -321,6 +331,7 @@ class ExchangeAppBase(tk.Tk):
             anchor="center",
         )
         self.account_tree.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
+        self.account_tree.bind("<<TreeviewSelect>>", self._on_account_tree_selection_changed, add="+")
         self.account_tree.bind("<Double-Button-1>", self._on_account_tree_double_click, add="+")
         self.account_tree.bind("<Button-2>", self._on_account_tree_right_click, add="+")
         self.account_tree.bind("<Button-3>", self._on_account_tree_right_click, add="+")
