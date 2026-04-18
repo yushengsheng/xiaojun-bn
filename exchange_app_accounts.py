@@ -95,7 +95,26 @@ class ExchangeAppAccountsMixin(object):
         if len(addr) <= prefix + suffix:
             return addr
         return addr[:prefix] + "..." + addr[-suffix:]
+    def _should_handle_account_paste_shortcut(self, focus=None) -> bool:
+        tree = getattr(self, "account_tree", None)
+        if tree is None:
+            return False
+        try:
+            if not tree.winfo_viewable():
+                return False
+        except Exception:
+            return False
+        if focus is tree:
+            return True
+        return self._pointer_in_account_list()
     def _on_paste_shortcut(self, event=None):
+        focus = self.focus_get()
+        if focus is not None:
+            widget_class = str(focus.winfo_class())
+            if widget_class in {"Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox"}:
+                return None
+        if not self._should_handle_account_paste_shortcut(focus):
+            return None
         try:
             raw = self.clipboard_get()
         except tk.TclError:
@@ -105,12 +124,6 @@ class ExchangeAppAccountsMixin(object):
         if parsed:
             self._import_accounts_from_text(raw, "剪贴板")
             return "break"
-
-        focus = self.focus_get()
-        if focus is not None:
-            widget_class = str(focus.winfo_class())
-            if widget_class in {"Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox"}:
-                return None
 
         if err_msg:
             messagebox.showerror("错误", f"剪贴板导入失败：{err_msg}")
