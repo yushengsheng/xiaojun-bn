@@ -344,7 +344,7 @@ class ExchangeAppBase(tk.Tk):
         self.account_row_menu.add_command(label="执行", command=self.run_context_account_execute)
         self.account_row_menu.add_command(label="停止", command=self.run_context_account_stop)
         self.account_row_menu.add_command(label="提现", command=self.run_context_account_withdraw)
-        self.account_row_menu.add_command(label="归集BNB", command=self.run_context_account_collect_bnb)
+        self.account_row_menu.add_command(label="归集BNB并提现", command=self.run_context_account_collect_bnb)
         self._context_account = None
         self._setup_account_list_mousewheel_bindings()
 
@@ -371,7 +371,21 @@ class ExchangeAppBase(tk.Tk):
         self.btn_query_all_assets.pack(side="left", padx=5)
         self.btn_batch_withdraw = ttk.Button(frame_batch_ctrl, text="批量提现", command=self.batch_manual_withdraw)
         self.btn_batch_withdraw.pack(side="left", padx=5)
-        self.btn_collect_bnb_combo = ttk.Button(frame_batch_ctrl, text="归集并买BNB", command=self.run_batch_collect_bnb_with_confirm)
+        try:
+            collect_withdraw_style = ttk.Style(self)
+            collect_withdraw_style.configure("CollectWithdraw.TButton", foreground="#C62828")
+            collect_withdraw_style.map(
+                "CollectWithdraw.TButton",
+                foreground=[("disabled", "#C08A8A"), ("active", "#B71C1C")],
+            )
+        except Exception:
+            pass
+        self.btn_collect_bnb_combo = ttk.Button(
+            frame_batch_ctrl,
+            text="归集BNB并提现",
+            command=self.run_batch_collect_bnb_with_confirm,
+            style="CollectWithdraw.TButton",
+        )
         self.btn_collect_bnb_combo.pack(side="left", padx=5)
 
         self.btn_del_accounts = ttk.Button(frame_batch_ctrl, text="删除选中", command=self.delete_selected_accounts)

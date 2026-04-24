@@ -16,6 +16,7 @@ import requests
 from api_clients import EvmClient
 from app_paths import LOG_FILE_PATH
 from core_models import EvmToken, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
+from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_binance_client import BinanceClient
 from exchange_logging import logger, runtime_log_path
 from onchain_relay_wallets import RelayWalletFileStore
@@ -662,6 +663,146 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     finally:
         collect_client.close()
     checks.append("collect-precision=ok")
+
+    class _SelftestLargeAssetBnbClient(BinanceClient):
+        def __init__(self):
+            super().__init__("selftest-key", "selftest-secret")
+            self.actions: list[tuple[str, str]] = []
+
+        def spot_all_balances(self, *, fast: bool = False):
+            return [
+                {"asset": "AAA", "free": "5", "locked": "0", "total": "5"},
+                {"asset": "BBB", "free": "7", "locked": "0", "total": "7"},
+                {"asset": "CCC", "free": "9", "locked": "0", "total": "9"},
+                {"asset": "USDT", "free": "11", "locked": "0", "total": "11"},
+                {"asset": "BNB", "free": "1", "locked": "0", "total": "1"},
+            ]
+
+        def get_convert_pair_info(self, from_asset: str, to_asset: str) -> dict[str, object] | None:
+            from_asset_u = str(from_asset or "").strip().upper()
+            to_asset_u = str(to_asset or "").strip().upper()
+            if (from_asset_u, to_asset_u) == ("AAA", "BNB"):
+                return {"fromAsset": "AAA", "toAsset": "BNB"}
+            return None
+
+        def convert_with_from_amount(
+            self,
+            from_asset: str,
+            to_asset: str,
+            from_amount,
+            *,
+            wallet_type: str = "SPOT",
+            valid_time: str = "10s",
+        ):
+            self.actions.append(("convert", f"{str(from_asset).upper()}->{str(to_asset).upper()}"))
+            return {"fromAmount": str(from_amount), "toAmount": "1"}
+
+        def find_usdt_symbol_for_asset(self, asset: str):
+            asset_u = str(asset or "").strip().upper()
+            if asset_u == "BBB":
+                return "BBBUSDT"
+            return None
+
+        def sell_asset_market(
+            self,
+            symbol: str,
+            free_balance,
+            reserve_ratio=Decimal("0.999"),
+            *,
+            small_qty_log_text: str | None = None,
+        ) -> bool:
+            self.actions.append(("sell", str(symbol or "").upper()))
+            return True
+
+    large_asset_client = _SelftestLargeAssetBnbClient()
+    try:
+        summary = large_asset_client.convert_large_spot_assets_to_bnb()
+        if summary.get("direct_bnb") != ["AAA"]:
+            raise RuntimeError(f"大额资产直兑BNB自检失败：直兑结果异常（{summary}）")
+        if summary.get("fallback_usdt") != ["BBB"]:
+            raise RuntimeError(f"大额资产直兑BNB自检失败：回退结果异常（{summary}）")
+        if summary.get("residual_assets") != ["CCC"]:
+            raise RuntimeError(f"大额资产直兑BNB自检失败：残留资产结果异常（{summary}）")
+        if large_asset_client.actions != [("convert", "AAA->BNB"), ("sell", "BBBUSDT")]:
+            raise RuntimeError(f"大额资产直兑BNB自检失败：执行路径异常（{large_asset_client.actions}）")
+    finally:
+        large_asset_client.close()
+    checks.append("large-asset-bnb=ok")
+
+    class _SelftestBnbFeeReadyClient(BinanceClient):
+        def __init__(self, *, spot_bnb: Decimal, funding_bnb: Decimal):
+            super().__init__("selftest-key", "selftest-secret")
+            self._spot_balances = {"BNB": Decimal(str(spot_bnb))}
+            self._funding_balances = {"BNB": Decimal(str(funding_bnb))}
+            self.transfers: list[tuple[str, str, Decimal]] = []
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            return Decimal(str(self._spot_balances.get(str(asset or "").strip().upper(), Decimal("0"))))
+
+        def funding_asset_balance(self, asset: str) -> Decimal:
+            return Decimal(str(self._funding_balances.get(str(asset or "").strip().upper(), Decimal("0"))))
+
+        def collect_funding_asset_to_spot(
+            self,
+            asset: str,
+            amount: Decimal | str | float | int | None = None,
+        ) -> Decimal:
+            asset_u = str(asset or "").strip().upper()
+            available_amount = Decimal(str(self._funding_balances.get(asset_u, Decimal("0"))))
+            if available_amount <= 0:
+                return Decimal("0")
+            transfer_amount = available_amount
+            if amount is not None:
+                transfer_amount = min(available_amount, Decimal(str(amount)))
+            if transfer_amount <= 0:
+                return Decimal("0")
+            self.transfers.append(("FUNDING_MAIN", asset_u, transfer_amount))
+            self._funding_balances[asset_u] = available_amount - transfer_amount
+            self._spot_balances[asset_u] = Decimal(str(self._spot_balances.get(asset_u, Decimal("0")))) + transfer_amount
+            return transfer_amount
+
+    bnb_ready_client = _SelftestBnbFeeReadyClient(spot_bnb=Decimal("0.010"), funding_bnb=Decimal("0.500"))
+    try:
+        spot_bnb = bnb_ready_client.ensure_bnb_fee_ready_in_spot(
+            min_spot_balance=Decimal("0.025"),
+            max_transfer_amount=Decimal("0.015"),
+            timeout_seconds=1.0,
+        )
+        if spot_bnb != Decimal("0.025"):
+            raise RuntimeError(f"BNB手续费现货确认自检失败：现货BNB异常（{spot_bnb}）")
+        if bnb_ready_client.funding_asset_balance("BNB") != Decimal("0.485"):
+            raise RuntimeError("BNB手续费现货确认自检失败：资金账户BNB剩余异常")
+        if bnb_ready_client.transfers != [("FUNDING_MAIN", "BNB", Decimal("0.015"))]:
+            raise RuntimeError(f"BNB手续费现货确认自检失败：划转记录异常（{bnb_ready_client.transfers}）")
+    finally:
+        bnb_ready_client.close()
+    checks.append("bnb-fee-ready=ok")
+
+    bnb_ready_skip_client = _SelftestBnbFeeReadyClient(spot_bnb=Decimal("0.030"), funding_bnb=Decimal("0.500"))
+    try:
+        spot_bnb = bnb_ready_skip_client.ensure_bnb_fee_ready_in_spot(
+            min_spot_balance=Decimal("0.025"),
+            max_transfer_amount=Decimal("0.015"),
+            timeout_seconds=1.0,
+        )
+        if spot_bnb != Decimal("0.030"):
+            raise RuntimeError(f"BNB手续费现货确认自检失败：免划转现货BNB异常（{spot_bnb}）")
+        if bnb_ready_skip_client.funding_asset_balance("BNB") != Decimal("0.500"):
+            raise RuntimeError("BNB手续费现货确认自检失败：免划转资金账户BNB异常")
+        if bnb_ready_skip_client.transfers:
+            raise RuntimeError(f"BNB手续费现货确认自检失败：本不应划转却发生了划转（{bnb_ready_skip_client.transfers}）")
+    finally:
+        bnb_ready_skip_client.close()
+    checks.append("bnb-fee-ready-skip=ok")
+
+    collect_coin, collect_enable = ExchangeAppBatchMixin._collect_bnb_withdraw_runtime(
+        force_bnb_withdraw=True,
+        enable_withdraw=False,
+        withdraw_coin="USDT",
+    )
+    if collect_coin != "BNB" or collect_enable is not True:
+        raise RuntimeError("归集BNB并提现自检失败：强制提现参数未固定为 BNB/开启")
+    checks.append("collect-bnb-withdraw=ok")
 
 def _emit_selftest_console(message: str, *, error: bool = False) -> None:
     stream = sys.stderr if error else sys.stdout

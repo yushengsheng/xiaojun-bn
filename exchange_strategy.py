@@ -203,12 +203,26 @@ class Strategy:
             quote_asset,
             BinanceClient._format_decimal(topup_amount),
         )
-        bought = self.c.buy_bnb_with_quote_amount(quote_asset, topup_amount)
-        if bought:
-            logger.info("闪兑预买 BNB 完成")
+        spot_bnb_before = self.c.spot_asset_balance_decimal("BNB")
+        bought_order = self.c.buy_bnb_with_quote_amount(quote_asset, topup_amount, return_order=True)
+        if bought_order:
+            bought_bnb = self.c._decimal_from_str(bought_order.get("toAmount", "0"), "0")
+            target_spot_bnb = spot_bnb_before + bought_bnb if bought_bnb > 0 else max(
+                spot_bnb_before,
+                Decimal(str(self.bnb_fee_stop_value or "0")),
+            )
+            spot_bnb = self.c.ensure_bnb_fee_ready_in_spot(
+                min_spot_balance=target_spot_bnb,
+                max_transfer_amount=bought_bnb if bought_bnb > 0 else None,
+                timeout_seconds=12.0,
+            )
+            logger.info(
+                "闪兑预买 BNB 完成，交易前已确认现货 BNB 手续费余额=%s",
+                BinanceClient._format_decimal(spot_bnb),
+            )
         else:
             logger.info("闪兑预买 BNB 未执行")
-        return bool(bought)
+        return bool(bought_order)
 
     @staticmethod
     def _pause_with_stop(stop_event, seconds: float) -> bool:

@@ -1583,18 +1583,19 @@ class BinanceClient:
         *,
         assume_spot_funds_ready: bool = False,
         spot_balance_snapshot: Decimal | str | float | int | None = None,
+        return_order: bool = False,
     ):
         quote_asset_u = str(quote_asset or "").strip().upper()
         if not quote_asset_u:
             raise RuntimeError("后置币种为空，无法预买 BNB")
         if quote_asset_u == "BNB":
             logger.info("后置币种为 BNB，无需预买 BNB")
-            return False
+            return None if return_order else False
 
         amount_dec = Decimal(str(amount or "0"))
         if amount_dec <= 0:
             logger.info("预买 BNB 金额 <= 0，跳过")
-            return False
+            return None if return_order else False
 
         if not assume_spot_funds_ready:
             self.collect_funding_asset_to_spot(quote_asset_u)
@@ -1614,14 +1615,14 @@ class BinanceClient:
                 quote_asset_u,
                 self._format_decimal(amount_dec),
             )
-            return False
+            return None if return_order else False
 
         logger.info(
             "已通过闪兑预买 BNB：使用 %s 金额 %s",
             quote_asset_u,
             self._format_decimal(amount_dec),
         )
-        return True
+        return order if return_order else True
 
     def spot_limit_sell_all_base(self, symbol: str, price: Decimal, reserve_ratio: Decimal = Decimal("1")):
         rules = self.get_symbol_trade_rules(symbol)
@@ -1753,6 +1754,67 @@ class BinanceClient:
 
         logger.info("大额币卖出为 USDT 完成，成功处理 %d 个币种", len(sold_assets))
         return sold_assets
+
+    def convert_large_spot_assets_to_bnb(self, skip_assets=None):
+        skip_assets = set(a.upper() for a in (skip_assets or []))
+        skip_assets.update({"USDT", "BNB"})
+
+        direct_converted: list[str] = []
+        usdt_fallback_assets: list[str] = []
+        residual_assets: list[str] = []
+        balances = self.spot_all_balances()
+
+        for item in balances:
+            asset = str(item.get("asset") or "").strip().upper()
+            free_amt = self._decimal_from_str(item.get("free", "0"), "0")
+
+            if asset in skip_assets or free_amt <= 0:
+                continue
+
+            direct_supported = bool(self.get_convert_pair_info(asset, "BNB"))
+            if direct_supported:
+                try:
+                    order = self.convert_with_from_amount(asset, "BNB", free_amt)
+                    if order:
+                        direct_converted.append(asset)
+                        logger.info("大额资产已直接闪兑为 BNB：%s", asset)
+                        time.sleep(0.3)
+                        continue
+                    logger.info("大额资产 %s 直兑 BNB 未执行，回退到 USDT 路线", asset)
+                except Exception as e:
+                    logger.warning("大额资产 %s 直兑 BNB 失败，回退到 USDT 路线: %s", asset, e)
+            else:
+                logger.info("闪兑不支持 %s -> BNB，回退到 USDT 路线", asset)
+
+            symbol = self.find_usdt_symbol_for_asset(asset)
+            if not symbol:
+                residual_assets.append(asset)
+                logger.warning("未找到 %sUSDT 交易对，暂时无法处理 %s", asset, asset)
+                continue
+
+            try:
+                ok = self.sell_asset_market(symbol, free_amt)
+                if ok:
+                    usdt_fallback_assets.append(asset)
+                    time.sleep(0.3)
+                else:
+                    residual_assets.append(asset)
+                    logger.warning("大额资产 %s 回退卖出 USDT 未执行，该资产仍未处理", asset)
+            except Exception as e:
+                residual_assets.append(asset)
+                logger.warning("大额资产 %s 回退卖出 USDT 失败: %s", asset, e)
+
+        logger.info(
+            "大额资产处理完成：直接闪兑BNB=%d，回退卖USDT=%d，残留=%d",
+            len(direct_converted),
+            len(usdt_fallback_assets),
+            len(residual_assets),
+        )
+        return {
+            "direct_bnb": direct_converted,
+            "fallback_usdt": usdt_fallback_assets,
+            "residual_assets": residual_assets,
+        }
 
     # -------- 现货买入（全部 USDT） --------
     def spot_buy_all_usdt(self, buffer=0.2, symbol="BTCUSDT"):
@@ -1907,25 +1969,125 @@ class BinanceClient:
             total += self._decimal_from_str(item.get("free", "0"), "0")
         return total
 
-    def collect_funding_asset_to_spot(self, asset: str) -> Decimal:
+    def collect_funding_asset_to_spot(
+        self,
+        asset: str,
+        amount: Decimal | str | float | int | None = None,
+    ) -> Decimal:
         asset_u = str(asset or "").strip().upper()
         if not asset_u:
             return Decimal("0")
         try:
-            amount = self.funding_asset_balance(asset_u)
+            available_amount = self.funding_asset_balance(asset_u)
         except Exception as e:
             logger.warning("查询资金账户 %s 余额失败: %s", asset_u, e)
             return Decimal("0")
-        if amount <= 0:
+        if available_amount <= 0:
+            return Decimal("0")
+        transfer_amount = available_amount
+        if amount is not None:
+            requested_amount = self._decimal_from_str(amount, "0")
+            if requested_amount <= 0:
+                return Decimal("0")
+            transfer_amount = min(available_amount, requested_amount)
+        if transfer_amount <= 0:
             return Decimal("0")
         try:
-            self.universal_transfer("FUNDING_MAIN", asset_u, amount)
-            logger.info("检测到资金账户 %s 余额，已自动划转到现货：%s", asset_u, self._format_decimal(amount))
+            self.universal_transfer("FUNDING_MAIN", asset_u, transfer_amount)
+            logger.info("检测到资金账户 %s 余额，已自动划转到现货：%s", asset_u, self._format_decimal(transfer_amount))
             time.sleep(0.5)
-            return amount
+            return transfer_amount
         except Exception as e:
-            logger.warning("资金账户划转到现货失败 %s %s: %s", asset_u, self._format_decimal(amount), e)
+            logger.warning("资金账户划转到现货失败 %s %s: %s", asset_u, self._format_decimal(transfer_amount), e)
             return Decimal("0")
+
+    def ensure_bnb_fee_ready_in_spot(
+        self,
+        *,
+        min_spot_balance: Decimal | str | float | int | None = None,
+        max_transfer_amount: Decimal | str | float | int | None = None,
+        timeout_seconds: float = 6.0,
+    ) -> Decimal:
+        asset_u = "BNB"
+        deadline = time.monotonic() + max(0.5, float(timeout_seconds or 0))
+        required_spot = self._decimal_from_str(min_spot_balance, "0") if min_spot_balance is not None else Decimal("0")
+        if required_spot < 0:
+            required_spot = Decimal("0")
+        remaining_transfer_cap = (
+            self._decimal_from_str(max_transfer_amount, "0") if max_transfer_amount is not None else None
+        )
+        if remaining_transfer_cap is not None and remaining_transfer_cap < 0:
+            remaining_transfer_cap = Decimal("0")
+        last_spot = Decimal("0")
+        last_funding = Decimal("0")
+
+        while True:
+            last_spot = self.spot_asset_balance_decimal(asset_u)
+            last_funding = self.funding_asset_balance(asset_u)
+            if required_spot > 0 and last_spot >= required_spot:
+                return last_spot
+            if required_spot <= 0 and last_funding <= 0:
+                return last_spot
+            if last_funding <= 0:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "预买BNB后现货 BNB 余额仍不足："
+                        f"现货={self._format_decimal(last_spot)}，"
+                        f"目标={self._format_decimal(required_spot)}"
+                    )
+                time.sleep(0.4)
+                continue
+
+            transfer_amount = last_funding
+            if required_spot > 0:
+                missing_amount = required_spot - last_spot
+                if missing_amount > 0:
+                    transfer_amount = min(transfer_amount, missing_amount)
+            if remaining_transfer_cap is not None:
+                if remaining_transfer_cap <= 0:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            "预买BNB后检测到 BNB 仍停留在资金账户，但本次可划转额度已用尽："
+                            f"现货={self._format_decimal(last_spot)}，"
+                            f"资金={self._format_decimal(last_funding)}，"
+                            f"目标={self._format_decimal(required_spot)}"
+                        )
+                    time.sleep(0.4)
+                    continue
+                transfer_amount = min(transfer_amount, remaining_transfer_cap)
+            if transfer_amount <= 0:
+                return last_spot
+
+            moved_amount = self.collect_funding_asset_to_spot(asset_u, amount=transfer_amount)
+            if remaining_transfer_cap is not None and moved_amount > 0:
+                remaining_transfer_cap = max(Decimal("0"), remaining_transfer_cap - moved_amount)
+            last_spot = self.spot_asset_balance_decimal(asset_u)
+            last_funding = self.funding_asset_balance(asset_u)
+            if required_spot > 0 and last_spot >= required_spot:
+                logger.info(
+                    "预买BNB后已确认手续费BNB位于现货账户：现货=%s，资金=%s，目标=%s",
+                    self._format_decimal(last_spot),
+                    self._format_decimal(last_funding),
+                    self._format_decimal(required_spot),
+                )
+                return last_spot
+            if required_spot <= 0 and last_funding <= 0:
+                logger.info(
+                    "预买BNB后已确认手续费BNB位于现货账户：现货=%s，资金=%s",
+                    self._format_decimal(last_spot),
+                    self._format_decimal(last_funding),
+                )
+                return last_spot
+
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "预买BNB后检测到 BNB 仍停留在资金账户，自动划转到现货失败："
+                    f"现货={self._format_decimal(last_spot)}，"
+                    f"资金={self._format_decimal(last_funding)}，"
+                    f"目标={self._format_decimal(required_spot)}，"
+                    f"本次划转={self._format_decimal(moved_amount)}"
+                )
+            time.sleep(0.4)
 
     def spot_asset_balance_decimal(self, asset: str) -> Decimal:
         asset_u = str(asset or "").strip().upper()
