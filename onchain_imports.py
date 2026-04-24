@@ -315,32 +315,56 @@ class OnchainImportMixin(object):
                 messagebox.showerror("参数错误", str(exc))
                 return False
         self.onchain_proxy_var.set(proxy_text)
-        relay_enabled = bool(self.relay_enabled_var.get()) if mode == self.MODE_1M else False
+        relay_enabled = bool(self.relay_enabled_var.get()) if mode in {self.MODE_1M, self.MODE_M1} else False
         relay_fee_reserve = self.relay_fee_reserve_var.get().strip()
-        if relay_enabled and amount_mode == self.AMOUNT_MODE_ALL:
+        if relay_enabled and amount_mode == self.AMOUNT_MODE_ALL and mode != self.MODE_M1:
             messagebox.showerror("参数错误", "启用中转时仅支持固定数量或随机数量，暂不支持“全部”")
             return False
         if relay_fee_reserve:
             try:
                 relay_fee_reserve_value = Decimal(relay_fee_reserve)
-                if relay_fee_reserve_value <= 0:
+                if relay_fee_reserve_value < 0:
                     raise InvalidOperation
                 relay_fee_reserve = self._decimal_to_text(relay_fee_reserve_value)
             except Exception:
+                messagebox.showerror("参数错误", "预留原生币手续费必须是大于等于 0 的数字")
+                return False
+            if relay_enabled and mode != self.MODE_M1 and relay_fee_reserve_value == 0:
                 messagebox.showerror("参数错误", "预留原生币手续费必须是大于 0 的数字")
                 return False
         elif relay_enabled:
             messagebox.showerror("参数错误", "启用中转后必须填写预留原生币手续费")
             return False
+        current_mode_amount_config = {
+            "amount_mode": amount_mode,
+            "amount": amount,
+            "random_min": random_min,
+            "random_max": random_max,
+        }
+        current_mode_relay_config = {
+            "relay_enabled": relay_enabled,
+            "relay_fee_reserve": relay_fee_reserve,
+        }
+        self._store_mode_amount_config(mode, current_mode_amount_config)
+        self._store_mode_relay_config(mode, current_mode_relay_config)
+        normalized_mode_amount_config = self._normalize_mode_amount_config(mode, current_mode_amount_config)
+        normalized_mode_relay_config = self._normalize_mode_relay_config(mode, current_mode_relay_config)
+        existing_mode_amounts = getattr(getattr(self.store, "settings", None), "mode_amounts", {}) or {}
+        existing_mode_relay_configs = getattr(getattr(self.store, "settings", None), "mode_relay_configs", {}) or {}
         self.store.settings = OnchainSettings(
             mode=mode,
             network=network,
             token_symbol=(token.symbol if token else ""),
             token_contract=(token.contract if token else ""),
-            amount_mode=amount_mode,
-            amount=amount,
-            random_min=random_min,
-            random_max=random_max,
+            amount_mode=normalized_mode_amount_config["amount_mode"],
+            amount=normalized_mode_amount_config["amount"],
+            random_min=normalized_mode_amount_config["random_min"],
+            random_max=normalized_mode_amount_config["random_max"],
+            mode_amounts=self._mode_amounts_payload(
+                existing_mode_amounts=existing_mode_amounts if isinstance(existing_mode_amounts, dict) else None,
+                current_mode=mode,
+                current_config=normalized_mode_amount_config,
+            ),
             delay_seconds=delay,
             worker_threads=threads,
             confirm_timeout_seconds=confirm_timeout_seconds,
@@ -349,8 +373,13 @@ class OnchainImportMixin(object):
             proxy_url=proxy_text,
             one_to_many_source=self.source_credential_var.get().strip(),
             many_to_one_target="",
-            relay_enabled=relay_enabled,
-            relay_fee_reserve=relay_fee_reserve,
+            relay_enabled=bool(normalized_mode_relay_config.get("relay_enabled")) if mode in self.MODE_RELAY_STORAGE_KEYS else False,
+            relay_fee_reserve=normalized_mode_relay_config["relay_fee_reserve"] if mode in self.MODE_RELAY_STORAGE_KEYS else str(getattr(getattr(self.store, "settings", None), "relay_fee_reserve", "") or "").strip(),
+            mode_relay_configs=self._mode_relay_configs_payload(
+                existing_mode_relay_configs=existing_mode_relay_configs if isinstance(existing_mode_relay_configs, dict) else None,
+                current_mode=mode,
+                current_config=normalized_mode_relay_config if mode in self.MODE_RELAY_STORAGE_KEYS else None,
+            ),
             relay_sweep_enabled=False,
             relay_sweep_target="",
         )
@@ -387,6 +416,10 @@ class OnchainImportMixin(object):
                 if str(item.get("source", "") or "").strip() or str(item.get("target", "") or "").strip()
             ]
             loaded_mode = st.mode if st.mode in {self.MODE_M2M, self.MODE_1M, self.MODE_M1} else self.MODE_M2M
+            self._mode_amount_config_ready = False
+            self._mode_relay_config_ready = False
+            self._load_mode_amount_configs_from_settings(st)
+            self._load_mode_relay_configs_from_settings(st)
             self.mode_var.set(loaded_mode)
             net = st.network if st.network in {"ETH", "BSC"} else ""
             self.network_var.set(net)
@@ -396,10 +429,6 @@ class OnchainImportMixin(object):
                 self.current_tokens = {}
                 self.coin_box.configure(values=[])
                 self.coin_var.set("")
-            self.amount_mode_var.set(st.amount_mode if st.amount_mode in {self.AMOUNT_MODE_FIXED, self.AMOUNT_MODE_RANDOM, self.AMOUNT_MODE_ALL} else self.AMOUNT_MODE_FIXED)
-            self.amount_var.set("" if self.amount_mode_var.get() == self.AMOUNT_MODE_ALL else (st.amount or ""))
-            self.random_min_var.set(st.random_min or "")
-            self.random_max_var.set(st.random_max or "")
             self.delay_var.set(st.delay_seconds)
             self.threads_var.set(str(max(1, int(st.worker_threads or 1))))
             self.confirm_timeout_var.set(self._decimal_to_text(Decimal(str(st.confirm_timeout_seconds or 180.0))))
@@ -407,8 +436,6 @@ class OnchainImportMixin(object):
             self.use_config_proxy_var.set(bool(st.use_config_proxy))
             self.onchain_proxy_var.set(st.proxy_url or "")
             self.source_credential_var.set(st.one_to_many_source or "")
-            self.relay_enabled_var.set(bool(st.relay_enabled))
-            self.relay_fee_reserve_var.set(st.relay_fee_reserve or "")
             loaded_target = st.many_to_one_target or ""
             try:
                 loaded_target = self._try_validate_recipient_address(loaded_target, "收款地址") or loaded_target
@@ -419,6 +446,12 @@ class OnchainImportMixin(object):
             self.source_balance_var.set("-")
             self.target_balance_var.set("-")
             self.checked_row_keys = set(self._active_row_keys())
+            self._mode_amount_config_ready = True
+            self._mode_relay_config_ready = True
+            self._apply_mode_amount_config(loaded_mode)
+            self._apply_mode_relay_config(loaded_mode)
+            self._last_mode_for_amounts = loaded_mode
+            self._last_mode_for_relay = loaded_mode
             self._on_coin_changed()
             self._on_mode_changed()
             if notice:

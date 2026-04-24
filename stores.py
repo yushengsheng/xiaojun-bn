@@ -382,6 +382,13 @@ class OnchainStore:
         if not target_raw:
             target_raw = settings_raw.get("many_to_one_target", "")
 
+        mode_amounts_raw = settings_raw.get("mode_amounts", {}) or {}
+        if not isinstance(mode_amounts_raw, dict):
+            mode_amounts_raw = {}
+        mode_relay_configs_raw = settings_raw.get("mode_relay_configs", {}) or {}
+        if not isinstance(mode_relay_configs_raw, dict):
+            mode_relay_configs_raw = {}
+
         self.settings = OnchainSettings(
             mode=str(settings_raw.get("mode", "多对多") or "多对多").strip(),
             network=str(settings_raw.get("network", "ETH") or "ETH").strip().upper(),
@@ -391,6 +398,11 @@ class OnchainStore:
             amount=str(settings_raw.get("amount", "") or "").strip(),
             random_min=str(settings_raw.get("random_min", "") or "").strip(),
             random_max=str(settings_raw.get("random_max", "") or "").strip(),
+            mode_amounts={
+                str(key or "").strip(): dict(value)
+                for key, value in mode_amounts_raw.items()
+                if isinstance(value, dict) and str(key or "").strip()
+            },
             delay_seconds=delay,
             worker_threads=threads,
             confirm_timeout_seconds=confirm_timeout_seconds,
@@ -401,6 +413,11 @@ class OnchainStore:
             many_to_one_target=str(target_raw or "").strip(),
             relay_enabled=bool(settings_raw.get("relay_enabled", False)),
             relay_fee_reserve=str(settings_raw.get("relay_fee_reserve", "") or "").strip(),
+            mode_relay_configs={
+                str(key or "").strip(): dict(value)
+                for key, value in mode_relay_configs_raw.items()
+                if isinstance(value, dict) and str(key or "").strip()
+            },
             relay_sweep_enabled=bool(settings_raw.get("relay_sweep_enabled", True)),
             relay_sweep_target=str(settings_raw.get("relay_sweep_target", "") or "").strip(),
         )

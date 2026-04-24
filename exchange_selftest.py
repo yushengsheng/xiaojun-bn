@@ -15,10 +15,11 @@ import requests
 
 from api_clients import EvmClient
 from app_paths import LOG_FILE_PATH
-from core_models import EvmToken, OnchainPairEntry, OnchainSettings
+from core_models import EvmToken, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
 from exchange_binance_client import BinanceClient
 from exchange_logging import logger, runtime_log_path
 from onchain_relay_wallets import RelayWalletFileStore
+from onchain_relay_runner import _record_matches_job
 from exchange_proxy_runtime import ExchangeProxyRuntime
 from secret_box import SECRET_BOX
 from shared_utils import decimal_to_text, random_decimal_between
@@ -82,6 +83,197 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             raise RuntimeError("链上导入列表自检失败：完整多对多记录未恢复")
         if loaded_store.multi_to_multi_drafts != store.multi_to_multi_drafts:
             raise RuntimeError("链上导入列表自检失败：待补齐草稿未恢复")
+        store.settings = OnchainSettings(
+            mode="多对1",
+            network="BSC",
+            token_symbol="BNB",
+            amount_mode="全部",
+            amount="全部",
+            mode_amounts={
+                "multi_to_multi": {
+                    "amount_mode": "全部",
+                    "amount": "全部",
+                    "random_min": "",
+                    "random_max": "",
+                },
+                "one_to_many": {
+                    "amount_mode": "固定数量",
+                    "amount": "0.01",
+                    "random_min": "",
+                    "random_max": "",
+                },
+                "many_to_one": {
+                    "amount_mode": "全部",
+                    "amount": "全部",
+                    "random_min": "",
+                    "random_max": "",
+                },
+            },
+            mode_relay_configs={
+                "one_to_many": {
+                    "relay_enabled": True,
+                    "relay_fee_reserve": "0.0001",
+                },
+                "many_to_one": {
+                    "relay_enabled": False,
+                    "relay_fee_reserve": "0",
+                },
+            },
+        )
+        store.save_settings_only()
+        loaded_store = OnchainStore(store_path)
+        loaded_store.load()
+        if loaded_store.settings.mode_amounts.get("many_to_one", {}).get("amount_mode") != "全部":
+            raise RuntimeError("链上配置自检失败：多对1数量模式未独立恢复")
+        if loaded_store.settings.mode_amounts.get("one_to_many", {}).get("amount") != "0.01":
+            raise RuntimeError("链上配置自检失败：1对多固定数量未独立恢复")
+        if loaded_store.settings.mode_relay_configs.get("many_to_one", {}).get("relay_fee_reserve") != "0":
+            raise RuntimeError("链上配置自检失败：多对1手续费预留未独立恢复")
+        if loaded_store.settings.mode_relay_configs.get("one_to_many", {}).get("relay_fee_reserve") != "0.0001":
+            raise RuntimeError("链上配置自检失败：1对多手续费预留未独立恢复")
+        if loaded_store.settings.mode_relay_configs.get("one_to_many", {}).get("relay_enabled") is not True:
+            raise RuntimeError("链上配置自检失败：1对多中转开关未独立恢复")
+        if loaded_store.settings.mode_relay_configs.get("many_to_one", {}).get("relay_enabled") is not False:
+            raise RuntimeError("链上配置自检失败：多对1中转开关未独立恢复")
+
+        import page_onchain_base
+
+        class _Var:
+            def __init__(self, value: str = ""):
+                self._value = value
+
+            def get(self):
+                return self._value
+
+            def set(self, value):
+                self._value = value
+
+        class _AmountProbe(page_onchain_base.OnchainTransferPageBase):
+            def __init__(self):
+                self.amount_mode_var = _Var(self.AMOUNT_MODE_FIXED)
+                self.amount_var = _Var("")
+                self.random_min_var = _Var("")
+                self.random_max_var = _Var("")
+                self.relay_enabled_var = _Var(False)
+                self.relay_fee_reserve_var = _Var("")
+                self._mode_amount_configs = {}
+                self._last_mode_for_amounts = self.MODE_M2M
+                self._mode_relay_configs = {}
+                self._last_mode_for_relay = self.MODE_M2M
+
+            def _mode(self):
+                return self._last_mode_for_amounts
+
+        probe = _AmountProbe()
+        probe._load_mode_amount_configs_from_settings(OnchainSettings())
+        if probe._mode_amount_configs.get(probe.MODE_M2M, {}).get("amount_mode") != probe.AMOUNT_MODE_ALL:
+            raise RuntimeError("链上配置自检失败：多对多默认数量模式不是“全部”")
+        if probe._mode_amount_configs.get(probe.MODE_1M, {}).get("amount_mode") != probe.AMOUNT_MODE_FIXED:
+            raise RuntimeError("链上配置自检失败：1对多默认数量模式不是“固定数量”")
+        if probe._mode_amount_configs.get(probe.MODE_M1, {}).get("amount_mode") != probe.AMOUNT_MODE_ALL:
+            raise RuntimeError("链上配置自检失败：多对1默认数量模式不是“全部”")
+
+        probe._load_mode_amount_configs_from_settings(
+            OnchainSettings(mode="1对多", amount_mode="固定数量", amount="0.02")
+        )
+        if probe._mode_amount_configs.get(probe.MODE_1M, {}).get("amount") != "0.02":
+            raise RuntimeError("链上配置自检失败：旧版1对多数量配置未迁移")
+        if probe._mode_amount_configs.get(probe.MODE_M2M, {}).get("amount_mode") != probe.AMOUNT_MODE_ALL:
+            raise RuntimeError("链上配置自检失败：旧版迁移污染了多对多默认值")
+
+        probe._store_mode_amount_config(
+            probe.MODE_1M,
+            {"amount_mode": probe.AMOUNT_MODE_FIXED, "amount": "0.03", "random_min": "", "random_max": ""},
+        )
+        probe._apply_mode_amount_config(probe.MODE_1M)
+        if probe.amount_var.get() != "0.03":
+            raise RuntimeError("链上配置自检失败：1对多独立数量未正确回填")
+        probe._apply_mode_amount_config(probe.MODE_M1)
+        if probe._amount_mode() != probe.AMOUNT_MODE_ALL:
+            raise RuntimeError("链上配置自检失败：切换到多对1后默认数量模式异常")
+        probe._apply_mode_amount_config(probe.MODE_1M)
+        if probe.amount_var.get() != "0.03":
+            raise RuntimeError("链上配置自检失败：模式切换后1对多数量被污染")
+
+        probe._store_mode_amount_config(
+            probe.MODE_1M,
+            {"amount_mode": probe.AMOUNT_MODE_RANDOM, "amount": "", "random_min": "abc", "random_max": "1"},
+        )
+        payload = probe._mode_amounts_payload(
+            existing_mode_amounts={
+                "one_to_many": {
+                    "amount_mode": probe.AMOUNT_MODE_FIXED,
+                    "amount": "0.02",
+                    "random_min": "",
+                    "random_max": "",
+                }
+            },
+            current_mode=probe.MODE_M2M,
+            current_config={"amount_mode": probe.AMOUNT_MODE_ALL, "amount": probe.AMOUNT_ALL_LABEL, "random_min": "", "random_max": ""},
+        )
+        if payload.get("one_to_many", {}).get("amount") != "0.02":
+            raise RuntimeError("链上配置自检失败：隐藏模式的无效数量配置错误覆盖了已保存值")
+
+        probe._load_mode_relay_configs_from_settings(OnchainSettings())
+        if probe._mode_relay_configs.get(probe.MODE_1M, {}).get("relay_fee_reserve") != "":
+            raise RuntimeError("链上配置自检失败：1对多默认手续费预留不是空值")
+        if probe._mode_relay_configs.get(probe.MODE_M1, {}).get("relay_fee_reserve") != "":
+            raise RuntimeError("链上配置自检失败：多对1默认手续费预留不是空值")
+        if probe._mode_relay_configs.get(probe.MODE_1M, {}).get("relay_enabled") is not False:
+            raise RuntimeError("链上配置自检失败：1对多默认中转开关不是关闭")
+        if probe._mode_relay_configs.get(probe.MODE_M1, {}).get("relay_enabled") is not False:
+            raise RuntimeError("链上配置自检失败：多对1默认中转开关不是关闭")
+
+        probe._load_mode_relay_configs_from_settings(
+            OnchainSettings(mode="1对多", relay_enabled=True, relay_fee_reserve="0.0001")
+        )
+        if probe._mode_relay_configs.get(probe.MODE_1M, {}).get("relay_fee_reserve") != "0.0001":
+            raise RuntimeError("链上配置自检失败：旧版1对多手续费预留未迁移")
+        if probe._mode_relay_configs.get(probe.MODE_M1, {}).get("relay_fee_reserve") != "":
+            raise RuntimeError("链上配置自检失败：旧版手续费预留迁移污染了多对1默认值")
+        if probe._mode_relay_configs.get(probe.MODE_1M, {}).get("relay_enabled") is not True:
+            raise RuntimeError("链上配置自检失败：旧版1对多中转开关未迁移")
+        if probe._mode_relay_configs.get(probe.MODE_M1, {}).get("relay_enabled") is not False:
+            raise RuntimeError("链上配置自检失败：旧版中转开关迁移污染了多对1默认值")
+
+        probe._store_mode_relay_config(
+            probe.MODE_1M,
+            {"relay_enabled": True, "relay_fee_reserve": "0.0001"},
+        )
+        probe._apply_mode_relay_config(probe.MODE_1M)
+        if probe.relay_fee_reserve_var.get() != "0.0001":
+            raise RuntimeError("链上配置自检失败：1对多手续费预留未正确回填")
+        if probe.relay_enabled_var.get() is not True:
+            raise RuntimeError("链上配置自检失败：1对多中转开关未正确回填")
+        probe._apply_mode_relay_config(probe.MODE_M1)
+        if probe.relay_fee_reserve_var.get() != "":
+            raise RuntimeError("链上配置自检失败：切换到多对1后默认手续费预留异常")
+        if probe.relay_enabled_var.get() is not False:
+            raise RuntimeError("链上配置自检失败：切换到多对1后默认中转开关异常")
+        probe._apply_mode_relay_config(probe.MODE_1M)
+        if probe.relay_fee_reserve_var.get() != "0.0001":
+            raise RuntimeError("链上配置自检失败：模式切换后1对多手续费预留被污染")
+        if probe.relay_enabled_var.get() is not True:
+            raise RuntimeError("链上配置自检失败：模式切换后1对多中转开关被污染")
+
+        probe._store_mode_relay_config(
+            probe.MODE_1M,
+            {"relay_enabled": False, "relay_fee_reserve": "abc"},
+        )
+        relay_payload = probe._mode_relay_configs_payload(
+            existing_mode_relay_configs={
+                "one_to_many": {
+                    "relay_enabled": True,
+                    "relay_fee_reserve": "0.0001",
+                }
+            },
+            current_mode=probe.MODE_M1,
+            current_config={"relay_enabled": False, "relay_fee_reserve": "0"},
+        )
+        if relay_payload.get("one_to_many", {}).get("relay_fee_reserve") != "0.0001":
+            raise RuntimeError("链上配置自检失败：隐藏模式的无效手续费预留错误覆盖了已保存值")
+        if relay_payload.get("one_to_many", {}).get("relay_enabled") is not True:
+            raise RuntimeError("链上配置自检失败：隐藏模式的无效中转配置错误覆盖了已保存值")
     checks.append("onchain-drafts=ok")
 
     with tempfile.TemporaryDirectory(prefix="xiaojun-relay-selftest-") as tmpdir:
@@ -157,9 +349,116 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                 raise RuntimeError("中转钱包自检失败：配置中的手续费预留未恢复")
             if abs(float(relay_loaded_store.settings.confirm_timeout_seconds) - 240.0) > 0.0001:
                 raise RuntimeError("中转钱包自检失败：配置中的确认超时未恢复")
+            relay_onchain_store.settings.mode = "多对1"
+            relay_onchain_store.settings.relay_enabled = True
+            relay_onchain_store.save_settings_only()
+            relay_loaded_store = OnchainStore(relay_store_path)
+            relay_loaded_store.load()
+            if relay_loaded_store.settings.mode != "多对1":
+                raise RuntimeError("中转钱包自检失败：多对1模式未恢复")
+            if not relay_loaded_store.settings.relay_enabled:
+                raise RuntimeError("中转钱包自检失败：多对1模式下中转开关未恢复")
+            many_to_one_resume_record = relay_store.build_record(
+                batch_id="relay-selftest-m1",
+                network="BSC",
+                source_address="0x0000000000000000000000000000000000000011",
+                target_address="0x0000000000000000000000000000000000000022",
+                relay_wallet=relay_wallet,
+                token=relay_token,
+                relay_fee_reserve=Decimal("0.0001"),
+                sweep_enabled=False,
+                sweep_target="0x0000000000000000000000000000000000000022",
+            )
+            many_to_one_resume_params = WithdrawRuntimeParams(
+                coin="USDT",
+                amount="1",
+                network="BSC",
+                delay=0.0,
+                threads=1,
+                token_contract=relay_token.contract,
+                token_decimals=relay_token.decimals,
+                token_is_native=False,
+                relay_enabled=True,
+                relay_fee_reserve=Decimal("0"),
+            )
+            if _record_matches_job(
+                many_to_one_resume_record,
+                many_to_one_resume_params,
+                many_to_one_resume_record.source,
+                many_to_one_resume_record.target,
+            ):
+                raise RuntimeError("中转钱包自检失败：多对1更改手续费预留后仍错误续跑旧记录")
         finally:
             relay_client.close()
     checks.append("relay-wallets=ok")
+
+    import exchange_app_log_view
+
+    class _LogViewProbe(exchange_app_log_view.ExchangeAppLogViewMixin):
+        def __init__(self, *, use_config_proxy: bool, raw_proxy: str, direct_ip: str | Exception, proxy_result=None, system_proxy=None):
+            self._snapshot = {
+                "use_config_proxy": use_config_proxy,
+                "raw_proxy": raw_proxy,
+            }
+            self._direct_ip = direct_ip
+            self._proxy_result = proxy_result
+            self._system_proxy = dict(system_proxy or {})
+
+        def _exchange_proxy_state_snapshot(self):
+            return dict(self._snapshot)
+
+        def _system_proxy_map(self):
+            return dict(self._system_proxy)
+
+        def _fetch_public_ip(self, *, use_exchange_proxy: bool, allow_system_proxy: bool = True):
+            if use_exchange_proxy:
+                return "9.9.9.9"
+            if isinstance(self._direct_ip, Exception):
+                raise self._direct_ip
+            return str(self._direct_ip)
+
+        def _test_exchange_proxy_once(self, *, include_exit_ip: bool = True, state=None):
+            if isinstance(self._proxy_result, Exception):
+                raise self._proxy_result
+            return self._proxy_result
+
+    ip_probe = _LogViewProbe(
+        use_config_proxy=True,
+        raw_proxy="ss://example",
+        direct_ip="1.2.3.4",
+        proxy_result=RuntimeError("proxy down"),
+    )
+    ip_text, proxy_status, proxy_exit_ip = ip_probe._resolve_exchange_ip_refresh_state()
+    if ip_text != "1.2.3.4":
+        raise RuntimeError("状态栏自检失败：代理失败时直连 IP 被错误覆盖")
+    if proxy_status != "连接失败":
+        raise RuntimeError("状态栏自检失败：代理失败时状态未标记为连接失败")
+    if proxy_exit_ip != "--":
+        raise RuntimeError("状态栏自检失败：代理失败时出口 IP 未保持空值")
+
+    direct_fail_probe = _LogViewProbe(
+        use_config_proxy=False,
+        raw_proxy="",
+        direct_ip=RuntimeError("network down"),
+        proxy_result=None,
+    )
+    ip_text, proxy_status, proxy_exit_ip = direct_fail_probe._resolve_exchange_ip_refresh_state()
+    if "获取失败: network down" != ip_text:
+        raise RuntimeError("状态栏自检失败：直连失败提示异常")
+    if proxy_status != "直连异常":
+        raise RuntimeError("状态栏自检失败：直连失败状态异常")
+    if proxy_exit_ip != "--":
+        raise RuntimeError("状态栏自检失败：直连失败时出口 IP 未保持空值")
+    checks.append("status-bar=ok")
+
+    merged_backend_error = ExchangeProxyRuntime._merge_backend_errors([
+        "xray 启动失败: 权限不足",
+        "sing-box 启动失败: 拒绝访问",
+    ])
+    merged_text = str(merged_backend_error)
+    if "xray 启动失败: 权限不足" not in merged_text or "sing-box 启动失败: 拒绝访问" not in merged_text:
+        raise RuntimeError("代理诊断自检失败：多后端失败信息未完整保留")
+    checks.append("proxy-errors=ok")
 
     random_value = random_decimal_between(Decimal("0.00001"), Decimal("0.00003"), Decimal("0.00001"))
     if random_value < Decimal("0.00001") or random_value > Decimal("0.00003"):
@@ -459,12 +758,36 @@ def _run_gui_selftest_checks(checks: list[str]) -> None:
                 if page is None:
                     raise RuntimeError("GUI 自检失败：链上页面未成功加载")
 
-                page.network_var.set("BSC")
-                page.amount_mode_var.set(page.AMOUNT_MODE_FIXED)
+                if page._amount_mode() != page.AMOUNT_MODE_ALL:
+                    raise RuntimeError("GUI 自检失败：多对多默认数量模式不是“全部”")
+                page.mode_var.set(page.MODE_1M)
+                _pump_tk_events(app, timeout=5.0)
+                if page._amount_mode() != page.AMOUNT_MODE_FIXED or page.amount_var.get().strip():
+                    raise RuntimeError("GUI 自检失败：1对多默认数量模式异常")
                 page.amount_var.set("0.01")
+                page.mode_var.set(page.MODE_M1)
+                _pump_tk_events(app, timeout=5.0)
+                if page._amount_mode() != page.AMOUNT_MODE_ALL:
+                    raise RuntimeError("GUI 自检失败：多对1默认数量模式不是“全部”")
+                page.mode_var.set(page.MODE_1M)
+                _pump_tk_events(app, timeout=5.0)
+                if page.amount_var.get().strip() != "0.01":
+                    raise RuntimeError("GUI 自检失败：模式切换后1对多数量未保持独立")
+
+                page.network_var.set("BSC")
+                page.mode_var.set(page.MODE_M1)
+                _pump_tk_events(app, timeout=5.0)
                 page.save_all()
                 if not onchain_path.exists():
                     raise RuntimeError("GUI 自检失败：未生成链上配置文件")
+                saved_store = OnchainStore(onchain_path)
+                saved_store.load()
+                if saved_store.settings.mode_amounts.get("multi_to_multi", {}).get("amount_mode") != page.AMOUNT_MODE_ALL:
+                    raise RuntimeError("GUI 自检失败：多对多数量配置未保存")
+                if saved_store.settings.mode_amounts.get("one_to_many", {}).get("amount") != "0.01":
+                    raise RuntimeError("GUI 自检失败：1对多独立数量配置未保存")
+                if saved_store.settings.mode_amounts.get("many_to_one", {}).get("amount_mode") != page.AMOUNT_MODE_ALL:
+                    raise RuntimeError("GUI 自检失败：多对1独立数量配置未保存")
 
                 page.open_wallet_generator()
                 _pump_tk_events(app, timeout=5.0)
@@ -556,6 +879,25 @@ def run_selftest(*, include_online_checks: bool = False, include_gui_checks: boo
             checks.append(f"xray={xray_path.name}")
         sing_box_path = ExchangeProxyRuntime.find_sing_box_executable()
         checks.append(f"sing-box={sing_box_path.name}")
+        with tempfile.TemporaryDirectory(prefix="xiaojun-proxy-runtime-") as tmpdir:
+            proxy_runtime = ExchangeProxyRuntime(Path(tmpdir), runtime_name="selftest")
+            def _probe_or_skip(backend_name: str) -> None:
+                try:
+                    proxy_runtime.probe_backend_launch(backend_name)
+                except Exception as exc:
+                    if os.name == "nt" and getattr(sys, "frozen", False):
+                        raise
+                    lower_text = str(exc or "").lower()
+                    if "operation not permitted" in lower_text or "permission denied" in lower_text:
+                        logger.warning("SELFTEST: 跳过 %s 运行时拉起检查（当前环境禁止本地监听端口）: %s", backend_name, exc)
+                        checks.append(f"{backend_name}-launch=skipped-permission")
+                        return
+                    raise
+                checks.append(f"{backend_name}-launch=ok")
+
+            if "xray_path" in locals():
+                _probe_or_skip("xray")
+            _probe_or_skip("sing-box")
 
         summary = ", ".join(checks)
         logger.info("SELFTEST OK: %s", summary)

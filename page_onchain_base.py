@@ -67,6 +67,20 @@ class OnchainTransferPageBase:
     AMOUNT_MODE_RANDOM = "随机数"
     AMOUNT_MODE_ALL = "全部"
     AMOUNT_ALL_LABEL = "全部"
+    MODE_AMOUNT_STORAGE_KEYS = {
+        MODE_M2M: "multi_to_multi",
+        MODE_1M: "one_to_many",
+        MODE_M1: "many_to_one",
+    }
+    MODE_RELAY_STORAGE_KEYS = {
+        MODE_1M: "one_to_many",
+        MODE_M1: "many_to_one",
+    }
+    MODE_AMOUNT_DEFAULTS = {
+        MODE_M2M: AMOUNT_MODE_ALL,
+        MODE_1M: AMOUNT_MODE_FIXED,
+        MODE_M1: AMOUNT_MODE_ALL,
+    }
     NETWORK_OPTIONS = ["", "ETH", "BSC"]
     MAX_TOKEN_DECIMALS = 36
     TREE_COL_MIN_WIDTHS = {
@@ -162,6 +176,12 @@ class OnchainTransferPageBase:
         self._summary_amount_text = "-"
         self._summary_gas_text = "-"
         self._import_target = "full"
+        self._mode_amount_configs: dict[str, dict[str, str]] = {}
+        self._mode_amount_config_ready = False
+        self._last_mode_for_amounts = self.mode_var.get().strip()
+        self._mode_relay_configs: dict[str, dict[str, object]] = {}
+        self._mode_relay_config_ready = False
+        self._last_mode_for_relay = self.mode_var.get().strip()
         self.m2m_import_drafts: list[dict[str, str]] = []
         self.checked_m2m_draft_rows: set[int] = set()
         self.generated_wallets: list[GeneratedWalletEntry] = []
@@ -428,8 +448,261 @@ class OnchainTransferPageBase:
         return self._mode() == self.MODE_1M
     def _is_mode_m1(self) -> bool:
         return self._mode() == self.MODE_M1
+    @classmethod
+    def _amount_storage_key(cls, mode: str) -> str:
+        return cls.MODE_AMOUNT_STORAGE_KEYS.get(str(mode or "").strip(), "")
+    @classmethod
+    def _default_mode_amount_config(cls, mode: str) -> dict[str, str]:
+        amount_mode = cls.MODE_AMOUNT_DEFAULTS.get(str(mode or "").strip(), cls.AMOUNT_MODE_FIXED)
+        return {
+            "amount_mode": amount_mode,
+            "amount": cls.AMOUNT_ALL_LABEL if amount_mode == cls.AMOUNT_MODE_ALL else "",
+            "random_min": "",
+            "random_max": "",
+        }
+    @classmethod
+    def _normalize_mode_amount_config(cls, mode: str, config: dict[str, object] | None) -> dict[str, str]:
+        raw = dict(config or {})
+        normalized = cls._default_mode_amount_config(mode)
+        amount_mode = str(raw.get("amount_mode", normalized["amount_mode"]) or normalized["amount_mode"]).strip()
+        if amount_mode not in {cls.AMOUNT_MODE_FIXED, cls.AMOUNT_MODE_RANDOM, cls.AMOUNT_MODE_ALL}:
+            amount_mode = normalized["amount_mode"]
+        amount = str(raw.get("amount", normalized["amount"]) or "").strip()
+        if amount_mode == cls.AMOUNT_MODE_ALL:
+            amount = cls.AMOUNT_ALL_LABEL
+        random_min = str(raw.get("random_min", normalized["random_min"]) or "").strip()
+        random_max = str(raw.get("random_max", normalized["random_max"]) or "").strip()
+        return {
+            "amount_mode": amount_mode,
+            "amount": amount,
+            "random_min": random_min,
+            "random_max": random_max,
+        }
+    @classmethod
+    def _persistable_mode_amount_config(cls, mode: str, config: dict[str, object] | None) -> dict[str, str] | None:
+        normalized = cls._normalize_mode_amount_config(mode, config)
+        default_config = cls._default_mode_amount_config(mode)
+        if normalized == default_config:
+            return dict(default_config)
+        amount_mode = normalized["amount_mode"]
+        if amount_mode == cls.AMOUNT_MODE_ALL:
+            return dict(default_config if default_config["amount_mode"] == cls.AMOUNT_MODE_ALL else {
+                "amount_mode": cls.AMOUNT_MODE_ALL,
+                "amount": cls.AMOUNT_ALL_LABEL,
+                "random_min": "",
+                "random_max": "",
+            })
+        if amount_mode == cls.AMOUNT_MODE_FIXED:
+            amount_raw = normalized["amount"].strip()
+            if not amount_raw:
+                return None
+            try:
+                amount_value = Decimal(amount_raw)
+            except Exception:
+                return None
+            if amount_value <= 0:
+                return None
+            return {
+                "amount_mode": cls.AMOUNT_MODE_FIXED,
+                "amount": decimal_to_text(amount_value),
+                "random_min": "",
+                "random_max": "",
+            }
+        if amount_mode == cls.AMOUNT_MODE_RANDOM:
+            min_raw = normalized["random_min"].strip()
+            max_raw = normalized["random_max"].strip()
+            if not min_raw or not max_raw:
+                return None
+            try:
+                min_value = Decimal(min_raw)
+                max_value = Decimal(max_raw)
+            except Exception:
+                return None
+            if min_value <= 0 or max_value <= 0 or max_value < min_value:
+                return None
+            return {
+                "amount_mode": cls.AMOUNT_MODE_RANDOM,
+                "amount": "",
+                "random_min": decimal_to_text(min_value),
+                "random_max": decimal_to_text(max_value),
+            }
+        return None
+    def _load_mode_amount_configs_from_settings(self, settings: OnchainSettings) -> None:
+        raw_mode_amounts = getattr(settings, "mode_amounts", {}) or {}
+        if not isinstance(raw_mode_amounts, dict):
+            raw_mode_amounts = {}
+        active_mode = str(getattr(settings, "mode", "") or "").strip()
+        legacy_config = {
+            "amount_mode": str(getattr(settings, "amount_mode", "") or "").strip(),
+            "amount": str(getattr(settings, "amount", "") or "").strip(),
+            "random_min": str(getattr(settings, "random_min", "") or "").strip(),
+            "random_max": str(getattr(settings, "random_max", "") or "").strip(),
+        }
+        legacy_has_explicit_value = (
+            legacy_config["amount_mode"] in {self.AMOUNT_MODE_ALL, self.AMOUNT_MODE_RANDOM}
+            or bool(legacy_config["amount"])
+            or bool(legacy_config["random_min"])
+            or bool(legacy_config["random_max"])
+        )
+        configs: dict[str, dict[str, str]] = {}
+        for mode in (self.MODE_M2M, self.MODE_1M, self.MODE_M1):
+            storage_key = self._amount_storage_key(mode)
+            stored = raw_mode_amounts.get(storage_key) if storage_key else None
+            if isinstance(stored, dict):
+                configs[mode] = self._normalize_mode_amount_config(mode, stored)
+                continue
+            if mode == active_mode and legacy_has_explicit_value:
+                configs[mode] = self._normalize_mode_amount_config(mode, legacy_config)
+                continue
+            configs[mode] = self._default_mode_amount_config(mode)
+        self._mode_amount_configs = configs
+    def _store_mode_amount_config(self, mode: str, config: dict[str, object]) -> None:
+        mode_key = str(mode or "").strip()
+        if mode_key not in self.MODE_AMOUNT_STORAGE_KEYS:
+            return
+        self._mode_amount_configs[mode_key] = self._normalize_mode_amount_config(mode_key, config)
+    def _capture_mode_amount_config(self, mode: str | None = None) -> None:
+        mode_key = str(mode or getattr(self, "_last_mode_for_amounts", "") or self._mode()).strip()
+        if mode_key not in self.MODE_AMOUNT_STORAGE_KEYS:
+            return
+        current = {
+            "amount_mode": self._amount_mode(),
+            "amount": self.amount_var.get().strip(),
+            "random_min": self.random_min_var.get().strip(),
+            "random_max": self.random_max_var.get().strip(),
+        }
+        if current["amount_mode"] == self.AMOUNT_MODE_ALL:
+            current["amount"] = self.AMOUNT_ALL_LABEL
+        self._store_mode_amount_config(mode_key, current)
+    def _apply_mode_amount_config(self, mode: str) -> None:
+        config = self._normalize_mode_amount_config(mode, self._mode_amount_configs.get(str(mode or "").strip()))
+        self.amount_mode_var.set(config["amount_mode"])
+        self.amount_var.set("" if config["amount_mode"] == self.AMOUNT_MODE_ALL else config["amount"])
+        self.random_min_var.set(config["random_min"])
+        self.random_max_var.set(config["random_max"])
+    def _mode_amounts_payload(
+        self,
+        *,
+        existing_mode_amounts: dict[str, dict[str, object]] | None = None,
+        current_mode: str | None = None,
+        current_config: dict[str, object] | None = None,
+    ) -> dict[str, dict[str, str]]:
+        payload: dict[str, dict[str, str]] = {}
+        existing_raw = existing_mode_amounts if isinstance(existing_mode_amounts, dict) else {}
+        for mode, storage_key in self.MODE_AMOUNT_STORAGE_KEYS.items():
+            candidate = current_config if str(current_mode or "").strip() == mode and current_config is not None else self._mode_amount_configs.get(mode)
+            persisted = self._persistable_mode_amount_config(mode, candidate)
+            if persisted is None:
+                persisted = self._persistable_mode_amount_config(mode, existing_raw.get(storage_key))
+            if persisted is None:
+                persisted = self._default_mode_amount_config(mode)
+            payload[storage_key] = dict(persisted)
+        return payload
+    @classmethod
+    def _relay_storage_key(cls, mode: str) -> str:
+        return cls.MODE_RELAY_STORAGE_KEYS.get(str(mode or "").strip(), "")
+    @classmethod
+    def _default_mode_relay_config(cls, mode: str) -> dict[str, object]:
+        return {"relay_enabled": False, "relay_fee_reserve": ""}
+    @classmethod
+    def _normalize_mode_relay_config(cls, mode: str, config: dict[str, object] | None) -> dict[str, object]:
+        raw = dict(config or {})
+        raw_enabled = raw.get("relay_enabled", False)
+        if isinstance(raw_enabled, str):
+            relay_enabled = raw_enabled.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            relay_enabled = bool(raw_enabled)
+        return {
+            "relay_enabled": relay_enabled,
+            "relay_fee_reserve": str(raw.get("relay_fee_reserve", "") or "").strip(),
+        }
+    @classmethod
+    def _persistable_mode_relay_config(cls, mode: str, config: dict[str, object] | None) -> dict[str, object] | None:
+        normalized = cls._normalize_mode_relay_config(mode, config)
+        reserve_raw = normalized["relay_fee_reserve"]
+        relay_enabled = bool(normalized.get("relay_enabled"))
+        if not reserve_raw:
+            return {
+                "relay_enabled": relay_enabled,
+                "relay_fee_reserve": "",
+            }
+        try:
+            reserve_value = Decimal(reserve_raw)
+        except Exception:
+            return None
+        if reserve_value < 0:
+            return None
+        return {
+            "relay_enabled": relay_enabled,
+            "relay_fee_reserve": decimal_to_text(reserve_value),
+        }
+    def _load_mode_relay_configs_from_settings(self, settings: OnchainSettings) -> None:
+        raw_mode_relay_configs = getattr(settings, "mode_relay_configs", {}) or {}
+        if not isinstance(raw_mode_relay_configs, dict):
+            raw_mode_relay_configs = {}
+        active_mode = str(getattr(settings, "mode", "") or "").strip()
+        legacy_enabled = bool(getattr(settings, "relay_enabled", False))
+        legacy_reserve = str(getattr(settings, "relay_fee_reserve", "") or "").strip()
+        legacy_has_explicit_value = active_mode in self.MODE_RELAY_STORAGE_KEYS and (legacy_enabled or bool(legacy_reserve))
+        configs: dict[str, dict[str, object]] = {}
+        for mode in (self.MODE_1M, self.MODE_M1):
+            storage_key = self._relay_storage_key(mode)
+            stored = raw_mode_relay_configs.get(storage_key) if storage_key else None
+            if isinstance(stored, dict):
+                configs[mode] = self._normalize_mode_relay_config(mode, stored)
+                continue
+            if mode == active_mode and legacy_has_explicit_value:
+                configs[mode] = self._normalize_mode_relay_config(
+                    mode,
+                    {"relay_enabled": legacy_enabled, "relay_fee_reserve": legacy_reserve},
+                )
+                continue
+            configs[mode] = self._default_mode_relay_config(mode)
+        self._mode_relay_configs = configs
+    def _store_mode_relay_config(self, mode: str, config: dict[str, object]) -> None:
+        mode_key = str(mode or "").strip()
+        if mode_key not in self.MODE_RELAY_STORAGE_KEYS:
+            return
+        self._mode_relay_configs[mode_key] = self._normalize_mode_relay_config(mode_key, config)
+    def _capture_mode_relay_config(self, mode: str | None = None) -> None:
+        mode_key = str(mode or getattr(self, "_last_mode_for_relay", "") or self._mode()).strip()
+        if mode_key not in self.MODE_RELAY_STORAGE_KEYS:
+            return
+        self._store_mode_relay_config(
+            mode_key,
+            {
+                "relay_enabled": bool(self.relay_enabled_var.get()),
+                "relay_fee_reserve": self.relay_fee_reserve_var.get().strip(),
+            },
+        )
+    def _apply_mode_relay_config(self, mode: str) -> None:
+        if str(mode or "").strip() not in self.MODE_RELAY_STORAGE_KEYS:
+            self.relay_enabled_var.set(False)
+            self.relay_fee_reserve_var.set("")
+            return
+        config = self._normalize_mode_relay_config(mode, self._mode_relay_configs.get(str(mode or "").strip()))
+        self.relay_enabled_var.set(bool(config.get("relay_enabled")))
+        self.relay_fee_reserve_var.set(config["relay_fee_reserve"])
+    def _mode_relay_configs_payload(
+        self,
+        *,
+        existing_mode_relay_configs: dict[str, dict[str, object]] | None = None,
+        current_mode: str | None = None,
+        current_config: dict[str, object] | None = None,
+    ) -> dict[str, dict[str, object]]:
+        payload: dict[str, dict[str, object]] = {}
+        existing_raw = existing_mode_relay_configs if isinstance(existing_mode_relay_configs, dict) else {}
+        for mode, storage_key in self.MODE_RELAY_STORAGE_KEYS.items():
+            candidate = current_config if str(current_mode or "").strip() == mode and current_config is not None else self._mode_relay_configs.get(mode)
+            persisted = self._persistable_mode_relay_config(mode, candidate)
+            if persisted is None:
+                persisted = self._persistable_mode_relay_config(mode, existing_raw.get(storage_key))
+            if persisted is None:
+                persisted = self._default_mode_relay_config(mode)
+            payload[storage_key] = dict(persisted)
+        return payload
     def _relay_controls_visible(self) -> bool:
-        return self._is_mode_1m()
+        return self._is_mode_1m() or self._is_mode_m1()
     def _relay_enabled(self) -> bool:
         return self._relay_controls_visible() and bool(self.relay_enabled_var.get())
     def _refresh_relay_controls(self) -> None:
@@ -442,6 +715,17 @@ class OnchainTransferPageBase:
         self._refresh_relay_controls()
         width = self.root.winfo_width() if hasattr(self, "root") and hasattr(self.root, "winfo_width") else 1500
         self._apply_setting_layout(self._layout_mode_for_width(width))
+    def _relay_fee_reserve_label_text(self) -> str:
+        if self._is_mode_m1():
+            return "源钱包手续费预留"
+        if self._is_mode_1m():
+            return "中转手续费预留"
+        return "预留原生币手续费"
+    def _refresh_relay_fee_reserve_label(self) -> None:
+        try:
+            self.lbl_relay_fee_reserve.configure(text=self._relay_fee_reserve_label_text())
+        except Exception:
+            pass
     @staticmethod
     def _mask(value: str, head: int = 6, tail: int = 4) -> str:
         return mask_text(value, head=head, tail=tail)
@@ -1597,7 +1881,7 @@ class OnchainTransferPageBase:
 
         show_source = self._is_mode_1m()
         show_target = self._is_mode_m1()
-        show_relay = show_source
+        show_relay = self._relay_controls_visible()
 
         if layout_mode == "wide":
             self.lbl_mode.grid(row=0, column=0, sticky=W)
@@ -1846,7 +2130,20 @@ class OnchainTransferPageBase:
         self.log_tree.column("msg", width=msg_width, stretch=True)
     def _on_mode_changed(self, *_args):
         mode = self._mode()
+        previous_mode = str(getattr(self, "_last_mode_for_amounts", "") or "").strip()
+        if self._mode_amount_config_ready:
+            if previous_mode and previous_mode != mode:
+                self._capture_mode_amount_config(previous_mode)
+            self._apply_mode_amount_config(mode)
+        self._last_mode_for_amounts = mode
+        previous_relay_mode = str(getattr(self, "_last_mode_for_relay", "") or "").strip()
+        if self._mode_relay_config_ready:
+            if previous_relay_mode and previous_relay_mode != mode:
+                self._capture_mode_relay_config(previous_relay_mode)
+            self._apply_mode_relay_config(mode)
+        self._last_mode_for_relay = mode
         self._set_import_target("full")
+        self._refresh_relay_fee_reserve_label()
         self._refresh_relay_controls()
         if mode == self.MODE_M2M:
             self.source_balance_var.set("-")

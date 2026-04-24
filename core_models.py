@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 
@@ -79,6 +79,7 @@ class OnchainSettings:
     amount: str = ""
     random_min: str = ""
     random_max: str = ""
+    mode_amounts: dict[str, dict[str, str]] = field(default_factory=dict)
     delay_seconds: float = 1.0
     worker_threads: int = 10
     confirm_timeout_seconds: float = 180.0
@@ -89,5 +90,6 @@ class OnchainSettings:
     many_to_one_target: str = ""
     relay_enabled: bool = False
     relay_fee_reserve: str = ""
+    mode_relay_configs: dict[str, dict[str, object]] = field(default_factory=dict)
     relay_sweep_enabled: bool = True
     relay_sweep_target: str = ""

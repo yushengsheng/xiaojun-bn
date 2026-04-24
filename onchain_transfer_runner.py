@@ -110,10 +110,10 @@ class OnchainTransferRunnerMixin(object):
 
         relay_enabled = False
         relay_fee_reserve: Decimal | None = None
-        if hasattr(self, "mode_var") and self._is_mode_1m() and getattr(self, "_relay_enabled", None):
+        if hasattr(self, "mode_var") and (self._is_mode_1m() or self._is_mode_m1()) and getattr(self, "_relay_enabled", None):
             relay_enabled = bool(self._relay_enabled())
         if relay_enabled:
-            if amount_mode == self.AMOUNT_MODE_ALL:
+            if amount_mode == self.AMOUNT_MODE_ALL and not self._is_mode_m1():
                 messagebox.showerror("参数错误", "启用中转时仅支持固定数量或随机数量，暂不支持“全部”")
                 return None
             reserve_raw = self.relay_fee_reserve_var.get().strip()
@@ -125,7 +125,10 @@ class OnchainTransferRunnerMixin(object):
             except Exception:
                 messagebox.showerror("参数错误", "预留原生币手续费格式错误")
                 return None
-            if relay_fee_reserve <= 0:
+            if relay_fee_reserve < 0:
+                messagebox.showerror("参数错误", "预留原生币手续费不能小于 0")
+                return None
+            if relay_fee_reserve == 0 and not self._is_mode_m1():
                 messagebox.showerror("参数错误", "预留原生币手续费必须大于 0")
                 return None
 
@@ -164,6 +167,14 @@ class OnchainTransferRunnerMixin(object):
             self.source_private_key_cache[source_key] = private_key
             self.source_address_cache[source_key] = address
         return private_key, address
+    def _relay_confirm_recovery_text(self) -> str:
+        if hasattr(self, "mode_var") and self._is_mode_m1():
+            return "手续费回收：主流程结束后手动触发，默认回收到最终目标地址"
+        return "手续费回收：主流程结束后手动触发，默认回收到对应源钱包"
+    def _relay_confirm_reserve_label_text(self) -> str:
+        if hasattr(self, "mode_var") and self._is_mode_m1():
+            return "源钱包手续费预留"
+        return "中转手续费预留"
     def _resolve_source_address(self, source: str) -> str:
         source_key = source.strip()
         if not source_key:
@@ -245,8 +256,8 @@ class OnchainTransferRunnerMixin(object):
                 if params.relay_enabled:
                     relay_text = (
                         f"中转：已启用\n"
-                        f"预留手续费：{self._decimal_to_text(params.relay_fee_reserve or Decimal('0'))} {self._network_fee_symbol(params.network)}\n"
-                        "手续费回收：主流程结束后手动触发，默认回收到源钱包\n"
+                        f"{self._relay_confirm_reserve_label_text()}：{self._decimal_to_text(params.relay_fee_reserve or Decimal('0'))} {self._network_fee_symbol(params.network)}\n"
+                        f"{self._relay_confirm_recovery_text()}\n"
                         f"中转钱包文件：{self.relay_wallet_store.file_path.name}\n"
                     )
                 text = (
@@ -514,8 +525,8 @@ class OnchainTransferRunnerMixin(object):
                 if params.relay_enabled:
                     relay_text = (
                         f"中转：已启用\n"
-                        f"预留手续费：{self._decimal_to_text(params.relay_fee_reserve or Decimal('0'))} {self._network_fee_symbol(params.network)}\n"
-                        "手续费回收：主流程结束后手动触发，默认回收到源钱包\n"
+                        f"{self._relay_confirm_reserve_label_text()}：{self._decimal_to_text(params.relay_fee_reserve or Decimal('0'))} {self._network_fee_symbol(params.network)}\n"
+                        f"{self._relay_confirm_recovery_text()}\n"
                         f"中转钱包文件：{self.relay_wallet_store.file_path.name}\n"
                     )
                 text = (

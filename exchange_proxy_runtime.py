@@ -211,6 +211,52 @@ class ExchangeProxyRuntime:
         return unique
 
     @staticmethod
+    def _path_is_within(path: Path, root: Path) -> bool:
+        try:
+            Path(path).resolve().relative_to(Path(root).resolve())
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _bundle_backend_roots(backend: str) -> list[Path]:
+        backend_name = str(backend or "").strip()
+        if not backend_name:
+            return []
+        roots = [BUNDLE_DIR / "bin" / backend_name]
+        alt = backend_name.replace("-", "_")
+        if alt != backend_name:
+            roots.append(BUNDLE_DIR / "bin" / alt)
+        return roots
+
+    @classmethod
+    def _stage_bundled_runtime_if_needed(cls, executable: Path, backend: str) -> Path:
+        candidate = Path(executable)
+        if not (os.name == "nt" and getattr(sys, "frozen", False)):
+            return candidate
+        if not candidate.exists():
+            return candidate
+        if not cls._path_is_within(candidate, BUNDLE_DIR):
+            return candidate
+
+        staged_root = cls._runtime_cache_dir(backend) / "bundled"
+        staged_root.mkdir(parents=True, exist_ok=True)
+
+        with cls._RUNTIME_PREPARE_LOCK:
+            for source_root in cls._bundle_backend_roots(backend):
+                if source_root.exists() and cls._path_is_within(candidate, source_root):
+                    shutil.copytree(source_root, staged_root, dirs_exist_ok=True)
+                    staged_executable = cls._find_extracted_executable(staged_root, backend)
+                    if staged_executable is not None and staged_executable.exists():
+                        return staged_executable
+                    break
+
+            staged_executable = staged_root / candidate.name
+            if (not staged_executable.exists()) or staged_executable.stat().st_size != candidate.stat().st_size:
+                shutil.copy2(candidate, staged_executable)
+            return staged_executable
+
+    @staticmethod
     def _candidate_xray_paths() -> list[Path]:
         home = Path.home()
         bundled_candidates = ExchangeProxyRuntime._collect_executable_candidates([
@@ -371,16 +417,16 @@ class ExchangeProxyRuntime:
         if env_path:
             p = Path(env_path)
             if p.exists():
-                return p
+                return cls._stage_bundled_runtime_if_needed(p, "sing-box")
         for exe_name in cls._candidate_executable_names("sing-box"):
             which_path = shutil.which(exe_name)
             if which_path:
-                return Path(which_path)
+                return cls._stage_bundled_runtime_if_needed(Path(which_path), "sing-box")
         for p in cls._candidate_sing_box_paths():
             if p.exists():
-                return p
+                return cls._stage_bundled_runtime_if_needed(p, "sing-box")
         try:
-            return cls._ensure_sing_box_runtime()
+            return cls._stage_bundled_runtime_if_needed(cls._ensure_sing_box_runtime(), "sing-box")
         except Exception as exc:
             raise RuntimeError(f"未找到 sing-box 可执行文件，且项目内自动准备失败：{exc}") from exc
 
@@ -390,14 +436,14 @@ class ExchangeProxyRuntime:
         if env_path:
             p = Path(env_path)
             if p.exists():
-                return p
+                return cls._stage_bundled_runtime_if_needed(p, "xray")
         for exe_name in cls._candidate_executable_names("xray"):
             which_path = shutil.which(exe_name)
             if which_path:
-                return Path(which_path)
+                return cls._stage_bundled_runtime_if_needed(Path(which_path), "xray")
         for p in cls._candidate_xray_paths():
             if p.exists():
-                return p
+                return cls._stage_bundled_runtime_if_needed(p, "xray")
         raise RuntimeError("未找到 xray 可执行文件，请先安装 xray 或放到项目 bin/ 目录")
 
     def _stop_locked(self) -> None:
@@ -502,6 +548,15 @@ class ExchangeProxyRuntime:
             msg = f"{msg} | runtime_log={self._log_path} | tail={tail}"
         return RuntimeError(msg)
 
+    @staticmethod
+    def _merge_backend_errors(errors: list[object]) -> RuntimeError:
+        parts = [str(item or "").strip() for item in errors if str(item or "").strip()]
+        if not parts:
+            return RuntimeError("SS 代理启动失败")
+        if len(parts) == 1:
+            return RuntimeError(parts[0])
+        return RuntimeError("SS 代理启动失败；" + "；".join(parts))
+
     def _write_sing_box_config(self, ss_info: dict[str, object], listen_port: int) -> Path:
         self.work_dir.mkdir(parents=True, exist_ok=True)
         config_path = self._runtime_file_path("ss_proxy", ".json")
@@ -586,6 +641,78 @@ class ExchangeProxyRuntime:
             time.sleep(0.4)
         raise RuntimeError(f"SS 代理启动失败：{last_err or '本地代理未就绪'}")
 
+    @staticmethod
+    def _wait_local_port_ready(port: int, timeout_sec: float = 6.0) -> None:
+        deadline = time.time() + timeout_sec
+        last_err = ""
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", int(port)), timeout=1.0):
+                    return
+            except Exception as exc:
+                last_err = str(exc)
+                time.sleep(0.2)
+        raise RuntimeError(f"本地代理监听端口未就绪: 127.0.0.1:{port} ({last_err or 'timeout'})")
+
+    def probe_backend_launch(self, backend: str) -> str:
+        backend_name = str(backend or "").strip().lower()
+        if backend_name not in {"xray", "sing-box"}:
+            raise RuntimeError(f"不支持的代理后端: {backend}")
+
+        ss_info = {
+            "server": "127.0.0.1",
+            "server_port": 9,
+            "method": "aes-128-gcm",
+            "password": "xiaojun-proxy-selftest",
+            "network": "tcp",
+        }
+        proc = None
+        config_path = None
+        log_handle = None
+        self._log_path = None
+        try:
+            listen_port = self._allocate_local_port()
+            log_handle = self._open_runtime_log()
+            if backend_name == "xray":
+                exe = self.find_xray_executable()
+                config_path = self._write_xray_config(ss_info, listen_port)
+                cmd = [str(exe), "run", "-c", str(config_path)]
+            else:
+                exe = self.find_sing_box_executable()
+                config_path = self._write_sing_box_config(ss_info, listen_port)
+                cmd = [str(exe), "run", "-c", str(config_path)]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_handle,
+                stderr=log_handle,
+                **self._hidden_process_kwargs(),
+            )
+            self._wait_local_port_ready(listen_port)
+            return Path(exe).name
+        except Exception as exc:
+            raise self._format_backend_error(backend_name, exc) from exc
+        finally:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            if log_handle is not None:
+                try:
+                    log_handle.close()
+                except Exception:
+                    pass
+            if config_path is not None:
+                try:
+                    Path(config_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self._log_path = None
+
     def ensure_proxy(self, ss_uri: str) -> str:
         raw = str(ss_uri or "").strip()
         if not raw:
@@ -597,6 +724,7 @@ class ExchangeProxyRuntime:
             ss_info = self.parse_ss_uri(raw)
             listen_port = self._allocate_local_port()
             last_exc = None
+            backend_errors: list[str] = []
             proc = None
             config_path = None
             local_proxy_url = ""
@@ -629,6 +757,7 @@ class ExchangeProxyRuntime:
                     break
                 except Exception as exc:
                     last_exc = self._format_backend_error(backend, exc)
+                    backend_errors.append(str(last_exc))
                     if proc is not None:
                         try:
                             proc.terminate()
@@ -653,7 +782,7 @@ class ExchangeProxyRuntime:
                     config_path = None
                     local_proxy_url = ""
             if proc is None or not local_proxy_url:
-                raise last_exc or RuntimeError("SS 代理启动失败")
+                raise self._merge_backend_errors(backend_errors) from last_exc
             self._proc = proc
             self._raw_source = raw
             self._local_proxy_url = local_proxy_url
