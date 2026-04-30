@@ -3,7 +3,19 @@
 
 from __future__ import annotations
 
-from page_onchain_base import *  # noqa: F401,F403
+from page_onchain_base import (
+    BOTH,
+    END,
+    LEFT,
+    Path,
+    RIGHT,
+    VERTICAL,
+    bind_paste_shortcuts,
+    merge_column_values,
+    messagebox,
+    tk,
+    ttk,
+)
 
 
 class OnchainWalletMixin(object):

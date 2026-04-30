@@ -22,7 +22,7 @@ Binance 自动化工具（Tkinter GUI）。
 ### Windows
 
 ```powershell
-py -3 -m pip install requests PySocks cryptography eth-account eth-utils
+py -3 -m pip install -r requirements.txt
 py -3 小军bn.py
 ```
 

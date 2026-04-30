@@ -3,8 +3,17 @@
 
 from __future__ import annotations
 
-from exchange_app_base import *  # noqa: F401,F403
-from exchange_app_base import _shift_text_view_state_after_trim
+from exchange_app_base import (
+    EXCHANGE_LOG_MAX_ROWS,
+    _shift_text_view_state_after_trim,
+    capture_vertical_view_state,
+    http_get_via_proxy,
+    ipaddress,
+    log_queue,
+    messagebox,
+    queue,
+    restore_vertical_view_state,
+)
 
 
 class ExchangeAppLogViewMixin(object):

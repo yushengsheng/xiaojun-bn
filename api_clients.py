@@ -237,6 +237,9 @@ class EvmClient:
 
     @classmethod
     def _dependency_install_command(cls, package_names: list[str]) -> str:
+        req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+        if os.path.exists(req_path):
+            return f'"{sys.executable}" -m pip install --user -r "{req_path}"'
         pkg_list = " ".join(str(name).strip() for name in package_names if str(name).strip())
         return f'"{sys.executable}" -m pip install --user {pkg_list}'.strip()
 
@@ -278,7 +281,7 @@ class EvmClient:
         try:
             from eth_account import Account  # type: ignore
         except Exception as exc:
-            cmd = f'"{sys.executable}" -m pip install --user eth-account eth-utils'
+            cmd = cls._dependency_install_command(["eth-account", "eth-utils"])
             raise RuntimeError(f"链上签名依赖不可用，请执行：{cmd}") from exc
         return Account
 
@@ -288,7 +291,7 @@ class EvmClient:
         try:
             import eth_utils  # type: ignore
         except Exception as exc:
-            cmd = f'"{sys.executable}" -m pip install --user eth-utils'
+            cmd = cls._dependency_install_command(["eth-utils"])
             raise RuntimeError(f"链上地址校验依赖不可用，请执行：{cmd}") from exc
         return eth_utils
 

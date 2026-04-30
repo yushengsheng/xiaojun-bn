@@ -10,6 +10,7 @@ Rules:
   - Python runtime dependencies collected by PyInstaller
   - pinned proxy runtimes downloaded during CI (`xray`, `sing-box`)
   - both onefile and portable onedir packages
+- Keep runtime dependency versions pinned in `requirements.txt` and build dependency versions pinned in `requirements-build.txt`.
 - Smoke test both packaged apps with `--selftest --selftest-gui` before publishing release assets.
   - `--selftest` should stay offline-friendly and focus on packaged integrity.
   - `--selftest-gui` should cover GUI startup, page loading, config save, and wallet generation.

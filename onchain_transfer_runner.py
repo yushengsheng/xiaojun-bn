@@ -4,7 +4,17 @@
 from __future__ import annotations
 
 from onchain_relay_runner import run_relay_batch, run_relay_fee_recovery
-from page_onchain_base import *  # noqa: F401,F403
+from page_onchain_base import (
+    Decimal,
+    InvalidOperation,
+    WithdrawRuntimeParams,
+    messagebox,
+    queue,
+    random_decimal_between,
+    set_ui_batch_size,
+    threading,
+    time,
+)
 
 
 class OnchainTransferRunnerMixin(object):

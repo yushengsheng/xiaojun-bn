@@ -3,7 +3,16 @@
 
 from __future__ import annotations
 
-from page_onchain_base import *  # noqa: F401,F403
+from page_onchain_base import (
+    Decimal,
+    InvalidOperation,
+    ONCHAIN_DATA_FILE,
+    OnchainPairEntry,
+    OnchainSettings,
+    Path,
+    messagebox,
+    re,
+)
 
 
 class OnchainImportMixin(object):

@@ -3,7 +3,15 @@
 
 from __future__ import annotations
 
-from page_onchain_base import *  # noqa: F401,F403
+from page_onchain_base import (
+    Decimal,
+    EvmToken,
+    WithdrawRuntimeParams,
+    messagebox,
+    queue,
+    set_ui_batch_size,
+    threading,
+)
 
 
 class OnchainQueryMixin(object):

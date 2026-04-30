@@ -9,7 +9,7 @@ scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 targetScript = FindMainScript(scriptDir)
 
 If targetScript = "" Then
-    MsgBox "Main script (*bn.py) was not found." & vbCrLf & scriptDir, vbCritical, "Launch Failed"
+    MsgBox "Main script was not found." & vbCrLf & scriptDir, vbCritical, "Launch Failed"
     WScript.Quit 1
 End If
 
@@ -22,7 +22,7 @@ End If
 If Not EnsureRuntimeDependencies(pythonCmd) Then
     MsgBox "Auto-installing runtime dependencies failed." & vbCrLf & _
            "Please run:" & vbCrLf & _
-           CliPythonCommand(pythonCmd) & " -m pip install --user requests PySocks cryptography eth-account eth-utils", _
+           CliPythonCommand(pythonCmd) & " -m pip install --user -r requirements.txt", _
            vbCritical, "Launch Failed"
     WScript.Quit 1
 End If
@@ -32,24 +32,13 @@ launchCmd = Quote(pythonCmd) & " " & Quote(targetScript)
 shell.Run launchCmd, 0, False
 
 Function FindMainScript(folderPath)
-    Dim folder, file
-    On Error Resume Next
-    Set folder = fso.GetFolder(folderPath)
-    If Err.Number <> 0 Then
-        Err.Clear
+    Dim candidate
+    candidate = fso.BuildPath(folderPath, ChrW(&H5C0F) & ChrW(&H519B) & "bn.py")
+    If FileExistsSafe(candidate) Then
+        FindMainScript = candidate
+    Else
         FindMainScript = ""
-        Exit Function
     End If
-    On Error GoTo 0
-
-    For Each file In folder.Files
-        If LCase(Right(file.Name, 5)) = "bn.py" Then
-            FindMainScript = file.Path
-            Exit Function
-        End If
-    Next
-
-    FindMainScript = ""
 End Function
 
 Function ResolvePythonGuiCommand()
@@ -161,7 +150,7 @@ Function EnsureRuntimeDependencies(pyExe)
         Exit Function
     End If
 
-    installCmd = Quote(cliPy) & " -m pip install --user requests PySocks cryptography eth-account eth-utils"
+    installCmd = Quote(cliPy) & " -m pip install --user -r " & Quote(fso.BuildPath(scriptDir, "requirements.txt"))
     rc = RunHiddenAndWait(installCmd)
     If rc <> 0 Then
         EnsureRuntimeDependencies = False

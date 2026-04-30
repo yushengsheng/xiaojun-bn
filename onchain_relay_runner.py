@@ -2223,7 +2223,6 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
             jobs_q.put((i, row_key, source, target))
 
         def worker():
-            total = len(jobs_data)
             while True:
                 if owner.stop_requested.is_set():
                     return
@@ -2377,7 +2376,6 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                             target=target,
                         )
                         confirm_timeout_seconds = _confirm_timeout_seconds(stage_params)
-                        sweep_timeout_seconds = _relay_sweep_timeout_seconds(confirm_timeout_seconds)
                         recovery_timeout_seconds = _broadcast_recovery_timeout_seconds(stage_params)
                         fee_wait_params = WithdrawRuntimeParams(
                             coin=owner._network_fee_symbol(params.network),
