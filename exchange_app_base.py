@@ -24,6 +24,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from api_clients import EvmClient
+from app_version import get_app_window_title
 from app_paths import (
     CONFIG_BACKUP_SUFFIX,
     DATA_FILE,
@@ -161,7 +162,7 @@ def _shift_text_view_state_after_trim(state: tuple[str, object] | None, trimmed_
 class ExchangeAppBase(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Binance 自动交易机器人（增强版 GUI）")
+        self.title(get_app_window_title())
         self.geometry("1320x920")
 
         self.client = None

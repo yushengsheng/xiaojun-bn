@@ -72,6 +72,7 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item "小军bn.py" "app_entry.py" -Force
+          Set-Content -Path "version.txt" -Value "${{ github.ref_name }}" -NoNewline
 
       - name: Build Windows packages (onefile + portable onedir)
         shell: pwsh
@@ -88,6 +89,7 @@ jobs:
             '--hidden-import', 'api_clients',
             '--hidden-import', 'exchange_binance_client',
             '--hidden-import', 'app_paths',
+            '--hidden-import', 'app_version',
             '--hidden-import', 'core_models',
             '--hidden-import', 'shared_utils',
             '--hidden-import', 'stores',
@@ -115,7 +117,8 @@ jobs:
             '--collect-all', 'parsimonious',
             '--collect-all', 'cytoolz',
             '--collect-all', 'bitarray',
-            '--collect-all', 'ckzg'
+            '--collect-all', 'ckzg',
+            '--add-data', 'version.txt;.'
           )
 
           Get-ChildItem "build-proxy/xray" -File -Recurse | ForEach-Object {
