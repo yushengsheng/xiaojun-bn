@@ -721,6 +721,11 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
 
     zero_round_client = _SelftestZeroRoundClient()
     zero_round_progress: list[tuple[int, int, str]] = []
+    zero_round_sleep_calls = {"count": 0}
+
+    def zero_round_sleep_fn():
+        zero_round_sleep_calls["count"] += 1
+
     zero_round_strategy = Strategy(
         client=zero_round_client,
         spot_rounds=0,
@@ -729,7 +734,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         withdraw_network="BSC",
         withdraw_fee_buffer=0,
         spot_symbol="BTCUSDT",
-        sleep_fn=lambda: None,
+        sleep_fn=zero_round_sleep_fn,
         enable_withdraw=False,
         trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
         trade_mode=TRADE_MODE_MARKET,
@@ -746,6 +751,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError(f"0轮现货兑换自检失败：兑换调用次数异常（{zero_round_client.calls}）")
     if not zero_round_progress or zero_round_progress[-1][0:2] != (1, 1):
         raise RuntimeError(f"0轮现货兑换自检失败：进度回调异常（{zero_round_progress}）")
+    if zero_round_sleep_calls["count"] != 1:
+        raise RuntimeError(f"0轮现货兑换自检失败：随机延迟未在兑换前执行（{zero_round_sleep_calls}）")
     if not zero_round_result or zero_round_result.get("withdraw_attempted") is not True:
         raise RuntimeError("0轮现货兑换自检失败：未保持既有最终提现流程")
     checks.append("spot-zero-round-convert=ok")
@@ -843,6 +850,25 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             f"0轮现货兑换到账检测自检失败：错误检测了后置币种（{zero_round_wait_client.collected_assets}）"
         )
     checks.append("spot-zero-round-wait=ok")
+
+    class _SelftestAccountAssetBalanceClient:
+        def __init__(self):
+            self.calls: list[tuple[str, bool]] = []
+
+        def query_asset_balances_breakdown(self, *, fast: bool = False) -> dict[str, Decimal]:
+            self.calls.append(("asset-breakdown", bool(fast)))
+            return {"USDT": Decimal("12.5"), "U": Decimal("2.5")}
+
+        def spot_all_balances(self, *, fast: bool = False):
+            raise RuntimeError("余额刷新不应走现货交易对余额路径")
+
+    asset_balance_client = _SelftestAccountAssetBalanceClient()
+    asset_balance_text = ExchangeAppBatchMixin._query_account_asset_balances_text(asset_balance_client, fast=True)
+    if asset_balance_text != "USDT 12.5 | U 2.5":
+        raise RuntimeError(f"账户资产余额查询自检失败：显示结果异常（{asset_balance_text}）")
+    if asset_balance_client.calls != [("asset-breakdown", True)]:
+        raise RuntimeError(f"账户资产余额查询自检失败：查询路径异常（{asset_balance_client.calls}）")
+    checks.append("account-asset-balance-query=ok")
 
     class _SelftestMarketRoundClient:
         def __init__(self):

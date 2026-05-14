@@ -145,6 +145,10 @@ class Strategy:
             quote_asset,
             self.spot_symbol,
         )
+        self.sleep_fn()
+        if stop_event and stop_event.is_set():
+            logger.info("检测到停止信号，跳过 0 轮现货兑换")
+            return
         try:
             result = self.c.convert_base_to_quote_all(symbol=self.spot_symbol)
             if result:

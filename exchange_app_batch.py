@@ -529,8 +529,7 @@ class ExchangeAppBatchMixin(object):
             try:
                 logger.info("交易所刷新余额链路：%s", self._exchange_proxy_route_text())
                 client = self._create_binance_client(key, secret)
-                spot_balances = client.spot_all_balances(fast=True)
-                balances_text = self._format_spot_balances_text(spot_balances)
+                balances_text = self._query_account_asset_balances_text(client, fast=True)
                 if self._closing:
                     return
 
@@ -749,6 +748,10 @@ class ExchangeAppBatchMixin(object):
                 continue
             parts.append(f"{asset} {cls._format_amount(total)}")
         return " | ".join(parts) if parts else "--"
+    @classmethod
+    def _query_account_asset_balances_text(cls, client, *, fast: bool = True) -> str:
+        asset_breakdown = client.query_asset_balances_breakdown(fast=fast)
+        return cls._format_asset_breakdown_text(asset_breakdown)
     @classmethod
     def _format_asset_breakdown_text(cls, balances: dict[str, Decimal]) -> str:
         if not balances:
@@ -1496,7 +1499,7 @@ class ExchangeAppBatchMixin(object):
                     client = self._create_binance_client(acc["api_key"], acc["api_secret"])
                     trade_symbol = futures_symbol if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES else spot_symbol
                     quote_asset = str(validated_quote_asset or "").strip().upper()
-                    if not quote_asset:
+                    if (not batch_total_asset_only) and (not quote_asset):
                         quote_asset = self._ensure_trade_symbol_supported(
                             client,
                             trade_account_type,
