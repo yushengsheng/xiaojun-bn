@@ -80,6 +80,7 @@ class ExchangeAppBatchMixin(object):
         trade_account_type: str = TRADE_ACCOUNT_TYPE_SPOT,
         trade_mode: str = TRADE_MODE_DEFAULT,
         required_quote_amount: Decimal | None = None,
+        spot_base_to_quote_only: bool = False,
     ):
         start = time.time()
         c = client or self.client
@@ -98,6 +99,8 @@ class ExchangeAppBatchMixin(object):
         except Exception as exc:
             logger.error("到账检测前解析交易对失败: %s", exc)
             return False
+        spot_base_to_quote_only = bool(spot_base_to_quote_only and trade_type == TRADE_ACCOUNT_TYPE_SPOT)
+        wait_asset = base_asset if spot_base_to_quote_only else quote_asset
         required_amount = Decimal(str(required_quote_amount)) if required_quote_amount is not None else Decimal("0")
         progress_log_times: dict[str, float] = {}
         error_log_times: dict[str, float] = {}
@@ -122,7 +125,7 @@ class ExchangeAppBatchMixin(object):
 
         while time.time() - start < timeout_sec:
             if stop_event and stop_event.is_set():
-                logger.info("检测 %s 时收到停止信号，结束检测", quote_asset)
+                logger.info("检测 %s 时收到停止信号，结束检测", wait_asset)
                 return False
             try:
                 base_balance_dec = Decimal("0")
@@ -153,13 +156,23 @@ class ExchangeAppBatchMixin(object):
                             quote_balance,
                         )
                 else:
-                    c.collect_funding_asset_to_spot(quote_asset)
-                    quote_balance_dec = c.spot_asset_balance_decimal(quote_asset)
-                    if mode_name == TRADE_MODE_CONVERT and base_asset:
+                    if spot_base_to_quote_only:
+                        quote_balance_dec = Decimal("0")
+                    else:
+                        c.collect_funding_asset_to_spot(quote_asset)
+                        quote_balance_dec = c.spot_asset_balance_decimal(quote_asset)
+                    if (spot_base_to_quote_only or mode_name == TRADE_MODE_CONVERT) and base_asset:
                         c.collect_funding_asset_to_spot(base_asset)
                         base_balance_dec = c.spot_asset_balance_decimal(base_asset)
                     quote_balance = float(quote_balance_dec)
-                    if mode_name == TRADE_MODE_LIMIT:
+                    if spot_base_to_quote_only:
+                        log_progress_throttled(
+                            "spot-balance-zero-round",
+                            "0轮兑换到账检测中，当前现货 %s = %.8f",
+                            base_asset,
+                            float(base_balance_dec),
+                        )
+                    elif mode_name == TRADE_MODE_LIMIT:
                         base_balance_dec = c.spot_asset_balance_decimal(base_asset)
                         log_progress_throttled(
                             "spot-balance-limit",
@@ -192,22 +205,26 @@ class ExchangeAppBatchMixin(object):
                 log_error_throttled(
                     f"balance-error:{type(e).__name__}:{e}",
                     "检测 %s 余额失败: %s",
-                    quote_asset,
+                    wait_asset,
                     e,
                 )
                 quote_balance = 0.0
                 base_balance_dec = Decimal("0")
 
             balance_ready = quote_balance > 0
-            if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+            if trade_type == TRADE_ACCOUNT_TYPE_SPOT and spot_base_to_quote_only:
+                balance_ready = base_balance_dec > 0
+            elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
                 balance_ready = Decimal(str(quote_balance)) > 0 or base_balance_dec > 0
-            if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_CONVERT:
+            elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_CONVERT:
                 balance_ready = Decimal(str(quote_balance)) > 0 or base_balance_dec > 0
-            if trade_type == TRADE_ACCOUNT_TYPE_FUTURES and required_amount > 0:
+            elif trade_type == TRADE_ACCOUNT_TYPE_FUTURES and required_amount > 0:
                 balance_ready = Decimal(str(quote_balance)) >= required_amount
 
             if balance_ready:
-                if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+                if trade_type == TRADE_ACCOUNT_TYPE_SPOT and spot_base_to_quote_only:
+                    logger.info("检测到可兑换 %s 余额，开始执行后续策略", base_asset)
+                elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
                     logger.info("检测到可挂单余额，开始执行后续策略")
                 elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_CONVERT:
                     logger.info("检测到可闪兑余额，开始执行后续策略")
@@ -218,7 +235,9 @@ class ExchangeAppBatchMixin(object):
             delay_seconds = min(self._current_random_delay_seconds(), max(0.0, timeout_sec - (time.time() - start)))
             if delay_seconds <= 0:
                 continue
-            if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+            if trade_type == TRADE_ACCOUNT_TYPE_SPOT and spot_base_to_quote_only:
+                log_progress_throttled("retry-zero-round", "未检测到可兑换 %s 余额，%.3f 秒后重试", base_asset, delay_seconds)
+            elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
                 log_progress_throttled("retry-limit", "未检测到可挂单余额，%.3f 秒后重试", delay_seconds)
             elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_CONVERT:
                 log_progress_throttled("retry-convert", "未检测到可闪兑余额，%.3f 秒后重试", delay_seconds)
@@ -226,18 +245,21 @@ class ExchangeAppBatchMixin(object):
                 log_progress_throttled("retry-balance", "%s 未到账，%.3f 秒后重试", quote_asset, delay_seconds)
             if stop_event:
                 if stop_event.wait(delay_seconds):
-                    logger.info("检测 %s 等待期间收到停止信号，结束检测", quote_asset)
+                    logger.info("检测 %s 等待期间收到停止信号，结束检测", wait_asset)
                     return False
             else:
                 time.sleep(delay_seconds)
 
+        if trade_type == TRADE_ACCOUNT_TYPE_SPOT and spot_base_to_quote_only:
+            logger.error("在 %d 秒内未检测到可兑换 %s 余额，终止任务", timeout_sec, base_asset)
+            return False
         if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
             logger.error("在 %d 秒内未检测到可挂单余额，终止任务", timeout_sec)
             return False
         if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_CONVERT:
             logger.error("在 %d 秒内未检测到可闪兑余额，终止任务", timeout_sec)
             return False
-        logger.error("在 %d 秒内未检测到 %s 到账，终止任务", timeout_sec, quote_asset)
+        logger.error("在 %d 秒内未检测到 %s 到账，终止任务", timeout_sec, wait_asset)
         return False
     def start_bot(self):
         if self.worker_thread and self.worker_thread.is_alive():
@@ -295,6 +317,7 @@ class ExchangeAppBatchMixin(object):
                 trade_mode,
                 spot_symbol,
                 futures_symbol,
+                spot_rounds,
             )
             effective_reprice_threshold = None
             if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode in {TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}:
@@ -387,6 +410,14 @@ class ExchangeAppBatchMixin(object):
 
         def worker():
             try:
+                zero_round_spot_conversion = (
+                    trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and spot_rounds == 0
+                )
+                wait_asset = (
+                    BinanceClient.get_spot_base_asset(spot_symbol)
+                    if zero_round_spot_conversion
+                    else quote_asset
+                )
                 if not self.wait_for_usdt(
                     usdt_timeout,
                     self.stop_event,
@@ -395,11 +426,12 @@ class ExchangeAppBatchMixin(object):
                     trade_account_type=trade_account_type,
                     trade_mode=trade_mode,
                     required_quote_amount=required_quote_amount,
+                    spot_base_to_quote_only=zero_round_spot_conversion,
                 ):
                     if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
                         logger.info("挂单余额检测未通过，任务结束")
                     else:
-                        logger.info("%s 检测未通过，任务结束", quote_asset)
+                        logger.info("%s 检测未通过，任务结束", wait_asset)
                     return
 
                 if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
@@ -412,6 +444,8 @@ class ExchangeAppBatchMixin(object):
                         futures_leverage,
                         futures_margin_type,
                     )
+                elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and spot_rounds == 0:
+                    logger.info("开始执行策略：0轮现货兑换，交易对=%s", spot_symbol)
                 elif trade_mode == TRADE_MODE_MARKET:
                     logger.info("开始执行策略：市价 %d 轮，预买BNB金额=%s", spot_rounds, bnb_topup_amount_value)
                 elif trade_mode == TRADE_MODE_CONVERT:
@@ -1302,6 +1336,7 @@ class ExchangeAppBatchMixin(object):
         configured_bnb_topup_amount_value = Decimal(str(bnb_topup_amount_value or "0"))
         show_bnb_topup_option = (
             trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
+            and spot_rounds != 0
             and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}
         )
         enable_bnb_topup = (
@@ -1468,6 +1503,7 @@ class ExchangeAppBatchMixin(object):
                             trade_mode,
                             spot_symbol,
                             futures_symbol,
+                            spot_rounds,
                         )
                     required_quote_amount = None
                     if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES and futures_amount_value is not None and futures_leverage > 0:
@@ -1644,10 +1680,21 @@ class ExchangeAppBatchMixin(object):
 
                     # 3) 原批量现货策略
                     else:
+                        zero_round_spot_conversion = (
+                            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and spot_rounds == 0
+                        )
+                        base_asset = (
+                            BinanceClient.get_spot_base_asset(spot_symbol)
+                            if zero_round_spot_conversion
+                            else ""
+                        )
+                        wait_asset = base_asset if zero_round_spot_conversion else quote_asset
                         need_wait_usdt = not skip_usdt_wait_in_batch
 
                         if need_wait_usdt:
-                            if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                            if zero_round_spot_conversion:
+                                set_status(f"检测{base_asset} 到账...")
+                            elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
                                 set_status("检测挂单余额...")
                             else:
                                 set_status(f"检测 {quote_asset} 到账...")
@@ -1659,22 +1706,26 @@ class ExchangeAppBatchMixin(object):
                                 trade_account_type=trade_account_type,
                                 trade_mode=trade_mode,
                                 required_quote_amount=required_quote_amount,
+                                spot_base_to_quote_only=zero_round_spot_conversion,
                             ):
                                 if combined_stop.is_set():
                                     logger.info(f"账号 #{idx} 已请求停止")
                                     finish_current_now("已停止", success=False)
                                 else:
-                                    if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                                    if zero_round_spot_conversion:
+                                        logger.info(f"账号 #{idx} {base_asset} 检测超时，跳过")
+                                        set_status(self._exchange_failed_status_text(f"{base_asset} 未到账"))
+                                    elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
                                         logger.info(f"账号 #{idx} 挂单余额检测超时，跳过")
                                         set_status(self._exchange_failed_status_text("无可挂单余额"))
                                     else:
-                                        logger.info(f"账号 #{idx} {quote_asset} 检测超时，跳过")
-                                        set_status(self._exchange_failed_status_text(f"{quote_asset} 未到账"))
+                                        logger.info(f"账号 #{idx} {wait_asset} 检测超时，跳过")
+                                        set_status(self._exchange_failed_status_text(f"{wait_asset} 未到账"))
                                     finish_current_now(success=False)
                                 continue
                         else:
-                            logger.info(f"账号 #{idx} 已开启“批量策略跳过{quote_asset}检测”")
-                            set_status(f"跳过{quote_asset}检测")
+                            logger.info(f"账号 #{idx} 已开启“批量策略跳过{wait_asset}检测”")
+                            set_status(f"跳过{wait_asset}检测")
 
                         set_status("策略执行中...")
                         if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
@@ -1688,6 +1739,8 @@ class ExchangeAppBatchMixin(object):
                                 futures_leverage,
                                 futures_margin_type,
                             )
+                        elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and spot_rounds == 0:
+                            logger.info("账号 #%d 开始执行0轮现货兑换，交易对=%s", idx, spot_symbol)
                         elif trade_mode == TRADE_MODE_MARKET:
                             logger.info("账号 #%d 开始执行市价策略：%d 轮，预买BNB金额=%s", idx, spot_rounds, bnb_topup_amount_value)
                         elif trade_mode == TRADE_MODE_CONVERT:
@@ -1852,6 +1905,7 @@ class ExchangeAppBatchMixin(object):
                         trade_mode,
                         spot_symbol,
                         futures_symbol,
+                        spot_rounds,
                     )
                     self._begin_batch_summary_tracking(
                         action_label=batch_action_label,

@@ -31,6 +31,7 @@ SUPPORTED_QUOTE_ASSET_SUFFIXES = (
     "BNB",
     "TRY",
     "EUR",
+    "U",
 )
 
 logger = logging.getLogger("bot")
@@ -597,7 +598,7 @@ class BinanceClient:
         return None
 
     def ensure_convert_symbol_supported(self, symbol: str) -> tuple[str, str]:
-        base_asset, quote_asset = self.ensure_spot_symbol_supported(symbol)
+        _symbol_u, base_asset, quote_asset = self._validated_spot_symbol_parts(symbol)
         if not self.get_convert_pair_info(quote_asset, base_asset):
             raise RuntimeError(f"闪兑不支持 {quote_asset} -> {base_asset}")
         if not self.get_convert_pair_info(base_asset, quote_asset):

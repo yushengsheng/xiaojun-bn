@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest-windows:
+    runs-on: windows-latest
+
+    env:
+      XRAY_TAG: v26.3.27
+      XRAY_ASSET: Xray-windows-64.zip
+      SING_BOX_TAG: v1.13.5
+      SING_BOX_ASSET: sing-box-1.13.5-windows-amd64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Download proxy runtimes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $proxyRoot = Join-Path $PWD "build-proxy"
+          $xrayDir = Join-Path $proxyRoot "xray"
+          $singBoxDir = Join-Path $proxyRoot "sing-box"
+          New-Item -ItemType Directory -Path $xrayDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $singBoxDir -Force | Out-Null
+
+          gh release download "${{ env.XRAY_TAG }}" --repo XTLS/Xray-core --pattern "${{ env.XRAY_ASSET }}" --dir $proxyRoot
+          Expand-Archive -Path (Join-Path $proxyRoot "${{ env.XRAY_ASSET }}") -DestinationPath $xrayDir -Force
+          Remove-Item (Join-Path $proxyRoot "${{ env.XRAY_ASSET }}") -Force
+
+          gh release download "${{ env.SING_BOX_TAG }}" --repo SagerNet/sing-box --pattern "${{ env.SING_BOX_ASSET }}" --dir $proxyRoot
+          Expand-Archive -Path (Join-Path $proxyRoot "${{ env.SING_BOX_ASSET }}") -DestinationPath $singBoxDir -Force
+          Remove-Item (Join-Path $proxyRoot "${{ env.SING_BOX_ASSET }}") -Force
+
+          if (-not (Get-ChildItem $xrayDir -Filter "xray.exe" -File -Recurse | Select-Object -First 1)) {
+            throw "xray.exe was not found after extraction."
+          }
+          if (-not (Get-ChildItem $singBoxDir -Filter "sing-box.exe" -File -Recurse | Select-Object -First 1)) {
+            throw "sing-box.exe was not found after extraction."
+          }
+
+      - name: Run regression checks
+        shell: pwsh
+        run: |
+          python -m compileall -q .
+          python .\小军bn.py --selftest --selftest-gui
+          python -m pip check

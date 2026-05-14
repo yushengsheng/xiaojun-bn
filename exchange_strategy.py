@@ -125,6 +125,39 @@ class Strategy:
     def _is_futures_mode(self) -> bool:
         return self._trade_account_type_name() == TRADE_ACCOUNT_TYPE_FUTURES
 
+    def _is_zero_round_spot_conversion(self) -> bool:
+        try:
+            rounds = int(self.spot_rounds)
+        except Exception:
+            return False
+        return (not self._is_futures_mode()) and rounds == 0
+
+    def _run_zero_round_spot_conversion(self, stop_event, progress_cb=None):
+        if stop_event and stop_event.is_set():
+            logger.info("检测到停止信号，跳过 0 轮现货兑换")
+            return
+
+        base_asset = self.c.get_spot_base_asset(self.spot_symbol)
+        quote_asset = self.c.get_spot_quote_asset(self.spot_symbol)
+        logger.info(
+            "现货轮次为 0，执行前置币种兑换为后置币种：%s -> %s，交易对=%s",
+            base_asset,
+            quote_asset,
+            self.spot_symbol,
+        )
+        try:
+            result = self.c.convert_base_to_quote_all(symbol=self.spot_symbol)
+            if result:
+                logger.info("0 轮现货兑换完成：%s -> %s", base_asset, quote_asset)
+            else:
+                logger.info("0 轮现货兑换未执行：可能 %s 余额不足或不满足最小闪兑金额", base_asset)
+        except Exception as e:
+            logger.error("0 轮现货兑换异常: %s", e)
+            if self._pause_with_stop(stop_event, 3):
+                return
+        if progress_cb:
+            progress_cb(1, 1, "0轮兑换 %s->%s" % (base_asset, quote_asset))
+
     def _futures_side_order(self) -> str:
         return "BUY" if self.futures_side == FUTURES_SIDE_LONG else "SELL"
 
@@ -1187,16 +1220,22 @@ class Strategy:
         withdraw_error = ""
         withdraw_attempted = False
 
-        self._run_bnb_topup_if_needed()
+        zero_round_spot_conversion = self._is_zero_round_spot_conversion()
 
-        if self._is_futures_mode():
-            self._run_futures_mode(stop_event, progress_cb=progress_cb)
-        elif self._is_convert_mode():
-            self._run_convert_mode(stop_event, progress_cb=progress_cb)
-        elif self._mode_name() == TRADE_MODE_MARKET:
-            self._run_market_mode(stop_event, progress_cb=progress_cb)
+        if zero_round_spot_conversion:
+            self._run_zero_round_spot_conversion(stop_event, progress_cb=progress_cb)
         else:
-            self._run_limit_like_mode(stop_event, progress_cb=progress_cb)
+            self._run_bnb_topup_if_needed()
+
+        if not zero_round_spot_conversion:
+            if self._is_futures_mode():
+                self._run_futures_mode(stop_event, progress_cb=progress_cb)
+            elif self._is_convert_mode():
+                self._run_convert_mode(stop_event, progress_cb=progress_cb)
+            elif self._mode_name() == TRADE_MODE_MARKET:
+                self._run_market_mode(stop_event, progress_cb=progress_cb)
+            else:
+                self._run_limit_like_mode(stop_event, progress_cb=progress_cb)
 
         if stop_event and stop_event.is_set():
             logger.info("检测到停止信号，跳过最终提现")

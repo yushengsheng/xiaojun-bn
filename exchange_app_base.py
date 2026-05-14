@@ -804,26 +804,27 @@ class ExchangeAppBase(tk.Tk):
                     runtime_rounds = int(self.spot_rounds_var.get())
                 except Exception as exc:
                     raise RuntimeError(f"{mode}模式下必须填写现货轮次") from exc
-                if runtime_rounds < 1:
-                    raise RuntimeError(f"{mode}模式下现货轮次必须大于等于 1")
+                if runtime_rounds < 0:
+                    raise RuntimeError(f"{mode}模式下现货轮次必须大于等于 0")
             else:
-                runtime_rounds = stored_rounds if stored_rounds > 0 else SPOT_ROUNDS_DEFAULT
-                fee_stop_value = self._decimal_field_value(fee_stop_text, "剩余bnb手续费", min_value=0)
-                if mode == TRADE_MODE_PREMIUM:
-                    premium_value = self._decimal_field_value(premium_text, "溢价", min_value=0)
-                    if not premium_append_threshold_text:
-                        premium_append_threshold_text = PREMIUM_APPEND_THRESHOLD_DEFAULT
-                    try:
-                        premium_order_count = int(premium_order_count_text)
-                    except Exception as exc:
-                        raise RuntimeError("笔数格式不正确") from exc
-                    if premium_order_count < 0:
-                        raise RuntimeError("笔数不能小于 0")
-                    premium_append_threshold_value = self._decimal_field_value(
-                        premium_append_threshold_text,
-                        "追加挂单",
-                        min_value=0,
-                    )
+                runtime_rounds = stored_rounds if stored_rounds >= 0 else SPOT_ROUNDS_DEFAULT
+                if runtime_rounds != 0:
+                    fee_stop_value = self._decimal_field_value(fee_stop_text, "剩余bnb手续费", min_value=0)
+                    if mode == TRADE_MODE_PREMIUM:
+                        premium_value = self._decimal_field_value(premium_text, "溢价", min_value=0)
+                        if not premium_append_threshold_text:
+                            premium_append_threshold_text = PREMIUM_APPEND_THRESHOLD_DEFAULT
+                        try:
+                            premium_order_count = int(premium_order_count_text)
+                        except Exception as exc:
+                            raise RuntimeError("笔数格式不正确") from exc
+                        if premium_order_count < 0:
+                            raise RuntimeError("笔数不能小于 0")
+                        premium_append_threshold_value = self._decimal_field_value(
+                            premium_append_threshold_text,
+                            "追加挂单",
+                            min_value=0,
+                        )
         else:
             runtime_rounds = stored_rounds if stored_rounds > 0 else SPOT_ROUNDS_DEFAULT
             try:
@@ -1026,7 +1027,7 @@ class ExchangeAppBase(tk.Tk):
             ttk.Label(row2_left, text="现货交易对:", style="ExchangeAccent.TLabel").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.spot_symbol_var, width=14).pack(side="left", padx=(4, 12))
             ttk.Label(row2_left, text="现货轮次:").pack(side="left")
-            ttk.Spinbox(row2_left, from_=1, to=100, textvariable=self.spot_rounds_var, width=6).pack(side="left", padx=(4, 12))
+            ttk.Spinbox(row2_left, from_=0, to=100, textvariable=self.spot_rounds_var, width=6).pack(side="left", padx=(4, 12))
             ttk.Label(row2_left, text="预购买BNB金额:").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.bnb_topup_amount_var, width=10).pack(side="left", padx=(4, 12))
         else:

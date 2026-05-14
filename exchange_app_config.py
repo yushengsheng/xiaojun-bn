@@ -236,12 +236,20 @@ class ExchangeAppConfigMixin(object):
         trade_mode: str,
         spot_symbol: str,
         futures_symbol: str,
+        spot_rounds: int | None = None,
     ) -> str:
         if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
             return client.get_um_futures_margin_asset(futures_symbol)
+        zero_round = False
+        if spot_rounds is not None:
+            try:
+                zero_round = int(spot_rounds) == 0
+            except Exception:
+                zero_round = False
+        if trade_mode == TRADE_MODE_CONVERT or zero_round:
+            _base_asset, quote_asset = client.ensure_convert_symbol_supported(spot_symbol)
+            return quote_asset
         _base_asset, quote_asset = client.ensure_spot_symbol_supported(spot_symbol)
-        if trade_mode == TRADE_MODE_CONVERT:
-            client.ensure_convert_symbol_supported(spot_symbol)
         return quote_asset
     @staticmethod
     def _encrypt_optional_text(value: str) -> str:

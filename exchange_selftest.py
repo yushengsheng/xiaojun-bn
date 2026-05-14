@@ -16,12 +16,16 @@ import requests
 from api_clients import EvmClient
 from app_paths import LOG_FILE_PATH
 from core_models import EvmToken, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
+from exchange_app_base import ExchangeAppBase
 from exchange_app_batch import ExchangeAppBatchMixin
+from exchange_app_config import ExchangeAppConfigMixin
 from exchange_binance_client import BinanceClient
+from exchange_constants import TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_LIMIT, TRADE_MODE_MARKET, TRADE_MODE_PREMIUM
 from exchange_logging import logger, runtime_log_path
 from onchain_relay_wallets import RelayWalletFileStore
 from onchain_relay_runner import _record_matches_job
 from exchange_proxy_runtime import ExchangeProxyRuntime
+from exchange_strategy import Strategy
 from secret_box import SECRET_BOX
 from shared_utils import decimal_to_text, random_decimal_between
 from stores import OnchainStore
@@ -481,11 +485,18 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                     "baseAsset": "XAUT",
                     "quoteAsset": "USDT",
                 }
+            if symbol_u == "BTCU":
+                return {
+                    "symbol": symbol_u,
+                    "status": "TRADING",
+                    "baseAsset": "BTC",
+                    "quoteAsset": "U",
+                }
             return None
 
         def get_convert_pair_info(self, from_asset: str, to_asset: str):
             key = (str(from_asset or "").strip().upper(), str(to_asset or "").strip().upper())
-            if key in {("USDT", "XAUT"), ("XAUT", "USDT")}:
+            if key in {("USDT", "XAUT"), ("XAUT", "USDT"), ("USDT", "U"), ("U", "USDT")}:
                 return {
                     "fromAsset": key[0],
                     "toAsset": key[1],
@@ -509,6 +520,55 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         if (base_asset, quote_asset) != ("XAUT", "USDT"):
             raise RuntimeError("交易对校验自检失败：现货资产解析异常")
         symbol_client.ensure_convert_symbol_supported("XAUTUSDT")
+        if BinanceClient.split_spot_symbol("USDTU") != ("USDT", "U"):
+            raise RuntimeError("U后置币种解析自检失败：USDTU 未解析为 USDT/U")
+        if BinanceClient.split_spot_symbol("UUSDT") != ("U", "USDT"):
+            raise RuntimeError("U后置币种解析自检失败：UUSDT 未解析为 U/USDT")
+        base_asset, quote_asset = symbol_client.ensure_spot_symbol_supported("BTCU")
+        if (base_asset, quote_asset) != ("BTC", "U"):
+            raise RuntimeError("U后置现货交易对自检失败：BTCU 解析异常")
+        base_asset, quote_asset = symbol_client.ensure_convert_symbol_supported("USDTU")
+        if (base_asset, quote_asset) != ("USDT", "U"):
+            raise RuntimeError("USDT->U闪兑资产对自检失败：USDTU 未被识别为闪兑资产对")
+        try:
+            symbol_client.ensure_spot_symbol_supported("USDTU")
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("USDTU现货校验自检失败：不应把USDTU误判为现货交易对")
+        quote_asset_for_zero_round = ExchangeAppConfigMixin._ensure_trade_symbol_supported(
+            symbol_client,
+            TRADE_ACCOUNT_TYPE_SPOT,
+            TRADE_MODE_MARKET,
+            "USDTU",
+            "BTCUSDT",
+            0,
+        )
+        if quote_asset_for_zero_round != "U":
+            raise RuntimeError("0轮USDTU校验自检失败：未按闪兑资产对放行")
+        try:
+            ExchangeAppConfigMixin._ensure_trade_symbol_supported(
+                symbol_client,
+                TRADE_ACCOUNT_TYPE_SPOT,
+                TRADE_MODE_MARKET,
+                "USDTU",
+                "BTCUSDT",
+                1,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("非0轮USDTU校验自检失败：普通市价不应放行非现货交易对")
+        quote_asset_for_convert = ExchangeAppConfigMixin._ensure_trade_symbol_supported(
+            symbol_client,
+            TRADE_ACCOUNT_TYPE_SPOT,
+            TRADE_MODE_CONVERT,
+            "USDTU",
+            "BTCUSDT",
+            1,
+        )
+        if quote_asset_for_convert != "U":
+            raise RuntimeError("闪兑模式USDTU校验自检失败：未按闪兑资产对放行")
         if symbol_client.get_um_futures_margin_asset("BTCUSDT") != "USDT":
             raise RuntimeError("交易对校验自检失败：合约保证金币种解析异常")
         try:
@@ -629,6 +689,347 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     finally:
         buy_client.close()
     checks.append("spot-buy-precision=ok")
+
+    class _SelftestZeroRoundClient:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        def get_spot_base_asset(self, symbol: str) -> str:
+            self.calls.append(("base", str(symbol or "").strip().upper()))
+            return "BTC"
+
+        def get_spot_quote_asset(self, symbol: str) -> str:
+            self.calls.append(("quote", str(symbol or "").strip().upper()))
+            return "USDT"
+
+        def convert_base_to_quote_all(self, symbol: str):
+            self.calls.append(("convert-base-to-quote", str(symbol or "").strip().upper()))
+            return {"status": "ok"}
+
+        def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
+            self.calls.append(("withdraw", str(coin or "").strip().upper()))
+            return 0
+
+        def spot_buy_all_usdt(self, symbol: str):
+            raise RuntimeError("0轮现货兑换不应执行市价买入")
+
+        def spot_sell_all_base(self, symbol: str, small_qty_log_text=None):
+            raise RuntimeError("0轮现货兑换不应执行市价卖出")
+
+        def buy_bnb_with_quote_amount(self, symbol: str, quote_amount):
+            raise RuntimeError("0轮现货兑换不应执行预买BNB")
+
+    zero_round_client = _SelftestZeroRoundClient()
+    zero_round_progress: list[tuple[int, int, str]] = []
+    zero_round_strategy = Strategy(
+        client=zero_round_client,
+        spot_rounds=0,
+        withdraw_coin="USDT",
+        withdraw_address="",
+        withdraw_network="BSC",
+        withdraw_fee_buffer=0,
+        spot_symbol="BTCUSDT",
+        sleep_fn=lambda: None,
+        enable_withdraw=False,
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+        bnb_topup_amount=Decimal("10"),
+    )
+    zero_round_result = zero_round_strategy.run(
+        stop_event=None,
+        progress_cb=lambda step, total, text: zero_round_progress.append((step, total, text)),
+    )
+    zero_round_convert_calls = [
+        call for call in zero_round_client.calls if call == ("convert-base-to-quote", "BTCUSDT")
+    ]
+    if len(zero_round_convert_calls) != 1:
+        raise RuntimeError(f"0轮现货兑换自检失败：兑换调用次数异常（{zero_round_client.calls}）")
+    if not zero_round_progress or zero_round_progress[-1][0:2] != (1, 1):
+        raise RuntimeError(f"0轮现货兑换自检失败：进度回调异常（{zero_round_progress}）")
+    if not zero_round_result or zero_round_result.get("withdraw_attempted") is not True:
+        raise RuntimeError("0轮现货兑换自检失败：未保持既有最终提现流程")
+    checks.append("spot-zero-round-convert=ok")
+
+    class _SelftestStableUZeroRoundClient:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        def get_spot_base_asset(self, symbol: str) -> str:
+            return BinanceClient.get_spot_base_asset(symbol)
+
+        def get_spot_quote_asset(self, symbol: str) -> str:
+            return BinanceClient.get_spot_quote_asset(symbol)
+
+        def convert_base_to_quote_all(self, symbol: str):
+            symbol_u = str(symbol or "").strip().upper()
+            base_asset = BinanceClient.get_spot_base_asset(symbol_u)
+            quote_asset = BinanceClient.get_spot_quote_asset(symbol_u)
+            self.calls.append(("convert", f"{base_asset}->{quote_asset}"))
+            return {"status": "ok"}
+
+        def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
+            self.calls.append(("withdraw", str(coin or "").strip().upper()))
+            return 0
+
+        def spot_buy_all_usdt(self, symbol: str):
+            raise RuntimeError("0轮U闪兑不应执行市价买入")
+
+        def spot_sell_all_base(self, symbol: str, small_qty_log_text=None):
+            raise RuntimeError("0轮U闪兑不应执行市价卖出")
+
+        def buy_bnb_with_quote_amount(self, symbol: str, quote_amount):
+            raise RuntimeError("0轮U闪兑不应执行预买BNB")
+
+    for symbol, expected_direction in (("USDTU", "USDT->U"), ("UUSDT", "U->USDT")):
+        stable_u_client = _SelftestStableUZeroRoundClient()
+        stable_u_strategy = Strategy(
+            client=stable_u_client,
+            spot_rounds=0,
+            withdraw_coin="USDT",
+            withdraw_address="",
+            withdraw_network="BSC",
+            withdraw_fee_buffer=0,
+            spot_symbol=symbol,
+            sleep_fn=lambda: None,
+            enable_withdraw=False,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            trade_mode=TRADE_MODE_MARKET,
+            bnb_topup_amount=Decimal("10"),
+        )
+        stable_u_strategy.run(stop_event=None)
+        if ("convert", expected_direction) not in stable_u_client.calls:
+            raise RuntimeError(f"0轮U闪兑方向自检失败：{symbol} 未执行 {expected_direction}（{stable_u_client.calls}）")
+    checks.append("spot-zero-round-u-convert=ok")
+
+    class _SelftestZeroRoundWaitClient:
+        def __init__(self):
+            self.collected_assets: list[str] = []
+
+        def collect_funding_asset_to_spot(self, asset: str):
+            self.collected_assets.append(str(asset or "").strip().upper())
+            return Decimal("0")
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            asset_u = str(asset or "").strip().upper()
+            return Decimal("0.01") if asset_u == "BTC" else Decimal("0")
+
+    class _SelftestZeroRoundWaitProbe(ExchangeAppBatchMixin):
+        def __init__(self, client):
+            self.client = client
+
+        def _normalize_trade_account_type(self, value):
+            return str(value or "").strip()
+
+        def _normalize_trade_mode(self, value):
+            return str(value or "").strip()
+
+        def _current_random_delay_seconds(self) -> float:
+            return 0.0
+
+    zero_round_wait_client = _SelftestZeroRoundWaitClient()
+    zero_round_wait_probe = _SelftestZeroRoundWaitProbe(zero_round_wait_client)
+    if not zero_round_wait_probe.wait_for_usdt(
+        1,
+        None,
+        client=zero_round_wait_client,
+        symbol="BTCUSDT",
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+        spot_base_to_quote_only=True,
+    ):
+        raise RuntimeError("0轮现货兑换到账检测自检失败：未检测前置币种余额")
+    if zero_round_wait_client.collected_assets != ["BTC"]:
+        raise RuntimeError(
+            f"0轮现货兑换到账检测自检失败：错误检测了后置币种（{zero_round_wait_client.collected_assets}）"
+        )
+    checks.append("spot-zero-round-wait=ok")
+
+    class _SelftestMarketRoundClient:
+        def __init__(self):
+            self.calls: list[tuple[str, str]] = []
+
+        def get_spot_base_asset(self, symbol: str) -> str:
+            return "BTC"
+
+        def get_spot_quote_asset(self, symbol: str) -> str:
+            return "USDT"
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            self.calls.append(("balance", str(asset or "").strip().upper()))
+            return Decimal("0.1") if str(asset or "").strip().upper() == "BNB" else Decimal("0")
+
+        def buy_bnb_with_quote_amount(self, quote_asset: str, quote_amount, return_order: bool = False):
+            self.calls.append(("bnb-topup", str(quote_asset or "").strip().upper()))
+            return {"toAmount": "0.001"} if return_order else True
+
+        def _decimal_from_str(self, value, default="0") -> Decimal:
+            try:
+                return Decimal(str(value))
+            except Exception:
+                return Decimal(str(default))
+
+        def ensure_bnb_fee_ready_in_spot(self, *, min_spot_balance, max_transfer_amount=None, timeout_seconds=12.0):
+            self.calls.append(("bnb-ready", str(min_spot_balance)))
+            return Decimal(str(min_spot_balance))
+
+        def spot_buy_all_usdt(self, symbol: str):
+            self.calls.append(("buy", str(symbol or "").strip().upper()))
+            return True
+
+        def spot_sell_all_base(self, symbol: str, small_qty_log_text=None):
+            self.calls.append(("sell", str(symbol or "").strip().upper()))
+            return True
+
+        def convert_base_to_quote_all(self, symbol: str):
+            raise RuntimeError("普通市价轮次不应走0轮闪兑分支")
+
+        def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
+            self.calls.append(("withdraw", str(coin or "").strip().upper()))
+            return 0
+
+    market_round_client = _SelftestMarketRoundClient()
+    market_round_progress: list[tuple[int, int, str]] = []
+    market_round_strategy = Strategy(
+        client=market_round_client,
+        spot_rounds=2,
+        withdraw_coin="USDT",
+        withdraw_address="",
+        withdraw_network="BSC",
+        withdraw_fee_buffer=0,
+        spot_symbol="BTCUSDT",
+        sleep_fn=lambda: None,
+        enable_withdraw=False,
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+        bnb_topup_amount=Decimal("5"),
+    )
+    market_round_result = market_round_strategy.run(
+        stop_event=None,
+        progress_cb=lambda step, total, text: market_round_progress.append((step, total, text)),
+    )
+    market_buy_count = sum(1 for call in market_round_client.calls if call == ("buy", "BTCUSDT"))
+    market_sell_count = sum(1 for call in market_round_client.calls if call == ("sell", "BTCUSDT"))
+    market_topup_count = sum(1 for call in market_round_client.calls if call == ("bnb-topup", "USDT"))
+    if market_buy_count != 2 or market_sell_count != 6 or market_topup_count != 1:
+        raise RuntimeError(f"普通市价轮次回归自检失败：执行路径异常（{market_round_client.calls}）")
+    if len(market_round_progress) != 2 or market_round_progress[-1][0:2] != (2, 2):
+        raise RuntimeError(f"普通市价轮次回归自检失败：进度回调异常（{market_round_progress}）")
+    if not market_round_result or market_round_result.get("withdraw_attempted") is not True:
+        raise RuntimeError("普通市价轮次回归自检失败：未保持既有最终提现流程")
+    checks.append("spot-market-rounds=ok")
+
+    class _SelftestQuoteWaitClient:
+        def __init__(self):
+            self.collected_assets: list[str] = []
+
+        def collect_funding_asset_to_spot(self, asset: str):
+            self.collected_assets.append(str(asset or "").strip().upper())
+            return Decimal("0")
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            asset_u = str(asset or "").strip().upper()
+            return Decimal("20") if asset_u == "USDT" else Decimal("0")
+
+    quote_wait_client = _SelftestQuoteWaitClient()
+    quote_wait_probe = _SelftestZeroRoundWaitProbe(quote_wait_client)
+    if not quote_wait_probe.wait_for_usdt(
+        1,
+        None,
+        client=quote_wait_client,
+        symbol="BTCUSDT",
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+    ):
+        raise RuntimeError("普通市价到账检测自检失败：未检测后置币种余额")
+    if quote_wait_client.collected_assets != ["USDT"]:
+        raise RuntimeError(
+            f"普通市价到账检测自检失败：错误检测了前置币种（{quote_wait_client.collected_assets}）"
+        )
+    checks.append("spot-quote-wait=ok")
+
+    class _SelftestUsdcQuoteWaitClient:
+        def __init__(self):
+            self.collected_assets: list[str] = []
+
+        def collect_funding_asset_to_spot(self, asset: str):
+            self.collected_assets.append(str(asset or "").strip().upper())
+            return Decimal("0")
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            asset_u = str(asset or "").strip().upper()
+            return Decimal("20") if asset_u == "USDC" else Decimal("0")
+
+    usdc_quote_wait_client = _SelftestUsdcQuoteWaitClient()
+    usdc_quote_wait_probe = _SelftestZeroRoundWaitProbe(usdc_quote_wait_client)
+    if not usdc_quote_wait_probe.wait_for_usdt(
+        1,
+        None,
+        client=usdc_quote_wait_client,
+        symbol="BTCUSDC",
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+    ):
+        raise RuntimeError("USDC后置币种到账检测自检失败：未检测USDC余额")
+    if usdc_quote_wait_client.collected_assets != ["USDC"]:
+        raise RuntimeError(
+            f"USDC后置币种到账检测自检失败：错误检测了其他币种（{usdc_quote_wait_client.collected_assets}）"
+        )
+    checks.append("spot-usdc-quote-wait=ok")
+
+    class _SimpleVar:
+        def __init__(self, value=""):
+            self._value = value
+
+        def get(self):
+            return self._value
+
+        def set(self, value):
+            self._value = value
+
+    class _SelftestTradeSettingsProbe(ExchangeAppBase):
+        def __init__(self, *, mode=TRADE_MODE_MARKET, spot_rounds=0):
+            self.trade_account_type_var = _SimpleVar(TRADE_ACCOUNT_TYPE_SPOT)
+            self.trade_mode_var = _SimpleVar(mode)
+            self.spot_symbol_var = _SimpleVar("BTCUSDT")
+            self.spot_rounds_var = _SimpleVar(spot_rounds)
+            self.futures_rounds_var = _SimpleVar(20)
+            self.premium_delta_var = _SimpleVar("")
+            self.premium_order_count_var = _SimpleVar(0)
+            self.premium_append_threshold_var = _SimpleVar("")
+            self.bnb_fee_stop_var = _SimpleVar("")
+            self.bnb_topup_amount_var = _SimpleVar("0")
+            self.reprice_threshold_var = _SimpleVar("0")
+            self.futures_symbol_var = _SimpleVar("BTCUSDT")
+            self.futures_amount_var = _SimpleVar("100")
+            self.futures_margin_type_var = _SimpleVar("CROSSED")
+            self.futures_side_var = _SimpleVar("")
+            self.futures_leverage_var = _SimpleVar(10)
+
+    market_zero_settings = _SelftestTradeSettingsProbe(
+        mode=TRADE_MODE_MARKET,
+        spot_rounds=0,
+    )._collect_trade_mode_settings()
+    if market_zero_settings.get("spot_rounds") != 0:
+        raise RuntimeError(f"0轮市价参数自检失败：轮次未保留为0（{market_zero_settings}）")
+    limit_zero_settings = _SelftestTradeSettingsProbe(
+        mode=TRADE_MODE_LIMIT,
+        spot_rounds=0,
+    )._collect_trade_mode_settings()
+    if limit_zero_settings.get("spot_rounds") != 0 or limit_zero_settings.get("bnb_fee_stop_value") is not None:
+        raise RuntimeError(f"0轮挂单参数自检失败：0轮不应强制挂单专属参数（{limit_zero_settings}）")
+    premium_zero_settings = _SelftestTradeSettingsProbe(
+        mode=TRADE_MODE_PREMIUM,
+        spot_rounds=0,
+    )._collect_trade_mode_settings()
+    if premium_zero_settings.get("spot_rounds") != 0 or premium_zero_settings.get("premium_delta_value") is not None:
+        raise RuntimeError(f"0轮溢价参数自检失败：0轮不应强制溢价专属参数（{premium_zero_settings}）")
+    try:
+        _SelftestTradeSettingsProbe(mode=TRADE_MODE_MARKET, spot_rounds=-1)._collect_trade_mode_settings()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("现货负轮次参数自检失败：负数轮次未被拒绝")
+    checks.append("spot-zero-round-settings=ok")
 
     class _SelftestCollectClient(BinanceClient):
         def __init__(self):
