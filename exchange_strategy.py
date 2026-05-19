@@ -1288,11 +1288,11 @@ class CombinedStopEvent:
                 time.sleep(0.1)
             return True
 
-        end_time = time.time() + max(0.0, float(timeout))
+        end_time = time.monotonic() + max(0.0, float(timeout))
         while True:
             if self.is_set():
                 return True
-            remaining = end_time - time.time()
+            remaining = end_time - time.monotonic()
             if remaining <= 0:
                 return self.is_set()
             step = min(0.2, remaining)

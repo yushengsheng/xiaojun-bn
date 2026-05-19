@@ -1807,7 +1807,40 @@ class ExchangeAppBatchMixin(object):
                                 low_ms, high_ms = max_delay, min_delay
                             else:
                                 low_ms, high_ms = min_delay, max_delay
-                            combined_stop.wait(random.randint(low_ms, high_ms) / 1000.0)
+                            delay_seconds = random.randint(low_ms, high_ms) / 1000.0
+                            if zero_round_spot_conversion:
+                                logger.info(
+                                    "账号 #%d 0轮随机延迟开始：计划 %.3f 秒（配置 %d-%d ms）",
+                                    idx,
+                                    delay_seconds,
+                                    low_ms,
+                                    high_ms,
+                                )
+                            delay_started_at = time.monotonic()
+                            interrupted = combined_stop.wait(delay_seconds)
+                            actual_delay = time.monotonic() - delay_started_at
+                            if zero_round_spot_conversion:
+                                if interrupted:
+                                    logger.info(
+                                        "账号 #%d 0轮随机延迟被停止信号中断：实际 %.3f / 计划 %.3f 秒",
+                                        idx,
+                                        actual_delay,
+                                        delay_seconds,
+                                    )
+                                elif actual_delay + 0.05 < delay_seconds:
+                                    logger.warning(
+                                        "账号 #%d 0轮随机延迟提前返回：实际 %.3f / 计划 %.3f 秒",
+                                        idx,
+                                        actual_delay,
+                                        delay_seconds,
+                                    )
+                                else:
+                                    logger.info(
+                                        "账号 #%d 0轮随机延迟结束：实际 %.3f / 计划 %.3f 秒",
+                                        idx,
+                                        actual_delay,
+                                        delay_seconds,
+                                    )
 
                         withdraw_state = {"amount": None}
 
