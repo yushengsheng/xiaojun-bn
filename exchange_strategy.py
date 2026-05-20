@@ -1249,6 +1249,17 @@ class Strategy:
                 "withdraw_attempted": withdraw_attempted,
             }
 
+        if self.enable_withdraw:
+            logger.info("最终提现前执行随机延迟")
+            self.sleep_fn()
+            if stop_event and stop_event.is_set():
+                logger.info("检测到停止信号，跳过最终提现")
+                return {
+                    "withdraw_amount": withdraw_amount,
+                    "withdraw_error": withdraw_error,
+                    "withdraw_attempted": withdraw_attempted,
+                }
+
         logger.info(f"开始最终提现所有 {self.withdraw_coin}")
         withdraw_attempted = True
         try:

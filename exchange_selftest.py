@@ -7,6 +7,7 @@ import contextlib
 import os
 import sys
 import tempfile
+import threading
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -709,8 +710,13 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     checks.append("spot-buy-precision=ok")
 
     class _SelftestZeroRoundClient:
-        def __init__(self):
+        def __init__(self, events=None):
             self.calls: list[tuple[str, str]] = []
+            self.events = events
+
+        def _record_event(self, name: str) -> None:
+            if self.events is not None:
+                self.events.append(name)
 
         def get_spot_base_asset(self, symbol: str) -> str:
             self.calls.append(("base", str(symbol or "").strip().upper()))
@@ -722,10 +728,12 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
 
         def convert_base_to_quote_all(self, symbol: str):
             self.calls.append(("convert-base-to-quote", str(symbol or "").strip().upper()))
+            self._record_event("convert")
             return {"status": "ok"}
 
         def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
             self.calls.append(("withdraw", str(coin or "").strip().upper()))
+            self._record_event("withdraw")
             return 0
 
         def spot_buy_all_usdt(self, symbol: str):
@@ -737,23 +745,25 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         def buy_bnb_with_quote_amount(self, symbol: str, quote_amount):
             raise RuntimeError("0轮现货兑换不应执行预买BNB")
 
-    zero_round_client = _SelftestZeroRoundClient()
+    zero_round_events: list[str] = []
+    zero_round_client = _SelftestZeroRoundClient(zero_round_events)
     zero_round_progress: list[tuple[int, int, str]] = []
     zero_round_sleep_calls = {"count": 0}
 
     def zero_round_sleep_fn():
         zero_round_sleep_calls["count"] += 1
+        zero_round_events.append("sleep")
 
     zero_round_strategy = Strategy(
         client=zero_round_client,
         spot_rounds=0,
         withdraw_coin="USDT",
-        withdraw_address="",
+        withdraw_address="0x0000000000000000000000000000000000000001",
         withdraw_network="BSC",
         withdraw_fee_buffer=0,
         spot_symbol="BTCUSDT",
         sleep_fn=zero_round_sleep_fn,
-        enable_withdraw=False,
+        enable_withdraw=True,
         trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
         trade_mode=TRADE_MODE_MARKET,
         bnb_topup_amount=Decimal("10"),
@@ -769,11 +779,47 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError(f"0轮现货兑换自检失败：兑换调用次数异常（{zero_round_client.calls}）")
     if not zero_round_progress or zero_round_progress[-1][0:2] != (1, 1):
         raise RuntimeError(f"0轮现货兑换自检失败：进度回调异常（{zero_round_progress}）")
-    if zero_round_sleep_calls["count"] != 1:
-        raise RuntimeError(f"0轮现货兑换自检失败：随机延迟未在兑换前执行（{zero_round_sleep_calls}）")
+    if zero_round_sleep_calls["count"] != 2:
+        raise RuntimeError(f"0轮现货兑换自检失败：随机延迟未在兑换前和最终提现前执行（{zero_round_sleep_calls}）")
+    if zero_round_events != ["sleep", "convert", "sleep", "withdraw"]:
+        raise RuntimeError(f"0轮现货兑换自检失败：随机延迟和提现顺序异常（{zero_round_events}）")
     if not zero_round_result or zero_round_result.get("withdraw_attempted") is not True:
         raise RuntimeError("0轮现货兑换自检失败：未保持既有最终提现流程")
     checks.append("spot-zero-round-convert=ok")
+
+    stop_withdraw_events: list[str] = []
+    stop_withdraw_client = _SelftestZeroRoundClient(stop_withdraw_events)
+    stop_withdraw_event = threading.Event()
+    stop_withdraw_sleep_calls = {"count": 0}
+
+    def stop_withdraw_sleep_fn():
+        stop_withdraw_sleep_calls["count"] += 1
+        stop_withdraw_events.append("sleep")
+        if stop_withdraw_sleep_calls["count"] == 2:
+            stop_withdraw_event.set()
+
+    stop_withdraw_strategy = Strategy(
+        client=stop_withdraw_client,
+        spot_rounds=0,
+        withdraw_coin="USDT",
+        withdraw_address="0x0000000000000000000000000000000000000001",
+        withdraw_network="BSC",
+        withdraw_fee_buffer=0,
+        spot_symbol="BTCUSDT",
+        sleep_fn=stop_withdraw_sleep_fn,
+        enable_withdraw=True,
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+        bnb_topup_amount=Decimal("10"),
+    )
+    stop_withdraw_result = stop_withdraw_strategy.run(stop_event=stop_withdraw_event)
+    if ("withdraw", "USDT") in stop_withdraw_client.calls:
+        raise RuntimeError(f"最终提现停止自检失败：停止后仍执行提现（{stop_withdraw_client.calls}）")
+    if stop_withdraw_result.get("withdraw_attempted") is not False:
+        raise RuntimeError(f"最终提现停止自检失败：停止后提现状态异常（{stop_withdraw_result}）")
+    if stop_withdraw_events != ["sleep", "convert", "sleep"]:
+        raise RuntimeError(f"最终提现停止自检失败：随机延迟和停止顺序异常（{stop_withdraw_events}）")
+    checks.append("final-withdraw-delay-stop=ok")
 
     class _SelftestStableUZeroRoundClient:
         def __init__(self):
