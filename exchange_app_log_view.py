@@ -14,6 +14,7 @@ from exchange_app_base import (
     queue,
     restore_vertical_view_state,
 )
+from sensitive_data import redact_sensitive_text
 
 
 class ExchangeAppLogViewMixin(object):
@@ -223,6 +224,7 @@ class ExchangeAppLogViewMixin(object):
     def _append_log_batch(self, messages: list[str]):
         if not messages:
             return
+        messages = [redact_sensitive_text(msg) for msg in messages]
         follow_tail, view_state = capture_vertical_view_state(self.text_log)
         self.text_log.configure(state="normal")
         self.text_log.insert("end", "\n".join(str(msg) for msg in messages) + "\n")

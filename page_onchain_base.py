@@ -46,6 +46,7 @@ from shared_utils import (
     stop_ui_bridge,
     set_ui_batch_size,
 )
+from sensitive_data import redact_sensitive_text
 from stores import OnchainStore
 from table_import_utils import (
     IMPORT_TARGET_PURPLE,
@@ -858,13 +859,13 @@ class OnchainTransferPageBase:
         if not use_config_proxy:
             system_proxy = self._onchain_system_proxy_map()
             if system_proxy:
-                return f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}"
+                return redact_sensitive_text(f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}")
             return "direct"
         if not raw_proxy:
             return "direct"
         if raw_proxy.lower().startswith("ss://"):
             return "builtin-ss"
-        return f"manual-proxy -> {self._normalize_onchain_proxy(raw_proxy)}"
+        return redact_sensitive_text(f"manual-proxy -> {self._normalize_onchain_proxy(raw_proxy)}")
     def _fetch_onchain_public_ip(
         self,
         *,

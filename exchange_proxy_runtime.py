@@ -26,6 +26,7 @@ import requests
 
 from app_paths import APP_DIR, BUNDLE_DIR, DATA_DIR
 from exchange_logging import logger
+from sensitive_data import redact_sensitive_text
 from stores import _atomic_write_text
 
 
@@ -546,7 +547,7 @@ class ExchangeProxyRuntime:
         msg = f"{backend} 启动失败: {exc}"
         if tail:
             msg = f"{msg} | runtime_log={self._log_path} | tail={tail}"
-        return RuntimeError(msg)
+        return RuntimeError(redact_sensitive_text(msg))
 
     @staticmethod
     def _merge_backend_errors(errors: list[object]) -> RuntimeError:

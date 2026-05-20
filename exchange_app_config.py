@@ -43,6 +43,7 @@ from exchange_app_base import (
     messagebox,
     requests,
 )
+from sensitive_data import redact_sensitive_text
 
 
 class ExchangeAppConfigMixin(object):
@@ -198,7 +199,7 @@ class ExchangeAppConfigMixin(object):
         if not use_config_proxy:
             system_proxy = self._system_proxy_map()
             if system_proxy:
-                return f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}"
+                return redact_sensitive_text(f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}")
             return "direct"
         if not raw_proxy:
             return "direct"
@@ -207,7 +208,7 @@ class ExchangeAppConfigMixin(object):
             backend = snap.get("backend") or "unknown"
             local_proxy = snap.get("local_proxy_url") or "pending"
             return f"builtin-ss/{backend} -> {local_proxy}"
-        return f"manual-proxy -> {self._normalize_exchange_proxy(raw_proxy)}"
+        return redact_sensitive_text(f"manual-proxy -> {self._normalize_exchange_proxy(raw_proxy)}")
     def _exchange_proxy_route_text(self) -> str:
         return self._exchange_proxy_route_text_from_state()
     @staticmethod

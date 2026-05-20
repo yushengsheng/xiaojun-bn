@@ -23,6 +23,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Check tracked sensitive artifacts
+        shell: pwsh
+        run: python tools/check_sensitive_artifacts.py --root . --git-only
+
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
@@ -167,6 +171,10 @@ jobs:
 
           Invoke-Selftest (Resolve-Path "dist/$appName.exe") (Resolve-Path "dist") "Onefile" @('--selftest', '--selftest-gui')
           Invoke-Selftest (Resolve-Path "dist/$portableName/$portableName.exe") (Resolve-Path "dist/$portableName") "Portable" @('--selftest', '--selftest-gui')
+
+      - name: Remove selftest runtime artifacts
+        shell: pwsh
+        run: python tools/check_sensitive_artifacts.py --root dist --include-direct-children --clean-runtime
 
       - name: Package release assets
         shell: pwsh

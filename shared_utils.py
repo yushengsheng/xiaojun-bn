@@ -12,6 +12,8 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 import tkinter as tk
 from tkinter import END, Scrollbar
 
+from sensitive_data import redact_sensitive_text
+
 
 LOG_MAX_ROWS = 500
 UI_BATCH_DELAY_MS = 50
@@ -299,7 +301,7 @@ def restore_vertical_view_state(widget, state: tuple[str, object] | None) -> Non
 
 
 def append_log_rows(log_tree, texts: list[str], max_rows: int = LOG_MAX_ROWS) -> None:
-    rows_to_add = [str(text or "") for text in texts if text is not None]
+    rows_to_add = [redact_sensitive_text(text) for text in texts if text is not None]
     if not rows_to_add:
         return
     follow_tail, first_fraction = capture_vertical_view_state(log_tree)

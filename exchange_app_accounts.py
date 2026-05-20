@@ -21,6 +21,7 @@ from exchange_app_base import (
     time,
     tk,
 )
+from sensitive_data import mask_api_key
 
 
 class ExchangeAppAccountsMixin(object):
@@ -219,7 +220,8 @@ class ExchangeAppAccountsMixin(object):
             messagebox.showinfo("提示", f"{source_name}没有新增账号，全部为重复 API（重复 {duplicate_count} 个）")
         return len(deduped_accounts)
     def record_withdraw(self, index, api_key, address, amount):
-        line = f"{index}+{api_key}+{address}+{amount:.8f}\n"
+        api_key_masked = mask_api_key(api_key)
+        line = f"{index}+{api_key_masked}+{address}+{amount:.8f}\n"
         try:
             WITHDRAW_SUCCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
             with self._result_file_lock:
@@ -230,7 +232,8 @@ class ExchangeAppAccountsMixin(object):
             logger.error("写入提现记录文件失败: %s", e)
     def record_total_asset(self, index, api_key, address, network, total_usdt):
         total_dec = Decimal(str(total_usdt))
-        line = f"{index}+{api_key}+{total_dec:.8f}\n"
+        api_key_masked = mask_api_key(api_key)
+        line = f"{index}+{api_key_masked}+{total_dec:.8f}\n"
 
         try:
             TOTAL_ASSET_RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -243,7 +246,7 @@ class ExchangeAppAccountsMixin(object):
         with self._result_file_lock:
             self.total_asset_results[index] = {
                 "index": index,
-                "api_key": api_key,
+                "api_key": api_key_masked,
                 "address": address,
                 "network": network,
                 "total_usdt": total_dec,

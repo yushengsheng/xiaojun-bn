@@ -27,6 +27,7 @@ from onchain_relay_runner import _record_matches_job
 from exchange_proxy_runtime import ExchangeProxyRuntime
 from exchange_strategy import Strategy
 from secret_box import SECRET_BOX
+from sensitive_data import mask_api_key, redact_sensitive_text
 from shared_utils import decimal_to_text, random_decimal_between
 from stores import OnchainStore
 
@@ -60,6 +61,23 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     if SECRET_BOX.decrypt(v1_cipher) != probe_text:
         raise RuntimeError("安全存储自检失败：旧版密文兼容回读失败")
     checks.append(f"secret-box={secret_backend}")
+
+    sample_api_key = "AK" + "1" * 62
+    sample_signature = "f" * 64
+    sample_private_key = "a" * 64
+    sample_proxy = "ss://example-sensitive-proxy"
+    redacted = redact_sensitive_text(
+        "api_key=%s&signature=%s 私钥：%s proxy=%s 1+%s+0x0000000000000000000000000000000000000001+1.0"
+        % (sample_api_key, sample_signature, sample_private_key, sample_proxy, sample_api_key)
+    )
+    for secret_text in (sample_api_key, sample_signature, sample_private_key, sample_proxy):
+        if secret_text in redacted:
+            raise RuntimeError("敏感信息脱敏自检失败：仍包含原始敏感字段")
+    if mask_api_key(sample_api_key) not in redacted:
+        raise RuntimeError("敏感信息脱敏自检失败：结果文件 API KEY 脱敏格式异常")
+    if redact_sensitive_text("secret-box=cryptography") != "secret-box=cryptography":
+        raise RuntimeError("敏感信息脱敏自检失败：误伤普通 selftest 文本")
+    checks.append("sensitive-redaction=ok")
 
     with tempfile.TemporaryDirectory(prefix="xiaojun-selftest-") as tmpdir:
         store_path = Path(tmpdir) / "onchain.json"
