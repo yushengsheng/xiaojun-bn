@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -100,17 +102,45 @@ def _runtime_matches(scan_root: Path, include_direct_children: bool) -> list[Pat
     return sorted(found, key=lambda p: str(p))
 
 
+def _make_writable(path: str) -> None:
+    try:
+        os.chmod(path, 0o700)
+    except Exception:
+        pass
+
+
+def _rmtree_onerror(func, path, _exc_info) -> None:
+    _make_writable(path)
+    try:
+        func(path)
+    except Exception:
+        pass
+
+
+def _remove_one_path(path: Path) -> bool:
+    for attempt in range(5):
+        try:
+            if path.is_dir():
+                shutil.rmtree(path, onerror=_rmtree_onerror)
+            else:
+                _make_writable(str(path))
+                path.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except Exception as exc:
+            if attempt >= 4:
+                print(f"WARNING: failed to remove runtime artifact {path}: {exc}", file=sys.stderr)
+                return False
+            time.sleep(0.5)
+    return False
+
+
 def _remove_paths(paths: list[Path]) -> list[Path]:
     removed: list[Path] = []
     for path in sorted(paths, key=lambda p: len(p.parts), reverse=True):
-        try:
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-        except FileNotFoundError:
-            continue
-        removed.append(path)
+        if _remove_one_path(path):
+            removed.append(path)
     return removed
 
 
