@@ -172,10 +172,6 @@ jobs:
           Invoke-Selftest (Resolve-Path "dist/$appName.exe") (Resolve-Path "dist") "Onefile" @('--selftest', '--selftest-gui')
           Invoke-Selftest (Resolve-Path "dist/$portableName/$portableName.exe") (Resolve-Path "dist/$portableName") "Portable" @('--selftest', '--selftest-gui')
 
-      - name: Remove selftest runtime artifacts
-        shell: pwsh
-        run: python tools/check_sensitive_artifacts.py --root dist --include-direct-children --clean-runtime
-
       - name: Package release assets
         shell: pwsh
         run: |
@@ -184,10 +180,34 @@ jobs:
           $exeZipName = "xiaojun-bn-${{ github.ref_name }}-windows-x64.zip"
           $portableName = "xiaojun-bn-${{ github.ref_name }}-windows-x64-portable"
           $portableZipName = "xiaojun-bn-${{ github.ref_name }}-windows-x64-portable.zip"
+          $portableStage = Join-Path "release" $portableName
 
           Copy-Item "dist/$exeName" "release/$exeName"
           Compress-Archive -Path "release/$exeName" -DestinationPath "release/$exeZipName" -Force
-          Compress-Archive -Path "dist/$portableName/*" -DestinationPath "release/$portableZipName" -Force
+
+          $excludeDirs = @("data", "logs")
+          $excludeFiles = @(
+            "bot_log.txt",
+            "bot_log.txt.*",
+            "*.log",
+            "*.log.*",
+            "total_asset_result.txt",
+            "withdraw_success.txt",
+            "中转钱包*.txt",
+            "exchange_*_proxy_runtime_*.log",
+            "onchain_*_proxy_runtime_*.log",
+            "exchange_ss_proxy_*.json",
+            "onchain_ss_proxy_*.json"
+          )
+          & robocopy "dist/$portableName" $portableStage /E /XD $excludeDirs /XF $excludeFiles /NFL /NDL /NJH /NJS /NC /NS /NP
+          if ($LASTEXITCODE -ge 8) {
+            throw "robocopy portable staging failed with exit code $LASTEXITCODE"
+          }
+          $global:LASTEXITCODE = 0
+
+          python tools/check_sensitive_artifacts.py --root $portableStage --include-direct-children
+          Compress-Archive -Path "$portableStage/*" -DestinationPath "release/$portableZipName" -Force
+          Remove-Item $portableStage -Recurse -Force
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
