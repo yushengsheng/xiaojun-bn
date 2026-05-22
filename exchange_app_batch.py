@@ -353,6 +353,7 @@ class ExchangeAppBatchMixin(object):
         self.btn_query_all_assets.config(state="disabled")
         self.btn_collect_bnb_combo.config(state="disabled")
         self.btn_batch_withdraw.config(state="disabled")
+        self.btn_batch_redeem_earn.config(state="disabled")
         self.btn_refresh.config(state="disabled")
         self.btn_withdraw.config(state="disabled")
         self._set_account_manage_buttons_state("disabled")
@@ -497,6 +498,7 @@ class ExchangeAppBatchMixin(object):
         self.btn_query_all_assets.config(state="normal")
         self.btn_collect_bnb_combo.config(state="normal")
         self.btn_batch_withdraw.config(state="normal")
+        self.btn_batch_redeem_earn.config(state="normal")
         self.btn_refresh.config(state="normal")
         self.btn_withdraw.config(state="normal")
         self._set_account_manage_buttons_state("normal")
@@ -622,17 +624,17 @@ class ExchangeAppBatchMixin(object):
         if tree is None:
             return None
         current_context = getattr(self, "_context_account", None)
-        if current_context is None:
-            return None
         try:
             selected = tree.selection()
         except Exception:
             selected = ()
         if not selected:
             self._set_context_account(None)
-            return None
-        selected_acc = self._account_from_tree_row_id(selected[0])
-        if selected_acc is not current_context:
+        elif current_context is not None:
+            selected_acc = self._account_from_tree_row_id(selected[0])
+            if selected_acc is not current_context:
+                self._set_context_account(None)
+        elif getattr(self, "_context_account", None) is not None:
             self._set_context_account(None)
         return None
     def _on_account_tree_double_click(self, event):
@@ -688,6 +690,35 @@ class ExchangeAppBatchMixin(object):
         if acc is None:
             return
         self.run_selected_accounts(accounts_to_run=[acc], require_confirm=True)
+    def copy_context_account_api_key(self):
+        acc = self._get_context_account_or_warn()
+        if acc is None:
+            return
+        self._copy_account_field(acc, "api_key", "API KEY")
+    def copy_context_account_withdraw_address(self):
+        acc = self._get_context_account_or_warn()
+        if acc is None:
+            return
+        self._copy_account_field(acc, "address", "提现地址")
+    def run_context_account_delete(self):
+        acc = self._get_context_account_or_warn()
+        if acc is None:
+            return
+        if self._batch_task_active or (self.worker_thread and self.worker_thread.is_alive()):
+            messagebox.showinfo("提示", "当前有任务在运行中，请先停止后再删除账号")
+            return
+        try:
+            idx_text = str(acc.get("index_var").get() or "").strip()
+        except Exception:
+            idx_text = ""
+        api_key_preview = self._mask_key(str(acc.get("api_key") or "").strip())
+        removed_count = self._delete_accounts(
+            [acc],
+            require_confirm=True,
+            confirm_text=f"确认删除账号 #{idx_text or '?'}（{api_key_preview}）吗？",
+        )
+        if removed_count > 0:
+            logger.info("已通过右键菜单删除账号 #%s", idx_text or "?")
     def run_context_account_query(self):
         acc = self._get_context_account_or_warn()
         if acc is None:
@@ -725,6 +756,11 @@ class ExchangeAppBatchMixin(object):
         if acc is None:
             return
         self.batch_manual_withdraw(accounts_to_run=[acc], require_confirm=True)
+    def run_context_account_redeem_earn(self):
+        acc = self._get_context_account_or_warn()
+        if acc is None:
+            return
+        self.batch_redeem_flexible_earn(accounts_to_run=[acc], require_confirm=True)
     def run_context_account_collect_bnb(self):
         acc = self._get_context_account_or_warn()
         if acc is None:
@@ -774,6 +810,12 @@ class ExchangeAppBatchMixin(object):
     def _exchange_failed_status_text(text: str, *, fallback: str = "失败") -> str:
         body = str(text or "").strip() or str(fallback or "失败").strip() or "失败"
         return body if body.startswith("×") else f"×{body}"
+    @staticmethod
+    def _plain_exchange_status_text(text: str, *, fallback: str = "") -> str:
+        body = str(text or "").strip()
+        while body[:1] in {"✔", "×"}:
+            body = body[1:].strip()
+        return body or str(fallback or "").strip()
     @classmethod
     def _format_withdraw_amount_status(cls, amount: float, coin: str, *, enable_withdraw: bool) -> tuple[str, bool]:
         coin_u = str(coin or "").strip().upper()
@@ -810,6 +852,43 @@ class ExchangeAppBatchMixin(object):
         if len(unique_assets) > limit:
             preview += f"等{len(unique_assets)}个"
         return preview
+    @staticmethod
+    def _detail_list_preview(items: list[str], *, limit: int = 3) -> str:
+        unique_items: list[str] = []
+        for item in items:
+            text = str(item or "").strip()
+            if text and text not in unique_items:
+                unique_items.append(text)
+        if not unique_items:
+            return "--"
+        preview = "，".join(unique_items[:limit])
+        if len(unique_items) > limit:
+            preview += f"等{len(unique_items)}项"
+        return preview
+    @staticmethod
+    def _wait_batch_random_delay(
+        stop_event,
+        min_delay_ms: int,
+        max_delay_ms: int,
+        *,
+        minimum_seconds: float = 0.0,
+        log_prefix: str = "",
+    ) -> bool:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        low_ms = max(0, int(min(min_delay_ms, max_delay_ms)))
+        high_ms = max(0, int(max(min_delay_ms, max_delay_ms)))
+        delay_seconds = random.randint(low_ms, high_ms) / 1000.0 if high_ms > 0 else 0.0
+        delay_seconds = max(float(minimum_seconds or 0.0), delay_seconds)
+        if delay_seconds <= 0:
+            return not (stop_event is not None and stop_event.is_set())
+        prefix = str(log_prefix or "").strip()
+        if prefix:
+            logger.info("%s随机延迟 %.3f 秒", prefix, delay_seconds)
+        if stop_event is None:
+            time.sleep(delay_seconds)
+            return True
+        return not stop_event.wait(delay_seconds)
     @staticmethod
     def _compact_error_text(err_text: str, max_len: int = 28) -> str:
         s = str(err_text or "").strip().replace("\n", " ")
@@ -872,6 +951,15 @@ class ExchangeAppBatchMixin(object):
             for value in results.values()
             if value is False or (pending_as_failed and value is not True)
         )
+        runner = str(data.get("runner") or "").strip()
+        if runner == "batch_redeem_flexible_earn":
+            redeemed_count = self._sum_batch_count_metrics(data.get("redeemed_assets_by_account") or {})
+            skipped_count = self._sum_batch_count_metrics(data.get("skipped_assets_by_account") or {})
+            auto_disabled_count = self._sum_batch_count_metrics(data.get("auto_disabled_by_account") or {})
+            return (
+                f"结果汇总：成功{success_count} | 失败{failed_count} | "
+                f"已赎回资产{redeemed_count} | 跳过资产{skipped_count} | 关闭自动申购{auto_disabled_count}"
+            )
         withdraw_text = self._format_batch_metric_totals(data.get("withdraw_by_account") or {})
         balance_text = self._format_batch_metric_totals(data.get("balance_by_account") or {})
         return f"结果汇总：成功{success_count} | 失败{failed_count} | 提现总额={withdraw_text} | 余额总额={balance_text}"
@@ -909,6 +997,29 @@ class ExchangeAppBatchMixin(object):
             except Exception:
                 amount_dec = Decimal("0")
             summary.setdefault("balance_by_account", {})[key] = (amount_dec, str(asset or "").strip().upper())
+            summary_text = self._build_batch_summary_text(summary)
+        self._schedule_batch_summary_text(summary_text)
+    @staticmethod
+    def _sum_batch_count_metrics(metrics_by_account: dict[str, int] | None) -> int:
+        total = 0
+        for value in dict(metrics_by_account or {}).values():
+            try:
+                total += max(0, int(value or 0))
+            except Exception:
+                continue
+        return total
+    def _record_batch_count_metric(self, acc: dict, field_name: str, value: int) -> None:
+        summary_text = ""
+        with self._batch_summary_lock:
+            summary = self._current_batch_summary
+            if not summary:
+                return
+            key = self._account_batch_key(acc)
+            try:
+                count_value = max(0, int(value or 0))
+            except Exception:
+                count_value = 0
+            summary.setdefault(str(field_name or "").strip(), {})[key] = count_value
             summary_text = self._build_batch_summary_text(summary)
         self._schedule_batch_summary_text(summary_text)
     def _begin_batch_summary_tracking(
@@ -1225,6 +1336,9 @@ class ExchangeAppBatchMixin(object):
         if runner == "batch_manual_withdraw":
             self.batch_manual_withdraw(accounts_to_run=accounts_to_retry, require_confirm=False)
             return
+        if runner == "batch_redeem_flexible_earn":
+            self.batch_redeem_flexible_earn(accounts_to_run=accounts_to_retry, require_confirm=False)
+            return
         self.run_selected_accounts(accounts_to_run=accounts_to_retry, require_confirm=False, **retry_kwargs)
     def run_query_total_assets_for_all_accounts(self):
         selected_accounts = self._get_selected_accounts()
@@ -1232,6 +1346,296 @@ class ExchangeAppBatchMixin(object):
             messagebox.showinfo("提示", "请至少勾选一个账号")
             return
         self.run_selected_accounts(accounts_to_run=selected_accounts, batch_total_asset_only=True, require_confirm=False)
+    def batch_redeem_flexible_earn(self, accounts_to_run=None, *, require_confirm: bool = True):
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("提示", "已有任务在运行中，请先停止当前任务")
+            return
+
+        selected = list(accounts_to_run) if accounts_to_run is not None else self._get_selected_accounts()
+        if not selected:
+            messagebox.showinfo("提示", "请至少勾选一个账号")
+            return
+
+        try:
+            min_delay = self._delay_var_value(self.min_delay_var, 1000, "最小")
+            max_delay = self._delay_var_value(self.max_delay_var, 3000, "最大")
+            max_threads = int(self.max_threads_var.get())
+        except (ValueError, RuntimeError) as e:
+            messagebox.showerror("错误", str(e) or "参数格式不正确")
+            return
+
+        if max_threads < 1:
+            max_threads = 1
+
+        if require_confirm:
+            text = (
+                f"即将对 {len(selected)} 个账号执行“批量赎回理财”。\n"
+                "流程包含：查询当前账号所有活期理财持仓，发现可赎回资产后逐个赎回到现货。\n"
+                "该模式不限制币种，只要活期理财里有可赎回资产就会处理。\n"
+                "赎回流程会复用共享策略中的随机延迟，并遵守单账号连续赎回的接口节流。\n\n"
+                "确认继续吗？"
+            )
+            if not messagebox.askyesno("确认执行", text):
+                return
+
+        logger.info("交易所批量赎回理财链路：%s", self._exchange_proxy_route_text())
+        self.stop_event = threading.Event()
+        self._batch_task_active = True
+        self._begin_batch_summary_tracking(
+            action_label="批量赎回理财",
+            runner="batch_redeem_flexible_earn",
+            retry_kwargs={},
+            selected_accounts=selected,
+        )
+        self._prepare_accounts_for_batch(selected)
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.btn_run_accounts.config(state="disabled")
+        self.btn_query_all_assets.config(state="disabled")
+        self.btn_collect_bnb_combo.config(state="disabled")
+        self.btn_batch_withdraw.config(state="disabled")
+        self.btn_batch_redeem_earn.config(state="disabled")
+        self._set_retry_failed_button_state()
+        self.btn_refresh.config(state="disabled")
+        self.btn_withdraw.config(state="disabled")
+        self._set_account_manage_buttons_state("disabled")
+        self._set_combo_states_for_run(True)
+        self.status_var.set(f"状态：批量赎回理财中 (并发 {max_threads} 线程)...")
+        self.progress["value"] = 0
+        self.progress["maximum"] = len(selected)
+
+        task_queue = queue.Queue()
+        for idx, acc in enumerate(selected, start=1):
+            task_queue.put((idx, acc))
+
+        total_accounts = len(selected)
+        completed_count = 0
+        count_lock = threading.Lock()
+        # Simple Earn 持仓查询单次权重较高，跨账号并发时做全局串行节流，避免瞬时把同一出口 IP 打爆。
+        position_query_gap_seconds = 1.7
+        position_query_lock = threading.Lock()
+        last_position_query_started_at = {"value": 0.0}
+
+        def finish_one():
+            nonlocal completed_count
+            with count_lock:
+                completed_count += 1
+                curr = completed_count
+
+            def _u():
+                self.progress["value"] = curr
+                self.status_var.set(f"批量赎回理财进度: {curr}/{total_accounts}")
+            self._dispatch_ui(_u)
+
+        def wait_for_position_query_slot(stop_event) -> bool:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return False
+                with position_query_lock:
+                    now = time.monotonic()
+                    last_started_at = float(last_position_query_started_at.get("value") or 0.0)
+                    wait_seconds = 0.0 if last_started_at <= 0 else max(
+                        0.0,
+                        position_query_gap_seconds - (now - last_started_at),
+                    )
+                    if wait_seconds <= 0:
+                        last_position_query_started_at["value"] = now
+                        return True
+                if stop_event is None:
+                    time.sleep(min(0.2, wait_seconds) if wait_seconds > 0 else 0.0)
+                elif stop_event.wait(min(0.2, wait_seconds) if wait_seconds > 0 else 0.0):
+                    return False
+
+        def redeem_worker(thread_id):
+            while not self.stop_event.is_set():
+                try:
+                    idx, acc = task_queue.get(timeout=1)
+                except queue.Empty:
+                    return
+
+                final_status_text = ""
+
+                def set_status(text, acc_ref=acc):
+                    self._schedule_account_status(acc_ref, text)
+                def set_final_status(text, acc_ref=acc):
+                    nonlocal final_status_text
+                    final_status_text = str(text or "").strip()
+                    self._schedule_account_status(acc_ref, final_status_text)
+
+                combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
+                op_success = False
+                client = None
+                try:
+                    if combined_stop.is_set():
+                        set_final_status("已停止")
+                    else:
+                        client = self._create_binance_client(acc["api_key"], acc["api_secret"])
+                        set_status("查询活期理财...")
+                        if not wait_for_position_query_slot(combined_stop):
+                            set_final_status("已停止")
+                            op_success = False
+                            continue
+                        positions = client.get_simple_earn_flexible_positions()
+
+                        redeemable_positions: list[dict] = []
+                        skipped_entries: list[str] = []
+                        for item in positions:
+                            asset = str((item or {}).get("asset") or "").strip().upper()
+                            product_id = str((item or {}).get("productId") or "").strip()
+                            total_amount = Decimal(str((item or {}).get("totalAmount") or "0"))
+                            can_redeem = bool((item or {}).get("canRedeem"))
+                            auto_subscribe = bool((item or {}).get("autoSubscribe"))
+                            if total_amount <= 0:
+                                continue
+                            if not asset:
+                                continue
+                            if not product_id:
+                                skipped_entries.append(f"{asset}(缺少产品ID)")
+                                continue
+                            if not can_redeem:
+                                skipped_entries.append(f"{asset}(当前不可赎回)")
+                                continue
+                            redeemable_positions.append(
+                                {
+                                    "asset": asset,
+                                    "productId": product_id,
+                                    "totalAmount": total_amount,
+                                    "autoSubscribe": auto_subscribe,
+                                }
+                            )
+
+                        if not redeemable_positions:
+                            self._record_batch_count_metric(acc, "redeemed_assets_by_account", 0)
+                            self._record_batch_count_metric(acc, "skipped_assets_by_account", len(skipped_entries))
+                            self._record_batch_count_metric(acc, "auto_disabled_by_account", 0)
+                            if skipped_entries:
+                                set_final_status(
+                                    self._exchange_success_status_text(
+                                        f"无资产可赎回；跳过：{self._detail_list_preview(skipped_entries)}"
+                                    )
+                                )
+                            else:
+                                set_final_status(self._exchange_success_status_text("无资产可赎回"))
+                            op_success = True
+                        else:
+                            redeemed_assets: list[str] = []
+                            auto_disabled_assets: list[str] = []
+                            failed_entries: list[str] = []
+                            stopped_early = False
+
+                            for pos_idx, item in enumerate(redeemable_positions, start=1):
+                                asset = str(item.get("asset") or "").strip().upper()
+                                amount = Decimal(str(item.get("totalAmount") or "0"))
+                                auto_subscribe_enabled = bool(item.get("autoSubscribe"))
+                                if combined_stop.is_set():
+                                    stopped_early = True
+                                    set_final_status("已停止")
+                                    break
+
+                                min_gap = 0.0 if pos_idx == 1 else 3.0
+                                delay_ok = self._wait_batch_random_delay(
+                                    combined_stop,
+                                    min_delay,
+                                    max_delay,
+                                    minimum_seconds=min_gap,
+                                    log_prefix=f"账号 #{idx} 活期{asset}赎回前 ",
+                                )
+                                if not delay_ok:
+                                    stopped_early = True
+                                    set_final_status("已停止")
+                                    break
+
+                                if auto_subscribe_enabled:
+                                    try:
+                                        client.set_simple_earn_flexible_auto_subscribe(
+                                            str(item.get("productId") or "").strip(),
+                                            False,
+                                        )
+                                        auto_disabled_assets.append(asset)
+                                        logger.info("账号 #%d 已关闭活期理财自动申购：%s", idx, asset)
+                                    except Exception as e:
+                                        logger.error("账号 #%d 关闭活期理财自动申购失败 %s: %s", idx, asset, e)
+                                        failed_entries.append(
+                                            f"{asset}(关闭自动申购失败:{summarize_exchange_exception(e, fallback='关闭失败', max_len=10)})"
+                                        )
+                                        continue
+
+                                set_status(f"赎回 {asset} ({pos_idx}/{len(redeemable_positions)})...")
+                                try:
+                                    result = client.redeem_simple_earn_flexible_product(
+                                        str(item.get("productId") or "").strip(),
+                                        redeem_all=True,
+                                        dest_account="SPOT",
+                                    )
+                                    redeem_id = str((result or {}).get("redeemId") or "").strip()
+                                    logger.info(
+                                        "账号 #%d 活期理财赎回已提交：资产=%s，金额=%s，redeemId=%s",
+                                        idx,
+                                        asset,
+                                        BinanceClient._format_decimal(amount),
+                                        redeem_id or "--",
+                                    )
+                                    redeemed_assets.append(asset)
+                                except Exception as e:
+                                    logger.error("账号 #%d 活期理财赎回失败 %s: %s", idx, asset, e)
+                                    failed_entries.append(
+                                        f"{asset}({summarize_exchange_exception(e, fallback='赎回失败', max_len=12)})"
+                                    )
+
+                            self._record_batch_count_metric(acc, "redeemed_assets_by_account", len(redeemed_assets))
+                            self._record_batch_count_metric(acc, "skipped_assets_by_account", len(skipped_entries))
+                            self._record_batch_count_metric(acc, "auto_disabled_by_account", len(auto_disabled_assets))
+
+                            if stopped_early:
+                                op_success = False
+                            elif failed_entries:
+                                parts: list[str] = []
+                                if redeemed_assets:
+                                    parts.append(f"已赎回：{self._asset_list_preview(redeemed_assets, limit=5)}")
+                                if auto_disabled_assets:
+                                    parts.append(f"已关自动申购：{self._asset_list_preview(auto_disabled_assets, limit=5)}")
+                                if skipped_entries:
+                                    parts.append(f"跳过：{self._detail_list_preview(skipped_entries)}")
+                                parts.append(f"失败：{self._detail_list_preview(failed_entries)}")
+                                set_final_status(self._exchange_failed_status_text("；".join(parts), fallback="部分赎回失败"))
+                                op_success = False
+                            else:
+                                parts = [f"已赎回：{self._asset_list_preview(redeemed_assets, limit=6)}"]
+                                if auto_disabled_assets:
+                                    parts.append(f"已关自动申购：{self._asset_list_preview(auto_disabled_assets, limit=6)}")
+                                if skipped_entries:
+                                    parts.append(f"跳过：{self._detail_list_preview(skipped_entries)}")
+                                set_final_status(self._exchange_success_status_text("；".join(parts)))
+                                op_success = True
+                except Exception as e:
+                    logger.error("账号 #%d 批量赎回理财失败: %s", idx, e)
+                    set_final_status(self._exchange_error_status_text("赎回理财失败", e, fallback="赎回理财失败"))
+                    op_success = False
+                finally:
+                    self._close_binance_client_instance(client)
+                    self._set_account_batch_active(acc, False)
+                    self._mark_batch_account_result(acc, op_success)
+                    task_queue.task_done()
+                    finish_one()
+                    result_text = self._plain_exchange_status_text(
+                        final_status_text,
+                        fallback=("成功" if op_success else "已停止" if combined_stop.is_set() else "失败"),
+                    )
+                    logger.info("[线程 %d] 账号 #%d 理财赎回处理完毕：%s", thread_id, idx, result_text)
+
+        def controller():
+            threads = []
+            for i in range(max_threads):
+                t = threading.Thread(target=redeem_worker, args=(i + 1,), daemon=True)
+                t.start()
+                threads.append(t)
+
+            for t in threads:
+                t.join()
+
+            self._dispatch_ui(self._on_worker_finished)
+
+        self.worker_thread = self._start_managed_thread(controller, name="exchange-batch-redeem-earn")
     def run_batch_collect_bnb_with_confirm(self, accounts_to_run=None):
         selected = list(accounts_to_run) if accounts_to_run is not None else self._get_selected_accounts()
         if not selected:
@@ -1378,8 +1782,6 @@ class ExchangeAppBatchMixin(object):
         else:
             bnb_topup_amount_value = configured_bnb_topup_amount_value
 
-        skip_usdt_wait_in_batch = bool(self.skip_usdt_wait_in_batch_var.get())
-
         if batch_total_asset_only:
             self.total_asset_results = {}
 
@@ -1421,6 +1823,7 @@ class ExchangeAppBatchMixin(object):
         self.btn_query_all_assets.config(state="disabled")
         self.btn_collect_bnb_combo.config(state="disabled")
         self.btn_batch_withdraw.config(state="disabled")
+        self.btn_batch_redeem_earn.config(state="disabled")
         self._set_retry_failed_button_state()
         self.btn_refresh.config(state="disabled")
         self.btn_withdraw.config(state="disabled")
@@ -1692,43 +2095,37 @@ class ExchangeAppBatchMixin(object):
                             else ""
                         )
                         wait_asset = base_asset if zero_round_spot_conversion else quote_asset
-                        need_wait_usdt = not skip_usdt_wait_in_batch
-
-                        if need_wait_usdt:
-                            if zero_round_spot_conversion:
-                                set_status(f"检测{base_asset} 到账...")
-                            elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
-                                set_status("检测挂单余额...")
-                            else:
-                                set_status(f"检测 {quote_asset} 到账...")
-                            if not self.wait_for_usdt(
-                                usdt_timeout,
-                                combined_stop,
-                                client=client,
-                                symbol=trade_symbol,
-                                trade_account_type=trade_account_type,
-                                trade_mode=trade_mode,
-                                required_quote_amount=required_quote_amount,
-                                spot_base_to_quote_only=zero_round_spot_conversion,
-                            ):
-                                if combined_stop.is_set():
-                                    logger.info(f"账号 #{idx} 已请求停止")
-                                    finish_current_now("已停止", success=False)
-                                else:
-                                    if zero_round_spot_conversion:
-                                        logger.info(f"账号 #{idx} {base_asset} 检测超时，跳过")
-                                        set_status(self._exchange_failed_status_text(f"{base_asset} 未到账"))
-                                    elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
-                                        logger.info(f"账号 #{idx} 挂单余额检测超时，跳过")
-                                        set_status(self._exchange_failed_status_text("无可挂单余额"))
-                                    else:
-                                        logger.info(f"账号 #{idx} {wait_asset} 检测超时，跳过")
-                                        set_status(self._exchange_failed_status_text(f"{wait_asset} 未到账"))
-                                    finish_current_now(success=False)
-                                continue
+                        if zero_round_spot_conversion:
+                            set_status(f"检测{base_asset} 到账...")
+                        elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                            set_status("检测挂单余额...")
                         else:
-                            logger.info(f"账号 #{idx} 已开启“批量策略跳过{wait_asset}检测”")
-                            set_status(f"跳过{wait_asset}检测")
+                            set_status(f"检测 {quote_asset} 到账...")
+                        if not self.wait_for_usdt(
+                            usdt_timeout,
+                            combined_stop,
+                            client=client,
+                            symbol=trade_symbol,
+                            trade_account_type=trade_account_type,
+                            trade_mode=trade_mode,
+                            required_quote_amount=required_quote_amount,
+                            spot_base_to_quote_only=zero_round_spot_conversion,
+                        ):
+                            if combined_stop.is_set():
+                                logger.info(f"账号 #{idx} 已请求停止")
+                                finish_current_now("已停止", success=False)
+                            else:
+                                if zero_round_spot_conversion:
+                                    logger.info(f"账号 #{idx} {base_asset} 检测超时，跳过")
+                                    set_status(self._exchange_failed_status_text(f"{base_asset} 未到账"))
+                                elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                                    logger.info(f"账号 #{idx} 挂单余额检测超时，跳过")
+                                    set_status(self._exchange_failed_status_text("无可挂单余额"))
+                                else:
+                                    logger.info(f"账号 #{idx} {wait_asset} 检测超时，跳过")
+                                    set_status(self._exchange_failed_status_text(f"{wait_asset} 未到账"))
+                                finish_current_now(success=False)
+                            continue
 
                         set_status("策略执行中...")
                         if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
@@ -2041,6 +2438,7 @@ class ExchangeAppBatchMixin(object):
         self.btn_query_all_assets.config(state="disabled")
         self.btn_collect_bnb_combo.config(state="disabled")
         self.btn_batch_withdraw.config(state="disabled")
+        self.btn_batch_redeem_earn.config(state="disabled")
         self._set_retry_failed_button_state()
         self.btn_refresh.config(state="disabled")
         self.btn_withdraw.config(state="disabled")

@@ -90,6 +90,26 @@ class ExchangeAppAccountsMixin(object):
             hint.place_forget()
             return
         hint.place(relx=0.5, rely=0.5, anchor="center")
+    def _copy_account_field(self, acc: dict | None, field_name: str, field_label: str) -> None:
+        if acc is None:
+            messagebox.showinfo("提示", "请先右键选择一个账号")
+            return
+        value = str(acc.get(field_name) or "").strip()
+        if not value:
+            messagebox.showinfo("提示", f"当前账号没有可复制的{field_label}")
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(value)
+        except tk.TclError as exc:
+            logger.error("复制%s失败: %s", field_label, exc)
+            messagebox.showerror("错误", f"复制{field_label}失败：{exc}")
+            return
+        try:
+            idx_text = str(acc.get("index_var").get() or "").strip()
+        except Exception:
+            idx_text = "?"
+        logger.info("已复制账号 #%s 的%s到剪贴板", idx_text or "?", field_label)
     def random_sleep(self, min_ms, max_ms):
         if max_ms < min_ms:
             min_ms, max_ms = max_ms, min_ms
@@ -541,17 +561,41 @@ class ExchangeAppAccountsMixin(object):
         self.acc_api_secret_var.set("")
         self.acc_withdraw_addr_var.set("")
     def delete_selected_accounts(self):
-        selected_count = sum(1 for acc in self.accounts if acc["selected_var"].get())
+        selected_accounts = [acc for acc in self.accounts if acc["selected_var"].get()]
+        selected_count = len(selected_accounts)
         logger.info("当前选中账号 %d 个，准备删除", selected_count)
         if selected_count <= 0:
             messagebox.showinfo("提示", "请至少勾选一个账号")
             return
-        if not messagebox.askyesno("确认删除", f"确认删除已勾选的 {selected_count} 个账号吗？"):
+        removed_count = self._delete_accounts(
+            selected_accounts,
+            require_confirm=True,
+            confirm_text=f"确认删除已勾选的 {selected_count} 个账号吗？",
+        )
+        if removed_count <= 0:
             return
+        logger.info("已删除选中账号 %d 个，当前剩余 %d 个", removed_count, len(self.accounts))
+    def _delete_accounts(
+        self,
+        accounts_to_delete: list[dict],
+        *,
+        require_confirm: bool = True,
+        confirm_title: str = "确认删除",
+        confirm_text: str = "",
+    ) -> int:
+        targets = [acc for acc in accounts_to_delete if acc in self.accounts]
+        if not targets:
+            return 0
+        if require_confirm:
+            text = str(confirm_text or "").strip() or f"确认删除 {len(targets)} 个账号吗？"
+            if not messagebox.askyesno(confirm_title, text):
+                return 0
         current_context = getattr(self, "_context_account", None)
-        keep = []
+        target_ids = {id(acc) for acc in targets}
+        keep: list[dict] = []
+        removed_count = 0
         for acc in self.accounts:
-            if acc["selected_var"].get():
+            if id(acc) in target_ids:
                 tree_id = str(acc.get("tree_id") or "").strip()
                 if tree_id:
                     self._account_tree_row_to_account.pop(tree_id, None)
@@ -559,6 +603,7 @@ class ExchangeAppAccountsMixin(object):
                         self.account_tree.delete(tree_id)
                     except Exception:
                         pass
+                removed_count += 1
             else:
                 keep.append(acc)
         self.accounts = keep
@@ -567,7 +612,7 @@ class ExchangeAppAccountsMixin(object):
         self._reindex_accounts()
         self._update_toggle_select_button_text()
         self._schedule_accounts_save()
-        logger.info("已删除选中账号 %d 个，当前剩余 %d 个", selected_count, len(self.accounts))
+        return removed_count
     def select_all_accounts(self):
         total_count = len(self.accounts)
         for acc in self.accounts:

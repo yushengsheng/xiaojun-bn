@@ -387,12 +387,19 @@ class ExchangeAppBase(tk.Tk):
         self.frame_list_canvas.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
         self.account_list_hint.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
         self._refresh_account_list_hint()
+
         self.account_row_menu = tk.Menu(self, tearoff=0)
+        self.account_row_menu.add_command(label="复制 API KEY", command=self.copy_context_account_api_key)
+        self.account_row_menu.add_command(label="复制提现地址", command=self.copy_context_account_withdraw_address)
+        self.account_row_menu.add_separator()
         self.account_row_menu.add_command(label="查询", command=self.run_context_account_query)
         self.account_row_menu.add_command(label="执行", command=self.run_context_account_execute)
         self.account_row_menu.add_command(label="停止", command=self.run_context_account_stop)
         self.account_row_menu.add_command(label="提现", command=self.run_context_account_withdraw)
+        self.account_row_menu.add_command(label="赎回理财", command=self.run_context_account_redeem_earn)
         self.account_row_menu.add_command(label="归集BNB并提现", command=self.run_context_account_collect_bnb)
+        self.account_row_menu.add_separator()
+        self.account_row_menu.add_command(label="删除该行", command=self.run_context_account_delete)
         self._context_account = None
         self._setup_account_list_mousewheel_bindings()
 
@@ -448,7 +455,6 @@ class ExchangeAppBase(tk.Tk):
         except Exception:
             pass
 
-        self.skip_usdt_wait_in_batch_var = tk.BooleanVar(value=False)
         self._current_batch_summary = None
         self._last_batch_retry = None
         self._batch_summary_lock = threading.Lock()
@@ -466,11 +472,13 @@ class ExchangeAppBase(tk.Tk):
         self.btn_export_asset_csv = ttk.Button(frame_batch_opts, text="导出总资产CSV", command=self.export_total_asset_csv)
         self.btn_export_asset_csv.pack(side="left", padx=5)
 
-        ttk.Checkbutton(
+        self.btn_batch_redeem_earn = ttk.Button(
             frame_batch_opts,
-            text="批量策略跳过USDT检测",
-            variable=self.skip_usdt_wait_in_batch_var
-        ).pack(side="left", padx=(12, 0))
+            text="批量赎回理财",
+            command=self.batch_redeem_flexible_earn,
+            style="CollectWithdraw.TButton",
+        )
+        self.btn_batch_redeem_earn.pack(side="left", padx=(12, 0))
         self.btn_retry_failed_accounts = ttk.Button(
             frame_batch_opts,
             text="失败重试",

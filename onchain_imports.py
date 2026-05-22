@@ -16,6 +16,48 @@ from page_onchain_base import (
 
 
 class OnchainImportMixin(object):
+    def _single_row_copy_fields(self) -> tuple[str, str] | None:
+        draft_idx = self._selected_draft_index()
+        if draft_idx is not None and self._is_mode_m2m():
+            if not (0 <= draft_idx < len(self.m2m_import_drafts)):
+                return None
+            item = self.m2m_import_drafts[draft_idx] or {}
+            return (
+                str(item.get("source", "") or "").strip(),
+                str(item.get("target", "") or "").strip(),
+            )
+        job = self._single_row_job()
+        if not job:
+            return None
+        _row_key, source, target = job
+        return str(source or "").strip(), str(target or "").strip()
+    def _copy_current_row_text(self, value: str, field_label: str, *, log_label: str | None = None) -> None:
+        text = str(value or "").strip()
+        if not text:
+            messagebox.showwarning("提示", f"当前行没有可复制的{field_label}")
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+        except Exception as exc:
+            messagebox.showerror("复制失败", f"复制{field_label}失败：{exc}")
+            return
+        self.log(f"已复制当前行{log_label or field_label}到剪贴板")
+    def copy_current_row_target_address(self):
+        fields = self._single_row_copy_fields()
+        if not fields:
+            messagebox.showwarning("提示", "请先右键选中一条数据")
+            return
+        _source, target = fields
+        self._copy_current_row_text(target, "收款地址")
+    def copy_current_row_source_credential(self):
+        fields = self._single_row_copy_fields()
+        if not fields:
+            messagebox.showwarning("提示", "请先右键选中一条数据")
+            return
+        source, _target = fields
+        self._copy_current_row_text(source, "转出私钥", log_label="转出钱包凭据")
     def _parse_m2m_lines(self, lines: list[str]) -> list[OnchainPairEntry]:
         result: list[OnchainPairEntry] = []
         seen: set[tuple[str, str]] = set()

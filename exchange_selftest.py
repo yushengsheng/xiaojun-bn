@@ -1295,6 +1295,123 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError("归集BNB并提现自检失败：强制提现参数未固定为 BNB/开启")
     checks.append("collect-bnb-withdraw=ok")
 
+    class _SelftestSimpleEarnClient(BinanceClient):
+        def __init__(self):
+            super().__init__("selftest-key", "selftest-secret")
+            self.requests_made: list[tuple[str, str, str, dict[str, object]]] = []
+
+        def request(self, base, method, path, params=None):
+            params_dict = dict(params or {})
+            self.requests_made.append((str(base), str(method), str(path), params_dict))
+            if method == "GET" and path == "/sapi/v1/simple-earn/flexible/position":
+                current = int(params_dict.get("current", 1) or 1)
+                if current == 1:
+                    return {
+                        "total": 3,
+                        "rows": [
+                            {
+                                "productId": "P-USDT",
+                                "asset": "usdt",
+                                "totalAmount": "12.34",
+                                "redeemingAmount": "0.1",
+                                "canRedeem": True,
+                                "autoSubscribe": False,
+                            },
+                            {
+                                "productId": "P-BNB",
+                                "asset": "bnb",
+                                "totalAmount": "0.5",
+                                "redeemingAmount": "0",
+                                "canRedeem": "true",
+                                "autoSubscribe": "1",
+                            },
+                        ],
+                    }
+                if current == 2:
+                    return {
+                        "total": 3,
+                        "rows": [
+                            {
+                                "productId": "P-USDC",
+                                "asset": "USDC",
+                                "totalAmount": "8.88",
+                                "redeemingAmount": "0",
+                                "canRedeem": "false",
+                                "autoSubscribe": "0",
+                            }
+                        ],
+                    }
+                return {"total": 3, "rows": []}
+            if method == "POST" and path == "/sapi/v1/simple-earn/flexible/redeem":
+                return {"success": True, "redeemId": "R-123"}
+            if method == "POST" and path == "/sapi/v1/simple-earn/flexible/setAutoSubscribe":
+                return {"success": True}
+            raise RuntimeError(f"活期理财自检遇到未知请求：{method} {path}")
+
+    simple_earn_client = _SelftestSimpleEarnClient()
+    try:
+        positions = simple_earn_client.get_simple_earn_flexible_positions()
+        if len(positions) != 3:
+            raise RuntimeError(f"活期理财持仓自检失败：分页数量异常（{positions}）")
+        if positions[0].get("asset") != "USDT" or positions[0].get("totalAmount") != Decimal("12.34"):
+            raise RuntimeError(f"活期理财持仓自检失败：USDT 记录解析异常（{positions[0]}）")
+        if positions[1].get("canRedeem") is not True or positions[1].get("autoSubscribe") is not True:
+            raise RuntimeError(f"活期理财持仓自检失败：布尔字段解析异常（{positions[1]}）")
+        if positions[2].get("canRedeem") is not False or positions[2].get("asset") != "USDC":
+            raise RuntimeError(f"活期理财持仓自检失败：USDC 记录解析异常（{positions[2]}）")
+
+        filtered_positions = simple_earn_client.get_simple_earn_flexible_positions(asset="USDT")
+        if len(filtered_positions) != 1 or filtered_positions[0].get("asset") != "USDT":
+            raise RuntimeError(f"活期理财持仓自检失败：按资产过滤异常（{filtered_positions}）")
+
+        redeem_result = simple_earn_client.redeem_simple_earn_flexible_product("P-USDT", redeem_all=True, dest_account="SPOT")
+        if str(redeem_result.get("redeemId") or "") != "R-123":
+            raise RuntimeError(f"活期理财赎回自检失败：返回结果异常（{redeem_result}）")
+        redeem_requests = [
+            req for req in simple_earn_client.requests_made
+            if req[1] == "POST" and req[2] == "/sapi/v1/simple-earn/flexible/redeem"
+        ]
+        if not redeem_requests:
+            raise RuntimeError("活期理财赎回自检失败：未发出赎回请求")
+        redeem_params = redeem_requests[-1][3]
+        if redeem_params != {"productId": "P-USDT", "redeemAll": "true", "destAccount": "SPOT"}:
+            raise RuntimeError(f"活期理财赎回自检失败：请求参数异常（{redeem_params}）")
+
+        auto_subscribe_result = simple_earn_client.set_simple_earn_flexible_auto_subscribe("P-BNB", False)
+        if auto_subscribe_result != {"success": True}:
+            raise RuntimeError(f"活期理财自动申购开关自检失败：返回结果异常（{auto_subscribe_result}）")
+        auto_subscribe_requests = [
+            req for req in simple_earn_client.requests_made
+            if req[1] == "POST" and req[2] == "/sapi/v1/simple-earn/flexible/setAutoSubscribe"
+        ]
+        if not auto_subscribe_requests:
+            raise RuntimeError("活期理财自动申购开关自检失败：未发出关闭请求")
+        auto_subscribe_params = auto_subscribe_requests[-1][3]
+        if auto_subscribe_params != {"productId": "P-BNB", "autoSubscribe": "false"}:
+            raise RuntimeError(f"活期理财自动申购开关自检失败：请求参数异常（{auto_subscribe_params}）")
+    finally:
+        simple_earn_client.close()
+    checks.append("simple-earn-flexible=ok")
+
+    class _SelftestBatchSummaryProbe(ExchangeAppBatchMixin):
+        pass
+
+    summary_probe = _SelftestBatchSummaryProbe()
+    redeem_summary_text = summary_probe._build_batch_summary_text(
+        {
+            "runner": "batch_redeem_flexible_earn",
+            "results": {"a": True, "b": False, "c": None},
+            "redeemed_assets_by_account": {"a": 2, "b": 1},
+            "skipped_assets_by_account": {"a": 0, "b": 3},
+            "auto_disabled_by_account": {"a": 2, "b": 1},
+        },
+        pending_as_failed=True,
+    )
+    expected_summary_text = "结果汇总：成功1 | 失败2 | 已赎回资产3 | 跳过资产3 | 关闭自动申购3"
+    if redeem_summary_text != expected_summary_text:
+        raise RuntimeError(f"理财赎回汇总自检失败：{redeem_summary_text}")
+    checks.append("simple-earn-summary=ok")
+
 def _emit_selftest_console(message: str, *, error: bool = False) -> None:
     stream = sys.stderr if error else sys.stdout
     try:
