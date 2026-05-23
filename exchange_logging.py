@@ -7,6 +7,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 import queue
+import re
+import threading
 import time
 from pathlib import Path
 
@@ -25,14 +27,41 @@ LOG_FILE_BACKUP_COUNT = 3
 COMPAT_LOG_MAX_BYTES = 5 * 1024 * 1024
 COMPAT_LOG_BACKUP_COUNT = 3
 EXCHANGE_LOG_MAX_ROWS = LOG_MAX_ROWS
+_ACCOUNT_LOG_CONTEXT = threading.local()
+_ACCOUNT_TEXT_RE = re.compile(r"账号\s*[#＃]?\s*\d+")
+
+
+def set_exchange_account_log_index(account_index: object) -> None:
+    text = str(account_index or "").strip()
+    if text:
+        _ACCOUNT_LOG_CONTEXT.account_index = text
+    else:
+        clear_exchange_account_log_index()
+
+
+def clear_exchange_account_log_index() -> None:
+    try:
+        del _ACCOUNT_LOG_CONTEXT.account_index
+    except AttributeError:
+        pass
+
+
+def current_exchange_account_log_index() -> str:
+    return str(getattr(_ACCOUNT_LOG_CONTEXT, "account_index", "") or "").strip()
 
 
 class SensitiveFormatter(logging.Formatter):
     def format(self, record):
+        account_index = current_exchange_account_log_index()
+        message = str(record.getMessage() or "")
+        if account_index and not _ACCOUNT_TEXT_RE.search(message):
+            record.account_prefix = f"[账号 #{account_index}] "
+        else:
+            record.account_prefix = ""
         return redact_sensitive_text(super().format(record))
 
 
-_formatter = SensitiveFormatter("%(asctime)s [%(levelname)s] %(message)s")
+_formatter = SensitiveFormatter("%(asctime)s [%(levelname)s] %(account_prefix)s%(message)s")
 logger = logging.getLogger("bot")
 logger.setLevel(logging.INFO)
 logger.propagate = False

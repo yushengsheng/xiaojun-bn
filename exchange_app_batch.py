@@ -25,11 +25,13 @@ from exchange_app_base import (
     TRADE_MODE_PREMIUM,
     WITHDRAW_COIN_DEFAULT,
     WITHDRAW_NETWORK_DEFAULT,
+    clear_exchange_account_log_index,
     logger,
     messagebox,
     queue,
     random,
     schedule_ui_callback,
+    set_exchange_account_log_index,
     summarize_exchange_exception,
     threading,
     time,
@@ -626,6 +628,15 @@ class ExchangeAppBatchMixin(object):
         for acc in self.accounts:
             self._clear_account_stop_request(acc)
             self._set_account_batch_active(acc, False)
+    @staticmethod
+    def _account_display_index(acc: dict, fallback: int) -> int:
+        try:
+            text = str(acc.get("index_var").get() or "").strip()
+            if text:
+                return int(text)
+        except Exception:
+            pass
+        return int(fallback)
     def _set_context_account(self, acc: dict | None):
         previous = getattr(self, "_context_account", None)
         self._context_account = acc
@@ -1431,8 +1442,8 @@ class ExchangeAppBatchMixin(object):
         self.progress["maximum"] = len(selected)
 
         task_queue = queue.Queue()
-        for idx, acc in enumerate(selected, start=1):
-            task_queue.put((idx, acc))
+        for batch_pos, acc in enumerate(selected, start=1):
+            task_queue.put((self._account_display_index(acc, batch_pos), acc))
 
         total_accounts = len(selected)
         completed_count = 0
@@ -1477,7 +1488,9 @@ class ExchangeAppBatchMixin(object):
                 try:
                     idx, acc = task_queue.get(timeout=1)
                 except queue.Empty:
+                    clear_exchange_account_log_index()
                     return
+                set_exchange_account_log_index(idx)
 
                 final_status_text = ""
 
@@ -1648,6 +1661,7 @@ class ExchangeAppBatchMixin(object):
                         fallback=("成功" if op_success else "已停止" if combined_stop.is_set() else "失败"),
                     )
                     logger.info("[线程 %d] 账号 #%d 理财赎回处理完毕：%s", thread_id, idx, result_text)
+                    clear_exchange_account_log_index()
 
         def controller():
             threads = []
@@ -1872,8 +1886,8 @@ class ExchangeAppBatchMixin(object):
         self.progress["maximum"] = total_accounts
 
         task_queue = queue.Queue()
-        for idx, acc in enumerate(selected, start=1):
-            task_queue.put((idx, acc))
+        for batch_pos, acc in enumerate(selected, start=1):
+            task_queue.put((self._account_display_index(acc, batch_pos), acc))
 
         completed_count = 0
         count_lock = threading.Lock()
@@ -1894,7 +1908,9 @@ class ExchangeAppBatchMixin(object):
                 try:
                     idx, acc = task_queue.get(timeout=1)
                 except queue.Empty:
+                    clear_exchange_account_log_index()
                     return
+                set_exchange_account_log_index(idx)
 
                 def set_status(text, acc_ref=acc):
                     self._schedule_account_status(acc_ref, text)
@@ -1918,6 +1934,7 @@ class ExchangeAppBatchMixin(object):
                     finish_one()
                     task_queue.task_done()
                     logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
+                    clear_exchange_account_log_index()
 
                 if combined_stop.is_set():
                     finish_current_now("已停止", success=False)
@@ -2360,6 +2377,7 @@ class ExchangeAppBatchMixin(object):
                         finish_one()
                         task_queue.task_done()
                         logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
+                    clear_exchange_account_log_index()
 
         def controller():
             nonlocal validated_quote_asset
@@ -2485,8 +2503,8 @@ class ExchangeAppBatchMixin(object):
         self.progress["maximum"] = len(selected)
 
         task_queue = queue.Queue()
-        for idx, acc in enumerate(selected, start=1):
-            task_queue.put((idx, acc))
+        for batch_pos, acc in enumerate(selected, start=1):
+            task_queue.put((self._account_display_index(acc, batch_pos), acc))
 
         total_accounts = len(selected)
         completed_count = 0
@@ -2498,7 +2516,9 @@ class ExchangeAppBatchMixin(object):
                 try:
                     idx, acc = task_queue.get(timeout=1)
                 except queue.Empty:
+                    clear_exchange_account_log_index()
                     return
+                set_exchange_account_log_index(idx)
 
                 def set_status(text, acc_ref=acc):
                     self._schedule_account_status(acc_ref, text)
@@ -2552,6 +2572,7 @@ class ExchangeAppBatchMixin(object):
                         self.progress["value"] = curr
                         self.status_var.set(f"批量提现进度: {curr}/{total_accounts}")
                     self._dispatch_ui(_u)
+                    clear_exchange_account_log_index()
 
         def controller():
             threads = []

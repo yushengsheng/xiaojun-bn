@@ -293,6 +293,19 @@ class OnchainTransferPageBase:
         self._apply_setting_layout("wide")
         self._refresh_relay_controls()
 
+        self.onchain_search_var = StringVar(value="")
+        self.onchain_search_result_var = StringVar(value="")
+        self._onchain_search_last_query = ""
+        search_bar = ttk.Frame(main)
+        search_bar.pack(fill="x", pady=(0, 6))
+        ttk.Label(search_bar, text="表格搜索:").pack(side=LEFT)
+        self.onchain_search_entry = ttk.Entry(search_bar, textvariable=self.onchain_search_var, width=44)
+        self.onchain_search_entry.pack(side=LEFT, padx=(4, 4))
+        self.onchain_search_entry.bind("<Return>", self.search_onchain_table, add="+")
+        ttk.Button(search_bar, text="搜索", command=self.search_onchain_table).pack(side=LEFT)
+        ttk.Button(search_bar, text="清空", command=self.clear_onchain_search).pack(side=LEFT, padx=(4, 0))
+        ttk.Label(search_bar, textvariable=self.onchain_search_result_var, style="Subtle.TLabel").pack(side=LEFT, padx=(8, 0))
+
         self.table_wrap = ttk.Frame(main)
         self.table_wrap.pack(fill=BOTH, expand=True)
         self.table_wrap.columnconfigure(0, weight=1)
@@ -1056,6 +1069,203 @@ class OnchainTransferPageBase:
     def _source_addr_text(self, source: str) -> str:
         addr = self.source_address_cache.get(source, "")
         return addr if addr else "-"
+    def _onchain_source_address_for_search(self, source: str) -> str:
+        source_key = str(source or "").strip()
+        if not source_key:
+            return ""
+        try:
+            cached_addr = self.source_address_cache.get(source_key, "")
+        except Exception:
+            cached_addr = ""
+        if cached_addr:
+            return cached_addr
+        client = getattr(self, "client", None)
+        if client is None:
+            return ""
+        try:
+            if client.is_address(source_key):
+                address = client.validate_evm_address(source_key, "转出钱包地址")
+            else:
+                private_key = client.credential_to_private_key(source_key)
+                address = client.address_from_private_key(private_key)
+        except Exception:
+            return ""
+        if address:
+            try:
+                lock = getattr(self, "wallet_cache_lock", None)
+                if lock is not None:
+                    with lock:
+                        self.source_address_cache[source_key] = address
+                else:
+                    self.source_address_cache[source_key] = address
+            except Exception:
+                pass
+        return address
+    @staticmethod
+    def _hex_key_search_variants(value: str) -> list[str]:
+        raw = str(value or "").strip()
+        if not re.fullmatch(r"(0x)?[a-fA-F0-9]{64}", raw):
+            return []
+        if raw.lower().startswith("0x"):
+            return [raw[2:]]
+        return [f"0x{raw}"]
+    def _onchain_search_values(self, source: str, target: str) -> tuple[str, ...]:
+        source_text = str(source or "").strip()
+        target_text = str(target or "").strip()
+        values: list[str] = [
+            source_text,
+            target_text,
+            self._display_credential(source_text),
+            self._display_credential(target_text),
+            self._onchain_source_address_for_search(source_text),
+        ]
+        values.extend(self._hex_key_search_variants(source_text))
+        return tuple(value for value in values if str(value or "").strip())
+    def _onchain_search_row_matches(self, row: dict[str, str], query: str) -> bool:
+        needle = str(query or "").strip().lower()
+        if not needle:
+            return False
+        return any(needle in value.lower() for value in self._onchain_search_values(row.get("source", ""), row.get("target", "")))
+    def _onchain_search_rows(self) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        mode = self._mode()
+        if mode == self.MODE_M2M:
+            for i, item in enumerate(self.store.multi_to_multi_pairs, start=1):
+                rows.append(
+                    {
+                        "row_id": f"onchain_row_{i}",
+                        "label": f"第 {i} 行",
+                        "source": str(item.source or "").strip(),
+                        "target": str(item.target or "").strip(),
+                    }
+                )
+            start_index = len(self.store.multi_to_multi_pairs) + 1
+            for i, row in enumerate(self.m2m_import_drafts, start=start_index):
+                rows.append(
+                    {
+                        "row_id": f"onchain_draft_{i}",
+                        "label": f"第 {i} 行（待补齐）",
+                        "source": str(row.get("source", "") or "").strip(),
+                        "target": str(row.get("target", "") or "").strip(),
+                    }
+                )
+            return rows
+        if mode == self.MODE_1M:
+            source = self.source_credential_var.get().strip()
+            for i, target in enumerate(self.store.one_to_many_addresses, start=1):
+                rows.append(
+                    {
+                        "row_id": f"onchain_row_{i}",
+                        "label": f"第 {i} 行",
+                        "source": source,
+                        "target": str(target or "").strip(),
+                    }
+                )
+            return rows
+        target = self.target_address_var.get().strip()
+        for i, source in enumerate(self.store.many_to_one_sources, start=1):
+            rows.append(
+                {
+                    "row_id": f"onchain_row_{i}",
+                    "label": f"第 {i} 行",
+                    "source": str(source or "").strip(),
+                    "target": target,
+                }
+            )
+        return rows
+    def _focused_onchain_search_position(self, rows: list[dict[str, str]]) -> int | None:
+        current_row_id = ""
+        try:
+            selected = tuple(self.tree.selection())
+        except Exception:
+            selected = ()
+        if selected:
+            current_row_id = str(selected[0])
+        if not current_row_id:
+            try:
+                current_row_id = str(self.tree.focus() or "")
+            except Exception:
+                current_row_id = ""
+        if not current_row_id:
+            return None
+        for position, row in enumerate(rows):
+            if row.get("row_id") == current_row_id:
+                return position
+        return None
+    def _focus_onchain_search_row(self, row_id: str) -> bool:
+        tree = getattr(self, "tree", None)
+        if tree is None:
+            return False
+        try:
+            if not tree.exists(row_id):
+                return False
+            tree.selection_set(row_id)
+            tree.focus(row_id)
+            tree.see(row_id)
+            tree.focus_set()
+            return True
+        except Exception:
+            return False
+    def search_onchain_table(self, _event=None):
+        search_var = getattr(self, "onchain_search_var", None)
+        query = str(search_var.get() if search_var is not None else "").strip()
+        result_var = getattr(self, "onchain_search_result_var", None)
+        entry = getattr(self, "onchain_search_entry", None)
+        if not query:
+            if result_var is not None:
+                result_var.set("请输入钱包地址或私钥")
+            if entry is not None:
+                try:
+                    entry.focus_set()
+                except Exception:
+                    pass
+            return "break"
+        rows = self._onchain_search_rows()
+        matches: list[tuple[int, dict[str, str]]] = [
+            (position, row)
+            for position, row in enumerate(rows)
+            if self._onchain_search_row_matches(row, query)
+        ]
+        if not matches:
+            if result_var is not None:
+                result_var.set("未找到匹配行")
+            self._onchain_search_last_query = query
+            if entry is not None:
+                try:
+                    entry.focus_set()
+                except Exception:
+                    pass
+            return "break"
+        last_query = str(getattr(self, "_onchain_search_last_query", "") or "")
+        current_position = self._focused_onchain_search_position(rows)
+        target_match_index = 0
+        if last_query == query and current_position is not None:
+            for i, (position, _row) in enumerate(matches):
+                if position > current_position:
+                    target_match_index = i
+                    break
+            else:
+                target_match_index = 0
+        target_row = matches[target_match_index][1]
+        self._onchain_search_last_query = query
+        self._focus_onchain_search_row(target_row.get("row_id", ""))
+        if result_var is not None:
+            result_var.set(f"找到 {target_match_index + 1}/{len(matches)}：{target_row.get('label', '')}")
+        return "break"
+    def clear_onchain_search(self):
+        var = getattr(self, "onchain_search_var", None)
+        if var is not None:
+            var.set("")
+        result_var = getattr(self, "onchain_search_result_var", None)
+        if result_var is not None:
+            result_var.set("")
+        self._onchain_search_last_query = ""
+        entry = getattr(self, "onchain_search_entry", None)
+        if entry is not None:
+            try:
+                entry.focus_set()
+            except Exception:
+                pass
     def _ensure_query_status_store(self) -> dict[str, str]:
         if not hasattr(self, "query_row_status"):
             self.query_row_status = {}
@@ -2134,6 +2344,9 @@ class OnchainTransferPageBase:
         self.log_tree.column("msg", width=msg_width, stretch=True)
     def _on_mode_changed(self, *_args):
         mode = self._mode()
+        if hasattr(self, "onchain_search_result_var"):
+            self.onchain_search_result_var.set("")
+            self._onchain_search_last_query = ""
         previous_mode = str(getattr(self, "_last_mode_for_amounts", "") or "").strip()
         if self._mode_amount_config_ready:
             if previous_mode and previous_mode != mode:

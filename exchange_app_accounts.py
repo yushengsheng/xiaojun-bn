@@ -90,6 +90,111 @@ class ExchangeAppAccountsMixin(object):
             hint.place_forget()
             return
         hint.place(relx=0.5, rely=0.5, anchor="center")
+    def _account_matches_search(self, acc: dict, query: str) -> bool:
+        needle = str(query or "").strip().lower()
+        if not needle:
+            return False
+        api_key = str(acc.get("api_key") or "").strip()
+        address = str(acc.get("address") or "").strip()
+        fields = (
+            api_key,
+            address,
+            self._mask_key(api_key),
+            self._mask_addr(address),
+        )
+        return any(needle in str(value or "").lower() for value in fields)
+    def _selected_account_index(self) -> int | None:
+        tree = getattr(self, "account_tree", None)
+        if tree is None:
+            return None
+        try:
+            selected = tree.selection()
+        except Exception:
+            selected = ()
+        if not selected:
+            return None
+        acc = self._account_from_tree_row_id(selected[0])
+        if acc not in self.accounts:
+            return None
+        try:
+            return self.accounts.index(acc)
+        except ValueError:
+            return None
+    def _focus_account_row(self, acc: dict) -> bool:
+        tree = getattr(self, "account_tree", None)
+        if tree is None or acc not in self.accounts:
+            return False
+        tree_id = str(acc.get("tree_id") or "").strip()
+        if not tree_id:
+            return False
+        try:
+            tree.selection_set(tree_id)
+            tree.focus(tree_id)
+            tree.see(tree_id)
+            tree.focus_set()
+            return True
+        except Exception:
+            return False
+    def search_account_list(self, _event=None):
+        query = str(getattr(self, "account_search_var", tk.StringVar()).get() or "").strip()
+        result_var = getattr(self, "account_search_result_var", None)
+        if not query:
+            if result_var is not None:
+                result_var.set("请输入 API KEY 或提现地址")
+            entry = getattr(self, "account_search_entry", None)
+            if entry is not None:
+                try:
+                    entry.focus_set()
+                except Exception:
+                    pass
+            return "break"
+        matches = [
+            (idx, acc)
+            for idx, acc in enumerate(self.accounts)
+            if self._account_matches_search(acc, query)
+        ]
+        if not matches:
+            if result_var is not None:
+                result_var.set("未找到匹配账号")
+            logger.info("账号搜索未找到匹配项")
+            return "break"
+
+        selected_index = self._selected_account_index()
+        last_query = str(getattr(self, "_account_search_last_query", "") or "")
+        start_index = 0
+        if last_query == query and selected_index is not None:
+            start_index = selected_index + 1
+        target_pos, target_acc = next(((idx, acc) for idx, acc in matches if idx >= start_index), matches[0])
+        self._account_search_last_query = query
+        self._focus_account_row(target_acc)
+
+        match_number = 1
+        for pos, (idx, _acc) in enumerate(matches, start=1):
+            if idx == target_pos:
+                match_number = pos
+                break
+        try:
+            account_no = str(target_acc.get("index_var").get() or "").strip()
+        except Exception:
+            account_no = str(target_pos + 1)
+        if result_var is not None:
+            result_var.set(f"找到 {match_number}/{len(matches)}：账号 #{account_no or target_pos + 1}")
+        logger.info("账号搜索命中：账号 #%s（%d/%d）", account_no or target_pos + 1, match_number, len(matches))
+        return "break"
+    def clear_account_search(self):
+        var = getattr(self, "account_search_var", None)
+        if var is not None:
+            var.set("")
+        result_var = getattr(self, "account_search_result_var", None)
+        if result_var is not None:
+            result_var.set("")
+        self._account_search_last_query = ""
+        entry = getattr(self, "account_search_entry", None)
+        if entry is not None:
+            try:
+                entry.focus_set()
+            except Exception:
+                pass
     def _copy_account_field(self, acc: dict | None, field_name: str, field_label: str) -> None:
         if acc is None:
             messagebox.showinfo("提示", "请先右键选择一个账号")

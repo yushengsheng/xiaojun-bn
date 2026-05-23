@@ -83,7 +83,13 @@ from exchange_constants import (
     WITHDRAW_NETWORK_DEFAULT,
     WITHDRAW_NETWORK_OPTIONS,
 )
-from exchange_logging import EXCHANGE_LOG_MAX_ROWS, log_queue, logger
+from exchange_logging import (
+    EXCHANGE_LOG_MAX_ROWS,
+    clear_exchange_account_log_index,
+    log_queue,
+    logger,
+    set_exchange_account_log_index,
+)
 from exchange_proxy_runtime import ExchangeProxyRuntime, http_get_via_proxy
 from exchange_strategy import CombinedStopEvent, Strategy
 from secret_box import SECRET_BOX
@@ -311,16 +317,32 @@ class ExchangeAppBase(tk.Tk):
         self.exchange_strategy_frame = frame_top
         self._rebuild_exchange_panels(frame_top, frame_mid)
 
-        frame_acc = ttk.LabelFrame(self.exchange_tab, text="账号列表管理（批量 API + 提现地址）")
+        frame_acc = ttk.LabelFrame(self.exchange_tab)
         frame_acc.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.acc_api_key_var = tk.StringVar()
         self.acc_api_secret_var = tk.StringVar()
         self.acc_withdraw_addr_var = tk.StringVar()
         self.acc_network_var = self.withdraw_net_var
+        self.account_search_var = tk.StringVar()
+        self.account_search_result_var = tk.StringVar(value="")
+        self._account_search_last_query = ""
 
         self.withdraw_net_var.trace_add("write", self._on_global_network_changed)
         self.max_threads_var = tk.IntVar(value=MAX_THREADS_DEFAULT)
+
+        frame_acc_header = ttk.Frame(frame_acc)
+        ttk.Label(frame_acc_header, text="账号列表管理（批量 API + 提现地址）").pack(side="left")
+        ttk.Label(frame_acc_header, text="搜索:").pack(side="left", padx=(12, 3))
+        self.account_search_entry = ttk.Entry(frame_acc_header, textvariable=self.account_search_var, width=34)
+        self.account_search_entry.pack(side="left", padx=(0, 4))
+        self.account_search_entry.bind("<Return>", self.search_account_list, add="+")
+        self.btn_search_accounts = ttk.Button(frame_acc_header, text="搜索", command=self.search_account_list)
+        self.btn_search_accounts.pack(side="left", padx=(0, 4))
+        self.btn_clear_account_search = ttk.Button(frame_acc_header, text="清空", command=self.clear_account_search)
+        self.btn_clear_account_search.pack(side="left", padx=(0, 6))
+        ttk.Label(frame_acc_header, textvariable=self.account_search_result_var, foreground="#666666").pack(side="left")
+        frame_acc.configure(labelwidget=frame_acc_header)
 
         self.frame_list_canvas = ttk.Frame(frame_acc)
         self.frame_list_canvas.pack(fill="both", expand=True, padx=5, pady=2)

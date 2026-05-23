@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import queue
 import sys
 import tempfile
 import threading
@@ -22,7 +23,7 @@ from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_app_config import ExchangeAppConfigMixin
 from exchange_binance_client import BinanceAPIError, BinanceClient
 from exchange_constants import TRADE_ACCOUNT_TYPE_FUTURES, TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_LIMIT, TRADE_MODE_MARKET, TRADE_MODE_PREMIUM
-from exchange_logging import logger, runtime_log_path
+from exchange_logging import clear_exchange_account_log_index, log_queue, logger, runtime_log_path, set_exchange_account_log_index
 from onchain_relay_wallets import RelayWalletFileStore
 from onchain_relay_runner import _record_matches_job
 from exchange_proxy_runtime import ExchangeProxyRuntime
@@ -39,6 +40,15 @@ def _load_onchain_page_class():
     except Exception as exc:
         return None, exc
     return OnchainTransferPage, None
+
+
+def _drain_exchange_log_queue() -> list[str]:
+    messages: list[str] = []
+    while True:
+        try:
+            messages.append(str(log_queue.get_nowait()))
+        except queue.Empty:
+            return messages
 
 
 def _run_online_selftest_checks(client: EvmClient, checks: list[str]) -> None:
@@ -79,6 +89,34 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     if redact_sensitive_text("secret-box=cryptography") != "secret-box=cryptography":
         raise RuntimeError("敏感信息脱敏自检失败：误伤普通 selftest 文本")
     checks.append("sensitive-redaction=ok")
+
+    class _SelftestVar:
+        def __init__(self, value: str = ""):
+            self._value = value
+
+        def get(self):
+            return self._value
+
+    if ExchangeAppBatchMixin._account_display_index({"index_var": _SelftestVar("8")}, 1) != 8:
+        raise RuntimeError("交易所日志账号编号自检失败：未使用账号列表显示编号")
+    if ExchangeAppBatchMixin._account_display_index({"index_var": _SelftestVar("")}, 3) != 3:
+        raise RuntimeError("交易所日志账号编号自检失败：空编号未回退到批次编号")
+
+    _drain_exchange_log_queue()
+    set_exchange_account_log_index(8)
+    try:
+        logger.info("策略内部日志自检")
+        logger.info("账号 #8 已有账号编号自检")
+    finally:
+        clear_exchange_account_log_index()
+    exchange_log_messages = _drain_exchange_log_queue()
+    internal_log = next((msg for msg in exchange_log_messages if "策略内部日志自检" in msg), "")
+    explicit_log = next((msg for msg in exchange_log_messages if "已有账号编号自检" in msg), "")
+    if "[账号 #8]" not in internal_log:
+        raise RuntimeError("交易所日志账号编号自检失败：策略内部日志未自动带账号编号")
+    if explicit_log.count("账号 #8") != 1:
+        raise RuntimeError("交易所日志账号编号自检失败：已有账号编号的日志被重复加前缀")
+    checks.append("exchange-log-account-context=ok")
 
     with tempfile.TemporaryDirectory(prefix="xiaojun-selftest-") as tmpdir:
         store_path = Path(tmpdir) / "onchain.json"
@@ -1745,6 +1783,53 @@ def _run_gui_selftest_checks(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：1对多独立数量配置未保存")
                 if saved_store.settings.mode_amounts.get("many_to_one", {}).get("amount_mode") != page.AMOUNT_MODE_ALL:
                     raise RuntimeError("GUI 自检失败：多对1独立数量配置未保存")
+
+                def _addr(n: int) -> str:
+                    return f"0x{n:040x}"
+
+                def _assert_onchain_search(query: str, expected_row_id: str, label: str) -> None:
+                    page.onchain_search_var.set(query)
+                    page.search_onchain_table()
+                    _pump_tk_events(app, timeout=5.0)
+                    selected = tuple(page.tree.selection())
+                    if not selected or selected[0] != expected_row_id:
+                        raise RuntimeError(
+                            f"GUI 自检失败：链上搜索未定位到{label}，期望 {expected_row_id}，实际 {selected}"
+                        )
+
+                source_a = "0x" + "1" * 64
+                source_b = "2" * 64
+                source_c = "0x" + "3" * 64
+                source_d = "0x" + "4" * 64
+                source_e = "5" * 64
+                source_a_addr = page.client.address_from_private_key(source_a)
+                source_e_addr = page.client.address_from_private_key("0x" + source_e)
+
+                page.store.multi_to_multi_pairs = [
+                    OnchainPairEntry(source=source_a, target=_addr(101)),
+                    OnchainPairEntry(source=source_b, target=_addr(102)),
+                ]
+                page.m2m_import_drafts = [{"source": source_c, "target": _addr(103)}]
+                page.mode_var.set(page.MODE_M2M)
+                _pump_tk_events(app, timeout=5.0)
+                _assert_onchain_search(_addr(102), "onchain_row_2", "多对多接收地址")
+                _assert_onchain_search(source_a_addr, "onchain_row_1", "多对多源钱包地址")
+                _assert_onchain_search(source_c, "onchain_draft_3", "多对多待补齐私钥")
+
+                page.store.one_to_many_addresses = [_addr(201), _addr(202)]
+                page.source_credential_var.set(source_a)
+                page.mode_var.set(page.MODE_1M)
+                _pump_tk_events(app, timeout=5.0)
+                _assert_onchain_search(_addr(202), "onchain_row_2", "1对多收款地址")
+                _assert_onchain_search(source_a_addr, "onchain_row_1", "1对多源钱包地址")
+
+                page.store.many_to_one_sources = [source_d, source_e]
+                page.target_address_var.set(_addr(301))
+                page.mode_var.set(page.MODE_M1)
+                _pump_tk_events(app, timeout=5.0)
+                _assert_onchain_search(source_e_addr, "onchain_row_2", "多对1源钱包地址")
+                _assert_onchain_search("0x" + source_e, "onchain_row_2", "多对1源钱包私钥")
+                checks.append("onchain-search-gui=ok")
 
                 page.open_wallet_generator()
                 _pump_tk_events(app, timeout=5.0)
