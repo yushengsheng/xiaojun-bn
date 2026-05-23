@@ -104,6 +104,7 @@ class ExchangeAppBatchMixin(object):
         required_amount = Decimal(str(required_quote_amount)) if required_quote_amount is not None else Decimal("0")
         progress_log_times: dict[str, float] = {}
         error_log_times: dict[str, float] = {}
+        full_collect_trade_assets: set[str] = set()
         progress_log_interval = 5.0
         error_log_interval = 5.0
 
@@ -122,6 +123,19 @@ class ExchangeAppBatchMixin(object):
                 return
             error_log_times[key] = now
             logger.error(message, *args)
+
+        def collect_trade_asset_to_spot(asset: str) -> None:
+            asset_u = str(asset or "").strip().upper()
+            if not asset_u:
+                return
+            if asset_u not in full_collect_trade_assets and hasattr(c, "collect_asset_to_spot"):
+                c.collect_asset_to_spot(asset_u, context="交易前")
+                full_collect_trade_assets.add(asset_u)
+                return
+            if hasattr(c, "collect_funding_asset_to_spot"):
+                c.collect_funding_asset_to_spot(asset_u)
+            elif hasattr(c, "collect_asset_to_spot"):
+                c.collect_asset_to_spot(asset_u, context="交易前")
 
         while time.time() - start < timeout_sec:
             if stop_event and stop_event.is_set():
@@ -159,10 +173,10 @@ class ExchangeAppBatchMixin(object):
                     if spot_base_to_quote_only:
                         quote_balance_dec = Decimal("0")
                     else:
-                        c.collect_funding_asset_to_spot(quote_asset)
+                        collect_trade_asset_to_spot(quote_asset)
                         quote_balance_dec = c.spot_asset_balance_decimal(quote_asset)
                     if (spot_base_to_quote_only or mode_name == TRADE_MODE_CONVERT) and base_asset:
-                        c.collect_funding_asset_to_spot(base_asset)
+                        collect_trade_asset_to_spot(base_asset)
                         base_balance_dec = c.spot_asset_balance_decimal(base_asset)
                     quote_balance = float(quote_balance_dec)
                     if spot_base_to_quote_only:
@@ -824,6 +838,18 @@ class ExchangeAppBatchMixin(object):
         if not enable_withdraw:
             return cls._exchange_success_status_text("自动提现已关闭"), True
         return cls._exchange_failed_status_text("提现失败：可提余额不足/预留过高"), False
+    @classmethod
+    def _format_trade_failure_status(cls, stage: str, err: object) -> str:
+        stage_text = str(stage or "").strip()
+        if stage_text == "开仓下单":
+            prefix = "开仓失败"
+        elif stage_text == "平仓下单":
+            prefix = "平仓失败"
+        elif "预检" in stage_text:
+            prefix = "合约预检失败"
+        else:
+            prefix = "交易失败"
+        return cls._exchange_error_status_text(prefix, err, fallback=prefix)
     @staticmethod
     def _collect_bnb_withdraw_runtime(*, force_bnb_withdraw: bool, enable_withdraw: bool, withdraw_coin: str) -> tuple[str, bool]:
         if force_bnb_withdraw:
@@ -2289,7 +2315,17 @@ class ExchangeAppBatchMixin(object):
                             result_amount = float((strategy_result or {}).get("withdraw_amount", 0.0)) if isinstance(strategy_result, dict) else 0.0
                             final_amount = callback_amount if callback_amount is not None else result_amount
 
-                            if isinstance(strategy_result, dict) and strategy_result.get("withdraw_error") and (final_amount or 0) <= 0:
+                            trade_error = strategy_result.get("trade_error") if isinstance(strategy_result, dict) else ""
+                            if trade_error:
+                                self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
+                                set_status(
+                                    self._format_trade_failure_status(
+                                        strategy_result.get("trade_error_stage", ""),
+                                        trade_error,
+                                    )
+                                )
+                                op_success = False
+                            elif isinstance(strategy_result, dict) and strategy_result.get("withdraw_error") and (final_amount or 0) <= 0:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
                                 set_status(
                                     self._exchange_error_status_text(

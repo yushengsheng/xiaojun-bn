@@ -88,6 +88,12 @@ def short_binance_api_error(code: int, msg: str) -> str:
         return "限流/系统繁忙"
     if code == -2015:
         return "API权限/IP白名单问题"
+    if code == -1135:
+        return "账号状态不允许交易"
+    if code == -4411:
+        return "需签署合约交易协议"
+    if code == 32020:
+        return "合约交易/划转临时暂停"
     if code == -2010:
         if "insufficient balance" in message_lower:
             return "余额不足"
@@ -906,7 +912,7 @@ class BinanceClient:
         base_asset = self.get_spot_base_asset(symbol_u)
         quote_asset = self.get_spot_quote_asset(symbol_u)
         self.ensure_convert_symbol_supported(symbol_u)
-        self.collect_funding_asset_to_spot(quote_asset)
+        self.collect_asset_to_spot(quote_asset, context="交易前")
 
         quote_balance = self.spot_asset_balance_decimal(quote_asset)
         buffer_dec = Decimal(str(buffer or "0"))
@@ -926,7 +932,7 @@ class BinanceClient:
         base_asset = self.get_spot_base_asset(symbol_u)
         quote_asset = self.get_spot_quote_asset(symbol_u)
         self.ensure_convert_symbol_supported(symbol_u)
-        self.collect_funding_asset_to_spot(base_asset)
+        self.collect_asset_to_spot(base_asset, context="交易前")
 
         base_balance = self.spot_asset_balance_decimal(base_asset)
         if base_balance <= 0:
@@ -1598,7 +1604,7 @@ class BinanceClient:
             return None
 
         quote_asset = self.get_spot_quote_asset(symbol)
-        self.collect_funding_asset_to_spot(quote_asset)
+        self.collect_asset_to_spot(quote_asset, context="交易前")
         quote_balance = Decimal(str(self.spot_balance(quote_asset)))
         if quote_balance <= 0:
             logger.info("现货 %s 余额不足，跳过挂单买入", quote_asset)
@@ -1674,7 +1680,7 @@ class BinanceClient:
             return False
 
         quote_asset = self.get_spot_quote_asset(symbol_u)
-        self.collect_funding_asset_to_spot(quote_asset)
+        self.collect_asset_to_spot(quote_asset, context="交易前")
         quote_balance = self.spot_asset_balance_decimal(quote_asset)
         quote_order_qty_fraction = int(rules.get("quoteOrderQtyFraction", 8) or 8)
         amount = self._quantize_to_fraction(amount, quote_order_qty_fraction)
@@ -1728,7 +1734,7 @@ class BinanceClient:
             return None if return_order else False
 
         if not assume_spot_funds_ready:
-            self.collect_funding_asset_to_spot(quote_asset_u)
+            self.collect_asset_to_spot(quote_asset_u, context="交易前")
         if spot_balance_snapshot is None:
             quote_balance = self.spot_asset_balance_decimal(quote_asset_u)
         else:
@@ -1950,7 +1956,7 @@ class BinanceClient:
     def spot_buy_all_usdt(self, buffer=0.2, symbol="BTCUSDT"):
         symbol_u = str(symbol or "").strip().upper()
         quote_asset = self.get_spot_quote_asset(symbol_u)
-        self.collect_funding_asset_to_spot(quote_asset)
+        self.collect_asset_to_spot(quote_asset, context="交易前")
         quote_balance = self.spot_asset_balance_decimal(quote_asset)
         buffer_dec = Decimal(str(buffer or "0"))
         if quote_balance <= buffer_dec:
@@ -1998,7 +2004,7 @@ class BinanceClient:
         coin = str(coin or "").strip().upper()
         if auto_collect_to_spot and coin:
             try:
-                moved_count = self.collect_asset_to_spot(coin)
+                moved_count = self.collect_asset_to_spot(coin, context="提现前")
                 if moved_count > 0:
                     # Give Binance a brief moment to reflect the transfer in spot balance.
                     time.sleep(0.5)
@@ -2123,7 +2129,7 @@ class BinanceClient:
         if transfer_amount <= 0:
             return Decimal("0")
         try:
-            self.universal_transfer("FUNDING_MAIN", asset_u, transfer_amount)
+            self._universal_transfer_with_retry("FUNDING_MAIN", asset_u, transfer_amount, context="资金账户划转到现货")
             logger.info("检测到资金账户 %s 余额，已自动划转到现货：%s", asset_u, self._format_decimal(transfer_amount))
             time.sleep(0.5)
             return transfer_amount
@@ -2257,7 +2263,7 @@ class BinanceClient:
             return Decimal("0")
 
         try:
-            self.universal_transfer("MAIN_UMFUTURE", asset_u, transfer_amount)
+            self._universal_transfer_with_retry("MAIN_UMFUTURE", asset_u, transfer_amount, context="现货划转到 U本位")
             logger.info("检测到现货 %s 余额，已自动划转到 U本位：%s", asset_u, self._format_decimal(transfer_amount))
             time.sleep(0.5)
             return transfer_amount
@@ -2329,10 +2335,40 @@ class BinanceClient:
         logger.info("划转成功: %s %s %s", transfer_type, asset, amt_str)
         return True
 
-    def collect_asset_to_spot(self, asset: str) -> int:
+    def _universal_transfer_with_retry(
+        self,
+        transfer_type: str,
+        asset: str,
+        amount: Decimal | str | float | int,
+        *,
+        context: str,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
+    ):
+        retries = max(0, int(max_retries or 0))
+        for attempt in range(retries + 1):
+            try:
+                return self.universal_transfer(transfer_type, asset, amount)
+            except Exception as e:
+                if attempt >= retries:
+                    raise
+                logger.warning(
+                    "%s失败 %s %s（重试 %d/%d）: %s",
+                    context,
+                    str(asset or "").strip().upper(),
+                    self._format_decimal(Decimal(str(amount))),
+                    attempt + 1,
+                    retries,
+                    e,
+                )
+                time.sleep(max(0.0, float(retry_delay or 0)))
+        return False
+
+    def collect_asset_to_spot(self, asset: str, *, context: str = "提现前") -> int:
         asset_u = str(asset or "").strip().upper()
         if not asset_u:
             return 0
+        context_text = str(context or "提现前").strip() or "提现前"
 
         total_count = 0
 
@@ -2345,17 +2381,18 @@ class BinanceClient:
                 if amount <= 0:
                     continue
                 try:
-                    self.universal_transfer("UMFUTURE_MAIN", asset_u, amount)
+                    self._universal_transfer_with_retry("UMFUTURE_MAIN", asset_u, amount, context=f"{context_text} U本位划转")
                     total_count += 1
                 except Exception as e:
                     logger.warning(
-                        "提现前 U本位划转失败 %s %s: %s",
+                        "%s U本位划转失败 %s %s: %s",
+                        context_text,
                         asset_u,
                         self._format_decimal(amount),
                         e,
                     )
         except Exception as e:
-            logger.warning("提现前查询 U本位 %s 余额失败: %s", asset_u, e)
+            logger.warning("%s查询 U本位 %s 余额失败: %s", context_text, asset_u, e)
 
         try:
             items = self.cm_futures_transferable_assets()
@@ -2366,17 +2403,18 @@ class BinanceClient:
                 if amount <= 0:
                     continue
                 try:
-                    self.universal_transfer("CMFUTURE_MAIN", asset_u, amount)
+                    self._universal_transfer_with_retry("CMFUTURE_MAIN", asset_u, amount, context=f"{context_text} 币本位划转")
                     total_count += 1
                 except Exception as e:
                     logger.warning(
-                        "提现前 币本位划转失败 %s %s: %s",
+                        "%s 币本位划转失败 %s %s: %s",
+                        context_text,
                         asset_u,
                         self._format_decimal(amount),
                         e,
                     )
         except Exception as e:
-            logger.warning("提现前查询 币本位 %s 余额失败: %s", asset_u, e)
+            logger.warning("%s查询 币本位 %s 余额失败: %s", context_text, asset_u, e)
 
         try:
             items = self.funding_positive_assets()
@@ -2387,20 +2425,21 @@ class BinanceClient:
                 if amount <= 0:
                     continue
                 try:
-                    self.universal_transfer("FUNDING_MAIN", asset_u, amount)
+                    self._universal_transfer_with_retry("FUNDING_MAIN", asset_u, amount, context=f"{context_text} 资金账户划转")
                     total_count += 1
                 except Exception as e:
                     logger.warning(
-                        "提现前 资金账户划转失败 %s %s: %s",
+                        "%s 资金账户划转失败 %s %s: %s",
+                        context_text,
                         asset_u,
                         self._format_decimal(amount),
                         e,
                     )
         except Exception as e:
-            logger.warning("提现前查询 资金账户 %s 余额失败: %s", asset_u, e)
+            logger.warning("%s查询 资金账户 %s 余额失败: %s", context_text, asset_u, e)
 
         if total_count > 0:
-            logger.info("提现前归集 %s 到现货完成，共处理 %d 项", asset_u, total_count)
+            logger.info("%s归集 %s 到现货完成，共处理 %d 项", context_text, asset_u, total_count)
         return total_count
 
     # -------- 归集合约/资金到现货 --------

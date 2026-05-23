@@ -20,8 +20,8 @@ from core_models import EvmToken, OnchainPairEntry, OnchainSettings, WithdrawRun
 from exchange_app_base import ExchangeAppBase
 from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_app_config import ExchangeAppConfigMixin
-from exchange_binance_client import BinanceClient
-from exchange_constants import TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_LIMIT, TRADE_MODE_MARKET, TRADE_MODE_PREMIUM
+from exchange_binance_client import BinanceAPIError, BinanceClient
+from exchange_constants import TRADE_ACCOUNT_TYPE_FUTURES, TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_LIMIT, TRADE_MODE_MARKET, TRADE_MODE_PREMIUM
 from exchange_logging import logger, runtime_log_path
 from onchain_relay_wallets import RelayWalletFileStore
 from onchain_relay_runner import _record_matches_job
@@ -1008,6 +1008,96 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError("普通市价轮次回归自检失败：未保持既有最终提现流程")
     checks.append("spot-market-rounds=ok")
 
+    class _SelftestFuturesOpenFailureClient:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def close_all_um_futures_positions_market(self, symbol: str):
+            self.calls.append("ensure-close")
+            return []
+
+        def get_um_futures_positions(self, symbol: str):
+            return []
+
+        def get_um_futures_position_mode(self):
+            return False
+
+        def get_um_futures_symbol_config(self, symbol: str):
+            return {"leverage": "20", "marginType": "CROSSED"}
+
+        def get_um_futures_margin_asset(self, symbol: str):
+            return "USDT"
+
+        def calculate_um_futures_order_quantity(self, symbol: str, amount, side: str):
+            return Decimal("0.057")
+
+        def um_futures_asset_balance(self, asset: str):
+            return {"availableBalance": "50"}
+
+        def ensure_um_futures_one_way_mode(self):
+            self.calls.append("one-way")
+
+        def ensure_um_futures_margin_type(self, symbol: str, margin_type: str):
+            self.calls.append("margin")
+
+        def ensure_um_futures_leverage(self, symbol: str, leverage: int):
+            self.calls.append("leverage")
+            return leverage
+
+        def place_um_futures_market_order(self, symbol: str, side: str, quantity):
+            self.calls.append("open")
+            raise BinanceAPIError(-1135, "Invalid account status.")
+
+        def close_um_futures_position_market(self, symbol: str):
+            raise RuntimeError("开仓失败后不应进入正常平仓")
+
+        def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
+            self.calls.append("withdraw")
+            return 0
+
+    class _SelftestNoSleepStop:
+        def is_set(self):
+            return False
+
+        def wait(self, _seconds=None):
+            return False
+
+    futures_failure_client = _SelftestFuturesOpenFailureClient()
+    futures_failure_progress: list[tuple[int, int, str]] = []
+    futures_failure_strategy = Strategy(
+        client=futures_failure_client,
+        spot_rounds=1,
+        withdraw_coin="USDT",
+        withdraw_address="",
+        withdraw_network="BSC",
+        withdraw_fee_buffer=0,
+        spot_symbol="BTCUSDT",
+        sleep_fn=lambda: None,
+        enable_withdraw=False,
+        trade_account_type=TRADE_ACCOUNT_TYPE_FUTURES,
+        trade_mode=TRADE_MODE_MARKET,
+        futures_symbol="XAUUSDT",
+        futures_rounds=1,
+        futures_amount=Decimal("260"),
+        futures_leverage=20,
+        futures_margin_type="CROSSED",
+    )
+    futures_failure_result = futures_failure_strategy.run(
+        stop_event=_SelftestNoSleepStop(),
+        progress_cb=lambda step, total, text: futures_failure_progress.append((step, total, text)),
+    )
+    if not futures_failure_result.get("trade_failed"):
+        raise RuntimeError(f"合约开仓失败自检失败：未返回交易失败状态（{futures_failure_result}）")
+    if futures_failure_result.get("trade_error_stage") != "开仓下单":
+        raise RuntimeError(f"合约开仓失败自检失败：失败阶段异常（{futures_failure_result}）")
+    if "开仓失败" not in [item[2] for item in futures_failure_progress]:
+        raise RuntimeError(f"合约开仓失败自检失败：未回调开仓失败状态（{futures_failure_progress}）")
+    if ExchangeAppBatchMixin._format_trade_failure_status("开仓下单", futures_failure_result.get("trade_error"))[:5] != "×开仓失败":
+        raise RuntimeError("合约开仓失败自检失败：批量状态栏未显示开仓失败")
+    if "withdraw" not in futures_failure_client.calls:
+        raise RuntimeError(f"合约开仓失败自检失败：失败后未保持最终归集提现流程（{futures_failure_client.calls}）")
+    checks.append("futures-open-failure-status=ok")
+
     class _SelftestQuoteWaitClient:
         def __init__(self):
             self.collected_assets: list[str] = []
@@ -1036,6 +1126,93 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             f"普通市价到账检测自检失败：错误检测了前置币种（{quote_wait_client.collected_assets}）"
         )
     checks.append("spot-quote-wait=ok")
+
+    class _SelftestSpotPretradeCollectClient:
+        def __init__(self):
+            self.collect_calls: list[tuple[str, str]] = []
+            self.balances: dict[str, Decimal] = {}
+
+        def collect_asset_to_spot(self, asset: str, *, context: str = "提现前"):
+            asset_u = str(asset or "").strip().upper()
+            self.collect_calls.append((asset_u, str(context or "")))
+            if asset_u == "USDT":
+                self.balances[asset_u] = Decimal("20")
+            elif asset_u == "BTC":
+                self.balances[asset_u] = Decimal("0.01")
+            return 1
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            return self.balances.get(str(asset or "").strip().upper(), Decimal("0"))
+
+    pretrade_quote_client = _SelftestSpotPretradeCollectClient()
+    pretrade_quote_probe = _SelftestZeroRoundWaitProbe(pretrade_quote_client)
+    if not pretrade_quote_probe.wait_for_usdt(
+        1,
+        None,
+        client=pretrade_quote_client,
+        symbol="BTCUSDT",
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+    ):
+        raise RuntimeError("现货交易前归集自检失败：后置币种归集后未通过到账检测")
+    if pretrade_quote_client.collect_calls != [("USDT", "交易前")]:
+        raise RuntimeError(f"现货交易前归集自检失败：后置币种归集路径异常（{pretrade_quote_client.collect_calls}）")
+
+    pretrade_base_client = _SelftestSpotPretradeCollectClient()
+    pretrade_base_probe = _SelftestZeroRoundWaitProbe(pretrade_base_client)
+    if not pretrade_base_probe.wait_for_usdt(
+        1,
+        None,
+        client=pretrade_base_client,
+        symbol="BTCUSDT",
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+        spot_base_to_quote_only=True,
+    ):
+        raise RuntimeError("现货交易前归集自检失败：前置币种归集后未通过0轮到账检测")
+    if pretrade_base_client.collect_calls != [("BTC", "交易前")]:
+        raise RuntimeError(f"现货交易前归集自检失败：前置币种归集路径异常（{pretrade_base_client.collect_calls}）")
+
+    class _SelftestSpotPretradeCollectRetryClient:
+        def __init__(self):
+            self.collect_calls: list[tuple[str, str]] = []
+            self.funding_calls: list[str] = []
+            self.balance = Decimal("0")
+
+        def collect_asset_to_spot(self, asset: str, *, context: str = "提现前"):
+            self.collect_calls.append((str(asset or "").strip().upper(), str(context or "")))
+            return 0
+
+        def collect_funding_asset_to_spot(self, asset: str):
+            asset_u = str(asset or "").strip().upper()
+            self.funding_calls.append(asset_u)
+            if asset_u == "USDT":
+                self.balance = Decimal("20")
+            return self.balance
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            return self.balance if str(asset or "").strip().upper() == "USDT" else Decimal("0")
+
+    class _SelftestPretradeDelayProbe(_SelftestZeroRoundWaitProbe):
+        def _current_random_delay_seconds(self) -> float:
+            return 0.01
+
+    pretrade_retry_client = _SelftestSpotPretradeCollectRetryClient()
+    pretrade_retry_probe = _SelftestPretradeDelayProbe(pretrade_retry_client)
+    if not pretrade_retry_probe.wait_for_usdt(
+        1,
+        None,
+        client=pretrade_retry_client,
+        symbol="BTCUSDT",
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+    ):
+        raise RuntimeError("现货交易前归集自检失败：资金账户后续归集未保持重试")
+    if pretrade_retry_client.collect_calls != [("USDT", "交易前")]:
+        raise RuntimeError(f"现货交易前归集自检失败：完整归集重复执行（{pretrade_retry_client.collect_calls}）")
+    if pretrade_retry_client.funding_calls != ["USDT"]:
+        raise RuntimeError(f"现货交易前归集自检失败：资金账户后续归集异常（{pretrade_retry_client.funding_calls}）")
+    checks.append("spot-pretrade-collect=ok")
 
     class _SelftestUsdcQuoteWaitClient:
         def __init__(self):
@@ -1154,6 +1331,37 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     finally:
         collect_client.close()
     checks.append("collect-precision=ok")
+
+    class _SelftestCollectRetryClient(BinanceClient):
+        def __init__(self):
+            super().__init__("selftest-key", "selftest-secret")
+            self.transfer_attempts = 0
+
+        def um_futures_transferable_assets(self, *, fast: bool = False):
+            return [{"asset": "USDT", "amount": Decimal("1.23")}]
+
+        def cm_futures_transferable_assets(self, *, fast: bool = False):
+            return []
+
+        def funding_positive_assets(self, *, fast: bool = False):
+            return []
+
+        def universal_transfer(self, transfer_type: str, asset: str, amount):
+            self.transfer_attempts += 1
+            if self.transfer_attempts <= 3:
+                raise BinanceAPIError(32020, "We have temporarily suspended Futures transactions. Please try again later.")
+            return True
+
+    collect_retry_client = _SelftestCollectRetryClient()
+    try:
+        collected = collect_retry_client.collect_asset_to_spot("USDT")
+        if collected != 1:
+            raise RuntimeError(f"归集划转重试自检失败：成功数量异常（{collected}）")
+        if collect_retry_client.transfer_attempts != 4:
+            raise RuntimeError(f"归集划转重试自检失败：未执行失败后3次重试（{collect_retry_client.transfer_attempts}）")
+    finally:
+        collect_retry_client.close()
+    checks.append("collect-transfer-retry=ok")
 
     class _SelftestLargeAssetBnbClient(BinanceClient):
         def __init__(self):

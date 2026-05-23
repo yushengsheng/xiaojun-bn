@@ -104,6 +104,8 @@ class Strategy:
             self.futures_margin_type = FUTURES_MARGIN_TYPE_DEFAULT
         if self.futures_side not in FUTURES_SIDE_OPTIONS:
             self.futures_side = FUTURES_SIDE_DEFAULT
+        self.trade_error = ""
+        self.trade_error_stage = ""
 
     def ensure_base_sold(self):
         try:
@@ -481,7 +483,7 @@ class Strategy:
         symbol_u = self.spot_symbol.upper()
         quote_asset = self.c.get_spot_quote_asset(symbol_u)
         base_asset = self.c.get_spot_base_asset(symbol_u)
-        self.c.collect_funding_asset_to_spot(quote_asset)
+        self.c.collect_asset_to_spot(quote_asset, context="交易前")
 
         bid_price = Decimal(str(book_ticker["bidPrice"]))
         ask_price = Decimal(str(book_ticker["askPrice"]))
@@ -786,7 +788,7 @@ class Strategy:
                         logger.info("溢价单模式当前无未完成订单，结束本次运行")
                         return
 
-                    self.c.collect_funding_asset_to_spot(quote_asset)
+                    self.c.collect_asset_to_spot(quote_asset, context="交易前")
                     cycle_quote_amount = self.c.spot_asset_balance_decimal(quote_asset)
                     if cycle_quote_amount <= 0:
                         logger.info("溢价单模式现货 %s 可用余额为 0，结束本次运行", quote_asset)
@@ -1206,9 +1208,21 @@ class Strategy:
                     BinanceClient._format_decimal(close_price),
                 )
             except Exception as e:
+                self.trade_error = str(e)
+                self.trade_error_stage = stage_label
                 logger.error("【%s失败】合约轮 %d：%s", stage_label, i + 1, e)
+                if progress_cb:
+                    if stage_label == "开仓下单":
+                        progress_cb(i + 1, total_steps, "开仓失败")
+                    elif stage_label == "平仓下单":
+                        progress_cb(i + 1, total_steps, "平仓失败")
+                    elif "预检" in stage_label:
+                        progress_cb(i + 1, total_steps, "合约预检失败")
+                    else:
+                        progress_cb(i + 1, total_steps, "合约失败")
                 if self._pause_with_stop(stop_event, 3):
                     return
+                return
             finally:
                 self.ensure_futures_position_closed()
 
@@ -1223,6 +1237,18 @@ class Strategy:
         withdraw_amount = 0.0
         withdraw_error = ""
         withdraw_attempted = False
+        self.trade_error = ""
+        self.trade_error_stage = ""
+
+        def result_payload():
+            return {
+                "withdraw_amount": withdraw_amount,
+                "withdraw_error": withdraw_error,
+                "withdraw_attempted": withdraw_attempted,
+                "trade_error": self.trade_error,
+                "trade_error_stage": self.trade_error_stage,
+                "trade_failed": bool(self.trade_error),
+            }
 
         zero_round_spot_conversion = self._is_zero_round_spot_conversion()
 
@@ -1243,22 +1269,14 @@ class Strategy:
 
         if stop_event and stop_event.is_set():
             logger.info("检测到停止信号，跳过最终提现")
-            return {
-                "withdraw_amount": withdraw_amount,
-                "withdraw_error": withdraw_error,
-                "withdraw_attempted": withdraw_attempted,
-            }
+            return result_payload()
 
         if self.enable_withdraw:
             logger.info("最终提现前执行随机延迟")
             self.sleep_fn()
             if stop_event and stop_event.is_set():
                 logger.info("检测到停止信号，跳过最终提现")
-                return {
-                    "withdraw_amount": withdraw_amount,
-                    "withdraw_error": withdraw_error,
-                    "withdraw_attempted": withdraw_attempted,
-                }
+                return result_payload()
 
         logger.info(f"开始最终提现所有 {self.withdraw_coin}")
         withdraw_attempted = True
@@ -1278,11 +1296,7 @@ class Strategy:
             logger.error(f"提现阶段异常: {e}")
 
         logger.info("策略执行完毕")
-        return {
-            "withdraw_amount": withdraw_amount,
-            "withdraw_error": withdraw_error,
-            "withdraw_attempted": withdraw_attempted,
-        }
+        return result_payload()
 
 class CombinedStopEvent:
     def __init__(self, *events):
