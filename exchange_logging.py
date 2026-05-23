@@ -17,7 +17,7 @@ from sensitive_data import redact_sensitive_text
 from shared_utils import LOG_MAX_ROWS
 
 
-log_queue: "queue.Queue[str]" = queue.Queue()
+log_queue: "queue.Queue[object]" = queue.Queue()
 LOG_FILE_RUNTIME_PREFIX = "exchange_runtime"
 LOG_FILE_RETENTION_COUNT = 10
 LOG_FILE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
@@ -61,6 +61,25 @@ class SensitiveFormatter(logging.Formatter):
         return redact_sensitive_text(super().format(record))
 
 
+class TkLogEntry:
+    __slots__ = ("message", "levelno", "levelname")
+
+    def __init__(self, message: str, *, levelno: int = logging.INFO, levelname: str = "INFO"):
+        self.message = str(message or "")
+        try:
+            self.levelno = int(levelno)
+        except Exception:
+            self.levelno = logging.INFO
+        self.levelname = str(levelname or "")
+
+    @property
+    def is_problem(self) -> bool:
+        return self.levelno >= logging.WARNING
+
+    def __str__(self) -> str:
+        return self.message
+
+
 _formatter = SensitiveFormatter("%(asctime)s [%(levelname)s] %(account_prefix)s%(message)s")
 logger = logging.getLogger("bot")
 logger.setLevel(logging.INFO)
@@ -71,7 +90,7 @@ class TkLogHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            log_queue.put(msg)
+            log_queue.put(TkLogEntry(msg, levelno=record.levelno, levelname=record.levelname))
         except Exception:
             pass
 

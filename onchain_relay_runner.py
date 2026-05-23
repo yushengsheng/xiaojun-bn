@@ -2034,9 +2034,10 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
     dispatch_ui = owner._dispatch_ui
     try:
         set_ui_batch_size(owner, params.threads)
+        row_number_by_key = owner._row_number_by_key_snapshot()
 
-        def job_prefix(index: int) -> str:
-            return f"[{index}/{len(jobs_data)}]"
+        def job_prefix(index: int, row_key: str = "") -> str:
+            return owner._row_log_prefix(row_key, index, len(jobs_data), row_number_by_key)
 
         token_desc = owner._token_desc_from_params(params)
         progress_keys = owner._unique_row_keys([row_key for row_key, _source, _target in jobs_data])
@@ -2061,7 +2062,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
 
         fallback_prefixes: dict[str, str] = {}
         for row_key, _source, _target in jobs_data:
-            fallback_prefixes[row_key] = job_prefix(len(fallback_prefixes) + 1)
+            fallback_prefixes[row_key] = job_prefix(len(fallback_prefixes) + 1, row_key)
             owner._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
             owner._mark_recovery_status_context(row_key, context_by_row_key.get(row_key, ""))
             dispatch_ui(lambda k=row_key: owner._set_recovery_status(k, "", ""))
@@ -2239,7 +2240,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                 warning = False
                 owner._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                 dispatch_ui(lambda k=row_key: owner._set_status(k, "running"))
-                prefix = job_prefix(i)
+                prefix = job_prefix(i, row_key)
                 try:
                     if dry_run:
                         relay_label = f"B{i}"

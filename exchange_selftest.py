@@ -336,6 +336,35 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             raise RuntimeError("链上配置自检失败：隐藏模式的无效手续费预留错误覆盖了已保存值")
         if relay_payload.get("one_to_many", {}).get("relay_enabled") is not True:
             raise RuntimeError("链上配置自检失败：隐藏模式的无效中转配置错误覆盖了已保存值")
+
+        class _RowStore:
+            pass
+
+        probe.store = _RowStore()
+        probe.store.multi_to_multi_pairs = [
+            OnchainPairEntry(source="s1", target="t1"),
+            OnchainPairEntry(source="s2", target="t2"),
+            OnchainPairEntry(source="s3", target="t3"),
+        ]
+        probe.store.one_to_many_addresses = ["a1", "a2", "a3"]
+        probe.store.many_to_one_sources = ["m1", "m2", "m3"]
+        probe._last_mode_for_amounts = probe.MODE_M2M
+        m2m_numbers = probe._row_number_by_key_snapshot()
+        m2m_key_2 = probe._m2m_key(probe.store.multi_to_multi_pairs[1])
+        m2m_key_3 = probe._m2m_key(probe.store.multi_to_multi_pairs[2])
+        if probe._row_log_prefix(m2m_key_2, 1, 2, m2m_numbers) != "[序号#2][1/2]":
+            raise RuntimeError("链上日志序号自检失败：多对多序号前缀异常")
+        if probe._row_group_log_prefix([m2m_key_2, m2m_key_3], 1, 1, m2m_numbers) != "[序号#2,3][1/1]":
+            raise RuntimeError("链上日志序号自检失败：多行序号前缀异常")
+        probe._last_mode_for_amounts = probe.MODE_1M
+        one_to_many_numbers = probe._row_number_by_key_snapshot()
+        if probe._row_log_prefix(probe._one_to_many_key("a3"), 2, 3, one_to_many_numbers) != "[序号#3][2/3]":
+            raise RuntimeError("链上日志序号自检失败：1对多序号前缀异常")
+        probe._last_mode_for_amounts = probe.MODE_M1
+        many_to_one_numbers = probe._row_number_by_key_snapshot()
+        if probe._row_log_prefix(probe._many_to_one_key("m1"), 1, 3, many_to_one_numbers) != "[序号#1][1/3]":
+            raise RuntimeError("链上日志序号自检失败：多对1序号前缀异常")
+    checks.append("onchain-log-sequence=ok")
     checks.append("onchain-drafts=ok")
 
     with tempfile.TemporaryDirectory(prefix="xiaojun-relay-selftest-") as tmpdir:
@@ -1740,6 +1769,26 @@ def _run_gui_selftest_checks(checks: list[str]) -> None:
                 app = App()
                 app.withdraw()
                 _pump_tk_events(app, timeout=5.0)
+                if int(app.account_tree.cget("height")) != 10:
+                    raise RuntimeError("GUI 自检失败：交易所账号列表高度不是10行")
+
+                _drain_exchange_log_queue()
+                logger.info("GUI日志拆分普通日志自检")
+                logger.error("GUI日志拆分报错日志自检")
+                _pump_tk_events(
+                    app,
+                    timeout=5.0,
+                    predicate=lambda: "GUI日志拆分报错日志自检" in app.text_error_log.get("1.0", "end"),
+                )
+                run_log_text = app.text_log.get("1.0", "end")
+                error_log_text = app.text_error_log.get("1.0", "end")
+                if "GUI日志拆分普通日志自检" not in run_log_text or "GUI日志拆分报错日志自检" not in run_log_text:
+                    raise RuntimeError("GUI 自检失败：运行日志未显示完整日志")
+                if "GUI日志拆分报错日志自检" not in error_log_text:
+                    raise RuntimeError("GUI 自检失败：报错日志未显示错误日志")
+                if "GUI日志拆分普通日志自检" in error_log_text:
+                    raise RuntimeError("GUI 自检失败：普通日志错误进入报错日志")
+                checks.append("exchange-log-split-gui=ok")
 
                 app.save_strategy_config()
                 if not strategy_path.exists():
@@ -1752,6 +1801,37 @@ def _run_gui_selftest_checks(checks: list[str]) -> None:
                 page = app.onchain_page
                 if page is None:
                     raise RuntimeError("GUI 自检失败：链上页面未成功加载")
+                if int(page.tree.cget("height")) != 10:
+                    raise RuntimeError("GUI 自检失败：链上账号列表高度不是10行")
+
+                def _tree_messages(tree) -> list[str]:
+                    return [str((tree.item(row_id, "values") or ["", ""])[1]) for row_id in tree.get_children()]
+
+                page.log("链上日志拆分普通日志自检")
+                page.log("链上日志拆分失败 0 普通汇总自检")
+                page.log("链上日志拆分失败：报错日志自检")
+                _pump_tk_events(
+                    app,
+                    timeout=5.0,
+                    predicate=lambda: any(
+                        "链上日志拆分失败：报错日志自检" in item
+                        for item in _tree_messages(page.error_log_tree)
+                    ),
+                )
+
+                onchain_run_logs = _tree_messages(page.log_tree)
+                onchain_error_logs = _tree_messages(page.error_log_tree)
+                if not any("链上日志拆分普通日志自检" in item for item in onchain_run_logs):
+                    raise RuntimeError("GUI 自检失败：链上运行日志未显示普通日志")
+                if not any("链上日志拆分失败：报错日志自检" in item for item in onchain_run_logs):
+                    raise RuntimeError("GUI 自检失败：链上运行日志未显示失败日志")
+                if not any("链上日志拆分失败：报错日志自检" in item for item in onchain_error_logs):
+                    raise RuntimeError("GUI 自检失败：链上报错日志未显示失败日志")
+                if any("链上日志拆分普通日志自检" in item for item in onchain_error_logs):
+                    raise RuntimeError("GUI 自检失败：链上普通日志错误进入报错日志")
+                if any("链上日志拆分失败 0 普通汇总自检" in item for item in onchain_error_logs):
+                    raise RuntimeError("GUI 自检失败：链上失败0日志错误进入报错日志")
+                checks.append("onchain-log-split-gui=ok")
 
                 if page._amount_mode() != page.AMOUNT_MODE_ALL:
                     raise RuntimeError("GUI 自检失败：多对多默认数量模式不是“全部”")

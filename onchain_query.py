@@ -491,6 +491,7 @@ class OnchainQueryMixin(object):
                     src = item.source.strip()
                     if src in sources:
                         row_keys_by_source.setdefault(src, []).append(self._m2m_key(item))
+            row_number_by_key = self._row_number_by_key_snapshot()
             progress_keys = self._unique_row_keys([key for src in sources for key in row_keys_by_source.get(src, [])])
             dispatch_ui(lambda keys=progress_keys: self._begin_progress("query", keys))
             dispatch_ui(lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
@@ -515,7 +516,7 @@ class OnchainQueryMixin(object):
                     except queue.Empty:
                         return
                     row_keys = list(row_keys_by_source.get(source, []))
-                    prefix = f"[{i}/{len(sources)}]"
+                    prefix = self._row_group_log_prefix(row_keys, i, len(sources), row_number_by_key)
                     dispatch_ui(lambda keys=row_keys: self._set_query_statuses(keys, "running"))
                     try:
                         addr = self._resolve_source_address(source)
@@ -577,6 +578,7 @@ class OnchainQueryMixin(object):
             src_count = 1 if source else 0
             context_sig = source.strip()
             row_keys_by_target = {target: self._one_to_many_key(target) for target in targets}
+            row_number_by_key = self._row_number_by_key_snapshot()
             self._mark_query_status_contexts(list(row_keys_by_target.values()), context_sig)
             dispatch_ui(lambda keys=self._unique_row_keys(list(row_keys_by_target.values())): self._begin_progress("query", keys))
             dispatch_ui(lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
@@ -628,7 +630,7 @@ class OnchainQueryMixin(object):
                     except queue.Empty:
                         return
                     row_key = row_keys_by_target.get(addr, "")
-                    prefix = f"[{i}/{len(targets)}]"
+                    prefix = self._row_log_prefix(row_key, i, len(targets), row_number_by_key)
                     if row_key:
                         self._mark_query_status_context(row_key, context_sig)
                         dispatch_ui(lambda k=row_key: self._set_query_status(k, "running"))
@@ -701,6 +703,7 @@ class OnchainQueryMixin(object):
             target_count = 1 if target else 0
             context_sig = self._normalize_context_target(target)
             row_keys_by_source = {source: self._many_to_one_key(source) for source in sources}
+            row_number_by_key = self._row_number_by_key_snapshot()
             self._mark_query_status_contexts(list(row_keys_by_source.values()), context_sig)
             dispatch_ui(lambda keys=self._unique_row_keys(list(row_keys_by_source.values())): self._begin_progress("query", keys))
             dispatch_ui(lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
@@ -749,7 +752,7 @@ class OnchainQueryMixin(object):
                     except queue.Empty:
                         return
                     row_key = row_keys_by_source.get(source, "")
-                    prefix = f"[{i}/{len(sources)}]"
+                    prefix = self._row_log_prefix(row_key, i, len(sources), row_number_by_key)
                     if row_key:
                         self._mark_query_status_context(row_key, context_sig)
                         dispatch_ui(lambda k=row_key: self._set_query_status(k, "running"))

@@ -364,7 +364,7 @@ class ExchangeAppBase(tk.Tk):
             columns=tree_cols,
             show="headings",
             selectmode="browse",
-            height=9,
+            height=10,
             style="ExchangeAccounts.Treeview",
         )
         self._account_tree_row_to_account = {}
@@ -510,15 +510,35 @@ class ExchangeAppBase(tk.Tk):
         self.btn_retry_failed_accounts.pack(side="left", padx=(8, 0))
         ttk.Label(frame_batch_opts, textvariable=self.exchange_batch_summary_var, foreground="#666666").pack(side="left", padx=(12, 0))
 
-        frame_log = ttk.LabelFrame(self.exchange_tab, text="运行日志")
+        frame_log = ttk.Frame(self.exchange_tab)
         frame_log.pack(fill="both", expand=True, padx=10, pady=5)
+        frame_log.columnconfigure(0, weight=1, uniform="exchange-log")
+        frame_log.columnconfigure(1, weight=1, uniform="exchange-log")
+        frame_log.rowconfigure(0, weight=1)
 
-        self.text_log = tk.Text(frame_log, wrap="word", height=10, state="disabled")
-        self.text_log.pack(fill="both", expand=True, side="left")
+        frame_run_log = ttk.LabelFrame(frame_log, text="运行日志")
+        frame_run_log.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        frame_run_log.columnconfigure(0, weight=1)
+        frame_run_log.rowconfigure(0, weight=1)
 
-        scrollbar_log = ttk.Scrollbar(frame_log, command=self.text_log.yview)
-        scrollbar_log.pack(side="right", fill="y")
+        self.text_log = tk.Text(frame_run_log, wrap="word", height=10, state="disabled")
+        self.text_log.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar_log = ttk.Scrollbar(frame_run_log, command=self.text_log.yview)
+        scrollbar_log.grid(row=0, column=1, sticky="ns")
         self.text_log["yscrollcommand"] = scrollbar_log.set
+
+        frame_error_log = ttk.LabelFrame(frame_log, text="报错日志")
+        frame_error_log.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        frame_error_log.columnconfigure(0, weight=1)
+        frame_error_log.rowconfigure(0, weight=1)
+
+        self.text_error_log = tk.Text(frame_error_log, wrap="word", height=10, state="disabled")
+        self.text_error_log.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar_error_log = ttk.Scrollbar(frame_error_log, command=self.text_error_log.yview)
+        scrollbar_error_log.grid(row=0, column=1, sticky="ns")
+        self.text_error_log["yscrollcommand"] = scrollbar_error_log.set
 
         onchain_shell = ttk.Frame(self.onchain_tab)
         onchain_shell.pack(fill="both", expand=True)

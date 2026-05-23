@@ -29,6 +29,7 @@ from onchain_relay_wallets import RelayWalletFileStore
 from shared_utils import (
     LOG_MAX_ROWS,
     SolidButton,
+    append_log_row,
     bind_paste_shortcuts,
     clear_ui_batch_size,
     decimal_to_text,
@@ -59,6 +60,22 @@ from table_import_utils import (
 import task_progress
 
 SUBMITTED_TIMEOUT_SECONDS = 180.0
+ONCHAIN_PROBLEM_LOG_KEYWORDS = (
+    "失败",
+    "异常",
+    "错误",
+    "报错",
+    "不足",
+    "超时",
+    "拒绝",
+    "无效",
+    "未确认",
+    "Traceback",
+    "Exception",
+    "Client Error",
+    "RPC",
+    "revert",
+)
 
 class OnchainTransferPageBase:
     MODE_M2M = "多对多"
@@ -312,7 +329,7 @@ class OnchainTransferPageBase:
         self.table_wrap.rowconfigure(0, weight=1)
 
         cols = ("checked", "idx", "source", "target", "status", "recovery", "balance")
-        self.tree = ttk.Treeview(self.table_wrap, columns=cols, show="headings", selectmode="extended", height=16)
+        self.tree = ttk.Treeview(self.table_wrap, columns=cols, show="headings", selectmode="extended", height=10)
         self._tree_column_ids = cols
         self._tree_heading_base_texts = {
             "checked": "勾选",
@@ -415,19 +432,42 @@ class OnchainTransferPageBase:
         self.log_box = ttk.LabelFrame(main, text="执行日志", padding=8)
         self.log_box.pack(fill=BOTH, expand=False)
         self.log_box.columnconfigure(0, weight=1)
+        self.log_box.columnconfigure(1, weight=1)
         self.log_box.rowconfigure(0, weight=1)
-        self.log_tree = ttk.Treeview(self.log_box, columns=("time", "msg"), show="headings", height=9)
+
+        self.run_log_box = ttk.LabelFrame(self.log_box, text="运行日志", padding=4)
+        self.run_log_box.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.run_log_box.columnconfigure(0, weight=1)
+        self.run_log_box.rowconfigure(0, weight=1)
+        self.log_tree = ttk.Treeview(self.run_log_box, columns=("time", "msg"), show="headings", height=9)
         self.log_tree.heading("time", text="时间")
         self.log_tree.heading("msg", text="日志")
         self.log_tree.column("time", width=170, anchor="center")
-        self.log_tree.column("msg", width=950, anchor="w")
+        self.log_tree.column("msg", width=450, anchor="w")
 
-        self.log_ybar = self._make_scrollbar(self.log_box, orient=VERTICAL, command=self.log_tree.yview)
-        self.log_xbar = self._make_scrollbar(self.log_box, orient="horizontal", command=self.log_tree.xview)
+        self.log_ybar = self._make_scrollbar(self.run_log_box, orient=VERTICAL, command=self.log_tree.yview)
+        self.log_xbar = self._make_scrollbar(self.run_log_box, orient="horizontal", command=self.log_tree.xview)
         self.log_tree.configure(yscrollcommand=self.log_ybar.set, xscrollcommand=self.log_xbar.set)
         self.log_tree.grid(row=0, column=0, sticky="nsew")
         self.log_ybar.grid(row=0, column=1, sticky="ns")
         self.log_xbar.grid(row=1, column=0, sticky="ew")
+
+        self.error_log_box = ttk.LabelFrame(self.log_box, text="报错日志", padding=4)
+        self.error_log_box.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        self.error_log_box.columnconfigure(0, weight=1)
+        self.error_log_box.rowconfigure(0, weight=1)
+        self.error_log_tree = ttk.Treeview(self.error_log_box, columns=("time", "msg"), show="headings", height=9)
+        self.error_log_tree.heading("time", text="时间")
+        self.error_log_tree.heading("msg", text="日志")
+        self.error_log_tree.column("time", width=170, anchor="center")
+        self.error_log_tree.column("msg", width=450, anchor="w")
+
+        self.error_log_ybar = self._make_scrollbar(self.error_log_box, orient=VERTICAL, command=self.error_log_tree.yview)
+        self.error_log_xbar = self._make_scrollbar(self.error_log_box, orient="horizontal", command=self.error_log_tree.xview)
+        self.error_log_tree.configure(yscrollcommand=self.error_log_ybar.set, xscrollcommand=self.error_log_xbar.set)
+        self.error_log_tree.grid(row=0, column=0, sticky="nsew")
+        self.error_log_ybar.grid(row=0, column=1, sticky="ns")
+        self.error_log_xbar.grid(row=1, column=0, sticky="ew")
 
         self.mode_var.trace_add("write", self._on_mode_changed)
         self.network_var.trace_add("write", self._on_network_changed)
@@ -1786,6 +1826,43 @@ class OnchainTransferPageBase:
         if self._is_mode_1m():
             return [self._one_to_many_key(x) for x in self.store.one_to_many_addresses]
         return [self._many_to_one_key(x) for x in self.store.many_to_one_sources]
+    def _row_number_by_key_snapshot(self) -> dict[str, int]:
+        return {row_key: index for index, row_key in enumerate(self._active_row_keys(), start=1)}
+    @staticmethod
+    def _row_number_prefix(row_keys: list[str], number_by_key: dict[str, int]) -> str:
+        numbers: list[int] = []
+        seen: set[int] = set()
+        for row_key in row_keys:
+            number = number_by_key.get(row_key)
+            if number is None or number in seen:
+                continue
+            seen.add(number)
+            numbers.append(number)
+        if not numbers:
+            return ""
+        if len(numbers) == 1:
+            return f"[序号#{numbers[0]}]"
+        return "[序号#" + ",".join(str(number) for number in numbers) + "]"
+    def _row_log_prefix(
+        self,
+        row_key: str,
+        index: int,
+        total: int,
+        number_by_key: dict[str, int] | None = None,
+    ) -> str:
+        number_prefix = self._row_number_prefix([row_key], number_by_key or {})
+        progress_prefix = f"[{index}/{total}]"
+        return f"{number_prefix}{progress_prefix}" if number_prefix else progress_prefix
+    def _row_group_log_prefix(
+        self,
+        row_keys: list[str],
+        index: int,
+        total: int,
+        number_by_key: dict[str, int] | None = None,
+    ) -> str:
+        number_prefix = self._row_number_prefix(row_keys, number_by_key or {})
+        progress_prefix = f"[{index}/{total}]"
+        return f"{number_prefix}{progress_prefix}" if number_prefix else progress_prefix
     def _refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
         self.row_index_map = {}
@@ -2334,14 +2411,20 @@ class OnchainTransferPageBase:
     def _on_log_resize(self, _event=None):
         if not hasattr(self, "log_tree"):
             return
-        width = self.log_tree.winfo_width()
-        if width <= 1 and hasattr(self, "log_box"):
-            width = self.log_box.winfo_width() - 20
-        if width <= 0:
-            return
-        msg_width = max(300, width - 190)
-        self.log_tree.column("time", width=170, stretch=False)
-        self.log_tree.column("msg", width=msg_width, stretch=True)
+        for tree, box in (
+            (getattr(self, "log_tree", None), getattr(self, "run_log_box", None)),
+            (getattr(self, "error_log_tree", None), getattr(self, "error_log_box", None)),
+        ):
+            if tree is None:
+                continue
+            width = tree.winfo_width()
+            if width <= 1 and box is not None:
+                width = box.winfo_width() - 20
+            if width <= 0:
+                continue
+            msg_width = max(220, width - 190)
+            tree.column("time", width=170, stretch=False)
+            tree.column("msg", width=msg_width, stretch=True)
     def _on_mode_changed(self, *_args):
         mode = self._mode()
         if hasattr(self, "onchain_search_result_var"):
@@ -2451,8 +2534,27 @@ class OnchainTransferPageBase:
         self._open_export_file(RELAY_MANUAL_EXPORT_FILE, "待人工处理文件")
     def open_relay_failed_export_file(self) -> None:
         self._open_export_file(RELAY_FAILED_EXPORT_FILE, "失败账号文件")
+    @staticmethod
+    def _is_problem_log_text(text: str) -> bool:
+        message = str(text or "")
+        if any(keyword in message for keyword in ONCHAIN_PROBLEM_LOG_KEYWORDS if keyword != "失败"):
+            return True
+        if re.search(r"失败\s*[1-9]\d*", message):
+            return True
+        return any(marker in message for marker in ("失败：", "失败:", "=失败", "失败，"))
+    def _append_error_log_row(self, text: str) -> None:
+        error_log_tree = getattr(self, "error_log_tree", None)
+        if error_log_tree is None:
+            return
+        append_log_row(error_log_tree, text, max_rows=LOG_MAX_ROWS)
     def log(self, text: str):
         queue_log_row(self, self.log_tree, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
+        if self._is_problem_log_text(text):
+            queue_ui_render(
+                self,
+                lambda t=str(text or ""): self._append_error_log_row(t),
+                root=getattr(self, "root", None),
+            )
     def test_onchain_proxy(self):
         snapshot = self._onchain_proxy_state_snapshot()
         route_text = self._onchain_proxy_route_text(state=snapshot)

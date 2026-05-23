@@ -287,7 +287,8 @@ class OnchainTransferRunnerMixin(object):
                     self.log("用户取消了当前行真实链上转账")
                     return
 
-            self.log(f"已启动当前行转账任务：mode={self._mode()}，币种={token_desc}")
+            row_prefix = self._row_log_prefix(row_key, 1, 1, self._row_number_by_key_snapshot())
+            self.log(f"{row_prefix} 已启动当前行转账任务：mode={self._mode()}，币种={token_desc}")
             self.stop_requested.clear()
             self.is_running = True
             self._start_managed_thread(
@@ -605,8 +606,10 @@ class OnchainTransferRunnerMixin(object):
         dispatch_ui = self._dispatch_ui
         try:
             set_ui_batch_size(self, params.threads)
-            def job_prefix(index: int) -> str:
-                return f"[{index}/{len(jobs_data)}]"
+            row_number_by_key = self._row_number_by_key_snapshot()
+
+            def job_prefix(index: int, row_key: str = "") -> str:
+                return self._row_log_prefix(row_key, index, len(jobs_data), row_number_by_key)
 
             amount_view = params.amount
             token_desc = self._token_desc_from_params(params)
@@ -633,7 +636,7 @@ class OnchainTransferRunnerMixin(object):
             )
             fallback_prefixes: dict[str, str] = {}
             for row_key, _source, _target in jobs_data:
-                fallback_prefixes[row_key] = job_prefix(len(fallback_prefixes) + 1)
+                fallback_prefixes[row_key] = job_prefix(len(fallback_prefixes) + 1, row_key)
                 self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                 dispatch_ui(lambda k=row_key: self._set_status(k, "waiting"))
 
@@ -786,7 +789,7 @@ class OnchainTransferRunnerMixin(object):
                     self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                     dispatch_ui(lambda k=row_key: self._set_status(k, "running"))
                     submitted_timeout_seconds = max(0.0, float(params.confirm_timeout_seconds))
-                    prefix = job_prefix(i)
+                    prefix = job_prefix(i, row_key)
                     try:
                         if dry_run:
                             if params.random_enabled and params.random_min is not None and params.random_max is not None:
@@ -801,7 +804,7 @@ class OnchainTransferRunnerMixin(object):
                                 amount_text = f"{self.AMOUNT_ALL_LABEL}(模拟)"
                             else:
                                 amount_text = params.amount
-                            prefix = f"[{i}/{total}][{self._mask_credential(source)}]"
+                            prefix = f"{job_prefix(i, row_key)}[{self._mask_credential(source)}]"
                             msg = (
                                 f"{prefix} 模拟成功 -> {params.coin} {amount_text} "
                                 f"到 {self._mask(target, head=8, tail=6)}"
@@ -876,7 +879,7 @@ class OnchainTransferRunnerMixin(object):
                     except Exception as exc:
                         if used_nonce is not None and source_addr and not tx_sent:
                             rollback_nonce(source_addr, used_nonce)
-                        msg = f"[{i}/{total}] 转账失败：{exc}"
+                        msg = f"{prefix} 转账失败：{exc}"
                     finally:
                         jobs_q.task_done()
 

@@ -17,6 +17,20 @@ from exchange_app_base import (
 from sensitive_data import redact_sensitive_text
 
 
+PROBLEM_LOG_LEVELS = ("[WARNING]", "[ERROR]", "[CRITICAL]")
+PROBLEM_LOG_KEYWORDS = (
+    "失败",
+    "异常",
+    "错误",
+    "报错",
+    "Traceback",
+    "Exception",
+    "Client Error",
+    "API error",
+    "APIError",
+)
+
+
 class ExchangeAppLogViewMixin(object):
     def _fetch_public_ip(self, *, use_exchange_proxy: bool, allow_system_proxy: bool = True) -> str:
         urls = [
@@ -156,7 +170,7 @@ class ExchangeAppLogViewMixin(object):
             def _update():
                 self.exchange_proxy_status_var.set(status)
                 self.exchange_proxy_exit_ip_var.set(exit_ip)
-                self._append_log(log_text)
+                self._append_log(log_text, problem=(not test_ok) or bool(save_err))
                 if not test_ok:
                     messagebox.showerror("代理测试失败", log_text)
                 elif save_err:
@@ -205,42 +219,91 @@ class ExchangeAppLogViewMixin(object):
         if self._closing:
             self._log_poll_after_token = None
             return
-        pending_logs: list[str] = []
+        pending_logs: list[object] = []
         while True:
             try:
                 msg = log_queue.get_nowait()
             except queue.Empty:
                 break
             else:
-                pending_logs.append(str(msg))
+                pending_logs.append(msg)
         if pending_logs:
             self._append_log_batch(pending_logs)
         try:
             self._log_poll_after_token = self.after(100, self._poll_log_queue)
         except Exception:
             self._log_poll_after_token = None
-    def _append_log(self, msg: str):
-        self._append_log_batch([msg])
-    def _append_log_batch(self, messages: list[str]):
+    @staticmethod
+    def _log_entry_text(entry: object) -> str:
+        return str(getattr(entry, "message", entry) or "")
+
+    @staticmethod
+    def _is_problem_log_entry(entry: object) -> bool:
+        explicit = getattr(entry, "is_problem", None)
+        if isinstance(explicit, bool):
+            return explicit
+        if callable(explicit):
+            try:
+                return bool(explicit())
+            except Exception:
+                pass
+        try:
+            if int(getattr(entry, "levelno")) >= 30:
+                return True
+        except Exception:
+            pass
+        text = str(getattr(entry, "message", entry) or "")
+        return any(marker in text for marker in PROBLEM_LOG_LEVELS) or any(keyword in text for keyword in PROBLEM_LOG_KEYWORDS)
+
+    def _append_log(self, msg: str, *, problem: bool | None = None):
+        if problem is None:
+            self._append_log_batch([msg])
+        else:
+            self._append_log_batch([_ManualLogEntry(msg, problem=problem)])
+
+    def _append_log_batch(self, messages: list[object]):
         if not messages:
             return
-        messages = [redact_sensitive_text(msg) for msg in messages]
-        follow_tail, view_state = capture_vertical_view_state(self.text_log)
-        self.text_log.configure(state="normal")
-        self.text_log.insert("end", "\n".join(str(msg) for msg in messages) + "\n")
+        run_messages = [redact_sensitive_text(self._log_entry_text(msg)) for msg in messages]
+        problem_messages = [
+            redact_sensitive_text(self._log_entry_text(msg))
+            for msg in messages
+            if self._is_problem_log_entry(msg)
+        ]
+        self._append_text_log_batch(self.text_log, run_messages)
+        if problem_messages and hasattr(self, "text_error_log"):
+            self._append_text_log_batch(self.text_error_log, problem_messages)
+
+    def _append_text_log_batch(self, text_widget, messages: list[str]):
+        if not messages:
+            return
+        follow_tail, view_state = capture_vertical_view_state(text_widget)
+        text_widget.configure(state="normal")
+        text_widget.insert("end", "\n".join(str(msg) for msg in messages) + "\n")
         trimmed_lines = 0
         try:
-            total_lines = max(0, int(str(self.text_log.index("end-1c")).split(".", 1)[0]) - 1)
+            total_lines = max(0, int(str(text_widget.index("end-1c")).split(".", 1)[0]) - 1)
         except Exception:
             total_lines = 0
         if total_lines > EXCHANGE_LOG_MAX_ROWS:
             trimmed_lines = total_lines - EXCHANGE_LOG_MAX_ROWS
             try:
-                self.text_log.delete("1.0", f"{trimmed_lines + 1}.0")
+                text_widget.delete("1.0", f"{trimmed_lines + 1}.0")
             except Exception:
                 trimmed_lines = 0
         if follow_tail:
-            self.text_log.see("end")
+            text_widget.see("end")
         else:
-            restore_vertical_view_state(self.text_log, _shift_text_view_state_after_trim(view_state, trimmed_lines))
-        self.text_log.configure(state="disabled")
+            restore_vertical_view_state(text_widget, _shift_text_view_state_after_trim(view_state, trimmed_lines))
+        text_widget.configure(state="disabled")
+
+
+class _ManualLogEntry:
+    __slots__ = ("message", "is_problem")
+
+    def __init__(self, message: str, *, problem: bool):
+        self.message = str(message or "")
+        self.is_problem = bool(problem)
+
+    def __str__(self) -> str:
+        return self.message
