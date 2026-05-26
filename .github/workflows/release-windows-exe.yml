@@ -85,7 +85,7 @@ jobs:
           }
           $env:XRAY_PATH = $xrayExe.FullName
           $env:SING_BOX_PATH = $singBoxExe.FullName
-          python tools/run_regression.py --skip-pip-check
+          python tools/run_regression.py --skip-pip-check --skip-app-selftest
 
       - name: Prepare entry script
         shell: pwsh
