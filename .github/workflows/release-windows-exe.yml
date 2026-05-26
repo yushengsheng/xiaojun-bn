@@ -38,10 +38,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
 
-      - name: Run source regression checks
-        shell: pwsh
-        run: python tools/run_regression.py --skip-pip-check
-
       - name: Download proxy runtimes
         shell: pwsh
         env:
@@ -75,6 +71,21 @@ jobs:
           if (-not $singBoxExe) {
             throw "sing-box.exe was not found after extraction."
           }
+
+      - name: Run source regression checks
+        shell: pwsh
+        run: |
+          $xrayExe = Get-ChildItem "build-proxy/xray" -Filter "xray.exe" -File -Recurse | Select-Object -First 1
+          if (-not $xrayExe) {
+            throw "xray.exe was not found before source regression."
+          }
+          $singBoxExe = Get-ChildItem "build-proxy/sing-box" -Filter "sing-box.exe" -File -Recurse | Select-Object -First 1
+          if (-not $singBoxExe) {
+            throw "sing-box.exe was not found before source regression."
+          }
+          $env:XRAY_PATH = $xrayExe.FullName
+          $env:SING_BOX_PATH = $singBoxExe.FullName
+          python tools/run_regression.py --skip-pip-check
 
       - name: Prepare entry script
         shell: pwsh
