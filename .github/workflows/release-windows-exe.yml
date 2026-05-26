@@ -38,6 +38,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
 
+      - name: Run source regression checks
+        shell: pwsh
+        run: python tools/run_regression.py --skip-pip-check
+
       - name: Download proxy runtimes
         shell: pwsh
         env:
@@ -84,46 +88,7 @@ jobs:
           $appName = "xiaojun-bn-${{ github.ref_name }}-windows-x64"
           $portableName = "xiaojun-bn-${{ github.ref_name }}-windows-x64-portable"
 
-          $commonArgs = @(
-            '--noconfirm',
-            '--clean',
-            '--windowed',
-            '--noupx',
-            '--hidden-import', 'page_onchain',
-            '--hidden-import', 'api_clients',
-            '--hidden-import', 'exchange_binance_client',
-            '--hidden-import', 'app_paths',
-            '--hidden-import', 'app_version',
-            '--hidden-import', 'core_models',
-            '--hidden-import', 'shared_utils',
-            '--hidden-import', 'stores',
-            '--hidden-import', 'secret_box',
-            '--hidden-import', 'table_import_utils',
-            '--hidden-import', 'task_progress',
-            '--collect-all', 'requests',
-            '--collect-all', 'urllib3',
-            '--collect-all', 'certifi',
-            '--collect-all', 'charset_normalizer',
-            '--collect-all', 'idna',
-            '--collect-all', 'socks',
-            '--collect-all', 'cryptography',
-            '--collect-all', 'cffi',
-            '--collect-all', 'pycparser',
-            '--collect-all', 'eth_account',
-            '--collect-all', 'eth_utils',
-            '--collect-all', 'eth_abi',
-            '--collect-all', 'eth_keyfile',
-            '--collect-all', 'eth_keys',
-            '--collect-all', 'eth_rlp',
-            '--collect-all', 'eth_hash',
-            '--collect-all', 'hexbytes',
-            '--collect-all', 'rlp',
-            '--collect-all', 'parsimonious',
-            '--collect-all', 'cytoolz',
-            '--collect-all', 'bitarray',
-            '--collect-all', 'ckzg',
-            '--add-data', 'version.txt;.'
-          )
+          $commonArgs = @(python tools/pyinstaller_common_args.py)
 
           Get-ChildItem "build-proxy/xray" -File -Recurse | ForEach-Object {
             $sourceDir = (Resolve-Path "build-proxy/xray").Path

@@ -11,6 +11,7 @@ Rules:
   - pinned proxy runtimes downloaded during CI (`xray`, `sing-box`)
   - both onefile and portable onedir packages
 - Keep runtime dependency versions pinned in `requirements.txt` and build dependency versions pinned in `requirements-build.txt`.
+- Run `python tools/run_regression.py --skip-pip-check` before building release packages on CI.
 - Smoke test both packaged apps with `--selftest --selftest-gui` before publishing release assets.
   - `--selftest` should stay offline-friendly and focus on packaged integrity.
   - `--selftest-gui` should cover GUI startup, page loading, config save, and wallet generation.
@@ -33,4 +34,4 @@ Current release asset naming:
 - `xiaojun-bn-<tag>-windows-x64.zip`
 - `xiaojun-bn-<tag>-windows-x64-portable.zip`
 
-If new internal modules are added, update the workflow hidden imports when needed so packaged builds remain complete.
+If new internal modules are added, update the workflow hidden imports when needed so packaged builds remain complete. If selftest modules are split, keep `tools/pyinstaller_common_args.py` and `tests/test_packaging_args.py` in sync.

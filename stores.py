@@ -10,6 +10,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
+from app_defaults import (
+    EXCHANGE_WORKER_THREADS_DEFAULT,
+    ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
+    ONCHAIN_DELAY_SECONDS_DEFAULT,
+    ONCHAIN_WORKER_THREADS_DEFAULT,
+)
 from app_paths import CONFIG_BACKUP_SUFFIX
 from core_models import (
     AccountEntry,
@@ -179,15 +185,15 @@ class AccountStore:
         self.one_to_many_source_api_key = SECRET_BOX.decrypt(str(one_to_many_raw.get("api_key", "") or "").strip()).strip()
         self.one_to_many_source_api_secret = SECRET_BOX.decrypt(str(one_to_many_raw.get("api_secret", "") or "").strip()).strip()
         try:
-            worker_threads = max(1, int(settings_raw.get("worker_threads", 5)))
+            worker_threads = max(1, int(settings_raw.get("worker_threads", EXCHANGE_WORKER_THREADS_DEFAULT)))
         except Exception:
-            worker_threads = 5
+            worker_threads = EXCHANGE_WORKER_THREADS_DEFAULT
         try:
-            delay_seconds = float(settings_raw.get("delay_seconds", 1.0))
+            delay_seconds = float(settings_raw.get("delay_seconds", ONCHAIN_DELAY_SECONDS_DEFAULT))
             if delay_seconds < 0:
                 delay_seconds = 0.0
         except Exception:
-            delay_seconds = 1.0
+            delay_seconds = ONCHAIN_DELAY_SECONDS_DEFAULT
 
         self.settings = GlobalSettings(
             coin=(settings_raw.get("coin") or "USDT").strip().upper(),
@@ -355,21 +361,23 @@ class OnchainStore:
             many_one_list.append(s)
 
         try:
-            delay = float(settings_raw.get("delay_seconds", 1.0))
+            delay = float(settings_raw.get("delay_seconds", ONCHAIN_DELAY_SECONDS_DEFAULT))
             if delay < 0:
                 delay = 0.0
         except Exception:
-            delay = 1.0
+            delay = ONCHAIN_DELAY_SECONDS_DEFAULT
         try:
-            threads = max(1, int(settings_raw.get("worker_threads", 10)))
+            threads = max(1, int(settings_raw.get("worker_threads", ONCHAIN_WORKER_THREADS_DEFAULT)))
         except Exception:
-            threads = 10
+            threads = ONCHAIN_WORKER_THREADS_DEFAULT
         try:
-            confirm_timeout_seconds = float(settings_raw.get("confirm_timeout_seconds", 180.0))
+            confirm_timeout_seconds = float(
+                settings_raw.get("confirm_timeout_seconds", ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)
+            )
             if confirm_timeout_seconds <= 0:
-                confirm_timeout_seconds = 180.0
+                confirm_timeout_seconds = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
         except Exception:
-            confirm_timeout_seconds = 180.0
+            confirm_timeout_seconds = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
 
         self.multi_to_multi_pairs = pairs
         self.multi_to_multi_drafts = drafts

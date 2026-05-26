@@ -5,16 +5,14 @@ from __future__ import annotations
 
 from exchange_app_base import (
     EXCHANGE_LOG_MAX_ROWS,
-    _shift_text_view_state_after_trim,
-    capture_vertical_view_state,
     http_get_via_proxy,
     ipaddress,
     log_queue,
     messagebox,
     queue,
-    restore_vertical_view_state,
 )
 from sensitive_data import redact_sensitive_text
+from shared_utils import append_text_log_messages
 
 
 PROBLEM_LOG_LEVELS = ("[WARNING]", "[ERROR]", "[CRITICAL]")
@@ -277,25 +275,7 @@ class ExchangeAppLogViewMixin(object):
     def _append_text_log_batch(self, text_widget, messages: list[str]):
         if not messages:
             return
-        follow_tail, view_state = capture_vertical_view_state(text_widget)
-        text_widget.configure(state="normal")
-        text_widget.insert("end", "\n".join(str(msg) for msg in messages) + "\n")
-        trimmed_lines = 0
-        try:
-            total_lines = max(0, int(str(text_widget.index("end-1c")).split(".", 1)[0]) - 1)
-        except Exception:
-            total_lines = 0
-        if total_lines > EXCHANGE_LOG_MAX_ROWS:
-            trimmed_lines = total_lines - EXCHANGE_LOG_MAX_ROWS
-            try:
-                text_widget.delete("1.0", f"{trimmed_lines + 1}.0")
-            except Exception:
-                trimmed_lines = 0
-        if follow_tail:
-            text_widget.see("end")
-        else:
-            restore_vertical_view_state(text_widget, _shift_text_view_state_after_trim(view_state, trimmed_lines))
-        text_widget.configure(state="disabled")
+        append_text_log_messages(text_widget, messages, max_rows=EXCHANGE_LOG_MAX_ROWS, prepend_time=False)
 
 
 class _ManualLogEntry:

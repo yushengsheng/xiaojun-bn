@@ -9,6 +9,7 @@ import queue
 import re
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from pathlib import Path
 import tkinter as tk
@@ -18,6 +19,12 @@ from tkinter import messagebox, ttk
 import requests
 
 from api_clients import EvmClient
+from app_defaults import (
+    ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
+    ONCHAIN_CONFIRM_WORKER_LIMIT_MAX,
+    ONCHAIN_DELAY_SECONDS_DEFAULT,
+    ONCHAIN_WORKER_THREADS_DEFAULT,
+)
 from app_paths import (
     ONCHAIN_DATA_FILE,
     RELAY_FAILED_EXPORT_FILE,
@@ -25,6 +32,7 @@ from app_paths import (
     RELAY_WALLET_FILE,
 )
 from core_models import EvmToken, GeneratedWalletEntry, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
+from exchange_logging import logger
 from onchain_relay_wallets import RelayWalletFileStore
 from shared_utils import (
     LOG_MAX_ROWS,
@@ -59,7 +67,7 @@ from table_import_utils import (
 )
 import task_progress
 
-SUBMITTED_TIMEOUT_SECONDS = 180.0
+SUBMITTED_TIMEOUT_SECONDS = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
 ONCHAIN_PROBLEM_LOG_KEYWORDS = (
     "失败",
     "异常",
@@ -161,7 +169,11 @@ class OnchainTransferPageBase:
         self._onchain_proxy_state_lock = threading.Lock()
         self._onchain_proxy_state = {"use_config_proxy": False, "raw_proxy": ""}
         self._runtime_state_lock = threading.Lock()
-        self._runtime_state = {"threads_raw": "10"}
+        self._runtime_state = {"threads_raw": str(ONCHAIN_WORKER_THREADS_DEFAULT)}
+        self._confirmation_executor_lock = threading.Lock()
+        self._confirmation_executor: ThreadPoolExecutor | None = None
+        self._confirmation_executor_max_workers = 0
+        self._confirmation_futures: set[Future] = set()
 
         self.mode_var = StringVar(value=self.MODE_M2M)
         self.network_var = StringVar(value="")
@@ -172,9 +184,9 @@ class OnchainTransferPageBase:
         self.amount_var = StringVar(value="")
         self.random_min_var = StringVar(value="")
         self.random_max_var = StringVar(value="")
-        self.delay_var = DoubleVar(value=1.0)
-        self.threads_var = StringVar(value="10")
-        self.confirm_timeout_var = StringVar(value="180")
+        self.delay_var = DoubleVar(value=ONCHAIN_DELAY_SECONDS_DEFAULT)
+        self.threads_var = StringVar(value=str(ONCHAIN_WORKER_THREADS_DEFAULT))
+        self.confirm_timeout_var = StringVar(value=str(int(ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)))
         self.dry_run_var = BooleanVar(value=False)
         self.use_config_proxy_var = BooleanVar(value=False)
         self.onchain_proxy_var = StringVar(value="")
@@ -439,35 +451,23 @@ class OnchainTransferPageBase:
         self.run_log_box.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
         self.run_log_box.columnconfigure(0, weight=1)
         self.run_log_box.rowconfigure(0, weight=1)
-        self.log_tree = ttk.Treeview(self.run_log_box, columns=("time", "msg"), show="headings", height=9)
-        self.log_tree.heading("time", text="时间")
-        self.log_tree.heading("msg", text="日志")
-        self.log_tree.column("time", width=170, anchor="center")
-        self.log_tree.column("msg", width=450, anchor="w")
-
-        self.log_ybar = self._make_scrollbar(self.run_log_box, orient=VERTICAL, command=self.log_tree.yview)
-        self.log_xbar = self._make_scrollbar(self.run_log_box, orient="horizontal", command=self.log_tree.xview)
-        self.log_tree.configure(yscrollcommand=self.log_ybar.set, xscrollcommand=self.log_xbar.set)
-        self.log_tree.grid(row=0, column=0, sticky="nsew")
+        self.log_text = tk.Text(self.run_log_box, wrap="word", height=9, state="disabled")
+        self.log_tree = self.log_text
+        self.log_ybar = self._make_scrollbar(self.run_log_box, orient=VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=self.log_ybar.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
         self.log_ybar.grid(row=0, column=1, sticky="ns")
-        self.log_xbar.grid(row=1, column=0, sticky="ew")
 
         self.error_log_box = ttk.LabelFrame(self.log_box, text="报错日志", padding=4)
         self.error_log_box.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         self.error_log_box.columnconfigure(0, weight=1)
         self.error_log_box.rowconfigure(0, weight=1)
-        self.error_log_tree = ttk.Treeview(self.error_log_box, columns=("time", "msg"), show="headings", height=9)
-        self.error_log_tree.heading("time", text="时间")
-        self.error_log_tree.heading("msg", text="日志")
-        self.error_log_tree.column("time", width=170, anchor="center")
-        self.error_log_tree.column("msg", width=450, anchor="w")
-
-        self.error_log_ybar = self._make_scrollbar(self.error_log_box, orient=VERTICAL, command=self.error_log_tree.yview)
-        self.error_log_xbar = self._make_scrollbar(self.error_log_box, orient="horizontal", command=self.error_log_tree.xview)
-        self.error_log_tree.configure(yscrollcommand=self.error_log_ybar.set, xscrollcommand=self.error_log_xbar.set)
-        self.error_log_tree.grid(row=0, column=0, sticky="nsew")
+        self.error_log_text = tk.Text(self.error_log_box, wrap="word", height=9, state="disabled")
+        self.error_log_tree = self.error_log_text
+        self.error_log_ybar = self._make_scrollbar(self.error_log_box, orient=VERTICAL, command=self.error_log_text.yview)
+        self.error_log_text.configure(yscrollcommand=self.error_log_ybar.set)
+        self.error_log_text.grid(row=0, column=0, sticky="nsew")
         self.error_log_ybar.grid(row=0, column=1, sticky="ns")
-        self.error_log_xbar.grid(row=1, column=0, sticky="ew")
 
         self.mode_var.trace_add("write", self._on_mode_changed)
         self.network_var.trace_add("write", self._on_network_changed)
@@ -822,11 +822,11 @@ class OnchainTransferPageBase:
     def _token_amount_text(self, symbol: str, amount: Decimal) -> str:
         return f"{self._decimal_to_text(amount)} {symbol.strip().upper()}"
     def _runtime_worker_threads(self) -> int:
-        raw = self._runtime_state_snapshot().get("threads_raw", 10)
-        return parse_worker_threads(raw, default=10)
+        raw = self._runtime_state_snapshot().get("threads_raw", ONCHAIN_WORKER_THREADS_DEFAULT)
+        return parse_worker_threads(raw, default=ONCHAIN_WORKER_THREADS_DEFAULT)
     def _sync_runtime_state(self) -> None:
         threads_var = getattr(self, "threads_var", None)
-        threads_raw = str(threads_var.get() if threads_var is not None else "10")
+        threads_raw = str(threads_var.get() if threads_var is not None else ONCHAIN_WORKER_THREADS_DEFAULT)
         with self._runtime_state_lock:
             self._runtime_state = {"threads_raw": threads_raw}
     def _runtime_state_snapshot(self) -> dict[str, object]:
@@ -1656,6 +1656,8 @@ class OnchainTransferPageBase:
         def runner():
             try:
                 target(*args, **call_kwargs)
+            except Exception:
+                logger.exception("链上后台线程异常：%s", name)
             finally:
                 current = threading.current_thread()
                 with self._managed_threads_lock:
@@ -1666,6 +1668,57 @@ class OnchainTransferPageBase:
             self._managed_threads.add(thread)
         thread.start()
         return thread
+    def _confirmation_worker_limit(self) -> int:
+        return min(max(1, self._runtime_worker_threads()), ONCHAIN_CONFIRM_WORKER_LIMIT_MAX)
+    def _confirmation_executor_for_current_settings(self) -> ThreadPoolExecutor:
+        with self._confirmation_executor_lock:
+            if self._confirmation_executor is not None:
+                return self._confirmation_executor
+            max_workers = self._confirmation_worker_limit()
+            self._confirmation_executor = ThreadPoolExecutor(
+                max_workers=max_workers,
+                thread_name_prefix="onchain-confirm",
+            )
+            self._confirmation_executor_max_workers = max_workers
+            return self._confirmation_executor
+    def _finish_confirmation_future(self, future: Future, task_name: str) -> None:
+        with self._confirmation_executor_lock:
+            self._confirmation_futures.discard(future)
+        if future.cancelled():
+            return
+        try:
+            exc = future.exception()
+        except Exception:
+            logger.exception("链上确认任务状态读取失败：%s", task_name)
+            return
+        if exc is not None:
+            logger.error("链上确认任务异常：%s", task_name, exc_info=(type(exc), exc, exc.__traceback__))
+    def _submit_confirmation_task(self, target, *, name: str = "onchain-confirm") -> Future | None:
+        if self._closing or bool(getattr(self.root, "_closing", False)):
+            return None
+        try:
+            executor = self._confirmation_executor_for_current_settings()
+            future = executor.submit(target)
+        except RuntimeError:
+            return None
+        with self._confirmation_executor_lock:
+            self._confirmation_futures.add(future)
+        future.add_done_callback(lambda f, task_name=name: self._finish_confirmation_future(f, task_name))
+        return future
+    def _shutdown_confirmation_executor(self) -> None:
+        with self._confirmation_executor_lock:
+            executor = self._confirmation_executor
+            self._confirmation_executor = None
+            self._confirmation_executor_max_workers = 0
+            futures = list(self._confirmation_futures)
+            self._confirmation_futures.clear()
+        for future in futures:
+            future.cancel()
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
     def _managed_threads_snapshot(self) -> list[threading.Thread]:
         current = threading.current_thread()
         with self._managed_threads_lock:
@@ -1693,6 +1746,7 @@ class OnchainTransferPageBase:
             self._close_wallet_generator()
         except Exception:
             pass
+        self._shutdown_confirmation_executor()
         self._join_managed_threads(timeout_total=1.0)
         try:
             self.client.close()
@@ -1701,9 +1755,9 @@ class OnchainTransferPageBase:
         stop_ui_bridge(self)
     def _finish_progress(self, kind: str, success: int, failed: int):
         flush_queued_ui_renders(self)
-        log_tree = getattr(self, "log_tree", None)
-        if log_tree is not None:
-            flush_queued_log_rows(self, log_tree, max_rows=LOG_MAX_ROWS)
+        log_text = getattr(self, "log_text", None) or getattr(self, "log_tree", None)
+        if log_text is not None:
+            flush_queued_log_rows(self, log_text, max_rows=LOG_MAX_ROWS)
         clear_ui_batch_size(self)
         task_progress.finish(self, kind, success, failed)
     def _show_result_summary_dialog(
@@ -2409,13 +2463,16 @@ class OnchainTransferPageBase:
             used += add
             self.tree.column(c, width=min_widths[c] + max(0, add), stretch=True)
     def _on_log_resize(self, _event=None):
-        if not hasattr(self, "log_tree"):
+        if not hasattr(self, "log_text"):
             return
         for tree, box in (
-            (getattr(self, "log_tree", None), getattr(self, "run_log_box", None)),
-            (getattr(self, "error_log_tree", None), getattr(self, "error_log_box", None)),
+            (getattr(self, "log_text", None), getattr(self, "run_log_box", None)),
+            (getattr(self, "error_log_text", None), getattr(self, "error_log_box", None)),
         ):
             if tree is None:
+                continue
+            widget_class_getter = getattr(tree, "winfo_class", None)
+            if not callable(widget_class_getter) or str(widget_class_getter()) != "Treeview":
                 continue
             width = tree.winfo_width()
             if width <= 1 and box is not None:
@@ -2543,12 +2600,12 @@ class OnchainTransferPageBase:
             return True
         return any(marker in message for marker in ("失败：", "失败:", "=失败", "失败，"))
     def _append_error_log_row(self, text: str) -> None:
-        error_log_tree = getattr(self, "error_log_tree", None)
-        if error_log_tree is None:
+        error_log_text = getattr(self, "error_log_text", None) or getattr(self, "error_log_tree", None)
+        if error_log_text is None:
             return
-        append_log_row(error_log_tree, text, max_rows=LOG_MAX_ROWS)
+        append_log_row(error_log_text, text, max_rows=LOG_MAX_ROWS)
     def log(self, text: str):
-        queue_log_row(self, self.log_tree, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
+        queue_log_row(self, self.log_text, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
         if self._is_problem_log_text(text):
             queue_ui_render(
                 self,

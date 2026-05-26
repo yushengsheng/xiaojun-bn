@@ -24,6 +24,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from api_clients import EvmClient
+from app_defaults import EXCHANGE_USDT_TIMEOUT_SECONDS_DEFAULT
 from app_version import get_app_window_title
 from app_paths import (
     CONFIG_BACKUP_SUFFIX,
@@ -95,6 +96,7 @@ from exchange_strategy import CombinedStopEvent, Strategy
 from secret_box import SECRET_BOX
 from shared_utils import (
     SolidButton,
+    _shift_text_view_state_after_trim,
     capture_vertical_view_state,
     dispatch_ui_callback,
     make_scrollbar,
@@ -149,21 +151,6 @@ def _require_dict_payload(raw: object) -> None:
     if isinstance(raw, dict):
         return
     raise RuntimeError("配置文件结构无效")
-def _shift_text_view_state_after_trim(state: tuple[str, object] | None, trimmed_lines: int) -> tuple[str, object] | None:
-    if trimmed_lines <= 0 or state is None:
-        return state
-    kind, payload = state
-    if kind != "text":
-        return state
-    index_text = str(payload or "").strip()
-    if not index_text:
-        return state
-    line_text, dot, col_text = index_text.partition(".")
-    try:
-        new_line = max(1, int(line_text) - int(trimmed_lines))
-    except Exception:
-        return state
-    return kind, f"{new_line}{dot or '.'}{col_text or '0'}"
 
 class ExchangeAppBase(tk.Tk):
     def __init__(self):
@@ -241,7 +228,7 @@ class ExchangeAppBase(tk.Tk):
 
         self.min_delay_var = tk.StringVar(value="")
         self.max_delay_var = tk.StringVar(value="")
-        self.usdt_timeout_var = tk.IntVar(value=30)
+        self.usdt_timeout_var = tk.IntVar(value=EXCHANGE_USDT_TIMEOUT_SECONDS_DEFAULT)
         self.ip_var = tk.StringVar(value="获取中...")
         self.exchange_proxy_status_var = tk.StringVar(value="未启用")
         self.exchange_proxy_exit_ip_var = tk.StringVar(value="--")
@@ -1188,6 +1175,8 @@ class ExchangeAppBase(tk.Tk):
         def runner():
             try:
                 target(*args, **call_kwargs)
+            except Exception:
+                logger.exception("交易所后台线程异常：%s", name)
             finally:
                 current = threading.current_thread()
                 with self._managed_threads_lock:

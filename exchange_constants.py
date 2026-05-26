@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from app_defaults import EXCHANGE_WORKER_THREADS_DEFAULT
+
 
 API_KEY_DEFAULT = ""
 API_SECRET_DEFAULT = ""
@@ -94,6 +96,6 @@ WITHDRAW_COIN_OPTIONS = (
     "USDC",
 )
 
-MAX_THREADS_DEFAULT = 5
+MAX_THREADS_DEFAULT = EXCHANGE_WORKER_THREADS_DEFAULT
 
 __all__ = [name for name in globals() if name.isupper()]

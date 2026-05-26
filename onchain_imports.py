@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from app_defaults import ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
 from page_onchain_base import (
     Decimal,
     InvalidOperation,
@@ -482,7 +483,9 @@ class OnchainImportMixin(object):
                 self.coin_var.set("")
             self.delay_var.set(st.delay_seconds)
             self.threads_var.set(str(max(1, int(st.worker_threads or 1))))
-            self.confirm_timeout_var.set(self._decimal_to_text(Decimal(str(st.confirm_timeout_seconds or 180.0))))
+            self.confirm_timeout_var.set(
+                self._decimal_to_text(Decimal(str(st.confirm_timeout_seconds or ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)))
+            )
             self.dry_run_var.set(st.dry_run)
             self.use_config_proxy_var.set(bool(st.use_config_proxy))
             self.onchain_proxy_var.set(st.proxy_url or "")

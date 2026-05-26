@@ -80,7 +80,9 @@ class TkLogEntry:
         return self.message
 
 
-_formatter = SensitiveFormatter("%(asctime)s [%(levelname)s] %(account_prefix)s%(message)s")
+_LOG_RECORD_FORMAT = "%(asctime)s [%(levelname)s] %(account_prefix)s%(message)s"
+_formatter = SensitiveFormatter(_LOG_RECORD_FORMAT)
+_tk_formatter = SensitiveFormatter(_LOG_RECORD_FORMAT, datefmt="%H:%M:%S")
 logger = logging.getLogger("bot")
 logger.setLevel(logging.INFO)
 logger.propagate = False
@@ -141,7 +143,7 @@ def _prune_runtime_logs(current_path: Path | None = None) -> None:
 
 
 _tk_handler = TkLogHandler()
-_tk_handler.setFormatter(_formatter)
+_tk_handler.setFormatter(_tk_formatter)
 logger.addHandler(_tk_handler)
 
 runtime_log_path: Path | None = None

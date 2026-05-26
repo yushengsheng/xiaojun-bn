@@ -3,13 +3,10 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
-import queue
 import sys
 import tempfile
 import threading
-import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -23,13 +20,14 @@ from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_app_config import ExchangeAppConfigMixin
 from exchange_binance_client import BinanceAPIError, BinanceClient
 from exchange_constants import TRADE_ACCOUNT_TYPE_FUTURES, TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_LIMIT, TRADE_MODE_MARKET, TRADE_MODE_PREMIUM
-from exchange_logging import clear_exchange_account_log_index, log_queue, logger, runtime_log_path, set_exchange_account_log_index
+from exchange_logging import logger, runtime_log_path
 from onchain_relay_wallets import RelayWalletFileStore
 from onchain_relay_runner import _record_matches_job
 from exchange_proxy_runtime import ExchangeProxyRuntime
 from exchange_strategy import Strategy
-from secret_box import SECRET_BOX
-from sensitive_data import mask_api_key, redact_sensitive_text
+from selftest_basic_checks import run_basic_selftest_checks
+from selftest_gui_checks import run_gui_selftest_checks
+from selftest_online_checks import run_online_selftest_checks
 from shared_utils import decimal_to_text, random_decimal_between
 from stores import OnchainStore
 
@@ -42,81 +40,8 @@ def _load_onchain_page_class():
     return OnchainTransferPage, None
 
 
-def _drain_exchange_log_queue() -> list[str]:
-    messages: list[str] = []
-    while True:
-        try:
-            messages.append(str(log_queue.get_nowait()))
-        except queue.Empty:
-            return messages
-
-
-def _run_online_selftest_checks(client: EvmClient, checks: list[str]) -> None:
-    zero_address = "0x0000000000000000000000000000000000000000"
-    eth_balance = client.get_balance_wei("ETH", zero_address)
-    bsc_balance = client.get_balance_wei("BSC", zero_address)
-    checks.append(f"eth-rpc={eth_balance}")
-    checks.append(f"bsc-rpc={bsc_balance}")
-
 def _run_offline_business_selftest_checks(checks: list[str]) -> None:
-    secret_backend = SECRET_BOX.modern_encryption_backend_name()
-    if secret_backend == "missing":
-        raise RuntimeError("安全存储新版密文后端不可用：缺少 cryptography / pycryptodome")
-    probe_text = "selftest-secret-box"
-    v2_cipher = SECRET_BOX.encrypt(probe_text)
-    if not str(v2_cipher).startswith(SECRET_BOX.PREFIX_V2):
-        raise RuntimeError("安全存储自检失败：未生成新版密文")
-    if SECRET_BOX.decrypt(v2_cipher) != probe_text:
-        raise RuntimeError("安全存储自检失败：新版密文回读不一致")
-    v1_cipher = SECRET_BOX._encrypt_v1(probe_text)
-    if SECRET_BOX.decrypt(v1_cipher) != probe_text:
-        raise RuntimeError("安全存储自检失败：旧版密文兼容回读失败")
-    checks.append(f"secret-box={secret_backend}")
-
-    sample_api_key = "AK" + "1" * 62
-    sample_signature = "f" * 64
-    sample_private_key = "a" * 64
-    sample_proxy = "ss://example-sensitive-proxy"
-    redacted = redact_sensitive_text(
-        "api_key=%s&signature=%s 私钥：%s proxy=%s 1+%s+0x0000000000000000000000000000000000000001+1.0"
-        % (sample_api_key, sample_signature, sample_private_key, sample_proxy, sample_api_key)
-    )
-    for secret_text in (sample_api_key, sample_signature, sample_private_key, sample_proxy):
-        if secret_text in redacted:
-            raise RuntimeError("敏感信息脱敏自检失败：仍包含原始敏感字段")
-    if mask_api_key(sample_api_key) not in redacted:
-        raise RuntimeError("敏感信息脱敏自检失败：结果文件 API KEY 脱敏格式异常")
-    if redact_sensitive_text("secret-box=cryptography") != "secret-box=cryptography":
-        raise RuntimeError("敏感信息脱敏自检失败：误伤普通 selftest 文本")
-    checks.append("sensitive-redaction=ok")
-
-    class _SelftestVar:
-        def __init__(self, value: str = ""):
-            self._value = value
-
-        def get(self):
-            return self._value
-
-    if ExchangeAppBatchMixin._account_display_index({"index_var": _SelftestVar("8")}, 1) != 8:
-        raise RuntimeError("交易所日志账号编号自检失败：未使用账号列表显示编号")
-    if ExchangeAppBatchMixin._account_display_index({"index_var": _SelftestVar("")}, 3) != 3:
-        raise RuntimeError("交易所日志账号编号自检失败：空编号未回退到批次编号")
-
-    _drain_exchange_log_queue()
-    set_exchange_account_log_index(8)
-    try:
-        logger.info("策略内部日志自检")
-        logger.info("账号 #8 已有账号编号自检")
-    finally:
-        clear_exchange_account_log_index()
-    exchange_log_messages = _drain_exchange_log_queue()
-    internal_log = next((msg for msg in exchange_log_messages if "策略内部日志自检" in msg), "")
-    explicit_log = next((msg for msg in exchange_log_messages if "已有账号编号自检" in msg), "")
-    if "[账号 #8]" not in internal_log:
-        raise RuntimeError("交易所日志账号编号自检失败：策略内部日志未自动带账号编号")
-    if explicit_log.count("账号 #8") != 1:
-        raise RuntimeError("交易所日志账号编号自检失败：已有账号编号的日志被重复加前缀")
-    checks.append("exchange-log-account-context=ok")
+    run_basic_selftest_checks(checks)
 
     with tempfile.TemporaryDirectory(prefix="xiaojun-selftest-") as tmpdir:
         store_path = Path(tmpdir) / "onchain.json"
@@ -1695,247 +1620,6 @@ def _emit_selftest_console(message: str, *, error: bool = False) -> None:
         pass
 
 
-@contextlib.contextmanager
-def _temporary_attr_overrides(patches: list[tuple[object, str, object]]):
-    sentinel = object()
-    previous: list[tuple[object, str, object]] = []
-    try:
-        for owner, attr_name, value in patches:
-            before = getattr(owner, attr_name, sentinel)
-            previous.append((owner, attr_name, before))
-            setattr(owner, attr_name, value)
-        yield
-    finally:
-        for owner, attr_name, before in reversed(previous):
-            if before is sentinel:
-                try:
-                    delattr(owner, attr_name)
-                except Exception:
-                    pass
-            else:
-                setattr(owner, attr_name, before)
-
-
-def _pump_tk_events(app, *, timeout: float = 20.0, predicate=None) -> None:
-    deadline = time.monotonic() + max(0.1, float(timeout))
-    while time.monotonic() < deadline:
-        app.update_idletasks()
-        app.update()
-        if predicate is None or predicate():
-            return
-        time.sleep(0.05)
-    if predicate is not None and not predicate():
-        raise RuntimeError("GUI 自检超时")
-
-
-def _run_gui_selftest_checks(checks: list[str]) -> None:
-    from tkinter import messagebox
-
-    import exchange_app_base
-    import exchange_app_config
-    import onchain_imports
-    import page_onchain_base
-    from exchange_app import App
-
-    dialogs: list[tuple[str, str, str]] = []
-
-    def _dialog_stub(kind: str):
-        def _inner(title, message, **_kwargs):
-            dialogs.append((kind, str(title), str(message)))
-            return True
-        return _inner
-
-    with tempfile.TemporaryDirectory(prefix="xiaojun-selftest-gui-") as tmpdir:
-        tmp_root = Path(tmpdir)
-        strategy_path = tmp_root / "exchange_strategy_settings.json"
-        proxy_path = tmp_root / "exchange_proxy_settings.json"
-        onchain_path = tmp_root / "onchain.json"
-        patches = [
-            (exchange_app_base.ExchangeAppBase, "update_ip", lambda self, schedule_next=True: None),
-            (exchange_app_base, "STRATEGY_CONFIG_FILE", strategy_path),
-            (exchange_app_base, "EXCHANGE_PROXY_CONFIG_FILE", proxy_path),
-            (exchange_app_config, "STRATEGY_CONFIG_FILE", strategy_path),
-            (exchange_app_config, "EXCHANGE_PROXY_CONFIG_FILE", proxy_path),
-            (page_onchain_base, "ONCHAIN_DATA_FILE", onchain_path),
-            (onchain_imports, "ONCHAIN_DATA_FILE", onchain_path),
-            (messagebox, "showinfo", _dialog_stub("info")),
-            (messagebox, "showwarning", _dialog_stub("warning")),
-            (messagebox, "showerror", _dialog_stub("error")),
-            (messagebox, "askyesno", lambda *_args, **_kwargs: True),
-        ]
-        with _temporary_attr_overrides(patches):
-            app = None
-            try:
-                app = App()
-                app.withdraw()
-                _pump_tk_events(app, timeout=5.0)
-                if int(app.account_tree.cget("height")) != 10:
-                    raise RuntimeError("GUI 自检失败：交易所账号列表高度不是10行")
-
-                _drain_exchange_log_queue()
-                logger.info("GUI日志拆分普通日志自检")
-                logger.error("GUI日志拆分报错日志自检")
-                _pump_tk_events(
-                    app,
-                    timeout=5.0,
-                    predicate=lambda: "GUI日志拆分报错日志自检" in app.text_error_log.get("1.0", "end"),
-                )
-                run_log_text = app.text_log.get("1.0", "end")
-                error_log_text = app.text_error_log.get("1.0", "end")
-                if "GUI日志拆分普通日志自检" not in run_log_text or "GUI日志拆分报错日志自检" not in run_log_text:
-                    raise RuntimeError("GUI 自检失败：运行日志未显示完整日志")
-                if "GUI日志拆分报错日志自检" not in error_log_text:
-                    raise RuntimeError("GUI 自检失败：报错日志未显示错误日志")
-                if "GUI日志拆分普通日志自检" in error_log_text:
-                    raise RuntimeError("GUI 自检失败：普通日志错误进入报错日志")
-                checks.append("exchange-log-split-gui=ok")
-
-                app.save_strategy_config()
-                if not strategy_path.exists():
-                    raise RuntimeError("GUI 自检失败：未生成交易所策略配置文件")
-                if not proxy_path.exists():
-                    raise RuntimeError("GUI 自检失败：未生成交易所代理配置文件")
-
-                app._show_main_page("onchain")
-                _pump_tk_events(app, timeout=5.0, predicate=lambda: getattr(app, "onchain_page", None) is not None)
-                page = app.onchain_page
-                if page is None:
-                    raise RuntimeError("GUI 自检失败：链上页面未成功加载")
-                if int(page.tree.cget("height")) != 10:
-                    raise RuntimeError("GUI 自检失败：链上账号列表高度不是10行")
-
-                def _tree_messages(tree) -> list[str]:
-                    return [str((tree.item(row_id, "values") or ["", ""])[1]) for row_id in tree.get_children()]
-
-                page.log("链上日志拆分普通日志自检")
-                page.log("链上日志拆分失败 0 普通汇总自检")
-                page.log("链上日志拆分失败：报错日志自检")
-                _pump_tk_events(
-                    app,
-                    timeout=5.0,
-                    predicate=lambda: any(
-                        "链上日志拆分失败：报错日志自检" in item
-                        for item in _tree_messages(page.error_log_tree)
-                    ),
-                )
-
-                onchain_run_logs = _tree_messages(page.log_tree)
-                onchain_error_logs = _tree_messages(page.error_log_tree)
-                if not any("链上日志拆分普通日志自检" in item for item in onchain_run_logs):
-                    raise RuntimeError("GUI 自检失败：链上运行日志未显示普通日志")
-                if not any("链上日志拆分失败：报错日志自检" in item for item in onchain_run_logs):
-                    raise RuntimeError("GUI 自检失败：链上运行日志未显示失败日志")
-                if not any("链上日志拆分失败：报错日志自检" in item for item in onchain_error_logs):
-                    raise RuntimeError("GUI 自检失败：链上报错日志未显示失败日志")
-                if any("链上日志拆分普通日志自检" in item for item in onchain_error_logs):
-                    raise RuntimeError("GUI 自检失败：链上普通日志错误进入报错日志")
-                if any("链上日志拆分失败 0 普通汇总自检" in item for item in onchain_error_logs):
-                    raise RuntimeError("GUI 自检失败：链上失败0日志错误进入报错日志")
-                checks.append("onchain-log-split-gui=ok")
-
-                if page._amount_mode() != page.AMOUNT_MODE_ALL:
-                    raise RuntimeError("GUI 自检失败：多对多默认数量模式不是“全部”")
-                page.mode_var.set(page.MODE_1M)
-                _pump_tk_events(app, timeout=5.0)
-                if page._amount_mode() != page.AMOUNT_MODE_FIXED or page.amount_var.get().strip():
-                    raise RuntimeError("GUI 自检失败：1对多默认数量模式异常")
-                page.amount_var.set("0.01")
-                page.mode_var.set(page.MODE_M1)
-                _pump_tk_events(app, timeout=5.0)
-                if page._amount_mode() != page.AMOUNT_MODE_ALL:
-                    raise RuntimeError("GUI 自检失败：多对1默认数量模式不是“全部”")
-                page.mode_var.set(page.MODE_1M)
-                _pump_tk_events(app, timeout=5.0)
-                if page.amount_var.get().strip() != "0.01":
-                    raise RuntimeError("GUI 自检失败：模式切换后1对多数量未保持独立")
-
-                page.network_var.set("BSC")
-                page.mode_var.set(page.MODE_M1)
-                _pump_tk_events(app, timeout=5.0)
-                page.save_all()
-                if not onchain_path.exists():
-                    raise RuntimeError("GUI 自检失败：未生成链上配置文件")
-                saved_store = OnchainStore(onchain_path)
-                saved_store.load()
-                if saved_store.settings.mode_amounts.get("multi_to_multi", {}).get("amount_mode") != page.AMOUNT_MODE_ALL:
-                    raise RuntimeError("GUI 自检失败：多对多数量配置未保存")
-                if saved_store.settings.mode_amounts.get("one_to_many", {}).get("amount") != "0.01":
-                    raise RuntimeError("GUI 自检失败：1对多独立数量配置未保存")
-                if saved_store.settings.mode_amounts.get("many_to_one", {}).get("amount_mode") != page.AMOUNT_MODE_ALL:
-                    raise RuntimeError("GUI 自检失败：多对1独立数量配置未保存")
-
-                def _addr(n: int) -> str:
-                    return f"0x{n:040x}"
-
-                def _assert_onchain_search(query: str, expected_row_id: str, label: str) -> None:
-                    page.onchain_search_var.set(query)
-                    page.search_onchain_table()
-                    _pump_tk_events(app, timeout=5.0)
-                    selected = tuple(page.tree.selection())
-                    if not selected or selected[0] != expected_row_id:
-                        raise RuntimeError(
-                            f"GUI 自检失败：链上搜索未定位到{label}，期望 {expected_row_id}，实际 {selected}"
-                        )
-
-                source_a = "0x" + "1" * 64
-                source_b = "2" * 64
-                source_c = "0x" + "3" * 64
-                source_d = "0x" + "4" * 64
-                source_e = "5" * 64
-                source_a_addr = page.client.address_from_private_key(source_a)
-                source_e_addr = page.client.address_from_private_key("0x" + source_e)
-
-                page.store.multi_to_multi_pairs = [
-                    OnchainPairEntry(source=source_a, target=_addr(101)),
-                    OnchainPairEntry(source=source_b, target=_addr(102)),
-                ]
-                page.m2m_import_drafts = [{"source": source_c, "target": _addr(103)}]
-                page.mode_var.set(page.MODE_M2M)
-                _pump_tk_events(app, timeout=5.0)
-                _assert_onchain_search(_addr(102), "onchain_row_2", "多对多接收地址")
-                _assert_onchain_search(source_a_addr, "onchain_row_1", "多对多源钱包地址")
-                _assert_onchain_search(source_c, "onchain_draft_3", "多对多待补齐私钥")
-
-                page.store.one_to_many_addresses = [_addr(201), _addr(202)]
-                page.source_credential_var.set(source_a)
-                page.mode_var.set(page.MODE_1M)
-                _pump_tk_events(app, timeout=5.0)
-                _assert_onchain_search(_addr(202), "onchain_row_2", "1对多收款地址")
-                _assert_onchain_search(source_a_addr, "onchain_row_1", "1对多源钱包地址")
-
-                page.store.many_to_one_sources = [source_d, source_e]
-                page.target_address_var.set(_addr(301))
-                page.mode_var.set(page.MODE_M1)
-                _pump_tk_events(app, timeout=5.0)
-                _assert_onchain_search(source_e_addr, "onchain_row_2", "多对1源钱包地址")
-                _assert_onchain_search("0x" + source_e, "onchain_row_2", "多对1源钱包私钥")
-                checks.append("onchain-search-gui=ok")
-
-                page.open_wallet_generator()
-                _pump_tk_events(app, timeout=5.0)
-                page.wallet_generate_count_var.set("2")
-                page.generate_wallets()
-                _pump_tk_events(
-                    app,
-                    timeout=20.0,
-                    predicate=lambda: len(getattr(page, "generated_wallets", [])) >= 2
-                    and not any(t.is_alive() for t in page._managed_threads_snapshot()),
-                )
-                if len(page.generated_wallets) != 2:
-                    raise RuntimeError("GUI 自检失败：钱包生成数量异常")
-                error_dialogs = [item for item in dialogs if item[0] == "error"]
-                if error_dialogs:
-                    raise RuntimeError(f"GUI 自检失败：出现错误弹窗 {error_dialogs[0][2]}")
-            finally:
-                if app is not None:
-                    try:
-                        app.destroy()
-                    except Exception:
-                        pass
-
-    checks.append("gui-smoke=ok")
-
-
 def run_selftest(*, include_online_checks: bool = False, include_gui_checks: bool = False) -> int:
     client = None
     try:
@@ -1965,12 +1649,12 @@ def run_selftest(*, include_online_checks: bool = False, include_gui_checks: boo
         checks.append(f"bsc-tokens={len(client.get_default_tokens('BSC'))}")
         _run_offline_business_selftest_checks(checks)
         if include_gui_checks:
-            _run_gui_selftest_checks(checks)
+            run_gui_selftest_checks(checks)
             checks.append("gui-check=enabled")
         else:
             checks.append("gui-check=skipped")
         if include_online_checks:
-            _run_online_selftest_checks(client, checks)
+            run_online_selftest_checks(client, checks)
             checks.append("online-check=enabled")
         else:
             checks.append("online-check=skipped")

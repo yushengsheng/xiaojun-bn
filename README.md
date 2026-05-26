@@ -22,15 +22,17 @@ Binance 自动化工具（Tkinter GUI）。
 ### Windows
 
 ```powershell
-py -3 -m pip install -r requirements.txt
-py -3 小军bn.py
+py -3 -m venv .venv
+.\.venv\Scripts\python -m pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\python 小军bn.py
 ```
 
 可选自检：
 
 ```powershell
-py -3 小军bn.py --selftest
-py -3 小军bn.py --selftest-online
+.\.venv\Scripts\python 小军bn.py --selftest
+.\.venv\Scripts\python 小军bn.py --selftest-online
 ```
 
 - `--selftest`：离线完整性自检，适合本地排查或发布冒烟验证
@@ -51,6 +53,7 @@ py -3 小军bn.py --selftest-online
 
 - 源码运行前请先安装依赖
 - macOS 一键启动脚本会在启动前按需自动安装依赖
+- 建议源码运行使用项目内 `.venv`，避免全局 Python 依赖冲突影响交易所、链上或打包自检
 
 ## 发布包说明
 
@@ -59,6 +62,20 @@ py -3 小军bn.py --selftest-online
 - GitHub Release 构建会一并打包交易所、代理、链上、UI 所需运行依赖
 - Release 会附带页面内置 SS 代理所需的 `xray` 与 `sing-box` 运行文件，无需目标电脑额外安装 v2rayN 或单独拷贝代理内核
 - Release 冒烟默认使用离线 `--selftest`；联机链上连通性需要时再额外执行 `--selftest-online`
+
+## 回归检查
+
+源码改动后建议先跑统一回归：
+
+```powershell
+.\.venv\Scripts\python tools\run_regression.py --gui
+```
+
+需要额外验证公网 RPC 时再加 `--online`。如果只是确认当前 Python 环境是否隔离，可运行：
+
+```powershell
+.\.venv\Scripts\python tools\check_python_environment.py
+```
 
 ## 账号导入格式（交易所批量页）
 

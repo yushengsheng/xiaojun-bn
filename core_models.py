@@ -6,6 +6,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from app_defaults import (
+    EXCHANGE_WORKER_THREADS_DEFAULT,
+    ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
+    ONCHAIN_DELAY_SECONDS_DEFAULT,
+    ONCHAIN_WORKER_THREADS_DEFAULT,
+)
+
 
 @dataclass
 class AccountEntry:
@@ -20,8 +27,8 @@ class GlobalSettings:
     coin: str = "USDT"
     network: str = ""
     amount: str = ""
-    delay_seconds: float = 1.0
-    worker_threads: int = 5
+    delay_seconds: float = ONCHAIN_DELAY_SECONDS_DEFAULT
+    worker_threads: int = EXCHANGE_WORKER_THREADS_DEFAULT
     mode: str = "M2M"
     random_amount_enabled: bool = False
     random_amount_min: str = ""
@@ -36,7 +43,7 @@ class WithdrawRuntimeParams:
     network: str
     delay: float
     threads: int
-    confirm_timeout_seconds: float = 180.0
+    confirm_timeout_seconds: float = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
     random_enabled: bool = False
     random_min: Decimal | None = None
     random_max: Decimal | None = None
@@ -80,9 +87,9 @@ class OnchainSettings:
     random_min: str = ""
     random_max: str = ""
     mode_amounts: dict[str, dict[str, str]] = field(default_factory=dict)
-    delay_seconds: float = 1.0
-    worker_threads: int = 10
-    confirm_timeout_seconds: float = 180.0
+    delay_seconds: float = ONCHAIN_DELAY_SECONDS_DEFAULT
+    worker_threads: int = ONCHAIN_WORKER_THREADS_DEFAULT
+    confirm_timeout_seconds: float = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
     dry_run: bool = True
     use_config_proxy: bool = False
     proxy_url: str = ""

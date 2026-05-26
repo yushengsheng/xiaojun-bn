@@ -708,9 +708,11 @@ class OnchainTransferRunnerMixin(object):
 
             def schedule_submitted_timeout(row_key: str, prefix: str, submitted_timeout_seconds: float):
                 timeout_msg = f"{prefix} 确认中超过 {submitted_timeout_seconds:g} 秒，自动判定失败"
+                timeout_deadline = time.monotonic() + max(0.0, float(submitted_timeout_seconds))
 
                 def timeout_worker():
-                    if submitted_timeout_seconds > 0 and self.stop_requested.wait(submitted_timeout_seconds):
+                    remaining = max(0.0, timeout_deadline - time.monotonic())
+                    if remaining > 0 and self.stop_requested.wait(remaining):
                         return
                     if self.stop_requested.is_set() or self._closing or bool(getattr(self.root, "_closing", False)):
                         return
@@ -718,7 +720,7 @@ class OnchainTransferRunnerMixin(object):
 
                 if submitted_timeout_seconds > 0:
                     timeout_name = f"onchain-submitted-timeout-{str(row_key or '')[-8:] or 'job'}"
-                    self._start_managed_thread(timeout_worker, name=timeout_name)
+                    self._submit_confirmation_task(timeout_worker, name=timeout_name)
                 else:
                     timeout_worker()
 
@@ -734,9 +736,9 @@ class OnchainTransferRunnerMixin(object):
                 if not tx_hash:
                     schedule_submitted_timeout(row_key, prefix, submitted_timeout_seconds)
                     return
+                confirm_deadline = time.time() + max(0.1, float(submitted_timeout_seconds))
 
                 def confirm_worker():
-                    deadline = time.time() + max(0.1, float(submitted_timeout_seconds))
                     last_error = ""
                     while True:
                         if self.stop_requested.is_set() or self._closing or bool(getattr(self.root, "_closing", False)):
@@ -758,7 +760,7 @@ class OnchainTransferRunnerMixin(object):
                                 return
                         except Exception as exc:
                             last_error = str(exc)
-                        if time.time() >= deadline:
+                        if time.time() >= confirm_deadline:
                             detail = f"，最后错误：{last_error}" if last_error else ""
                             finalize_job(row_key, "failed", f"{prefix} 确认中超过 {submitted_timeout_seconds:g} 秒，txid={tx_hash}{detail}")
                             return
@@ -766,7 +768,7 @@ class OnchainTransferRunnerMixin(object):
                             return
 
                 timeout_name = f"onchain-submitted-confirm-{str(row_key or '')[-8:] or 'job'}"
-                self._start_managed_thread(confirm_worker, name=timeout_name)
+                self._submit_confirmation_task(confirm_worker, name=timeout_name)
 
             def worker():
                 total = len(jobs_data)

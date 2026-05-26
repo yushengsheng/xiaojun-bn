@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import threading
 import time
 from datetime import datetime
@@ -12,12 +13,100 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 import tkinter as tk
 from tkinter import END, Scrollbar
 
+from app_defaults import LOG_MAX_ROWS_DEFAULT, UI_BATCH_DELAY_MS_DEFAULT
 from sensitive_data import redact_sensitive_text
 
 
-LOG_MAX_ROWS = 500
-UI_BATCH_DELAY_MS = 50
+LOG_MAX_ROWS = LOG_MAX_ROWS_DEFAULT
+UI_BATCH_DELAY_MS = UI_BATCH_DELAY_MS_DEFAULT
 logger = logging.getLogger(__name__)
+LOG_AMOUNT_TAG = "log_amount_value"
+LOG_AMOUNT_ROW_TAG = "log_amount_row"
+LOG_AMOUNT_COLOR = "#C2410C"
+_LOG_NUMBER_RE = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_LOG_COIN_RE = r"(?:USDT|USDC|BUSD|BNB|BTC|ETH|SOL|TRX|XRP|DOGE|ADA|DOT|MATIC|POL|LTC)"
+_LOG_AMOUNT_LABEL_RE = (
+    r"(?:预买BNB金额|剩余bnb手续费|提现总额|余额总额|转账总额|预估gas合计|"
+    r"总资产|可提余额|提现额度|下单金额|当前参考价|重挂阈值|"
+    r"金额|余额|总额|预估gas|gas费|gas合计|手续费|均价|价格|旧价|新价|溢价|数量|"
+    r"amount|balance|total|price|qty|quantity|fee)"
+)
+_LOG_AMOUNT_VALUE_PATTERNS = (
+    re.compile(
+        rf"{_LOG_AMOUNT_LABEL_RE}\s*(?:[=:：]|为|约)?\s*(?:{_LOG_COIN_RE}\s*)?"
+        rf"(?P<value>{_LOG_NUMBER_RE})(?![\w.])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?<![A-Z0-9]){_LOG_COIN_RE}(?![A-Z0-9])\s*"
+        rf"(?:(?:[=:：])|(?:合计\s*[=:：])|约)?\s*(?P<value>{_LOG_NUMBER_RE})(?![\w.])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?P<value>{_LOG_NUMBER_RE})\s*(?<![A-Z0-9]){_LOG_COIN_RE}(?![A-Z0-9])",
+        re.IGNORECASE,
+    ),
+)
+
+
+def log_amount_value_spans(text: str) -> list[tuple[int, int]]:
+    message = str(text or "")
+    if not message:
+        return []
+    spans: list[tuple[int, int]] = []
+    for pattern in _LOG_AMOUNT_VALUE_PATTERNS:
+        for match in pattern.finditer(message):
+            start, end = match.span("value")
+            if start >= 0 and end > start:
+                spans.append((start, end))
+    if not spans:
+        return []
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(set(spans)):
+        if not merged or start >= merged[-1][1]:
+            merged.append((start, end))
+        else:
+            prev_start, prev_end = merged[-1]
+            merged[-1] = (prev_start, max(prev_end, end))
+    return merged
+
+
+def configure_log_amount_tag(text_widget) -> None:
+    if bool(getattr(text_widget, "_log_amount_tag_configured", False)):
+        return
+    try:
+        text_widget.tag_configure(LOG_AMOUNT_TAG, foreground=LOG_AMOUNT_COLOR)
+        text_widget.tag_raise(LOG_AMOUNT_TAG)
+        setattr(text_widget, "_log_amount_tag_configured", True)
+    except Exception:
+        pass
+
+
+def configure_log_amount_row_tag(log_tree) -> None:
+    if bool(getattr(log_tree, "_log_amount_row_tag_configured", False)):
+        return
+    try:
+        log_tree.tag_configure(LOG_AMOUNT_ROW_TAG, foreground=LOG_AMOUNT_COLOR)
+        setattr(log_tree, "_log_amount_row_tag_configured", True)
+    except Exception:
+        pass
+
+
+def insert_log_message_with_amount_highlights(text_widget, message: str) -> None:
+    text = str(message)
+    start_index = text_widget.index("end-1c")
+    text_widget.insert("end", text)
+    for start, end in log_amount_value_spans(text):
+        try:
+            text_widget.tag_add(LOG_AMOUNT_TAG, f"{start_index}+{start}c", f"{start_index}+{end}c")
+        except Exception:
+            pass
+    text_widget.insert("end", "\n")
+
+
+def _widget_class(widget) -> str:
+    widget_class_getter = getattr(widget, "winfo_class", None)
+    return str(widget_class_getter()).strip() if callable(widget_class_getter) else ""
 
 
 def _parse_hex_color(value: str) -> tuple[int, int, int] | None:
@@ -226,8 +315,7 @@ def capture_vertical_view_state(widget, *, follow_threshold: float = 0.995) -> t
     except Exception:
         return True, None
     follow_tail = last_fraction >= float(follow_threshold)
-    widget_class_getter = getattr(widget, "winfo_class", None)
-    widget_class = str(widget_class_getter()).strip() if callable(widget_class_getter) else ""
+    widget_class = _widget_class(widget)
     if widget_class == "Text":
         index = getattr(widget, "index", None)
         if callable(index):
@@ -300,14 +388,36 @@ def restore_vertical_view_state(widget, state: tuple[str, object] | None) -> Non
             pass
 
 
+def _shift_text_view_state_after_trim(state: tuple[str, object] | None, trimmed_lines: int) -> tuple[str, object] | None:
+    if trimmed_lines <= 0 or state is None:
+        return state
+    kind, payload = state
+    if kind != "text":
+        return state
+    index_text = str(payload or "").strip()
+    if not index_text:
+        return state
+    line_text, dot, col_text = index_text.partition(".")
+    try:
+        new_line = max(1, int(line_text) - int(trimmed_lines))
+    except Exception:
+        return state
+    return kind, f"{new_line}{dot or '.'}{col_text or '0'}"
+
+
 def append_log_rows(log_tree, texts: list[str], max_rows: int = LOG_MAX_ROWS) -> None:
     rows_to_add = [redact_sensitive_text(text) for text in texts if text is not None]
     if not rows_to_add:
         return
+    if _widget_class(log_tree) == "Text":
+        append_text_log_messages(log_tree, rows_to_add, max_rows=max_rows, prepend_time=True)
+        return
     follow_tail, first_fraction = capture_vertical_view_state(log_tree)
+    configure_log_amount_row_tag(log_tree)
     for text in rows_to_add:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_tree.insert("", END, values=(now, text))
+        now = datetime.now().strftime("%H:%M:%S")
+        tags = (LOG_AMOUNT_ROW_TAG,) if log_amount_value_spans(text) else ()
+        log_tree.insert("", END, values=(now, text), tags=tags)
     rows = list(log_tree.get_children())
     overflow = len(rows) - max_rows
     if overflow > 0:
@@ -318,6 +428,45 @@ def append_log_rows(log_tree, texts: list[str], max_rows: int = LOG_MAX_ROWS) ->
             log_tree.see(rows[-1])
         else:
             restore_vertical_view_state(log_tree, first_fraction)
+
+
+def append_text_log_messages(
+    text_widget,
+    messages: list[str],
+    *,
+    max_rows: int = LOG_MAX_ROWS,
+    prepend_time: bool = False,
+) -> None:
+    rows_to_add = [str(message) for message in messages if message is not None]
+    if not rows_to_add:
+        return
+    follow_tail, view_state = capture_vertical_view_state(text_widget)
+    try:
+        text_widget.configure(state="normal")
+        configure_log_amount_tag(text_widget)
+        for text in rows_to_add:
+            display_text = f"{datetime.now().strftime('%H:%M:%S')}  {text}" if prepend_time else text
+            insert_log_message_with_amount_highlights(text_widget, display_text)
+        trimmed_lines = 0
+        try:
+            total_lines = max(0, int(str(text_widget.index("end-1c")).split(".", 1)[0]) - 1)
+        except Exception:
+            total_lines = 0
+        if total_lines > max_rows:
+            trimmed_lines = total_lines - max_rows
+            try:
+                text_widget.delete("1.0", f"{trimmed_lines + 1}.0")
+            except Exception:
+                trimmed_lines = 0
+        if follow_tail:
+            text_widget.see("end")
+        else:
+            restore_vertical_view_state(text_widget, _shift_text_view_state_after_trim(view_state, trimmed_lines))
+    finally:
+        try:
+            text_widget.configure(state="disabled")
+        except Exception:
+            pass
 
 
 def current_ui_batch_size(owner, batch_size: int | None = None, default: int = 1) -> int:
