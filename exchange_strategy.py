@@ -134,13 +134,22 @@ class Strategy:
             return False
         return (not self._is_futures_mode()) and rounds == 0
 
+    @staticmethod
+    def _emit_progress(progress_cb, step: int, total: int, text: str) -> None:
+        if progress_cb:
+            progress_cb(step, total, text)
+
+    def _spot_pair_assets(self) -> tuple[str, str]:
+        symbol_u = str(self.spot_symbol or "").strip().upper()
+        return self.c.get_spot_base_asset(symbol_u), self.c.get_spot_quote_asset(symbol_u)
+
     def _run_zero_round_spot_conversion(self, stop_event, progress_cb=None):
         if stop_event and stop_event.is_set():
             logger.info("检测到停止信号，跳过 0 轮现货兑换")
             return
 
-        base_asset = self.c.get_spot_base_asset(self.spot_symbol)
-        quote_asset = self.c.get_spot_quote_asset(self.spot_symbol)
+        base_asset, quote_asset = self._spot_pair_assets()
+        self._emit_progress(progress_cb, 0, 1, "0轮兑换 %s->%s" % (base_asset, quote_asset))
         logger.info(
             "现货轮次为 0，执行前置币种兑换为后置币种：%s -> %s，交易对=%s",
             base_asset,
@@ -161,8 +170,7 @@ class Strategy:
             logger.error("0 轮现货兑换异常: %s", e)
             if self._pause_with_stop(stop_event, 3):
                 return
-        if progress_cb:
-            progress_cb(1, 1, "0轮兑换 %s->%s" % (base_asset, quote_asset))
+        self._emit_progress(progress_cb, 1, 1, "0轮兑换 %s->%s 完成" % (base_asset, quote_asset))
 
     def _futures_side_order(self) -> str:
         return "BUY" if self.futures_side == FUTURES_SIDE_LONG else "SELL"
@@ -502,7 +510,14 @@ class Strategy:
             "ask_price": ask_price,
         }
 
-    def _place_limit_orders(self, mode_name: str, book_ticker: dict[str, Decimal]) -> tuple[dict | None, dict | None]:
+    def _place_limit_orders(
+        self,
+        mode_name: str,
+        book_ticker: dict[str, Decimal],
+        *,
+        progress_cb=None,
+        step: int = 0,
+    ) -> tuple[dict | None, dict | None]:
         plan = self._limit_order_plan(book_ticker)
         quote_asset = str(plan["quote_asset"])
         base_asset = str(plan["base_asset"])
@@ -518,6 +533,18 @@ class Strategy:
 
         buy_order = None
         sell_order = None
+        action_parts: list[str] = []
+        if quote_balance > 0:
+            action_parts.append(f"挂买{base_asset}")
+        if base_balance > 0:
+            action_parts.append(f"挂卖{base_asset}")
+        if action_parts:
+            self._emit_progress(
+                progress_cb,
+                max(0, int(step or 0)),
+                max(int(step or 0) + 1, 1),
+                f"{mode_name}轮 {int(step or 0) + 1} {'/'.join(action_parts)}",
+            )
         if quote_balance > 0:
             buy_order = self.c.spot_limit_buy_quote_amount(self.spot_symbol, bid_price, quote_balance)
         if base_balance > 0:
@@ -753,12 +780,12 @@ class Strategy:
 
     def _run_premium_append_mode(self, stop_event, progress_cb=None):
         mode_name = self._mode_name()
-        quote_asset = self.c.get_spot_quote_asset(self.spot_symbol)
         append_threshold = self._premium_append_threshold_value()
         order_count = self._premium_split_order_count()
         if order_count <= 1 or append_threshold <= 0:
             self._run_premium_mode(stop_event, progress_cb=progress_cb)
             return
+        base_asset, quote_asset = self._spot_pair_assets()
 
         step = 0
         active_buy_orders: dict[str, dict[str, object]] = {}
@@ -817,6 +844,12 @@ class Strategy:
 
                     book_ticker = self.c.get_book_ticker(self.spot_symbol)
                     current_bid = Decimal(str(book_ticker["bidPrice"]))
+                    self._emit_progress(
+                        progress_cb,
+                        step,
+                        max(step + 1, 1),
+                        f"{mode_name}分笔 挂买 {base_asset} 第1笔",
+                    )
                     initial_order = self._place_premium_split_buy_order(per_order_quote_amount, current_bid, 1)
                     if not initial_order:
                         logger.info("溢价单模式首笔买单未执行（可能余额不足或不满足最小下单额），结束本次运行")
@@ -835,6 +868,12 @@ class Strategy:
 
                     if status == "FILLED" or (status in {"CANCELED", "EXPIRED", "EXPIRED_IN_MATCH"} and executed_qty > 0):
                         buy_fill_price = self.c.get_order_average_price(order) or Decimal(str(state.get("price", "0") or "0"))
+                        self._emit_progress(
+                            progress_cb,
+                            step,
+                            max(step + 1, 1),
+                            f"{mode_name}分笔 挂卖 {base_asset}",
+                        )
                         sell_state = self._place_premium_split_sell_order(executed_qty, buy_fill_price)
                         if sell_state:
                             active_sell_orders[str(sell_state["order_id"])] = sell_state
@@ -860,8 +899,7 @@ class Strategy:
                             BinanceClient._format_decimal(qty),
                             BinanceClient._format_decimal(avg_price),
                         )
-                        if progress_cb:
-                            progress_cb(step, max(step, 1), f"{mode_name}分笔 {step}")
+                        self._emit_progress(progress_cb, step, max(step, 1), f"{mode_name}分笔 {step} 完成")
                     elif status in {"CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
                         active_sell_orders.pop(order_key, None)
                         logger.warning(
@@ -877,6 +915,12 @@ class Strategy:
                         price_diff = abs(current_bid - last_append_price)
                         if price_diff >= append_threshold:
                             next_slot_index = submitted_buy_count + 1
+                            self._emit_progress(
+                                progress_cb,
+                                step,
+                                max(step + 1, 1),
+                                f"{mode_name}分笔 挂买 {base_asset} 第{next_slot_index}笔",
+                            )
                             appended_order = self._place_premium_split_buy_order(
                                 per_order_quote_amount,
                                 current_bid,
@@ -912,6 +956,7 @@ class Strategy:
     def _run_market_mode(self, stop_event, progress_cb=None):
         total_steps = self.spot_rounds if self.spot_rounds > 0 else 1
         step = 0
+        base_asset, _quote_asset = self._spot_pair_assets()
 
         self.ensure_base_sold()
 
@@ -924,9 +969,27 @@ class Strategy:
             logger.info("--- 现货轮 %d/%d 开始 ---", i + 1, self.spot_rounds)
 
             try:
+                self._emit_progress(
+                    progress_cb,
+                    step,
+                    total_steps,
+                    "现货轮 %d/%d 买入 %s" % (i + 1, self.spot_rounds, base_asset),
+                )
                 buy_success = self.c.spot_buy_all_usdt(symbol=self.spot_symbol)
                 if buy_success:
+                    self._emit_progress(
+                        progress_cb,
+                        step,
+                        total_steps,
+                        "现货轮 %d/%d 等待卖出 %s" % (i + 1, self.spot_rounds, base_asset),
+                    )
                     self.sleep_fn()
+                    self._emit_progress(
+                        progress_cb,
+                        step,
+                        total_steps,
+                        "现货轮 %d/%d 卖出 %s" % (i + 1, self.spot_rounds, base_asset),
+                    )
                     self.c.spot_sell_all_base(symbol=self.spot_symbol)
                 else:
                     logger.info("买入未执行（可能余额不足），跳过本轮卖出")
@@ -939,8 +1002,7 @@ class Strategy:
                     return
 
             step += 1
-            if progress_cb:
-                progress_cb(step, total_steps, "现货轮 %d/%d" % (i + 1, self.spot_rounds))
+            self._emit_progress(progress_cb, step, total_steps, "现货轮 %d/%d 完成" % (i + 1, self.spot_rounds))
             self.sleep_fn()
 
         self.ensure_base_sold()
@@ -948,6 +1010,7 @@ class Strategy:
     def _run_convert_mode(self, stop_event, progress_cb=None):
         total_steps = self.spot_rounds if self.spot_rounds > 0 else 1
         step = 0
+        base_asset, quote_asset = self._spot_pair_assets()
 
         self.ensure_base_sold()
 
@@ -960,9 +1023,27 @@ class Strategy:
             logger.info("--- 闪兑轮 %d/%d 开始 ---", i + 1, self.spot_rounds)
 
             try:
+                self._emit_progress(
+                    progress_cb,
+                    step,
+                    total_steps,
+                    "闪兑轮 %d/%d %s->%s" % (i + 1, self.spot_rounds, quote_asset, base_asset),
+                )
                 buy_result = self.c.convert_quote_to_base_all(symbol=self.spot_symbol)
                 if buy_result:
+                    self._emit_progress(
+                        progress_cb,
+                        step,
+                        total_steps,
+                        "闪兑轮 %d/%d 等待 %s->%s" % (i + 1, self.spot_rounds, base_asset, quote_asset),
+                    )
                     self.sleep_fn()
+                    self._emit_progress(
+                        progress_cb,
+                        step,
+                        total_steps,
+                        "闪兑轮 %d/%d %s->%s" % (i + 1, self.spot_rounds, base_asset, quote_asset),
+                    )
                     sell_result = self.c.convert_base_to_quote_all(symbol=self.spot_symbol)
                     if not sell_result:
                         logger.info("闪兑卖出未执行（可能余额不足或不满足最小闪兑金额），结束本次运行")
@@ -978,8 +1059,7 @@ class Strategy:
                     return
 
             step += 1
-            if progress_cb:
-                progress_cb(step, total_steps, "闪兑轮 %d/%d" % (i + 1, self.spot_rounds))
+            self._emit_progress(progress_cb, step, total_steps, "闪兑轮 %d/%d 完成" % (i + 1, self.spot_rounds))
             self.sleep_fn()
 
         self.ensure_base_sold()
@@ -997,7 +1077,12 @@ class Strategy:
 
             try:
                 book_ticker = self.c.get_book_ticker(self.spot_symbol)
-                buy_order, sell_order = self._place_limit_orders(mode_name, book_ticker)
+                buy_order, sell_order = self._place_limit_orders(
+                    mode_name,
+                    book_ticker,
+                    progress_cb=progress_cb,
+                    step=step,
+                )
                 if not buy_order and not sell_order:
                     logger.info("%s模式当前无可挂出的买卖单（余额不足或不满足最小下单额），结束本次运行", mode_name)
                     return
@@ -1012,8 +1097,7 @@ class Strategy:
                     step += 1
                     filled_summary = self._limit_fill_summary(list(payload.get("filled_orders") or []))
                     logger.info("--- %s轮 %d 完成：%s ---", mode_name, step, filled_summary)
-                    if progress_cb:
-                        progress_cb(step, max(step, 1), f"{mode_name}轮 {step}")
+                    self._emit_progress(progress_cb, step, max(step, 1), f"{mode_name}轮 {step} 完成")
                     self.sleep_fn()
                     continue
                 if action == "reprice":
@@ -1036,6 +1120,7 @@ class Strategy:
 
         step = 0
         mode_name = self._mode_name()
+        base_asset, _quote_asset = self._spot_pair_assets()
 
         while True:
             if stop_event and stop_event.is_set():
@@ -1047,6 +1132,12 @@ class Strategy:
             step += 1
             logger.info("--- %s轮 %d 开始 ---", mode_name, step)
             try:
+                self._emit_progress(
+                    progress_cb,
+                    max(step - 1, 0),
+                    max(step, 1),
+                    f"{mode_name}轮 {step} 买入 {base_asset}",
+                )
                 buy_result, _ask_price = self._place_buy_order_with_reprice(stop_event, mode_name)
                 buy_order = buy_result
                 if not buy_order:
@@ -1057,8 +1148,20 @@ class Strategy:
                 if buy_fill_price <= 0:
                     buy_fill_price = Decimal(str(self.c.get_book_ticker(self.spot_symbol)["bidPrice"]))
 
+                self._emit_progress(
+                    progress_cb,
+                    max(step - 1, 0),
+                    max(step, 1),
+                    f"{mode_name}轮 {step} 等待卖出 {base_asset}",
+                )
                 self.sleep_fn()
 
+                self._emit_progress(
+                    progress_cb,
+                    max(step - 1, 0),
+                    max(step, 1),
+                    f"{mode_name}轮 {step} 卖出 {base_asset}",
+                )
                 sell_order = self._place_sell_order_with_reprice(stop_event, mode_name, buy_fill_price)
                 if not sell_order:
                     logger.info("%s模式卖出未执行（可能余额不足或不满足最小下单额），结束本次运行", mode_name)
@@ -1073,8 +1176,7 @@ class Strategy:
                 if self._pause_with_stop(stop_event, 3):
                     return
 
-            if progress_cb:
-                progress_cb(step, max(step, 1), f"{mode_name}轮 {step}")
+            self._emit_progress(progress_cb, step, max(step, 1), f"{mode_name}轮 {step} 完成")
             self.sleep_fn()
 
     def _run_limit_like_mode(self, stop_event, progress_cb=None):

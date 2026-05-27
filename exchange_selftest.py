@@ -769,7 +769,11 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     ]
     if len(zero_round_convert_calls) != 1:
         raise RuntimeError(f"0轮现货兑换自检失败：兑换调用次数异常（{zero_round_client.calls}）")
-    if not zero_round_progress or zero_round_progress[-1][0:2] != (1, 1):
+    expected_zero_round_progress = [
+        (0, 1, "0轮兑换 BTC->USDT"),
+        (1, 1, "0轮兑换 BTC->USDT 完成"),
+    ]
+    if zero_round_progress != expected_zero_round_progress:
         raise RuntimeError(f"0轮现货兑换自检失败：进度回调异常（{zero_round_progress}）")
     if zero_round_sleep_calls["count"] != 2:
         raise RuntimeError(f"0轮现货兑换自检失败：随机延迟未在兑换前和最终提现前执行（{zero_round_sleep_calls}）")
@@ -994,10 +998,34 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     market_topup_count = sum(1 for call in market_round_client.calls if call == ("bnb-topup", "USDT"))
     if market_buy_count != 2 or market_sell_count != 6 or market_topup_count != 1:
         raise RuntimeError(f"普通市价轮次回归自检失败：执行路径异常（{market_round_client.calls}）")
-    if len(market_round_progress) != 2 or market_round_progress[-1][0:2] != (2, 2):
-        raise RuntimeError(f"普通市价轮次回归自检失败：进度回调异常（{market_round_progress}）")
+    expected_market_round_progress = [
+        (0, 2, "现货轮 1/2 买入 BTC"),
+        (0, 2, "现货轮 1/2 等待卖出 BTC"),
+        (0, 2, "现货轮 1/2 卖出 BTC"),
+        (1, 2, "现货轮 1/2 完成"),
+        (1, 2, "现货轮 2/2 买入 BTC"),
+        (1, 2, "现货轮 2/2 等待卖出 BTC"),
+        (1, 2, "现货轮 2/2 卖出 BTC"),
+        (2, 2, "现货轮 2/2 完成"),
+    ]
+    if market_round_progress != expected_market_round_progress:
+        raise RuntimeError(f"普通市价轮次状态栏自检失败：进度回调异常（{market_round_progress}）")
     if not market_round_result or market_round_result.get("withdraw_attempted") is not True:
         raise RuntimeError("普通市价轮次回归自检失败：未保持既有最终提现流程")
+    no_withdraw_status, no_withdraw_success = ExchangeAppBatchMixin._format_batch_strategy_completion_status(
+        0.0,
+        "USDT",
+        enable_withdraw=False,
+    )
+    if no_withdraw_status is not None or no_withdraw_success is not True:
+        raise RuntimeError("批量策略状态栏自检失败：关闭自动提现时不应覆盖最后轮次状态")
+    withdraw_status, withdraw_success = ExchangeAppBatchMixin._format_batch_strategy_completion_status(
+        0.0,
+        "USDT",
+        enable_withdraw=True,
+    )
+    if withdraw_success is not False or "提现失败" not in str(withdraw_status):
+        raise RuntimeError("批量策略状态栏自检失败：开启自动提现时未保持提现结果状态")
     checks.append("spot-market-rounds=ok")
 
     class _SelftestFuturesOpenFailureClient:

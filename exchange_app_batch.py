@@ -850,6 +850,17 @@ class ExchangeAppBatchMixin(object):
             return cls._exchange_success_status_text("自动提现已关闭"), True
         return cls._exchange_failed_status_text("提现失败：可提余额不足/预留过高"), False
     @classmethod
+    def _format_batch_strategy_completion_status(
+        cls,
+        amount: float,
+        coin: str,
+        *,
+        enable_withdraw: bool,
+    ) -> tuple[str | None, bool]:
+        if not enable_withdraw:
+            return None, True
+        return cls._format_withdraw_amount_status(amount, coin, enable_withdraw=enable_withdraw)
+    @classmethod
     def _format_trade_failure_status(cls, stage: str, err: object) -> str:
         stage_text = str(stage or "").strip()
         if stage_text == "开仓下单":
@@ -2354,12 +2365,13 @@ class ExchangeAppBatchMixin(object):
                                 op_success = False
                             else:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
-                                status_text, withdraw_success = self._format_withdraw_amount_status(
+                                status_text, withdraw_success = self._format_batch_strategy_completion_status(
                                     float(final_amount or 0.0),
                                     withdraw_coin,
                                     enable_withdraw=enable_withdraw,
                                 )
-                                set_status(status_text)
+                                if status_text is not None:
+                                    set_status(status_text)
                                 op_success = withdraw_success
                         else:
                             set_status("已停止")
