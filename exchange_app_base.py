@@ -793,7 +793,10 @@ class ExchangeAppBase(tk.Tk):
     def _collect_trade_mode_settings(self) -> dict[str, object]:
         trade_account_type = self._normalize_trade_account_type(self.trade_account_type_var.get())
         mode = self._normalize_trade_mode(self.trade_mode_var.get())
-        spot_symbol = str(self.spot_symbol_var.get() or "").strip().upper()
+        spot_symbol_raw = str(self.spot_symbol_var.get() or "")
+        spot_symbol = BinanceClient.normalize_trade_symbol(spot_symbol_raw)
+        if spot_symbol_raw.strip() and spot_symbol_raw != spot_symbol:
+            self.spot_symbol_var.set(spot_symbol)
         try:
             stored_rounds = int(self.spot_rounds_var.get())
         except Exception:
@@ -809,7 +812,10 @@ class ExchangeAppBase(tk.Tk):
         fee_stop_text = str(self.bnb_fee_stop_var.get() or "").strip()
         bnb_topup_text = str(self.bnb_topup_amount_var.get() or "").strip()
         reprice_threshold_text = str(self.reprice_threshold_var.get() or "").strip()
-        futures_symbol = str(self.futures_symbol_var.get() or "").strip().upper()
+        futures_symbol_raw = str(self.futures_symbol_var.get() or "")
+        futures_symbol = BinanceClient.normalize_trade_symbol(futures_symbol_raw)
+        if futures_symbol_raw.strip() and futures_symbol_raw != futures_symbol:
+            self.futures_symbol_var.set(futures_symbol)
         futures_amount_text = str(self.futures_amount_var.get() or "").strip()
         futures_margin_type = self._normalize_futures_margin_type(self.futures_margin_type_var.get())
         futures_side = str(self.futures_side_var.get() or FUTURES_SIDE_DEFAULT).strip()
@@ -890,6 +896,7 @@ class ExchangeAppBase(tk.Tk):
             "trade_mode": mode,
             "spot_rounds": runtime_rounds,
             "stored_spot_rounds": stored_rounds,
+            "spot_symbol": spot_symbol,
             "premium_delta": premium_text,
             "premium_delta_value": premium_value,
             "premium_order_count": premium_order_count,

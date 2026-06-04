@@ -276,7 +276,7 @@ class ExchangeAppConfigMixin(object):
             "bnb_fee_stop": trade_settings["bnb_fee_stop"],
             "bnb_topup_amount": trade_settings["bnb_topup_amount"],
             "reprice_threshold": trade_settings["reprice_threshold"],
-            "spot_symbol": self.spot_symbol_var.get().strip().upper(),
+            "spot_symbol": str(trade_settings["spot_symbol"] or "").strip().upper(),
             "futures_symbol": str(trade_settings["futures_symbol"] or "").strip().upper(),
             "futures_rounds": int(trade_settings["stored_futures_rounds"]),
             "futures_amount": str(trade_settings["futures_amount"] or "").strip(),
@@ -407,9 +407,13 @@ class ExchangeAppConfigMixin(object):
             self.reprice_threshold_var.set(
                 str(raw.get("reprice_threshold", raw.get("reprice_threshold_percent", REPRICE_THRESHOLD_DEFAULT)) or REPRICE_THRESHOLD_DEFAULT).strip()
             )
-            self.spot_symbol_var.set(str(raw.get("spot_symbol", SPOT_SYMBOL_DEFAULT) or SPOT_SYMBOL_DEFAULT).strip().upper())
+            self.spot_symbol_var.set(
+                BinanceClient.normalize_trade_symbol(raw.get("spot_symbol", SPOT_SYMBOL_DEFAULT) or SPOT_SYMBOL_DEFAULT)
+            )
             self.futures_symbol_var.set(
-                str(raw.get("futures_symbol", FUTURES_SYMBOL_DEFAULT) or FUTURES_SYMBOL_DEFAULT).strip().upper()
+                BinanceClient.normalize_trade_symbol(
+                    raw.get("futures_symbol", FUTURES_SYMBOL_DEFAULT) or FUTURES_SYMBOL_DEFAULT
+                )
             )
             self.futures_rounds_var.set(int(raw.get("futures_rounds", FUTURES_ROUNDS_DEFAULT)))
             self.futures_amount_var.set(str(raw.get("futures_amount", FUTURES_AMOUNT_DEFAULT) or FUTURES_AMOUNT_DEFAULT).strip())

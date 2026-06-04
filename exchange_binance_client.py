@@ -614,8 +614,18 @@ class BinanceClient:
 
     # -------- 工具：从 symbol 推断现货基础币种 --------
     @staticmethod
-    def split_spot_symbol(symbol: str) -> tuple[str, str]:
+    def normalize_trade_symbol(symbol: str) -> str:
         symbol_u = str(symbol or "").strip().upper()
+        if "/" not in symbol_u:
+            return symbol_u
+        parts = [part.strip() for part in symbol_u.split("/") if part.strip()]
+        if len(parts) == 2 and all(re.fullmatch(r"[A-Z0-9]+", part) for part in parts):
+            return "".join(parts)
+        return symbol_u
+
+    @staticmethod
+    def split_spot_symbol(symbol: str) -> tuple[str, str]:
+        symbol_u = BinanceClient.normalize_trade_symbol(symbol)
         for suffix in SUPPORTED_QUOTE_ASSET_SUFFIXES:
             if symbol_u.endswith(suffix) and len(symbol_u) > len(suffix):
                 return symbol_u[:-len(suffix)], suffix
@@ -623,7 +633,7 @@ class BinanceClient:
 
     @classmethod
     def _validated_spot_symbol_parts(cls, symbol: str) -> tuple[str, str, str]:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = cls.normalize_trade_symbol(symbol)
         if not symbol_u:
             raise RuntimeError("现货交易对不能为空")
         base_asset, quote_asset = cls.split_spot_symbol(symbol_u)
@@ -655,7 +665,7 @@ class BinanceClient:
 
     # -------- 公共行情 / 交易规则 --------
     def get_exchange_info(self, symbol: str):
-        symbol = symbol.upper()
+        symbol = self.normalize_trade_symbol(symbol)
         if symbol in self._exchange_info_cache:
             return self._exchange_info_cache[symbol]
         data = self.public_get(self.spot, "/api/v3/exchangeInfo", {"symbol": symbol})
@@ -667,7 +677,7 @@ class BinanceClient:
         return info
 
     def get_symbol_price(self, symbol: str) -> Optional[Decimal]:
-        symbol = symbol.upper()
+        symbol = self.normalize_trade_symbol(symbol)
         try:
             data = self.public_get(self.spot, "/api/v3/ticker/price", {"symbol": symbol})
             price = Decimal(str(data.get("price")))
@@ -908,7 +918,7 @@ class BinanceClient:
         return order
 
     def convert_quote_to_base_all(self, symbol: str, buffer=0.2) -> dict[str, Any] | None:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         base_asset = self.get_spot_base_asset(symbol_u)
         quote_asset = self.get_spot_quote_asset(symbol_u)
         self.ensure_convert_symbol_supported(symbol_u)
@@ -928,7 +938,7 @@ class BinanceClient:
         return self.convert_with_from_amount(quote_asset, base_asset, amount)
 
     def convert_base_to_quote_all(self, symbol: str) -> dict[str, Any] | None:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         base_asset = self.get_spot_base_asset(symbol_u)
         quote_asset = self.get_spot_quote_asset(symbol_u)
         self.ensure_convert_symbol_supported(symbol_u)
@@ -1066,7 +1076,7 @@ class BinanceClient:
         return any(str(snippet or "").lower() in text for snippet in snippets if snippet)
 
     def get_um_futures_exchange_info(self, symbol: str):
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         if not symbol_u:
             return None
         if symbol_u in self._um_futures_exchange_info_cache:
@@ -1086,7 +1096,7 @@ class BinanceClient:
         return info
 
     def ensure_um_futures_symbol_supported(self, symbol: str) -> dict[str, Any]:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         if not symbol_u:
             raise RuntimeError("合约交易对不能为空")
         info = self.get_um_futures_exchange_info(symbol_u)
@@ -1097,7 +1107,7 @@ class BinanceClient:
         return info
 
     def get_um_futures_symbol_price(self, symbol: str) -> Optional[Decimal]:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         if not symbol_u:
             return None
         try:
@@ -1153,7 +1163,7 @@ class BinanceClient:
         }
 
     def get_um_futures_margin_asset(self, symbol: str) -> str:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         info = self.ensure_um_futures_symbol_supported(symbol_u)
         margin_asset = str(info.get("marginAsset") or info.get("quoteAsset") or "").strip().upper()
         if not margin_asset:
@@ -1161,7 +1171,7 @@ class BinanceClient:
         return margin_asset
 
     def get_um_futures_book_ticker(self, symbol: str) -> dict[str, Decimal]:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         data = self.public_get(self.um_futures, "/fapi/v1/ticker/bookTicker", {"symbol": symbol_u})
         bid_price = self._decimal_from_str(data.get("bidPrice"), "0")
         ask_price = self._decimal_from_str(data.get("askPrice"), "0")
@@ -1173,7 +1183,7 @@ class BinanceClient:
         }
 
     def get_um_futures_symbol_config(self, symbol: str) -> dict | None:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         if not symbol_u:
             return None
         data = self.request(
@@ -1216,7 +1226,7 @@ class BinanceClient:
             raise
 
     def ensure_um_futures_margin_type(self, symbol: str, margin_type: str) -> bool:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         target_margin_type = str(margin_type or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper()
         config = self.get_um_futures_symbol_config(symbol_u)
         current_margin_type = str((config or {}).get("marginType") or "").strip().upper()
@@ -1240,7 +1250,7 @@ class BinanceClient:
             raise
 
     def ensure_um_futures_leverage(self, symbol: str, leverage: int) -> int:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         leverage_i = int(leverage)
         if leverage_i < 1 or leverage_i > 125:
             raise RuntimeError("合约杠杆必须在 1-125 之间")
@@ -1303,7 +1313,7 @@ class BinanceClient:
         return value if value in {"BOTH", "LONG", "SHORT"} else ""
 
     def get_um_futures_positions(self, symbol: str) -> list[dict]:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         data = self.request(
             self.um_futures,
             "GET",
@@ -1330,7 +1340,7 @@ class BinanceClient:
         return selected
 
     def calculate_um_futures_order_quantity(self, symbol: str, notional_amount, direction_side: str) -> Decimal:
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         amount = Decimal(str(notional_amount))
         if amount <= 0:
             raise RuntimeError("合约下单金额必须大于 0")
@@ -1383,7 +1393,7 @@ class BinanceClient:
         reduce_only: bool = False,
         position_side: str | None = None,
     ):
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         side_u = str(side or "").strip().upper()
         position_side_u = self._normalize_um_futures_position_side(position_side)
         rules = self.get_um_futures_trade_rules(symbol_u)
@@ -1473,7 +1483,7 @@ class BinanceClient:
         return close_orders[0] if close_orders else None
 
     def get_book_ticker(self, symbol: str) -> dict[str, Decimal]:
-        symbol_u = symbol.upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         data = self.public_get(self.spot, "/api/v3/ticker/bookTicker", {"symbol": symbol_u})
         bid_price = self._decimal_from_str(data.get("bidPrice"), "0")
         ask_price = self._decimal_from_str(data.get("askPrice"), "0")
@@ -1485,7 +1495,7 @@ class BinanceClient:
         }
 
     def place_limit_order(self, symbol: str, side: str, quantity: Decimal, price: Decimal):
-        symbol_u = symbol.upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         side_u = side.upper()
         rules = self.get_symbol_trade_rules(symbol_u)
         if not rules:
@@ -1541,7 +1551,7 @@ class BinanceClient:
             "GET",
             "/api/v3/order",
             {
-                "symbol": symbol.upper(),
+                "symbol": self.normalize_trade_symbol(symbol),
                 "orderId": int(order_id),
             },
         )
@@ -1552,13 +1562,13 @@ class BinanceClient:
             "DELETE",
             "/api/v3/order",
             {
-                "symbol": symbol.upper(),
+                "symbol": self.normalize_trade_symbol(symbol),
                 "orderId": int(order_id),
             },
         )
 
     def wait_order_filled(self, symbol: str, order_id: int | str, stop_event=None, poll_interval: float = 1.0):
-        symbol_u = symbol.upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         while True:
             if stop_event and stop_event.is_set():
                 try:
@@ -1665,7 +1675,7 @@ class BinanceClient:
         return self.place_limit_order(symbol, "SELL", qty, price_dec)
 
     def spot_buy_quote_amount(self, symbol: str, quote_amount: Decimal | str | float | int):
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         amount = Decimal(str(quote_amount))
         if amount <= 0:
             logger.info("买入金额 <= 0，跳过买入 %s", symbol_u)
@@ -1954,7 +1964,7 @@ class BinanceClient:
 
     # -------- 现货买入（全部 USDT） --------
     def spot_buy_all_usdt(self, buffer=0.2, symbol="BTCUSDT"):
-        symbol_u = str(symbol or "").strip().upper()
+        symbol_u = self.normalize_trade_symbol(symbol)
         quote_asset = self.get_spot_quote_asset(symbol_u)
         self.collect_asset_to_spot(quote_asset, context="交易前")
         quote_balance = self.spot_asset_balance_decimal(quote_asset)

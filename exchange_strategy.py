@@ -78,7 +78,7 @@ class Strategy:
         self.withdraw_address = withdraw_address
         self.withdraw_network = withdraw_network
         self.withdraw_fee_buffer = withdraw_fee_buffer
-        self.spot_symbol = spot_symbol
+        self.spot_symbol = BinanceClient.normalize_trade_symbol(spot_symbol)
         self.sleep_fn = sleep_fn
         self.enable_withdraw = enable_withdraw
         self.withdraw_callback = withdraw_callback
@@ -94,7 +94,7 @@ class Strategy:
         self.reprice_threshold_amount = Decimal(
             str(reprice_threshold_amount if reprice_threshold_amount is not None else REPRICE_THRESHOLD_DEFAULT)
         )
-        self.futures_symbol = str(futures_symbol or FUTURES_SYMBOL_DEFAULT).strip().upper()
+        self.futures_symbol = BinanceClient.normalize_trade_symbol(futures_symbol or FUTURES_SYMBOL_DEFAULT)
         self.futures_rounds = max(1, int(futures_rounds or FUTURES_ROUNDS_DEFAULT))
         self.futures_amount = Decimal(str(futures_amount if futures_amount is not None else "0"))
         self.futures_leverage = max(1, int(futures_leverage or FUTURES_LEVERAGE_DEFAULT))

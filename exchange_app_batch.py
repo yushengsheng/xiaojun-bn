@@ -313,7 +313,7 @@ class ExchangeAppBatchMixin(object):
             messagebox.showerror("错误", str(e) or "参数格式不正确")
             return
 
-        spot_symbol = self.spot_symbol_var.get().strip().upper()
+        spot_symbol = BinanceClient.normalize_trade_symbol(self.spot_symbol_var.get())
         trade_symbol = futures_symbol if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES else spot_symbol
         enable_withdraw = bool(self.enable_withdraw_var.get())
         withdraw_address = self.withdraw_addr_var.get().strip()
@@ -1742,7 +1742,7 @@ class ExchangeAppBatchMixin(object):
         if max_threads < 1:
             max_threads = 1
 
-        spot_symbol = self.spot_symbol_var.get().strip().upper()
+        spot_symbol = BinanceClient.normalize_trade_symbol(self.spot_symbol_var.get())
         enable_withdraw = (
             bool(batch_enable_withdraw_override)
             if batch_enable_withdraw_override is not None
@@ -1775,7 +1775,7 @@ class ExchangeAppBatchMixin(object):
             bnb_fee_stop_value = None
             bnb_topup_amount_value = Decimal("0")
             reprice_threshold_value = Decimal(REPRICE_THRESHOLD_DEFAULT)
-            futures_symbol = self.futures_symbol_var.get().strip().upper()
+            futures_symbol = BinanceClient.normalize_trade_symbol(self.futures_symbol_var.get())
             try:
                 futures_rounds = max(1, int(self.futures_rounds_var.get() or FUTURES_ROUNDS_DEFAULT))
             except Exception:
