@@ -1002,7 +1002,12 @@ class Strategy:
                     return
 
             step += 1
-            self._emit_progress(progress_cb, step, total_steps, "现货轮 %d/%d 完成" % (i + 1, self.spot_rounds))
+            self._emit_progress(
+                progress_cb,
+                step,
+                total_steps,
+                "现货轮%s%d/%d完成" % (base_asset.upper(), i + 1, self.spot_rounds),
+            )
             self.sleep_fn()
 
         self.ensure_base_sold()

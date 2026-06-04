@@ -1002,11 +1002,11 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         (0, 2, "现货轮 1/2 买入 BTC"),
         (0, 2, "现货轮 1/2 等待卖出 BTC"),
         (0, 2, "现货轮 1/2 卖出 BTC"),
-        (1, 2, "现货轮 1/2 完成"),
+        (1, 2, "现货轮BTC1/2完成"),
         (1, 2, "现货轮 2/2 买入 BTC"),
         (1, 2, "现货轮 2/2 等待卖出 BTC"),
         (1, 2, "现货轮 2/2 卖出 BTC"),
-        (2, 2, "现货轮 2/2 完成"),
+        (2, 2, "现货轮BTC2/2完成"),
     ]
     if market_round_progress != expected_market_round_progress:
         raise RuntimeError(f"普通市价轮次状态栏自检失败：进度回调异常（{market_round_progress}）")
