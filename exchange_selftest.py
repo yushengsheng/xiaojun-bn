@@ -22,7 +22,13 @@ from exchange_binance_client import BinanceAPIError, BinanceClient
 from exchange_constants import TRADE_ACCOUNT_TYPE_FUTURES, TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_LIMIT, TRADE_MODE_MARKET, TRADE_MODE_PREMIUM
 from exchange_logging import logger, runtime_log_path
 from onchain_relay_wallets import RelayWalletFileStore
-from onchain_relay_runner import _record_matches_job
+from onchain_relay_runner import (
+    _record_matches_job,
+    _relay_is_terminal_dust_state,
+    _relay_native_dust_below_threshold,
+    _relay_positive_tracked_tokens,
+    _relay_token_dust_below_threshold,
+)
 from exchange_proxy_runtime import ExchangeProxyRuntime
 from exchange_strategy import Strategy
 from selftest_basic_checks import run_basic_selftest_checks
@@ -340,6 +346,69 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             )
             if completed_relay_record.sweep_resolution != "manual_empty":
                 raise RuntimeError("中转钱包自检失败：手动清空终态未恢复")
+            if not _relay_is_terminal_dust_state(completed_relay_record, {}):
+                raise RuntimeError("中转钱包自检失败：终态 dust 记录未被识别")
+            if _relay_is_terminal_dust_state(completed_relay_record, {"USDT": (relay_token, 1)}):
+                raise RuntimeError("中转钱包自检失败：仍有代币余额时不应忽略终态记录")
+            custom_relay_token = EvmToken(
+                symbol="ABC",
+                contract="0x00000000000000000000000000000000000000ab",
+                decimals=18,
+                is_native=False,
+            )
+            native_relay_token = EvmToken(symbol="BNB", contract="", decimals=18, is_native=True)
+            recoverable_tokens = _relay_positive_tracked_tokens({
+                "ABC": (custom_relay_token, 1),
+                "BNB": (native_relay_token, 1),
+            })
+            if "ABC" not in recoverable_tokens or "BNB" in recoverable_tokens:
+                raise RuntimeError("中转钱包自检失败：自定义中转代币识别异常")
+
+            class _DustThresholdOwner:
+                def _network_fee_symbol(self, network):
+                    return "BNB"
+
+                def _units_to_amount(self, units, decimals):
+                    return Decimal(int(units)) / (Decimal(10) ** int(decimals))
+
+                def _decimal_to_text(self, value):
+                    return format(Decimal(value).normalize(), "f")
+
+                def _token_amount_text(self, symbol, amount):
+                    return f"{self._decimal_to_text(amount)} {symbol}"
+
+                def _gas_fee_amount_text(self, network, amount_units):
+                    return f"{self._decimal_to_text(self._units_to_amount(amount_units, 18))} BNB"
+
+            dust_owner = _DustThresholdOwner()
+            dust_low, dust_detail = _relay_token_dust_below_threshold(
+                dust_owner,
+                {"USDT": (relay_token, 1_390_000_000_000)},
+            )
+            if not dust_low:
+                raise RuntimeError("中转钱包自检失败：低于固定阈值的代币 dust 未被识别")
+            if "dust阈值" not in dust_detail:
+                raise RuntimeError("中转钱包自检失败：代币 dust 说明文案缺少固定阈值")
+            dust_equal, _dust_detail = _relay_token_dust_below_threshold(
+                dust_owner,
+                {"USDT": (relay_token, 100_000_000_000_000)},
+            )
+            if dust_equal:
+                raise RuntimeError("中转钱包自检失败：等于固定阈值的代币余额被误判为 dust")
+            native_low, native_detail = _relay_native_dust_below_threshold(
+                dust_owner,
+                "BSC",
+                9_999_999_999_999,
+            )
+            if not native_low or "dust阈值" not in native_detail:
+                raise RuntimeError("中转钱包自检失败：低于固定阈值的 BNB dust 未被识别")
+            native_equal, _native_detail = _relay_native_dust_below_threshold(
+                dust_owner,
+                "BSC",
+                10_000_000_000_000,
+            )
+            if native_equal:
+                raise RuntimeError("中转钱包自检失败：等于固定阈值的 BNB 余额被误判为 dust")
 
             relay_store_path = relay_root / "onchain-relay.json"
             relay_onchain_store = OnchainStore(relay_store_path)

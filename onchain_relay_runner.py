@@ -26,8 +26,17 @@ RELAY_POLL_INTERVAL_SECONDS = 2.0
 RELAY_SWEEP_SAFETY_GAS_MULTIPLIER = 1
 RELAY_SWEEP_TERMINAL_RESOLUTIONS = {"manual_empty", "dust_left"}
 RELAY_TRACKED_TOKEN_SYMBOLS = {"USDT", "USDC"}
+RELAY_STABLE_TOKEN_SYMBOLS = {"USDT", "USDC"}
 RELAY_BACKGROUND_SWEEP_START_DELAY_SECONDS = 3.0
+RELAY_STABLE_TOKEN_DUST_THRESHOLD = Decimal("0.0001")
+RELAY_BNB_DUST_THRESHOLD = Decimal("0.00001")
 _RELAY_SWEEP_LOG_LOCK = threading.Lock()
+
+
+class RelayAutoForwardPending(RuntimeError):
+    def __init__(self, message: str, *, txid: str = ""):
+        super().__init__(message)
+        self.txid = str(txid or "").strip()
 
 
 def _utc_now_text() -> str:
@@ -264,25 +273,54 @@ def _relay_recovery_record_needs_scan(record: RelayWalletRecord, *, batch_scoped
     return True
 
 
-def _relay_recovery_tokens(owner, network: str) -> list[EvmToken]:
+def _relay_record_recovery_token(record: RelayWalletRecord | None) -> EvmToken | None:
+    if record is None or bool(getattr(record, "token_is_native", True)):
+        return None
+    contract = str(getattr(record, "token_contract", "") or "").strip()
+    if not contract:
+        return None
+    symbol = str(getattr(record, "token_symbol", "") or "").strip().upper() or "TOKEN"
+    try:
+        decimals = max(0, int(getattr(record, "token_decimals", 18) or 18))
+    except Exception:
+        decimals = 18
+    return EvmToken(symbol=symbol, contract=contract, decimals=decimals, is_native=False)
+
+
+def _relay_recovery_tokens(owner, network: str, record: RelayWalletRecord | None = None) -> list[EvmToken]:
     tracked: list[EvmToken] = []
     seen_symbols: set[str] = set()
+    seen_contracts: set[str] = set()
     for token in owner.client.get_default_tokens(network):
         symbol = str(token.symbol or "").strip().upper()
         if not symbol:
             continue
         if not token.is_native and symbol not in RELAY_TRACKED_TOKEN_SYMBOLS:
             continue
-        if symbol in seen_symbols:
+        contract_key = str(token.contract or "").strip().lower()
+        if symbol in seen_symbols or (contract_key and contract_key in seen_contracts):
             continue
         tracked.append(token)
         seen_symbols.add(symbol)
+        if contract_key:
+            seen_contracts.add(contract_key)
+    record_token = _relay_record_recovery_token(record)
+    if record_token is not None:
+        symbol = str(record_token.symbol or "").strip().upper()
+        contract_key = str(record_token.contract or "").strip().lower()
+        if symbol and symbol not in seen_symbols and contract_key not in seen_contracts:
+            tracked.append(record_token)
     return tracked
 
 
-def _relay_tracked_balance_snapshot(owner, network: str, relay_addr: str) -> dict[str, tuple[EvmToken, int]]:
+def _relay_tracked_balance_snapshot(
+    owner,
+    network: str,
+    relay_addr: str,
+    record: RelayWalletRecord | None = None,
+) -> dict[str, tuple[EvmToken, int]]:
     snapshot: dict[str, tuple[EvmToken, int]] = {}
-    for token in _relay_recovery_tokens(owner, network):
+    for token in _relay_recovery_tokens(owner, network, record):
         if token.is_native:
             units = owner.client.get_balance_wei(network, relay_addr)
         else:
@@ -309,12 +347,85 @@ def _relay_positive_tracked_tokens(snapshot: dict[str, tuple[EvmToken, int]]) ->
     return {
         symbol: (token, units)
         for symbol, (token, units) in snapshot.items()
-        if symbol in RELAY_TRACKED_TOKEN_SYMBOLS and int(units) > 0
+        if not bool(token.is_native) and int(units) > 0
     }
+
+
+def _relay_threshold_units(amount: Decimal, decimals: int) -> int:
+    scale = Decimal(10) ** max(0, int(decimals))
+    return max(0, int(amount * scale))
+
+
+def _relay_network_fee_symbol(owner, network: str) -> str:
+    resolver = getattr(owner, "_network_fee_symbol", None)
+    if callable(resolver):
+        try:
+            value = str(resolver(network) or "").strip().upper()
+            if value:
+                return value
+        except Exception:
+            pass
+    return {"BSC": "BNB", "ETH": "ETH"}.get(str(network or "").strip().upper(), "")
+
+
+def _relay_token_dust_below_threshold(
+    owner,
+    positive_tracked_tokens: dict[str, tuple[EvmToken, int]],
+) -> tuple[bool, str]:
+    if not positive_tracked_tokens:
+        return False, ""
+    details: list[str] = []
+    for symbol in sorted(positive_tracked_tokens):
+        token, units = positive_tracked_tokens[symbol]
+        token_units = max(0, int(units))
+        token_symbol = str(getattr(token, "symbol", "") or symbol or "").strip().upper()
+        if token_units <= 0:
+            continue
+        if token_symbol not in RELAY_STABLE_TOKEN_SYMBOLS or bool(getattr(token, "is_native", False)):
+            return False, ""
+        threshold_units = _relay_threshold_units(RELAY_STABLE_TOKEN_DUST_THRESHOLD, token.decimals)
+        if token_units >= threshold_units:
+            return False, ""
+        balance_text = _relay_balance_text(owner, token, token_units)
+        threshold_text = _relay_balance_text(owner, token, threshold_units)
+        details.append(f"{balance_text} < dust阈值 {threshold_text}")
+    if not details:
+        return False, ""
+    return True, " / ".join(details)
+
+
+def _relay_native_dust_below_threshold(owner, network: str, native_units: int) -> tuple[bool, str]:
+    units = max(0, int(native_units))
+    if units <= 0:
+        return False, ""
+    symbol = _relay_network_fee_symbol(owner, network)
+    if symbol != "BNB":
+        return False, ""
+    threshold_units = _relay_threshold_units(RELAY_BNB_DUST_THRESHOLD, 18)
+    if units >= threshold_units:
+        return False, ""
+    balance_text = owner._gas_fee_amount_text(network, units)
+    threshold_text = owner._gas_fee_amount_text(network, threshold_units)
+    return True, f"{balance_text} < dust阈值 {threshold_text}"
 
 
 def _relay_snapshot_has_positive_balance(snapshot: dict[str, tuple[EvmToken, int]]) -> bool:
     return any(int(units) > 0 for _token, units in snapshot.values())
+
+
+def _relay_is_terminal_dust_state(
+    record: RelayWalletRecord,
+    positive_tracked_tokens: dict[str, tuple[EvmToken, int]],
+) -> bool:
+    status = str(getattr(record, "status", "") or "").strip().lower()
+    last_error = str(getattr(record, "last_error", "") or "").strip()
+    sweep_resolution = str(getattr(record, "sweep_resolution", "") or "").strip().lower()
+    return (
+        status == "completed"
+        and not last_error
+        and sweep_resolution in RELAY_SWEEP_TERMINAL_RESOLUTIONS
+        and not positive_tracked_tokens
+    )
 
 
 def _relay_native_balance_entry(snapshot: dict[str, tuple[EvmToken, int]]) -> tuple[EvmToken | None, int]:
@@ -1246,6 +1357,199 @@ def _reconcile_relay_record_stage(
     return current
 
 
+def _relay_auto_forward_tracked_tokens(
+    owner,
+    record: RelayWalletRecord,
+    *,
+    network: str,
+    relay_addr: str,
+    target: str,
+    positive_tracked_tokens: dict[str, tuple[EvmToken, int]],
+    timeout_seconds: float,
+    recovery_timeout_seconds: float,
+) -> tuple[RelayWalletRecord, int, list[str]]:
+    relay_private_key = owner.client.credential_to_private_key(record.private_key)
+    next_nonce = owner.client.get_nonce(network, relay_addr)
+    current = record
+    gas_fee_total = 0
+    forwarded_parts: list[str] = []
+    for symbol in sorted(positive_tracked_tokens):
+        token, units = positive_tracked_tokens[symbol]
+        transfer_units = max(0, int(units))
+        if transfer_units <= 0:
+            continue
+        target_before_units = owner.client.get_erc20_balance(network, token.contract, target)
+        gas_price = owner.client.get_gas_price_wei(network)
+        gas_limit = owner.client.estimate_erc20_transfer_gas(
+            network,
+            relay_addr,
+            token.contract,
+            target,
+            transfer_units,
+        )
+        gas_cost = gas_price * gas_limit
+        native_balance = owner.client.get_balance_wei(network, relay_addr)
+        if native_balance < gas_cost:
+            current_text = owner._gas_fee_amount_text(network, native_balance)
+            required_text = owner._gas_fee_amount_text(network, gas_cost)
+            raise RuntimeError(f"中转钱包原生币不足，无法自动续转 {symbol}：当前 {current_text}，至少需要 {required_text}")
+        submission = owner.client.submit_erc20_transfer_reliably(
+            network=network,
+            private_key=relay_private_key,
+            token_contract=token.contract,
+            to_address=target,
+            amount_units=transfer_units,
+            nonce=next_nonce,
+            gas_price_wei=gas_price,
+            gas_limit=gas_limit,
+            source_address=relay_addr,
+            recovery_timeout_seconds=recovery_timeout_seconds,
+        )
+        current = _update_relay_record(
+            owner,
+            current,
+            status="token_forward_submitted",
+            token_forward_txid=submission.tx_hash,
+            token_forward_nonce=_tx_nonce_text(next_nonce),
+            sweep_target=str(current.sweep_target or "").strip(),
+            last_error="",
+        )
+        _append_relay_sweep_log(
+            "recovery_auto_forward_submitted",
+            network=network,
+            relay_address=relay_addr,
+            target=target,
+            token=symbol,
+            amount_units=str(transfer_units),
+            txid=submission.tx_hash,
+        )
+        try:
+            _wait_for_transaction_success(
+                owner,
+                network,
+                submission.tx_hash,
+                label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转资产自动续转确认",
+                timeout_seconds=timeout_seconds,
+            )
+            _wait_for_token_balance_at_least(
+                owner,
+                WithdrawRuntimeParams(
+                    coin=symbol,
+                    amount="0",
+                    network=network,
+                    delay=0.0,
+                    threads=1,
+                    token_contract=token.contract,
+                    token_decimals=token.decimals,
+                    token_is_native=False,
+                ),
+                target,
+                target_before_units + transfer_units,
+                label=f"{owner._mask(target, head=8, tail=6)} 自动续转到账",
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            raise RelayAutoForwardPending(
+                f"中转资产自动续转已提交，但确认较慢：{exc}",
+                txid=submission.tx_hash,
+            ) from exc
+        amount_text = owner._token_amount_text(
+            symbol,
+            owner._units_to_amount(transfer_units, token.decimals),
+        )
+        forwarded_parts.append(amount_text)
+        gas_fee_total += gas_cost
+        next_nonce += 1
+    if forwarded_parts:
+        current = _update_relay_record(owner, current, status="forwarded", last_error="")
+    return current, gas_fee_total, forwarded_parts
+
+
+def _relay_auto_forward_native_balance(
+    owner,
+    record: RelayWalletRecord,
+    *,
+    network: str,
+    relay_addr: str,
+    target: str,
+    native_balance: int,
+    timeout_seconds: float,
+    recovery_timeout_seconds: float,
+) -> tuple[RelayWalletRecord, int, int, str]:
+    gas_price = owner.client.get_gas_price_wei(network)
+    forward_value, gas_cost, _safety_units = _relay_sweep_plan(
+        native_balance,
+        gas_price,
+        owner.client.NATIVE_GAS_LIMIT,
+        keep_safety=False,
+    )
+    if forward_value <= 0:
+        return record, 0, gas_cost, ""
+    relay_private_key = owner.client.credential_to_private_key(record.private_key)
+    nonce = owner.client.get_nonce(network, relay_addr)
+    target_before_units = owner.client.get_balance_wei(network, target)
+    submission = owner.client.submit_native_transfer_reliably(
+        network=network,
+        private_key=relay_private_key,
+        to_address=target,
+        value_wei=forward_value,
+        nonce=nonce,
+        gas_price_wei=gas_price,
+        gas_limit=owner.client.NATIVE_GAS_LIMIT,
+        source_address=relay_addr,
+        recovery_timeout_seconds=recovery_timeout_seconds,
+    )
+    current = _update_relay_record(
+        owner,
+        record,
+        status="token_forward_submitted",
+        token_forward_txid=submission.tx_hash,
+        token_forward_nonce=_tx_nonce_text(nonce),
+        sweep_target=str(record.sweep_target or "").strip(),
+        last_error="",
+    )
+    _append_relay_sweep_log(
+        "recovery_auto_forward_submitted",
+        network=network,
+        relay_address=relay_addr,
+        target=target,
+        token=owner._network_fee_symbol(network),
+        amount_units=str(forward_value),
+        txid=submission.tx_hash,
+    )
+    try:
+        _wait_for_transaction_success(
+            owner,
+            network,
+            submission.tx_hash,
+            label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转原生资产自动续转确认",
+            timeout_seconds=timeout_seconds,
+        )
+        _wait_for_token_balance_at_least(
+            owner,
+            WithdrawRuntimeParams(
+                coin=owner._network_fee_symbol(network),
+                amount="0",
+                network=network,
+                delay=0.0,
+                threads=1,
+                token_decimals=18,
+                token_is_native=True,
+            ),
+            target,
+            target_before_units + forward_value,
+            label=f"{owner._mask(target, head=8, tail=6)} 自动续转到账",
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        raise RelayAutoForwardPending(
+            f"中转原生资产自动续转已提交，但确认较慢：{exc}",
+            txid=submission.tx_hash,
+        ) from exc
+    current = _update_relay_record(owner, current, status="forwarded", last_error="")
+    return current, forward_value, gas_cost, submission.tx_hash
+
+
 def run_relay_fee_recovery(
     owner,
     dry_run: bool,
@@ -1413,13 +1717,24 @@ def run_relay_fee_recovery(
                     network = str(record.network or "").strip().upper()
                     relay_addr = owner._validate_recipient_address(record.relay_address, "中转钱包地址")
                     sweep_target = owner._validate_recipient_address(record.sweep_target or record.source, "手续费回收地址")
-                    snapshot = _relay_tracked_balance_snapshot(owner, network, relay_addr)
+                    snapshot = _relay_tracked_balance_snapshot(owner, network, relay_addr, record)
                     _native_token, native_balance = _relay_native_balance_entry(snapshot)
                     positive_tracked_tokens = _relay_positive_tracked_tokens(snapshot)
                     positive_balance_text = _relay_positive_balance_text(owner, snapshot)
                     has_positive_balance = _relay_snapshot_has_positive_balance(snapshot)
                     current_status = str(record.status or "").strip()
                     sweep_resolution = str(record.sweep_resolution or "").strip().lower()
+                    auto_forward_gas_fee = 0
+
+                    if _relay_is_terminal_dust_state(record, positive_tracked_tokens):
+                        finish_job(
+                            progress_key,
+                            display_row_key,
+                            outcome="ignored",
+                            msg=f"{prefix} 已核对：中转钱包已是终态，仅剩已标记的原生币边际",
+                            status_text="已核对",
+                        )
+                        continue
 
                     if not has_positive_balance:
                         if dry_run:
@@ -1427,7 +1742,7 @@ def run_relay_fee_recovery(
                                 progress_key,
                                 display_row_key,
                                 outcome=("ignored" if current_status == "completed" else "already_empty"),
-                                msg=f"{prefix} 妯拟核对完成：中转钱包无 BNB/USDT/USDC 余额",
+                                msg=f"{prefix} 模拟核对完成：中转钱包无 BNB/USDT/USDC 余额",
                                 status_text=("已核对" if current_status == "completed" else "已清空"),
                             )
                             continue
@@ -1475,7 +1790,6 @@ def run_relay_fee_recovery(
 
                     if positive_tracked_tokens:
                         if forward_state == "pending":
-                            pending_reason = f"第二跳交易确认中，当前余额：{positive_balance_text}"
                             finish_job(
                                 progress_key,
                                 display_row_key,
@@ -1484,17 +1798,77 @@ def run_relay_fee_recovery(
                                 status_text="确认中",
                                 network=network,
                                 manual_tokens=positive_tracked_tokens,
-                                export_row=_relay_build_manual_export_row(
-                                    owner,
-                                    record,
-                                    snapshot,
-                                    sweep_target=sweep_target,
-                                    reason=pending_reason,
-                                ),
                             )
                             continue
-                        manual_reason = f"中转钱包仍有余额：{positive_balance_text}"
-                        if not dry_run:
+                        if dry_run:
+                            finish_job(
+                                progress_key,
+                                display_row_key,
+                                outcome="skipped",
+                                msg=f"{prefix} 模拟跳过：检测到 {positive_balance_text}，正式运行会自动续转到收款地址",
+                                status_text="已跳过",
+                                network=network,
+                                manual_tokens=positive_tracked_tokens,
+                            )
+                            continue
+                        try:
+                            rescue_target = owner._validate_recipient_address(record.target, "收款地址")
+                            dust_below_threshold, dust_detail = _relay_token_dust_below_threshold(owner, positive_tracked_tokens)
+                            if dust_below_threshold:
+                                _update_relay_record(
+                                    owner,
+                                    record,
+                                    status="completed",
+                                    sweep_target=sweep_target,
+                                    sweep_resolution="dust_left",
+                                    last_error="",
+                                )
+                                finish_job(
+                                    progress_key,
+                                    display_row_key,
+                                    outcome="kept_margin",
+                                    msg=f"{prefix} 无需人工处理：残留资产低于 dust 阈值，已标记 dust_left（{dust_detail}）",
+                                    status_text="已忽略dust",
+                                )
+                                continue
+                            updated_record, token_gas_fee, forwarded_parts = _relay_auto_forward_tracked_tokens(
+                                owner,
+                                record,
+                                network=network,
+                                relay_addr=relay_addr,
+                                target=rescue_target,
+                                positive_tracked_tokens=positive_tracked_tokens,
+                                timeout_seconds=sweep_timeout_value,
+                                recovery_timeout_seconds=min(max(6.0, sweep_timeout_value / 3.0), 20.0),
+                            )
+                            record = updated_record
+                            auto_forward_gas_fee += token_gas_fee
+                            if forwarded_parts:
+                                dispatch_ui(
+                                    lambda m=(
+                                        f"{prefix} 中转资产自动续转完成："
+                                        f"{owner._mask(relay_addr, head=8, tail=6)} -> "
+                                        f"{owner._mask(rescue_target, head=8, tail=6)}，"
+                                        f"金额={' / '.join(forwarded_parts)}"
+                                    ): owner.log(m)
+                                )
+                            snapshot = _relay_tracked_balance_snapshot(owner, network, relay_addr, record)
+                            _native_token, native_balance = _relay_native_balance_entry(snapshot)
+                            positive_tracked_tokens = _relay_positive_tracked_tokens(snapshot)
+                            positive_balance_text = _relay_positive_balance_text(owner, snapshot)
+                            has_positive_balance = _relay_snapshot_has_positive_balance(snapshot)
+                            forward_state = "success"
+                        except RelayAutoForwardPending as exc:
+                            finish_job(
+                                progress_key,
+                                display_row_key,
+                                outcome="pending",
+                                msg=f"{prefix} {exc}",
+                                status_text="确认中",
+                            )
+                            continue
+                        except Exception as exc:
+                            manual_reason = f"自动续转失败：{exc}；当前余额：{positive_balance_text}"
                             owner.relay_wallet_store.update_record(
                                 relay_addr,
                                 batch_id=record.batch_id,
@@ -1502,23 +1876,68 @@ def run_relay_fee_recovery(
                                 sweep_target=sweep_target,
                                 last_error=manual_reason,
                             )
-                        finish_job(
-                            progress_key,
-                            display_row_key,
-                            outcome="warning",
-                            msg=f"{prefix} 待人工处理：检测到 {positive_balance_text}，已导出对应私钥",
-                            status_text="待人工",
-                            network=network,
-                            manual_tokens=positive_tracked_tokens,
-                            export_row=_relay_build_manual_export_row(
+                            finish_job(
+                                progress_key,
+                                display_row_key,
+                                outcome="warning",
+                                msg=f"{prefix} 待人工处理：{manual_reason}",
+                                status_text="待人工",
+                                network=network,
+                                manual_tokens=positive_tracked_tokens,
+                                export_row=_relay_build_manual_export_row(
+                                    owner,
+                                    record,
+                                    snapshot,
+                                    sweep_target=sweep_target,
+                                    reason=manual_reason,
+                                ),
+                            )
+                            continue
+                        if positive_tracked_tokens:
+                            manual_reason = f"自动续转后仍有余额：{positive_balance_text}"
+                            owner.relay_wallet_store.update_record(
+                                relay_addr,
+                                batch_id=record.batch_id,
+                                status=current_status or "created",
+                                sweep_target=sweep_target,
+                                last_error=manual_reason,
+                            )
+                            finish_job(
+                                progress_key,
+                                display_row_key,
+                                outcome="warning",
+                                msg=f"{prefix} 待人工处理：{manual_reason}",
+                                status_text="待人工",
+                                network=network,
+                                manual_tokens=positive_tracked_tokens,
+                                export_row=_relay_build_manual_export_row(
+                                    owner,
+                                    record,
+                                    snapshot,
+                                    sweep_target=sweep_target,
+                                    reason=manual_reason,
+                                ),
+                            )
+                            continue
+                        if not has_positive_balance:
+                            _update_relay_record(
                                 owner,
                                 record,
-                                snapshot,
+                                status="completed",
                                 sweep_target=sweep_target,
-                                reason=manual_reason,
-                            ),
-                        )
-                        continue
+                                sweep_resolution="manual_empty",
+                                last_error="",
+                            )
+                            finish_job(
+                                progress_key,
+                                display_row_key,
+                                outcome="already_empty",
+                                msg=f"{prefix} 自动续转完成：中转钱包已清空",
+                                status_text="已清空",
+                                network=network,
+                                gas_fee=auto_forward_gas_fee,
+                            )
+                            continue
 
                     sweep_state = _transaction_receipt_state(owner, network, record.gas_sweep_txid)
                     if sweep_state == "pending":
@@ -1604,31 +2023,147 @@ def run_relay_fee_recovery(
                                 status_text="确认中",
                             )
                             continue
-                        manual_reason = f"{state_text}，当前余额 {positive_balance_text}"
-                        if not dry_run:
-                            owner.relay_wallet_store.update_record(
-                                relay_addr,
-                                batch_id=record.batch_id,
-                                status=current_status or "created",
-                                sweep_target=sweep_target,
-                                last_error=manual_reason,
-                            )
-                        finish_job(
-                            progress_key,
-                            display_row_key,
-                            outcome="warning",
-                            msg=f"{prefix} 待人工处理：{state_text}，中转钱包仍有 {positive_balance_text}",
-                            status_text="待人工",
-                            network=network,
-                            export_row=_relay_build_manual_export_row(
+                        if not bool(record.token_is_native):
+                            if dry_run:
+                                finish_job(
+                                    progress_key,
+                                    display_row_key,
+                                    outcome="skipped",
+                                    msg=f"{prefix} 模拟跳过：{state_text}，但中转钱包已无 USDT/USDC，正式运行会清理陈旧状态",
+                                    status_text="已跳过",
+                                )
+                                continue
+                            record = _update_relay_record(
                                 owner,
                                 record,
-                                snapshot,
+                                status="forwarded",
                                 sweep_target=sweep_target,
-                                reason=manual_reason,
-                            ),
-                        )
-                        continue
+                                last_error="",
+                            )
+                            forward_state = "success"
+                            if native_balance > 0:
+                                dispatch_ui(
+                                    lambda m=(
+                                        f"{prefix} 已清理陈旧第二跳状态：中转钱包无 USDT/USDC，"
+                                        f"继续处理剩余 {owner._gas_fee_amount_text(network, native_balance)}"
+                                    ): owner.log(m)
+                                )
+                            else:
+                                _update_relay_record(
+                                    owner,
+                                    record,
+                                    status="completed",
+                                    sweep_target=sweep_target,
+                                    sweep_resolution="manual_empty",
+                                    last_error="",
+                                )
+                                finish_job(
+                                    progress_key,
+                                    display_row_key,
+                                    outcome="already_empty",
+                                    msg=f"{prefix} 已清理陈旧状态：中转钱包已无 USDT/USDC 余额",
+                                    status_text="已清空",
+                                )
+                                continue
+                        else:
+                            if dry_run:
+                                finish_job(
+                                    progress_key,
+                                    display_row_key,
+                                    outcome="skipped",
+                                    msg=f"{prefix} 模拟跳过：{state_text}，正式运行会尝试将中转原生资产续转到收款地址",
+                                    status_text="已跳过",
+                                )
+                                continue
+                            try:
+                                rescue_target = owner._validate_recipient_address(record.target, "收款地址")
+                                record, forward_value, native_forward_gas, _txid = _relay_auto_forward_native_balance(
+                                    owner,
+                                    record,
+                                    network=network,
+                                    relay_addr=relay_addr,
+                                    target=rescue_target,
+                                    native_balance=native_balance,
+                                    timeout_seconds=sweep_timeout_value,
+                                    recovery_timeout_seconds=min(max(6.0, sweep_timeout_value / 3.0), 20.0),
+                                )
+                                auto_forward_gas_fee += native_forward_gas
+                                if forward_value <= 0:
+                                    native_dust, native_dust_detail = _relay_native_dust_below_threshold(
+                                        owner,
+                                        network,
+                                        native_balance,
+                                    )
+                                    if not native_dust:
+                                        raise RuntimeError(
+                                            "中转原生资产余额不足以支付转账 gas，且不低于 dust 阈值，需人工确认"
+                                        )
+                                    _update_relay_record(
+                                        owner,
+                                        record,
+                                        status="completed",
+                                        sweep_target=sweep_target,
+                                        sweep_resolution="dust_left",
+                                        last_error="",
+                                    )
+                                    finish_job(
+                                        progress_key,
+                                        display_row_key,
+                                        outcome="kept_margin",
+                                        msg=(
+                                            f"{prefix} 暂不继续清空：{state_text}，"
+                                            f"当前余额低于 dust 阈值，已标记 dust_left（{native_dust_detail}）"
+                                        ),
+                                        status_text="已留边际",
+                                    )
+                                    continue
+                                dispatch_ui(
+                                    lambda m=(
+                                        f"{prefix} 中转原生资产自动续转完成："
+                                        f"{owner._mask(relay_addr, head=8, tail=6)} -> "
+                                        f"{owner._mask(rescue_target, head=8, tail=6)}，"
+                                        f"金额={owner._gas_fee_amount_text(network, forward_value)}"
+                                    ): owner.log(m)
+                                )
+                                snapshot = _relay_tracked_balance_snapshot(owner, network, relay_addr, record)
+                                _native_token, native_balance = _relay_native_balance_entry(snapshot)
+                                positive_balance_text = _relay_positive_balance_text(owner, snapshot)
+                                has_positive_balance = _relay_snapshot_has_positive_balance(snapshot)
+                                forward_state = "success"
+                            except RelayAutoForwardPending as exc:
+                                finish_job(
+                                    progress_key,
+                                    display_row_key,
+                                    outcome="pending",
+                                    msg=f"{prefix} {exc}",
+                                    status_text="确认中",
+                                )
+                                continue
+                            except Exception as exc:
+                                manual_reason = f"自动续转失败：{exc}；当前余额 {positive_balance_text}"
+                                owner.relay_wallet_store.update_record(
+                                    relay_addr,
+                                    batch_id=record.batch_id,
+                                    status=current_status or "created",
+                                    sweep_target=sweep_target,
+                                    last_error=manual_reason,
+                                )
+                                finish_job(
+                                    progress_key,
+                                    display_row_key,
+                                    outcome="warning",
+                                    msg=f"{prefix} 待人工处理：{manual_reason}",
+                                    status_text="待人工",
+                                    network=network,
+                                    export_row=_relay_build_manual_export_row(
+                                        owner,
+                                        record,
+                                        snapshot,
+                                        sweep_target=sweep_target,
+                                        reason=manual_reason,
+                                    ),
+                                )
+                                continue
 
                     if dry_run:
                         if forward_state != "success":
@@ -1665,13 +2200,30 @@ def run_relay_fee_recovery(
                                 status_text="已清空",
                             )
                         elif sweep_value <= 0:
+                            native_dust, native_dust_detail = _relay_native_dust_below_threshold(
+                                owner,
+                                network,
+                                native_balance,
+                            )
+                            if not native_dust:
+                                finish_job(
+                                    progress_key,
+                                    display_row_key,
+                                    outcome="skipped",
+                                    msg=(
+                                        f"{prefix} 模拟跳过：当前余额 {owner._gas_fee_amount_text(network, native_balance)} "
+                                        "不足以支付回收 gas，且不低于 dust 阈值"
+                                    ),
+                                    status_text="已跳过",
+                                )
+                                continue
                             finish_job(
                                 progress_key,
                                 display_row_key,
                                 outcome="kept_margin",
                                 msg=(
-                                    f"{prefix} 模拟结果：余额 {owner._gas_fee_amount_text(network, native_balance)} "
-                                    f"将保留为安全边际（约 {owner._gas_fee_amount_text(network, safety_units)}）"
+                                    f"{prefix} 模拟结果：BNB 残留低于 dust 阈值，正式运行会标记 dust_left"
+                                    f"（{native_dust_detail}）"
                                 ),
                                 status_text="已留边际",
                             )
@@ -1874,7 +2426,7 @@ def run_relay_fee_recovery(
                             status_text=status_text,
                             network=network,
                             recovered_value=sweep_value,
-                            gas_fee=sweep_gas_cost,
+                            gas_fee=sweep_gas_cost + auto_forward_gas_fee,
                         )
                         continue
 
@@ -1883,12 +2435,45 @@ def run_relay_fee_recovery(
 
                     native_balance = owner.client.get_balance_wei(network, relay_addr)
                     sweep_gas_price = owner.client.get_gas_price_wei(network)
-                    _sweep_value, _sweep_gas_cost, safety_units = _relay_sweep_plan(
+                    _sweep_value, _sweep_gas_cost, _safety_units = _relay_sweep_plan(
                         native_balance,
                         sweep_gas_price,
                         owner.client.NATIVE_GAS_LIMIT,
                         keep_safety=True,
                     )
+                    native_dust, native_dust_detail = _relay_native_dust_below_threshold(
+                        owner,
+                        network,
+                        native_balance,
+                    )
+                    if not native_dust:
+                        manual_reason = (
+                            f"中转钱包原生币余额 {owner._gas_fee_amount_text(network, native_balance)} "
+                            "不足以支付回收 gas，且不低于 dust 阈值，需人工确认"
+                        )
+                        owner.relay_wallet_store.update_record(
+                            relay_addr,
+                            batch_id=record.batch_id,
+                            status=current_status or "forwarded",
+                            sweep_target=sweep_target,
+                            last_error=manual_reason,
+                        )
+                        finish_job(
+                            progress_key,
+                            display_row_key,
+                            outcome="warning",
+                            msg=f"{prefix} 待人工处理：{manual_reason}",
+                            status_text="待人工",
+                            network=network,
+                            export_row=_relay_build_manual_export_row(
+                                owner,
+                                record,
+                                snapshot,
+                                sweep_target=sweep_target,
+                                reason=manual_reason,
+                            ),
+                        )
+                        continue
                     _update_relay_record(
                         owner,
                         record,
@@ -1902,8 +2487,8 @@ def run_relay_fee_recovery(
                         display_row_key,
                         outcome="kept_margin",
                         msg=(
-                            f"{prefix} 暂不继续清空：当前余额 {owner._gas_fee_amount_text(network, native_balance)}，"
-                            f"保留安全边际 {owner._gas_fee_amount_text(network, safety_units)}"
+                            f"{prefix} 暂不继续清空：BNB 残留低于 dust 阈值，"
+                            f"已标记 dust_left（{native_dust_detail}）"
                         ),
                         status_text="已留边际",
                     )
