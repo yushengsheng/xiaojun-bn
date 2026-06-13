@@ -20,6 +20,7 @@ from exchange_constants import (
     FUTURES_SYMBOL_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_ORDER_COUNT_DEFAULT,
+    PREMIUM_PARTIAL_FILL_DEFAULT,
     REPRICE_THRESHOLD_DEFAULT,
     TRADE_ACCOUNT_TYPE_DEFAULT,
     TRADE_ACCOUNT_TYPE_FUTURES,
@@ -62,6 +63,7 @@ class Strategy:
         premium_delta: Decimal | None = None,
         premium_order_count: int = PREMIUM_ORDER_COUNT_DEFAULT,
         premium_append_threshold: Decimal | None = None,
+        premium_partial_fill: bool = PREMIUM_PARTIAL_FILL_DEFAULT,
         bnb_fee_stop_value: Decimal | None = None,
         bnb_topup_amount: Decimal | None = None,
         reprice_threshold_amount: Decimal | None = None,
@@ -89,6 +91,7 @@ class Strategy:
         self.premium_append_threshold = Decimal(
             str(premium_append_threshold if premium_append_threshold is not None else PREMIUM_APPEND_THRESHOLD_DEFAULT)
         )
+        self.premium_partial_fill = bool(premium_partial_fill)
         self.bnb_fee_stop_value = Decimal(str(bnb_fee_stop_value if bnb_fee_stop_value is not None else "0"))
         self.bnb_topup_amount = Decimal(str(bnb_topup_amount if bnb_topup_amount is not None else "0"))
         self.reprice_threshold_amount = Decimal(
@@ -210,7 +213,12 @@ class Strategy:
     def _premium_split_order_count(self) -> int:
         return max(0, int(self.premium_order_count or 0))
 
+    def _premium_partial_fill_mode_enabled(self) -> bool:
+        return self._mode_name() == TRADE_MODE_PREMIUM and bool(self.premium_partial_fill)
+
     def _premium_append_threshold_value(self) -> Decimal:
+        if self._premium_partial_fill_mode_enabled():
+            return Decimal("0")
         if self._premium_split_order_count() <= 1:
             return Decimal("0")
         threshold = Decimal(str(self.premium_append_threshold or "0"))
@@ -248,7 +256,7 @@ class Strategy:
         return self.c.adjust_price_to_valid_tick(self.spot_symbol, desired_price, round_up=True)
 
     def _reprice_threshold_value(self) -> Decimal:
-        if self._premium_append_mode_enabled():
+        if self._premium_partial_fill_mode_enabled() or self._premium_append_mode_enabled():
             return Decimal("0")
         threshold = Decimal(str(self.reprice_threshold_amount or "0"))
         if threshold <= 0:
@@ -695,6 +703,21 @@ class Strategy:
         except Exception:
             return Decimal("0")
 
+    @staticmethod
+    def _order_cumulative_quote_decimal(order_data: dict) -> Decimal:
+        if not isinstance(order_data, dict):
+            return Decimal("0")
+        raw = order_data.get("cummulativeQuoteQty", order_data.get("cumulativeQuoteQty", "0"))
+        try:
+            value = Decimal(str(raw or "0"))
+        except Exception:
+            return Decimal("0")
+        return value if value > 0 else Decimal("0")
+
+    @staticmethod
+    def _order_terminal_status(status: str) -> bool:
+        return str(status or "").strip().upper() in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}
+
     def _place_premium_split_buy_order(self, quote_amount: Decimal, price: Decimal, slot_index: int) -> dict | None:
         quote_asset = self.c.get_spot_quote_asset(self.spot_symbol)
         available_quote = self.c.spot_asset_balance_decimal(quote_asset)
@@ -777,6 +800,276 @@ class Strategy:
                 except Exception as exc:
                     logger.warning("停止时撤销溢价单模式未完成订单失败 %s #%s: %s", side_u, order_id, exc)
                 orders.pop(order_key, None)
+
+    def _run_premium_partial_fill_mode(self, stop_event, progress_cb=None):
+        mode_name = self._mode_name()
+        base_asset, quote_asset = self._spot_pair_assets()
+        active_buy_orders: dict[str, dict[str, object]] = {}
+        active_sell_orders: dict[str, dict[str, object]] = {}
+        pending_base_qty = Decimal("0")
+        pending_base_quote = Decimal("0")
+        pending_quote = Decimal("0")
+        step = 0
+        stop_new_entries = False
+        stop_reason_logged = False
+        mode_logged = False
+
+        def _add_active_order(
+            active_orders: dict[str, dict[str, object]],
+            order: dict,
+            fallback_price: Decimal,
+            *,
+            side_text: str,
+            extra: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            order_id = order.get("orderId")
+            if not order_id:
+                raise RuntimeError(f"溢价单部分成交循环{side_text}单返回缺少 orderId")
+            order_price = self._order_price_decimal(order, fallback_price)
+            state: dict[str, object] = {
+                "order_id": order_id,
+                "price": order_price,
+                "processed_qty": Decimal("0"),
+                "processed_quote": Decimal("0"),
+            }
+            if extra:
+                state.update(extra)
+            active_orders[str(order_id)] = state
+            return state
+
+        def _processed_decimal(state: dict[str, object], key: str) -> Decimal:
+            try:
+                return Decimal(str(state.get(key, "0") or "0"))
+            except Exception:
+                return Decimal("0")
+
+        def _order_delta(order: dict, state: dict[str, object]) -> tuple[Decimal, Decimal, Decimal]:
+            order_price = self._order_price_decimal(order, Decimal(str(state.get("price", "0") or "0")))
+            state["price"] = order_price
+            executed_qty = self._order_executed_qty_decimal(order)
+            cumulative_quote = self._order_cumulative_quote_decimal(order)
+            processed_qty = _processed_decimal(state, "processed_qty")
+            processed_quote = _processed_decimal(state, "processed_quote")
+            delta_qty = executed_qty - processed_qty
+            delta_quote = cumulative_quote - processed_quote
+            if delta_qty <= 0:
+                return Decimal("0"), Decimal("0"), order_price
+            if delta_quote <= 0 and order_price > 0:
+                delta_quote = delta_qty * order_price
+            if delta_quote < 0:
+                delta_quote = Decimal("0")
+            state["processed_qty"] = executed_qty
+            state["processed_quote"] = processed_quote + delta_quote
+            return delta_qty, delta_quote, order_price
+
+        def _place_initial_buy() -> bool:
+            nonlocal mode_logged
+            available_quote = self.c.spot_asset_balance_decimal(quote_asset)
+            if available_quote <= 0:
+                logger.info("溢价单部分成交循环现货 %s 可用余额为 0，结束本次运行", quote_asset)
+                return False
+            if not mode_logged:
+                logger.info(
+                    "启用溢价单部分成交循环：买单部分成交立即挂卖，卖单部分成交立即挂买；追加挂单和重挂阈值已自动关闭"
+                )
+                mode_logged = True
+            book_ticker = self.c.get_book_ticker(self.spot_symbol)
+            buy_price = Decimal(str(book_ticker["bidPrice"]))
+            self._emit_progress(progress_cb, step, max(step + 1, 1), f"{mode_name}部分成交 买入 {base_asset}")
+            buy_order = self.c.spot_limit_buy_all_usdt(symbol=self.spot_symbol, price=buy_price)
+            if not buy_order:
+                return False
+            state = _add_active_order(active_buy_orders, buy_order, buy_price, side_text="买")
+            logger.info(
+                "溢价单部分成交循环挂出买单：金额约=%s %s 价格=%s",
+                BinanceClient._format_decimal(available_quote),
+                quote_asset,
+                BinanceClient._format_decimal(Decimal(str(state["price"]))),
+            )
+            return True
+
+        def _try_place_pending_sell() -> bool:
+            nonlocal pending_base_qty, pending_base_quote
+            if pending_base_qty <= 0:
+                return False
+            available_base = self.c.spot_asset_balance_decimal(base_asset)
+            sell_qty = min(pending_base_qty, available_base)
+            if sell_qty <= 0:
+                return False
+            if pending_base_quote > 0 and pending_base_qty > 0:
+                buy_avg_price = pending_base_quote / pending_base_qty
+            else:
+                buy_avg_price = Decimal(str(self.c.get_book_ticker(self.spot_symbol)["bidPrice"]))
+            sell_price = self._premium_sell_price(buy_avg_price)
+            self._emit_progress(progress_cb, step, max(step + 1, 1), f"{mode_name}部分成交 卖出 {base_asset}")
+            sell_order = self.c.spot_limit_sell_quantity(self.spot_symbol, sell_price, sell_qty)
+            if not sell_order:
+                return False
+
+            order_qty = Decimal(str(sell_order.get("origQty", sell_order.get("executedQty", sell_qty)) or sell_qty))
+            if order_qty <= 0 or order_qty > sell_qty:
+                order_qty = sell_qty
+            base_before = pending_base_qty
+            quote_before = pending_base_quote
+            quote_for_order = Decimal("0")
+            if base_before > 0 and quote_before > 0:
+                quote_for_order = quote_before * order_qty / base_before
+            pending_base_qty = max(Decimal("0"), base_before - order_qty)
+            pending_base_quote = max(Decimal("0"), quote_before - quote_for_order)
+
+            state = _add_active_order(
+                active_sell_orders,
+                sell_order,
+                sell_price,
+                side_text="卖",
+                extra={
+                    "quantity": order_qty,
+                    "buy_fill_price": buy_avg_price,
+                },
+            )
+            logger.info(
+                "溢价单部分成交循环已将买单新增成交挂卖：数量=%s 买入均价=%s 卖价=%s",
+                BinanceClient._format_decimal(order_qty),
+                BinanceClient._format_decimal(buy_avg_price),
+                BinanceClient._format_decimal(Decimal(str(state["price"]))),
+            )
+            return True
+
+        def _try_place_pending_buy() -> bool:
+            nonlocal pending_quote
+            if stop_new_entries or pending_quote <= 0:
+                return False
+            available_quote = self.c.spot_asset_balance_decimal(quote_asset)
+            buy_amount = min(pending_quote, available_quote)
+            if buy_amount <= 0:
+                return False
+            book_ticker = self.c.get_book_ticker(self.spot_symbol)
+            buy_price = Decimal(str(book_ticker["bidPrice"]))
+            self._emit_progress(progress_cb, step, max(step + 1, 1), f"{mode_name}部分成交 买入 {base_asset}")
+            buy_order = self.c.spot_limit_buy_quote_amount(self.spot_symbol, buy_price, buy_amount)
+            if not buy_order:
+                return False
+
+            state = _add_active_order(active_buy_orders, buy_order, buy_price, side_text="买")
+            order_price = Decimal(str(state["price"]))
+            try:
+                order_qty = Decimal(str(buy_order.get("origQty", buy_order.get("executedQty", "0")) or "0"))
+            except Exception:
+                order_qty = Decimal("0")
+            locked_quote = order_qty * order_price if order_qty > 0 and order_price > 0 else buy_amount
+            if locked_quote <= 0 or locked_quote > buy_amount:
+                locked_quote = buy_amount
+            pending_quote = max(Decimal("0"), pending_quote - locked_quote)
+            logger.info(
+                "溢价单部分成交循环已将卖单新增成交挂买：金额=%s %s 价格=%s",
+                BinanceClient._format_decimal(locked_quote),
+                quote_asset,
+                BinanceClient._format_decimal(order_price),
+            )
+            return True
+
+        while True:
+            if stop_event and stop_event.is_set():
+                self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
+                logger.info("检测到停止信号，已撤销溢价单部分成交循环未完成订单")
+                return
+
+            if (not stop_new_entries) and self._should_stop_for_bnb_fee():
+                stop_new_entries = True
+                if not stop_reason_logged:
+                    logger.info("溢价单部分成交循环已触发 BNB 手续费停止条件，停止新增买单，继续处理已成交基础币卖出")
+                    stop_reason_logged = True
+
+            try:
+                if (
+                    not active_buy_orders
+                    and not active_sell_orders
+                    and pending_base_qty <= 0
+                    and pending_quote <= 0
+                ):
+                    if stop_new_entries:
+                        logger.info("溢价单部分成交循环当前无未完成订单，结束本次运行")
+                        return
+                    if not _place_initial_buy():
+                        logger.info("溢价单部分成交循环首笔买单未执行（可能余额不足或不满足最小下单额），结束本次运行")
+                        return
+
+                for order_key, state in list(active_buy_orders.items()):
+                    order = self.c.get_order(self.spot_symbol, state["order_id"])
+                    status = str(order.get("status") or "").upper()
+                    delta_qty, delta_quote, order_price = _order_delta(order, state)
+                    if delta_qty > 0:
+                        pending_base_qty += delta_qty
+                        pending_base_quote += delta_quote
+                        logger.info(
+                            "溢价单部分成交循环买单新增成交：订单#%s 数量=%s 均价=%s，准备挂卖",
+                            state["order_id"],
+                            BinanceClient._format_decimal(delta_qty),
+                            BinanceClient._format_decimal(delta_quote / delta_qty if delta_qty > 0 and delta_quote > 0 else order_price),
+                        )
+                    if self._order_terminal_status(status):
+                        active_buy_orders.pop(order_key, None)
+
+                _try_place_pending_sell()
+
+                for order_key, state in list(active_sell_orders.items()):
+                    order = self.c.get_order(self.spot_symbol, state["order_id"])
+                    status = str(order.get("status") or "").upper()
+                    delta_qty, delta_quote, order_price = _order_delta(order, state)
+                    if delta_qty > 0:
+                        pending_quote += delta_quote
+                        logger.info(
+                            "溢价单部分成交循环卖单新增成交：订单#%s 数量=%s 均价=%s，准备挂买",
+                            state["order_id"],
+                            BinanceClient._format_decimal(delta_qty),
+                            BinanceClient._format_decimal(delta_quote / delta_qty if delta_qty > 0 and delta_quote > 0 else order_price),
+                        )
+                    if status == "FILLED":
+                        active_sell_orders.pop(order_key, None)
+                        step += 1
+                        self._emit_progress(progress_cb, step, max(step, 1), f"{mode_name}部分成交 {step} 完成")
+                    elif self._order_terminal_status(status):
+                        active_sell_orders.pop(order_key, None)
+
+                _try_place_pending_buy()
+
+                if not active_buy_orders and not active_sell_orders:
+                    if pending_base_qty > 0 and not _try_place_pending_sell():
+                        logger.info(
+                            "溢价单部分成交循环剩余 %s 数量 %s 暂无法挂卖，结束本次运行",
+                            base_asset,
+                            BinanceClient._format_decimal(pending_base_qty),
+                        )
+                        return
+                    if pending_quote > 0:
+                        if stop_new_entries:
+                            logger.info(
+                                "溢价单部分成交循环已触发停止条件，卖出所得 %s %s 不再挂买，结束本次运行",
+                                BinanceClient._format_decimal(pending_quote),
+                                quote_asset,
+                            )
+                            return
+                        if not _try_place_pending_buy():
+                            logger.info(
+                                "溢价单部分成交循环剩余 %s 金额 %s 暂无法挂买，结束本次运行",
+                                quote_asset,
+                                BinanceClient._format_decimal(pending_quote),
+                            )
+                            return
+
+                if stop_event and stop_event.wait(1.0):
+                    continue
+                if not stop_event:
+                    time.sleep(1.0)
+            except Exception as e:
+                if stop_event and stop_event.is_set():
+                    self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
+                    logger.info("检测到停止信号，已停止后续执行（%s部分成交循环）", mode_name)
+                    return
+                logger.error("%s部分成交循环执行异常: %s", mode_name, e)
+                if self._pause_with_stop(stop_event, 3):
+                    self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
+                    return
 
     def _run_premium_append_mode(self, stop_event, progress_cb=None):
         mode_name = self._mode_name()
@@ -1119,6 +1412,9 @@ class Strategy:
                     return
 
     def _run_premium_mode(self, stop_event, progress_cb=None):
+        if self._premium_partial_fill_mode_enabled():
+            self._run_premium_partial_fill_mode(stop_event, progress_cb=progress_cb)
+            return
         if self._premium_append_mode_enabled():
             self._run_premium_append_mode(stop_event, progress_cb=progress_cb)
             return

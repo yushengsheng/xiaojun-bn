@@ -21,6 +21,7 @@ from exchange_app_base import (
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_DELTA_DEFAULT,
     PREMIUM_ORDER_COUNT_DEFAULT,
+    PREMIUM_PARTIAL_FILL_DEFAULT,
     REPRICE_THRESHOLD_DEFAULT,
     SECRET_BOX,
     SPOT_ROUNDS_DEFAULT,
@@ -273,6 +274,7 @@ class ExchangeAppConfigMixin(object):
             "premium_delta": trade_settings["premium_delta"],
             "premium_order_count": int(trade_settings["premium_order_count"]),
             "premium_append_threshold": trade_settings["premium_append_threshold"],
+            "premium_partial_fill": bool(trade_settings["premium_partial_fill"]),
             "bnb_fee_stop": trade_settings["bnb_fee_stop"],
             "bnb_topup_amount": trade_settings["bnb_topup_amount"],
             "reprice_threshold": trade_settings["reprice_threshold"],
@@ -402,6 +404,7 @@ class ExchangeAppConfigMixin(object):
                     or PREMIUM_APPEND_THRESHOLD_DEFAULT
                 ).strip()
             )
+            self.premium_partial_fill_var.set(bool(raw.get("premium_partial_fill", PREMIUM_PARTIAL_FILL_DEFAULT)))
             self.bnb_fee_stop_var.set(str(raw.get("bnb_fee_stop", BNB_FEE_STOP_DEFAULT) or BNB_FEE_STOP_DEFAULT).strip())
             self.bnb_topup_amount_var.set(str(raw.get("bnb_topup_amount", BNB_TOPUP_AMOUNT_DEFAULT) or BNB_TOPUP_AMOUNT_DEFAULT).strip())
             self.reprice_threshold_var.set(

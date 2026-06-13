@@ -296,6 +296,7 @@ class ExchangeAppBatchMixin(object):
             premium_delta_value = trade_settings["premium_delta_value"]
             premium_order_count = int(trade_settings["premium_order_count"])
             premium_append_threshold_value = trade_settings["premium_append_threshold_value"]
+            premium_partial_fill = bool(trade_settings["premium_partial_fill"])
             bnb_fee_stop_value = trade_settings["bnb_fee_stop_value"]
             bnb_topup_amount_value = trade_settings["bnb_topup_amount_value"]
             reprice_threshold_value = trade_settings["reprice_threshold_value"]
@@ -342,7 +343,9 @@ class ExchangeAppBatchMixin(object):
                     and premium_order_count > 1
                     and Decimal(str(premium_append_threshold_value or "0")) > 0
                 )
-                if premium_append_mode_enabled:
+                if premium_partial_fill:
+                    effective_reprice_threshold = Decimal("0")
+                elif premium_append_mode_enabled:
                     effective_reprice_threshold = Decimal("0")
                 elif reprice_threshold_value > 0:
                     effective_reprice_threshold = client.normalize_price_delta(
@@ -407,6 +410,7 @@ class ExchangeAppBatchMixin(object):
             premium_delta=premium_delta_value,
             premium_order_count=premium_order_count,
             premium_append_threshold=premium_append_threshold_value,
+            premium_partial_fill=premium_partial_fill,
             bnb_fee_stop_value=bnb_fee_stop_value,
             bnb_topup_amount=bnb_topup_amount_value,
             reprice_threshold_amount=reprice_threshold_value,
@@ -480,20 +484,21 @@ class ExchangeAppBatchMixin(object):
                         premium_order_count > 1 and Decimal(str(premium_append_threshold_value or "0")) > 0
                     )
                     premium_append_log_text = Decimal("0")
-                    if premium_append_mode_enabled:
+                    if (not premium_partial_fill) and premium_append_mode_enabled:
                         premium_append_log_text = client.normalize_price_delta(
                             spot_symbol,
                             premium_append_threshold_value,
                             min_one_tick=True,
                         )
                     logger.info(
-                        "开始执行策略：溢价单模式，预买BNB金额=%s，溢价=%s %s，笔数=%s，追加挂单=%s %s，剩余bnb手续费=%s，重挂阈值=%s %s",
+                        "开始执行策略：溢价单模式，预买BNB金额=%s，溢价=%s %s，笔数=%s，追加挂单=%s %s，部分成交循环=%s，剩余bnb手续费=%s，重挂阈值=%s %s",
                         bnb_topup_amount_value,
                         premium_delta_value,
                         quote_asset,
                         premium_order_count,
                         BinanceClient._format_decimal(premium_append_log_text),
                         quote_asset,
+                        "开" if premium_partial_fill else "关",
                         bnb_fee_stop_value,
                         BinanceClient._format_decimal(effective_reprice_threshold or Decimal("0")),
                         quote_asset,
@@ -1756,6 +1761,7 @@ class ExchangeAppBatchMixin(object):
             premium_delta_value = trade_settings["premium_delta_value"]
             premium_order_count = int(trade_settings["premium_order_count"])
             premium_append_threshold_value = trade_settings["premium_append_threshold_value"]
+            premium_partial_fill = bool(trade_settings["premium_partial_fill"])
             bnb_fee_stop_value = trade_settings["bnb_fee_stop_value"]
             bnb_topup_amount_value = trade_settings["bnb_topup_amount_value"]
             reprice_threshold_value = trade_settings["reprice_threshold_value"]
@@ -1772,6 +1778,7 @@ class ExchangeAppBatchMixin(object):
             premium_delta_value = None
             premium_order_count = PREMIUM_ORDER_COUNT_DEFAULT
             premium_append_threshold_value = Decimal(PREMIUM_APPEND_THRESHOLD_DEFAULT)
+            premium_partial_fill = False
             bnb_fee_stop_value = None
             bnb_topup_amount_value = Decimal("0")
             reprice_threshold_value = Decimal(REPRICE_THRESHOLD_DEFAULT)
@@ -2220,7 +2227,9 @@ class ExchangeAppBatchMixin(object):
                             premium_append_mode_enabled = (
                                 premium_order_count > 1 and Decimal(str(premium_append_threshold_value or "0")) > 0
                             )
-                            if premium_append_mode_enabled:
+                            if premium_partial_fill:
+                                effective_reprice_threshold = Decimal("0")
+                            elif premium_append_mode_enabled:
                                 effective_reprice_threshold = Decimal("0")
                             elif reprice_threshold_value > 0:
                                 effective_reprice_threshold = client.normalize_price_delta(
@@ -2231,14 +2240,14 @@ class ExchangeAppBatchMixin(object):
                             else:
                                 effective_reprice_threshold = Decimal("0")
                             premium_append_log_text = Decimal("0")
-                            if premium_append_mode_enabled:
+                            if (not premium_partial_fill) and premium_append_mode_enabled:
                                 premium_append_log_text = client.normalize_price_delta(
                                     spot_symbol,
                                     premium_append_threshold_value,
                                     min_one_tick=True,
                                 )
                             logger.info(
-                                "账号 #%d 开始执行溢价单策略：预买BNB金额=%s，溢价=%s %s，笔数=%s，追加挂单=%s %s，剩余bnb手续费=%s，重挂阈值=%s %s",
+                                "账号 #%d 开始执行溢价单策略：预买BNB金额=%s，溢价=%s %s，笔数=%s，追加挂单=%s %s，部分成交循环=%s，剩余bnb手续费=%s，重挂阈值=%s %s",
                                 idx,
                                 bnb_topup_amount_value,
                                 premium_delta_value,
@@ -2246,6 +2255,7 @@ class ExchangeAppBatchMixin(object):
                                 premium_order_count,
                                 BinanceClient._format_decimal(premium_append_log_text),
                                 quote_asset,
+                                "开" if premium_partial_fill else "关",
                                 bnb_fee_stop_value,
                                 BinanceClient._format_decimal(effective_reprice_threshold),
                                 quote_asset,
@@ -2325,6 +2335,7 @@ class ExchangeAppBatchMixin(object):
                             premium_delta=premium_delta_value,
                             premium_order_count=premium_order_count,
                             premium_append_threshold=premium_append_threshold_value,
+                            premium_partial_fill=premium_partial_fill,
                             bnb_fee_stop_value=bnb_fee_stop_value,
                             bnb_topup_amount=bnb_topup_amount_value,
                             reprice_threshold_amount=reprice_threshold_value,

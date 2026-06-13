@@ -1097,6 +1097,191 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError("批量策略状态栏自检失败：开启自动提现时未保持提现结果状态")
     checks.append("spot-market-rounds=ok")
 
+    class _SelftestPremiumPartialFillClient:
+        def __init__(self):
+            self.quote_free = Decimal("100")
+            self.base_free = Decimal("0")
+            self.actions: list[tuple[str, Decimal | str]] = []
+            self.timeline: list[tuple[str, object, str | None]] = []
+            self.read_counts: dict[int, int] = {}
+
+        def get_spot_base_asset(self, symbol: str) -> str:
+            return "BTC"
+
+        def get_spot_quote_asset(self, symbol: str) -> str:
+            return "USDT"
+
+        def spot_balance(self, asset: str) -> Decimal:
+            return Decimal("10") if str(asset or "").strip().upper() == "BNB" else self.spot_asset_balance_decimal(asset)
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            asset_u = str(asset or "").strip().upper()
+            if asset_u == "BTC":
+                return self.base_free
+            if asset_u == "USDT":
+                return self.quote_free
+            if asset_u == "BNB":
+                return Decimal("10")
+            return Decimal("0")
+
+        def get_book_ticker(self, symbol: str):
+            return {"bidPrice": Decimal("10"), "askPrice": Decimal("10.5")}
+
+        def normalize_price_delta(self, symbol: str, delta, *, min_one_tick: bool = True) -> Decimal:
+            return Decimal(str(delta or "0"))
+
+        def adjust_price_to_valid_tick(self, symbol: str, desired_price, round_up: bool = False) -> Decimal:
+            return Decimal(str(desired_price))
+
+        def spot_limit_buy_all_usdt(self, symbol: str, price):
+            price_dec = Decimal(str(price))
+            self.actions.append(("initial-buy", price_dec))
+            self.timeline.append(("place-buy", 1, None))
+            self.quote_free = Decimal("0")
+            return {"orderId": 1, "price": str(price_dec), "origQty": "10", "executedQty": "0"}
+
+        def spot_limit_sell_quantity(self, symbol: str, price, quantity):
+            price_dec = Decimal(str(price))
+            qty_dec = Decimal(str(quantity))
+            self.actions.append(("sell", qty_dec, price_dec))
+            self.timeline.append(("place-sell", 2, None))
+            self.base_free = max(Decimal("0"), self.base_free - qty_dec)
+            return {"orderId": 2, "price": str(price_dec), "origQty": str(qty_dec), "executedQty": "0"}
+
+        def spot_limit_buy_quote_amount(self, symbol: str, price, quote_amount):
+            price_dec = Decimal(str(price))
+            amount_dec = Decimal(str(quote_amount))
+            self.actions.append(("rebuy", amount_dec, price_dec))
+            self.timeline.append(("place-buy", 3, None))
+            self.quote_free = max(Decimal("0"), self.quote_free - amount_dec)
+            return {
+                "orderId": 3,
+                "price": str(price_dec),
+                "origQty": str(amount_dec / price_dec),
+                "executedQty": "0",
+            }
+
+        def get_order(self, symbol: str, order_id):
+            order_id_int = int(order_id)
+            read_count = self.read_counts.get(order_id_int, 0) + 1
+            self.read_counts[order_id_int] = read_count
+            if order_id_int == 1 and read_count == 1:
+                self.base_free += Decimal("4")
+                status = "PARTIALLY_FILLED"
+                order = {
+                    "orderId": 1,
+                    "status": status,
+                    "price": "10",
+                    "origQty": "10",
+                    "executedQty": "4",
+                    "cummulativeQuoteQty": "40",
+                }
+            elif order_id_int == 1:
+                status = "CANCELED"
+                order = {
+                    "orderId": 1,
+                    "status": status,
+                    "price": "10",
+                    "origQty": "10",
+                    "executedQty": "4",
+                    "cummulativeQuoteQty": "40",
+                }
+            elif order_id_int == 2 and read_count == 1:
+                self.quote_free += Decimal("22")
+                status = "PARTIALLY_FILLED"
+                order = {
+                    "orderId": 2,
+                    "status": status,
+                    "price": "11",
+                    "origQty": "4",
+                    "executedQty": "2",
+                    "cummulativeQuoteQty": "22",
+                }
+            elif order_id_int == 2:
+                status = "CANCELED"
+                order = {
+                    "orderId": 2,
+                    "status": status,
+                    "price": "11",
+                    "origQty": "4",
+                    "executedQty": "2",
+                    "cummulativeQuoteQty": "22",
+                }
+            else:
+                status = "CANCELED"
+                order = {
+                    "orderId": order_id_int,
+                    "status": status,
+                    "price": "10",
+                    "origQty": "2.2",
+                    "executedQty": "0",
+                    "cummulativeQuoteQty": "0",
+                }
+            self.timeline.append(("read", order_id_int, status))
+            return order
+
+        def get_order_average_price(self, order_data: dict) -> Decimal | None:
+            executed_qty = Decimal(str(order_data.get("executedQty", "0") or "0"))
+            quote_qty = Decimal(str(order_data.get("cummulativeQuoteQty", "0") or "0"))
+            if executed_qty > 0 and quote_qty > 0:
+                return quote_qty / executed_qty
+            return Decimal(str(order_data.get("price", "0") or "0"))
+
+        def cancel_order(self, symbol: str, order_id):
+            self.timeline.append(("cancel", int(order_id), None))
+            return {"orderId": int(order_id), "status": "CANCELED"}
+
+        def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
+            self.actions.append(("withdraw", str(coin or "").strip().upper()))
+            return 0
+
+    class _SelftestImmediateWait:
+        def is_set(self):
+            return False
+
+        def wait(self, _seconds=None):
+            return False
+
+    premium_partial_client = _SelftestPremiumPartialFillClient()
+    premium_partial_strategy = Strategy(
+        client=premium_partial_client,
+        spot_rounds=1,
+        withdraw_coin="USDT",
+        withdraw_address="",
+        withdraw_network="BSC",
+        withdraw_fee_buffer=0,
+        spot_symbol="BTCUSDT",
+        sleep_fn=lambda: None,
+        enable_withdraw=False,
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_PREMIUM,
+        premium_delta=Decimal("1"),
+        premium_partial_fill=True,
+        bnb_fee_stop_value=Decimal("0"),
+    )
+    premium_partial_strategy.run(stop_event=_SelftestImmediateWait())
+    action_names = [item[0] for item in premium_partial_client.actions]
+    if action_names[:3] != ["initial-buy", "sell", "rebuy"]:
+        raise RuntimeError(f"溢价单部分成交循环自检失败：下单顺序异常（{premium_partial_client.actions}）")
+    sell_action = premium_partial_client.actions[1]
+    rebuy_action = premium_partial_client.actions[2]
+    if sell_action != ("sell", Decimal("4"), Decimal("11")):
+        raise RuntimeError(f"溢价单部分成交循环自检失败：买单部分成交挂卖异常（{sell_action}）")
+    if rebuy_action != ("rebuy", Decimal("22"), Decimal("10")):
+        raise RuntimeError(f"溢价单部分成交循环自检失败：卖单部分成交挂买异常（{rebuy_action}）")
+    try:
+        sell_place_index = premium_partial_client.timeline.index(("place-sell", 2, None))
+        buy_terminal_index = premium_partial_client.timeline.index(("read", 1, "CANCELED"))
+        rebuy_place_index = premium_partial_client.timeline.index(("place-buy", 3, None))
+        sell_terminal_index = premium_partial_client.timeline.index(("read", 2, "CANCELED"))
+    except ValueError as exc:
+        raise RuntimeError(f"溢价单部分成交循环自检失败：关键时序缺失（{premium_partial_client.timeline}）") from exc
+    if sell_place_index >= buy_terminal_index:
+        raise RuntimeError(f"溢价单部分成交循环自检失败：卖单等待了买单终态（{premium_partial_client.timeline}）")
+    if rebuy_place_index >= sell_terminal_index:
+        raise RuntimeError(f"溢价单部分成交循环自检失败：回买等待了卖单终态（{premium_partial_client.timeline}）")
+    checks.append("premium-partial-fill-loop=ok")
+
     class _SelftestFuturesOpenFailureClient:
         def __init__(self):
             self.calls: list[str] = []
@@ -1352,6 +1537,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.premium_delta_var = _SimpleVar("")
             self.premium_order_count_var = _SimpleVar(0)
             self.premium_append_threshold_var = _SimpleVar("")
+            self.premium_partial_fill_var = _SimpleVar(False)
             self.bnb_fee_stop_var = _SimpleVar("")
             self.bnb_topup_amount_var = _SimpleVar("0")
             self.reprice_threshold_var = _SimpleVar("0")

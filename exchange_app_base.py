@@ -64,6 +64,7 @@ from exchange_constants import (
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_DELTA_DEFAULT,
     PREMIUM_ORDER_COUNT_DEFAULT,
+    PREMIUM_PARTIAL_FILL_DEFAULT,
     REPRICE_THRESHOLD_DEFAULT,
     SPOT_ROUNDS_DEFAULT,
     SPOT_SYMBOL_DEFAULT,
@@ -209,6 +210,7 @@ class ExchangeAppBase(tk.Tk):
         self.premium_delta_var = tk.StringVar(value=PREMIUM_DELTA_DEFAULT)
         self.premium_order_count_var = tk.IntVar(value=PREMIUM_ORDER_COUNT_DEFAULT)
         self.premium_append_threshold_var = tk.StringVar(value=PREMIUM_APPEND_THRESHOLD_DEFAULT)
+        self.premium_partial_fill_var = tk.BooleanVar(value=PREMIUM_PARTIAL_FILL_DEFAULT)
         self.bnb_fee_stop_var = tk.StringVar(value=BNB_FEE_STOP_DEFAULT)
         self.bnb_topup_amount_var = tk.StringVar(value=BNB_TOPUP_AMOUNT_DEFAULT)
         self.reprice_threshold_var = tk.StringVar(value=REPRICE_THRESHOLD_DEFAULT)
@@ -809,6 +811,7 @@ class ExchangeAppBase(tk.Tk):
         premium_text = str(self.premium_delta_var.get() or "").strip()
         premium_order_count_text = str(self.premium_order_count_var.get() or PREMIUM_ORDER_COUNT_DEFAULT).strip()
         premium_append_threshold_text = str(self.premium_append_threshold_var.get() or "").strip()
+        premium_partial_fill = bool(self.premium_partial_fill_var.get())
         fee_stop_text = str(self.bnb_fee_stop_var.get() or "").strip()
         bnb_topup_text = str(self.bnb_topup_amount_var.get() or "").strip()
         reprice_threshold_text = str(self.reprice_threshold_var.get() or "").strip()
@@ -902,6 +905,7 @@ class ExchangeAppBase(tk.Tk):
             "premium_order_count": premium_order_count,
             "premium_append_threshold": premium_append_threshold_text,
             "premium_append_threshold_value": premium_append_threshold_value,
+            "premium_partial_fill": premium_partial_fill,
             "bnb_fee_stop": fee_stop_text,
             "bnb_fee_stop_value": fee_stop_value,
             "bnb_topup_amount": bnb_topup_text,
@@ -1125,6 +1129,7 @@ class ExchangeAppBase(tk.Tk):
                 ttk.Entry(row3_left, textvariable=self.premium_append_threshold_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
                 ttk.Label(row3_left, text=self._reprice_threshold_label_text()).pack(side="left")
                 ttk.Entry(row3_left, textvariable=self.reprice_threshold_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
+                ttk.Checkbutton(row3_left, text="部分成交循环", variable=self.premium_partial_fill_var).pack(side="left", padx=(0, 8))
 
             ttk.Label(row3_right, text="提现预留:").pack(side="left")
             ttk.Entry(row3_right, textvariable=self.withdraw_buffer_var, width=row3_withdraw_width).pack(side="left", padx=row3_withdraw_pad)
