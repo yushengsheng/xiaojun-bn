@@ -343,9 +343,7 @@ class ExchangeAppBatchMixin(object):
                     and premium_order_count > 1
                     and Decimal(str(premium_append_threshold_value or "0")) > 0
                 )
-                if premium_partial_fill:
-                    effective_reprice_threshold = Decimal("0")
-                elif premium_append_mode_enabled:
+                if (not premium_partial_fill) and premium_append_mode_enabled:
                     effective_reprice_threshold = Decimal("0")
                 elif reprice_threshold_value > 0:
                     effective_reprice_threshold = client.normalize_price_delta(
@@ -2227,9 +2225,7 @@ class ExchangeAppBatchMixin(object):
                             premium_append_mode_enabled = (
                                 premium_order_count > 1 and Decimal(str(premium_append_threshold_value or "0")) > 0
                             )
-                            if premium_partial_fill:
-                                effective_reprice_threshold = Decimal("0")
-                            elif premium_append_mode_enabled:
+                            if (not premium_partial_fill) and premium_append_mode_enabled:
                                 effective_reprice_threshold = Decimal("0")
                             elif reprice_threshold_value > 0:
                                 effective_reprice_threshold = client.normalize_price_delta(

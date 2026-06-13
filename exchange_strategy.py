@@ -256,7 +256,7 @@ class Strategy:
         return self.c.adjust_price_to_valid_tick(self.spot_symbol, desired_price, round_up=True)
 
     def _reprice_threshold_value(self) -> Decimal:
-        if self._premium_partial_fill_mode_enabled() or self._premium_append_mode_enabled():
+        if self._premium_append_mode_enabled():
             return Decimal("0")
         threshold = Decimal(str(self.reprice_threshold_amount or "0"))
         if threshold <= 0:
@@ -862,6 +862,106 @@ class Strategy:
             state["processed_quote"] = processed_quote + delta_quote
             return delta_qty, delta_quote, order_price
 
+        def _buy_order_quote_amount(order: dict, order_price: Decimal, fallback_amount: Decimal) -> Decimal:
+            try:
+                orig_qty = Decimal(str(order.get("origQty", order.get("executedQty", "0")) or "0"))
+            except Exception:
+                orig_qty = Decimal("0")
+            if orig_qty > 0 and order_price > 0:
+                return orig_qty * order_price
+            try:
+                fallback = Decimal(str(fallback_amount or "0"))
+            except Exception:
+                fallback = Decimal("0")
+            return fallback if fallback > 0 else Decimal("0")
+
+        def _remaining_buy_quote(state: dict[str, object]) -> Decimal:
+            quote_amount = _processed_decimal(state, "quote_amount")
+            processed_quote = _processed_decimal(state, "processed_quote")
+            remaining = quote_amount - processed_quote
+            return remaining if remaining > 0 else Decimal("0")
+
+        def _record_buy_delta(order: dict, state: dict[str, object]) -> tuple[Decimal, Decimal, Decimal]:
+            nonlocal pending_base_qty, pending_base_quote
+            delta_qty, delta_quote, order_price = _order_delta(order, state)
+            if delta_qty > 0:
+                pending_base_qty += delta_qty
+                pending_base_quote += delta_quote
+                logger.info(
+                    "溢价单部分成交循环买单新增成交：订单#%s 数量=%s 均价=%s，准备挂卖",
+                    state["order_id"],
+                    BinanceClient._format_decimal(delta_qty),
+                    BinanceClient._format_decimal(delta_quote / delta_qty if delta_qty > 0 and delta_quote > 0 else order_price),
+                )
+            return delta_qty, delta_quote, order_price
+
+        def _try_reprice_buy_order(order_key: str, state: dict[str, object], order_price: Decimal) -> bool:
+            if stop_new_entries or self._reprice_threshold_value() <= 0:
+                return False
+            book_ticker = self.c.get_book_ticker(self.spot_symbol)
+            should_reprice, current_ref = self._should_reprice_open_order("BUY", order_price, book_ticker)
+            if not should_reprice:
+                return False
+
+            latest_order = self._cancel_limit_order_with_fill_guard(state["order_id"], "BUY")
+            latest_status = str(latest_order.get("status") or "").upper()
+            _record_buy_delta(latest_order, state)
+            active_buy_orders.pop(order_key, None)
+
+            remaining_quote = _remaining_buy_quote(state)
+            if latest_status == "FILLED" or remaining_quote <= 0:
+                logger.info(
+                    "溢价单部分成交循环买单价格偏离超过 %s，撤单前已全部成交或无剩余金额：旧单#%s 旧价=%s 当前买1=%s",
+                    self._reprice_threshold_log_text(),
+                    state["order_id"],
+                    BinanceClient._format_decimal(order_price),
+                    BinanceClient._format_decimal(current_ref),
+                )
+                return True
+
+            available_quote = self.c.spot_asset_balance_decimal(quote_asset)
+            reprice_amount = min(remaining_quote, available_quote)
+            if reprice_amount <= 0:
+                logger.info(
+                    "溢价单部分成交循环买单价格偏离超过 %s，已撤销旧单#%s，但 %s 可用余额不足，剩余金额=%s %s 暂不重挂",
+                    self._reprice_threshold_log_text(),
+                    state["order_id"],
+                    quote_asset,
+                    BinanceClient._format_decimal(remaining_quote),
+                    quote_asset,
+                )
+                return True
+
+            buy_price = Decimal(str(book_ticker["bidPrice"]))
+            self._emit_progress(progress_cb, step, max(step + 1, 1), f"{mode_name}部分成交 重挂买入 {base_asset}")
+            buy_order = self.c.spot_limit_buy_quote_amount(self.spot_symbol, buy_price, reprice_amount)
+            if not buy_order:
+                logger.info(
+                    "溢价单部分成交循环买单价格偏离超过 %s，旧单#%s 已撤销，剩余金额=%s %s 不满足重挂条件",
+                    self._reprice_threshold_log_text(),
+                    state["order_id"],
+                    BinanceClient._format_decimal(reprice_amount),
+                    quote_asset,
+                )
+                return True
+
+            new_state = _add_active_order(active_buy_orders, buy_order, buy_price, side_text="重挂买")
+            new_price = Decimal(str(new_state["price"]))
+            new_quote_amount = _buy_order_quote_amount(buy_order, new_price, reprice_amount)
+            new_state["quote_amount"] = new_quote_amount
+            logger.info(
+                "溢价单部分成交循环买单价格偏离超过 %s，已撤单重挂：旧单#%s 旧价=%s 当前买1=%s 重挂金额=%s %s 新单#%s 新价=%s",
+                self._reprice_threshold_log_text(),
+                state["order_id"],
+                BinanceClient._format_decimal(order_price),
+                BinanceClient._format_decimal(current_ref),
+                BinanceClient._format_decimal(new_quote_amount),
+                quote_asset,
+                new_state["order_id"],
+                BinanceClient._format_decimal(new_price),
+            )
+            return True
+
         def _place_initial_buy() -> bool:
             nonlocal mode_logged
             available_quote = self.c.spot_asset_balance_decimal(quote_asset)
@@ -869,9 +969,17 @@ class Strategy:
                 logger.info("溢价单部分成交循环现货 %s 可用余额为 0，结束本次运行", quote_asset)
                 return False
             if not mode_logged:
-                logger.info(
-                    "启用溢价单部分成交循环：买单部分成交立即挂卖，卖单部分成交立即挂买；追加挂单和重挂阈值已自动关闭"
-                )
+                reprice_threshold = self._reprice_threshold_value()
+                if reprice_threshold > 0:
+                    logger.info(
+                        "启用溢价单部分成交循环：买单部分成交立即挂卖，卖单部分成交立即挂买；追加挂单已自动关闭，买单重挂阈值=%s %s，卖单不自动重挂",
+                        BinanceClient._format_decimal(reprice_threshold),
+                        quote_asset,
+                    )
+                else:
+                    logger.info(
+                        "启用溢价单部分成交循环：买单部分成交立即挂卖，卖单部分成交立即挂买；追加挂单已自动关闭，买单重挂未启用，卖单不自动重挂"
+                    )
                 mode_logged = True
             book_ticker = self.c.get_book_ticker(self.spot_symbol)
             buy_price = Decimal(str(book_ticker["bidPrice"]))
@@ -880,9 +988,11 @@ class Strategy:
             if not buy_order:
                 return False
             state = _add_active_order(active_buy_orders, buy_order, buy_price, side_text="买")
+            quote_amount = _buy_order_quote_amount(buy_order, Decimal(str(state["price"])), available_quote)
+            state["quote_amount"] = quote_amount
             logger.info(
                 "溢价单部分成交循环挂出买单：金额约=%s %s 价格=%s",
-                BinanceClient._format_decimal(available_quote),
+                BinanceClient._format_decimal(quote_amount if quote_amount > 0 else available_quote),
                 quote_asset,
                 BinanceClient._format_decimal(Decimal(str(state["price"]))),
             )
@@ -959,6 +1069,7 @@ class Strategy:
             locked_quote = order_qty * order_price if order_qty > 0 and order_price > 0 else buy_amount
             if locked_quote <= 0 or locked_quote > buy_amount:
                 locked_quote = buy_amount
+            state["quote_amount"] = locked_quote
             pending_quote = max(Decimal("0"), pending_quote - locked_quote)
             logger.info(
                 "溢价单部分成交循环已将卖单新增成交挂买：金额=%s %s 价格=%s",
@@ -997,18 +1108,11 @@ class Strategy:
                 for order_key, state in list(active_buy_orders.items()):
                     order = self.c.get_order(self.spot_symbol, state["order_id"])
                     status = str(order.get("status") or "").upper()
-                    delta_qty, delta_quote, order_price = _order_delta(order, state)
-                    if delta_qty > 0:
-                        pending_base_qty += delta_qty
-                        pending_base_quote += delta_quote
-                        logger.info(
-                            "溢价单部分成交循环买单新增成交：订单#%s 数量=%s 均价=%s，准备挂卖",
-                            state["order_id"],
-                            BinanceClient._format_decimal(delta_qty),
-                            BinanceClient._format_decimal(delta_quote / delta_qty if delta_qty > 0 and delta_quote > 0 else order_price),
-                        )
+                    _delta_qty, _delta_quote, order_price = _record_buy_delta(order, state)
                     if self._order_terminal_status(status):
                         active_buy_orders.pop(order_key, None)
+                        continue
+                    _try_reprice_buy_order(order_key, state, order_price)
 
                 _try_place_pending_sell()
 
