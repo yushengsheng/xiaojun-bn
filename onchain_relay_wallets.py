@@ -297,10 +297,33 @@ class RelayWalletFileStore:
 
             result_by_key: dict[tuple[str, str], tuple[bool, list[int] | Exception]] = {}
             worker_count = max(1, min(int(worker_threads or 1), len(expired_records)))
+            query_done = 0
+            query_failed = 0
+            progress_interval = max(1, checked // 10)
+
+            def log_query_progress() -> None:
+                if not callable(log):
+                    return
+                if query_done == 1 or query_done >= checked or query_done % progress_interval == 0:
+                    log(
+                        f"中转钱包过期清理进度：余额查询 {query_done}/{checked}，"
+                        f"查询失败 {query_failed}，线程数={worker_count}"
+                    )
+
+            if callable(log):
+                log(
+                    f"中转钱包过期清理开始：发现 {checked} 条超过 {RELAY_RETENTION_HOURS} 小时的记录，"
+                    f"线程数={worker_count}，正在查询余额..."
+                )
             if worker_count == 1:
                 for record in expired_records:
                     record_key = (str(record.batch_id or "").strip(), str(record.relay_address or "").strip())
-                    result_by_key[record_key] = inspect_record(record)
+                    result = inspect_record(record)
+                    result_by_key[record_key] = result
+                    query_done += 1
+                    if not result[0]:
+                        query_failed += 1
+                    log_query_progress()
             else:
                 with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="relay-retention") as executor:
                     future_map = {
@@ -311,7 +334,12 @@ class RelayWalletFileStore:
                         for record in expired_records
                     }
                     for future in as_completed(future_map):
-                        result_by_key[future_map[future]] = future.result()
+                        result = future.result()
+                        result_by_key[future_map[future]] = result
+                        query_done += 1
+                        if not result[0]:
+                            query_failed += 1
+                        log_query_progress()
 
             for record in expired_records:
                 record_key = (str(record.batch_id or "").strip(), str(record.relay_address or "").strip())
