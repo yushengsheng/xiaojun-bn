@@ -10,6 +10,7 @@ HIDDEN_IMPORTS = (
     "app_defaults",
     "exchange_binance_client",
     "app_paths",
+    "app_lock",
     "app_version",
     "core_models",
     "shared_utils",

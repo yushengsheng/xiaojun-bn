@@ -20,7 +20,7 @@ try:
 except Exception:
     CRYPTO_AES = None
 
-from app_paths import SECRET_KEY_FILE
+from app_paths import APP_LOCK_FILE, SECRET_KEY_FILE
 
 
 def _atomic_write_secret_text(path: Path, content: str, encoding: str = "utf-8") -> None:
@@ -61,7 +61,9 @@ class SecretBox:
 
     PREFIX_V1 = "enc::v1::"
     PREFIX_V2 = "enc::v2::"
+    LOCKED_MARKER = "locked::v1"
     ENV_KEY = "WITHDRAW_SECRET_KEY"
+    TEST_BYPASS_ENV = "XIAOJUN_APP_LOCK_BYPASS"
     KEY_FILE = SECRET_KEY_FILE
 
     def __init__(self, key_file: Path | None = None):
@@ -111,11 +113,16 @@ class SecretBox:
 
     def _load_or_create_key(self) -> bytes:
         env_key = os.environ.get(self.ENV_KEY, "").strip()
-        if env_key:
+        if env_key and not APP_LOCK_FILE.exists():
             return self._decode_key(env_key)
 
         if self.key_file.exists():
-            return self._decode_key(self.key_file.read_text(encoding="utf-8").strip())
+            raw_key_text = self.key_file.read_text(encoding="utf-8").strip()
+            if raw_key_text.startswith(self.LOCKED_MARKER):
+                if str(os.environ.get(self.TEST_BYPASS_ENV, "") or "").strip() == "1":
+                    return os.urandom(32)
+                raise RuntimeError("程序密码未解锁，无法读取本地敏感配置")
+            return self._decode_key(raw_key_text)
 
         self.key_file.parent.mkdir(parents=True, exist_ok=True)
         key = os.urandom(32)
@@ -131,6 +138,31 @@ class SecretBox:
             if self._key_cache is None:
                 self._key_cache = self._load_or_create_key()
             return self._key_cache
+
+    def has_cached_key(self) -> bool:
+        with self._lock:
+            return self._key_cache is not None
+
+    def set_unlocked_key(self, key: bytes) -> None:
+        raw = bytes(key or b"")
+        if len(raw) != 32:
+            raise RuntimeError("解锁密钥长度无效")
+        with self._lock:
+            self._key_cache = raw
+
+    def clear_cached_key(self) -> None:
+        with self._lock:
+            self._key_cache = None
+
+    def export_raw_key(self) -> bytes:
+        return self._key()
+
+    def write_locked_marker(self) -> None:
+        _atomic_write_secret_text(self.key_file, self.LOCKED_MARKER, encoding="utf-8")
+        try:
+            os.chmod(self.key_file, 0o600)
+        except Exception:
+            pass
 
     @staticmethod
     def modern_encryption_available() -> bool:

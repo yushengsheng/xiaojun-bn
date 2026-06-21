@@ -3,12 +3,16 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from core_models import EvmToken
+import onchain_relay_wallets as relay_wallets_module
 from onchain_relay_wallets import RelayWalletFileStore, RelayWalletRecord
+from secret_box import SecretBox
 
 
 class _FakeCleanupClient:
@@ -43,6 +47,52 @@ def _expired_record(index: int) -> RelayWalletRecord:
 
 
 class RelayWalletCleanupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._secret_tmpdir = tempfile.TemporaryDirectory(prefix="xiaojun-relay-secret-test-")
+        self._secret_box_patch = patch.object(
+            relay_wallets_module,
+            "SECRET_BOX",
+            SecretBox(Path(self._secret_tmpdir.name) / ".secret.key"),
+        )
+        self._secret_box_patch.start()
+
+    def tearDown(self) -> None:
+        self._secret_box_patch.stop()
+        self._secret_tmpdir.cleanup()
+
+    def test_relay_wallet_file_encrypts_private_key_at_rest(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-relay-wallet-secret-test-") as tmpdir:
+            store = RelayWalletFileStore(Path(tmpdir) / "relay.txt")
+            private_key = "1" * 64
+            record = _expired_record(1)
+            record.private_key = private_key
+
+            store.append_records([record])
+
+            raw_text = store.file_path.read_text(encoding="utf-8")
+            self.assertNotIn(private_key, raw_text)
+            self.assertIn("enc::", raw_text)
+            loaded = store.load_records()
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].private_key, private_key)
+
+    def test_relay_wallet_file_rewrites_legacy_plain_private_key(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-relay-wallet-secret-test-") as tmpdir:
+            path = Path(tmpdir) / "relay.txt"
+            private_key = "2" * 64
+            record = _expired_record(2)
+            record.private_key = private_key
+            path.write_text(json.dumps(record.__dict__, ensure_ascii=False) + "\n", encoding="utf-8")
+            store = RelayWalletFileStore(path)
+
+            rewritten = store.rewrite_encrypted()
+
+            self.assertEqual(rewritten, 1)
+            raw_text = path.read_text(encoding="utf-8")
+            self.assertNotIn(private_key, raw_text)
+            self.assertIn("enc::", raw_text)
+            self.assertEqual(store.load_records()[0].private_key, private_key)
+
     def test_cleanup_logs_balance_query_progress(self) -> None:
         with tempfile.TemporaryDirectory(prefix="xiaojun-relay-cleanup-test-") as tmpdir:
             store = RelayWalletFileStore(Path(tmpdir) / "relay.txt")

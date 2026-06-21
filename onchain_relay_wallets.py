@@ -15,6 +15,7 @@ from pathlib import Path
 
 from app_paths import RELAY_WALLET_FILE
 from core_models import EvmToken, GeneratedWalletEntry
+from secret_box import SECRET_BOX
 
 RELAY_RETENTION_HOURS = 72
 RELAY_TRACKED_BALANCE_SYMBOLS = {"USDT", "USDC"}
@@ -172,13 +173,19 @@ class RelayWalletFileStore:
             if not isinstance(raw, dict):
                 raise RuntimeError(f"中转钱包.txt 第 {line_no} 行格式无效")
             record = RelayWalletRecord.from_raw(raw)
+            record.private_key = SECRET_BOX.decrypt(record.private_key).strip()
             if not record.relay_address or not record.private_key:
                 raise RuntimeError(f"中转钱包.txt 第 {line_no} 行缺少中转钱包地址或私钥")
             records.append(record)
         return records
 
     def _save_records_locked(self, records: list[RelayWalletRecord]) -> None:
-        lines = [json.dumps(asdict(record), ensure_ascii=False, separators=(",", ":")) for record in records]
+        lines: list[str] = []
+        for record in records:
+            payload = asdict(record)
+            private_key = str(payload.get("private_key") or "").strip()
+            payload["private_key"] = SECRET_BOX.encrypt(private_key) if private_key else ""
+            lines.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         content = "\n".join(lines)
         if content:
             content += "\n"
@@ -187,6 +194,12 @@ class RelayWalletFileStore:
     def load_records(self) -> list[RelayWalletRecord]:
         with self._lock:
             return self._load_records_locked()
+
+    def rewrite_encrypted(self) -> int:
+        with self._lock:
+            records = self._load_records_locked()
+            self._save_records_locked(records)
+            return len(records)
 
     def append_records(self, records: list[RelayWalletRecord]) -> None:
         if not records:

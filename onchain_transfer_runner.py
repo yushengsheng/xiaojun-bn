@@ -954,4 +954,5 @@ class OnchainTransferRunnerMixin(object):
                 lambda s=success if "success" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("transfer", s, f),
             )
         finally:
+            self._clear_source_private_key_cache()
             self.is_running = False

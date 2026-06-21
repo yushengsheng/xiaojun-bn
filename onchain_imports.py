@@ -58,6 +58,10 @@ class OnchainImportMixin(object):
             messagebox.showwarning("提示", "请先右键选中一条数据")
             return
         source, _target = fields
+        if self._is_mode_1m() and source:
+            if not messagebox.askyesno("复制确认", "即将复制1对多转出钱包凭据到剪贴板。确认继续？"):
+                self.log("用户取消复制1对多转出钱包凭据")
+                return
         self._copy_current_row_text(source, "转出私钥", log_label="转出钱包凭据")
     def _parse_m2m_lines(self, lines: list[str]) -> list[OnchainPairEntry]:
         result: list[OnchainPairEntry] = []
@@ -403,6 +407,8 @@ class OnchainImportMixin(object):
         normalized_mode_relay_config = self._normalize_mode_relay_config(mode, current_mode_relay_config)
         existing_mode_amounts = getattr(getattr(self.store, "settings", None), "mode_amounts", {}) or {}
         existing_mode_relay_configs = getattr(getattr(self.store, "settings", None), "mode_relay_configs", {}) or {}
+        one_to_many_source_ephemeral = bool(self.one_to_many_source_ephemeral_var.get())
+        one_to_many_source = "" if one_to_many_source_ephemeral else self.source_credential_var.get().strip()
         self.store.settings = OnchainSettings(
             mode=mode,
             network=network,
@@ -423,7 +429,8 @@ class OnchainImportMixin(object):
             dry_run=bool(self.dry_run_var.get()),
             use_config_proxy=bool(self.use_config_proxy_var.get()),
             proxy_url=proxy_text,
-            one_to_many_source=self.source_credential_var.get().strip(),
+            one_to_many_source=one_to_many_source,
+            one_to_many_source_ephemeral=one_to_many_source_ephemeral,
             many_to_one_target="",
             relay_enabled=bool(normalized_mode_relay_config.get("relay_enabled")) if mode in self.MODE_RELAY_STORAGE_KEYS else False,
             relay_fee_reserve=normalized_mode_relay_config["relay_fee_reserve"] if mode in self.MODE_RELAY_STORAGE_KEYS else str(getattr(getattr(self.store, "settings", None), "relay_fee_reserve", "") or "").strip(),
@@ -451,6 +458,8 @@ class OnchainImportMixin(object):
         try:
             self.store.save_settings_only()
             self.log("链上批量转账配置已保存")
+            if bool(self.one_to_many_source_ephemeral_var.get()) and self.source_credential_var.get().strip():
+                self.log("1对多转出钱包已设置为仅本次使用，未保存到配置文件")
             messagebox.showinfo("成功", f"批量转账配置已保存到：{ONCHAIN_DATA_FILE}")
         except Exception as exc:
             messagebox.showerror("保存失败", str(exc))
@@ -489,6 +498,7 @@ class OnchainImportMixin(object):
             self.dry_run_var.set(st.dry_run)
             self.use_config_proxy_var.set(bool(st.use_config_proxy))
             self.onchain_proxy_var.set(st.proxy_url or "")
+            self.one_to_many_source_ephemeral_var.set(bool(getattr(st, "one_to_many_source_ephemeral", False)))
             self.source_credential_var.set(st.one_to_many_source or "")
             loaded_target = st.many_to_one_target or ""
             try:

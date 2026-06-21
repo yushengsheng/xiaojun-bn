@@ -21,15 +21,17 @@ from pathlib import Path
 
 import requests
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from api_clients import EvmClient
 from app_defaults import EXCHANGE_USDT_TIMEOUT_SECONDS_DEFAULT
+from app_lock import APP_LOCK, APP_LOCK_MIN_PASSWORD_LENGTH
 from app_version import get_app_window_title
 from app_paths import (
     CONFIG_BACKUP_SUFFIX,
     DATA_FILE,
     EXCHANGE_PROXY_CONFIG_FILE,
+    RELAY_WALLET_FILE,
     STRATEGY_CONFIG_FILE,
     TOTAL_ASSET_RESULT_FILE,
     WITHDRAW_SUCCESS_FILE,
@@ -158,6 +160,14 @@ class ExchangeAppBase(tk.Tk):
         super().__init__()
         self.title(get_app_window_title())
         self.geometry("1320x920")
+        self.withdraw()
+        self.app_lock = APP_LOCK
+        self._app_locked = False
+        if not self._ensure_app_unlocked_before_load():
+            self.destroy()
+            raise SystemExit(0)
+        self._migrate_sensitive_files_after_unlock()
+        self.deiconify()
 
         self.client = None
         self.worker_thread = None
@@ -197,6 +207,123 @@ class ExchangeAppBase(tk.Tk):
         self._load_accounts()
         self._log_poll_after_token = self.after(100, self._poll_log_queue)
         self.update_ip()
+    def _prompt_app_password(self, title: str, prompt: str) -> str | None:
+        return simpledialog.askstring(title, prompt, show="*", parent=self)
+    def _prompt_new_app_password(self, *, title: str = "设置程序密码") -> str | None:
+        while True:
+            password = self._prompt_app_password(title, f"请输入程序密码（至少 {APP_LOCK_MIN_PASSWORD_LENGTH} 位）")
+            if password is None:
+                return None
+            confirm = self._prompt_app_password(title, "请再次输入程序密码")
+            if confirm is None:
+                return None
+            if password != confirm:
+                messagebox.showerror("密码不一致", "两次输入的程序密码不一致，请重新输入。", parent=self)
+                continue
+            try:
+                self.app_lock.validate_new_password(password)
+            except Exception as exc:
+                messagebox.showerror("密码无效", str(exc), parent=self)
+                continue
+            return password
+    def _prompt_unlock_app(self, *, allow_exit: bool) -> bool:
+        env_password = self.app_lock.env_password()
+        if env_password:
+            try:
+                self.app_lock.unlock(env_password)
+                return True
+            except Exception:
+                pass
+        while True:
+            password = self._prompt_app_password("程序解锁", "请输入程序密码")
+            if password is None:
+                return False
+            try:
+                self.app_lock.unlock(password)
+                return True
+            except Exception as exc:
+                messagebox.showerror("解锁失败", str(exc), parent=self)
+    def _ensure_app_unlocked_before_load(self) -> bool:
+        if self.app_lock.bypass_enabled():
+            return True
+        env_password = self.app_lock.env_password()
+        if self.app_lock.is_configured():
+            return self._prompt_unlock_app(allow_exit=True)
+        if env_password:
+            try:
+                self.app_lock.setup_password(env_password)
+                return True
+            except Exception as exc:
+                messagebox.showerror("程序密码设置失败", str(exc), parent=self)
+                return False
+        messagebox.showinfo(
+            "设置程序密码",
+            "首次启用新版安全保护，需要先设置程序密码。\n\n"
+            "设置后，本地敏感配置文件必须输入该密码才能解密。",
+            parent=self,
+        )
+        password = self._prompt_new_app_password(title="设置程序密码")
+        if password is None:
+            return False
+        try:
+            self.app_lock.setup_password(password)
+            return True
+        except Exception as exc:
+            messagebox.showerror("程序密码设置失败", str(exc), parent=self)
+            return False
+    def _migrate_sensitive_files_after_unlock(self) -> None:
+        if self.app_lock.bypass_enabled():
+            return
+        try:
+            if not RELAY_WALLET_FILE.exists():
+                return
+            from onchain_relay_wallets import RelayWalletFileStore
+
+            count = RelayWalletFileStore(RELAY_WALLET_FILE).rewrite_encrypted()
+            if count:
+                logger.info("已加密迁移中转钱包文件：%s，记录=%d", RELAY_WALLET_FILE, count)
+        except Exception as exc:
+            logger.error("中转钱包文件加密迁移失败: %s", exc)
+    def change_app_password(self):
+        if self._batch_task_active or (self.worker_thread and self.worker_thread.is_alive()):
+            messagebox.showwarning("提示", "请先停止当前交易所任务后再修改程序密码")
+            return
+        page = getattr(self, "onchain_page", None)
+        if page is not None and bool(getattr(page, "is_running", False)):
+            messagebox.showwarning("提示", "请先停止当前链上任务后再修改程序密码")
+            return
+        old_password = self._prompt_app_password("修改程序密码", "请输入当前程序密码")
+        if old_password is None:
+            return
+        new_password = self._prompt_new_app_password(title="修改程序密码")
+        if new_password is None:
+            return
+        try:
+            self.app_lock.change_password(old_password, new_password)
+            messagebox.showinfo("成功", "程序密码已修改")
+        except Exception as exc:
+            messagebox.showerror("修改失败", str(exc))
+    def lock_app(self):
+        if self._batch_task_active or (self.worker_thread and self.worker_thread.is_alive()):
+            messagebox.showwarning("提示", "请先停止当前交易所任务后再锁定程序")
+            return
+        page = getattr(self, "onchain_page", None)
+        if page is not None and bool(getattr(page, "is_running", False)):
+            messagebox.showwarning("提示", "请先停止当前链上任务后再锁定程序")
+            return
+        self._cancel_after_token("_accounts_save_after_token")
+        self._save_accounts_silently()
+        self._app_locked = True
+        self.app_lock.lock()
+        self.withdraw()
+        unlocked = self._prompt_unlock_app(allow_exit=True)
+        if unlocked:
+            self._app_locked = False
+            self.deiconify()
+            self.lift()
+            return
+        self._closing = True
+        self._finalize_close()
     def _build_ui(self):
         self.api_key_var = tk.StringVar(value=API_KEY_DEFAULT)
         self.api_secret_var = tk.StringVar(value=API_SECRET_DEFAULT)
@@ -287,6 +414,10 @@ class ExchangeAppBase(tk.Tk):
         ttk.Label(proxy_bar, text="出口 IP:").grid(row=0, column=7, sticky="e")
         self.lbl_top_proxy_exit_ip = ttk.Label(proxy_bar, textvariable=self.exchange_proxy_exit_ip_var)
         self.lbl_top_proxy_exit_ip.grid(row=0, column=8, sticky="w", padx=(4, 0))
+        self.btn_change_app_password = ttk.Button(proxy_bar, text="修改密码", command=self.change_app_password)
+        self.btn_change_app_password.grid(row=0, column=9, sticky="w", padx=(12, 4))
+        self.btn_lock_app = ttk.Button(proxy_bar, text="锁定", command=self.lock_app)
+        self.btn_lock_app.grid(row=0, column=10, sticky="w")
 
         self.main_content = ttk.Frame(self)
         self.main_content.pack(fill="both", expand=True, padx=8, pady=(4, 8))
@@ -1155,6 +1286,9 @@ class ExchangeAppBase(tk.Tk):
         if self._closing:
             return
         self._closing = True
+        if bool(getattr(self, "_app_locked", False)):
+            self._finalize_close()
+            return
         self._close_deadline_monotonic = time.monotonic() + 2.5
         logger.info("收到窗口关闭请求，开始优雅停止后台任务")
         self._cancel_after_token("_accounts_save_after_token")

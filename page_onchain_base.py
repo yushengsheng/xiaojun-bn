@@ -193,6 +193,8 @@ class OnchainTransferPageBase:
         self.onchain_proxy_status_var = StringVar(value="未启用")
         self.onchain_proxy_exit_ip_var = StringVar(value="--")
         self.source_credential_var = StringVar(value="")
+        self.one_to_many_source_ephemeral_var = BooleanVar(value=False)
+        self._source_credential_visible = False
         self.target_address_var = StringVar(value="")
         self.relay_enabled_var = BooleanVar(value=False)
         self.relay_fee_reserve_var = StringVar(value="")
@@ -298,7 +300,13 @@ class OnchainTransferPageBase:
         self.ent_confirm_timeout = ttk.Entry(setting, textvariable=self.confirm_timeout_var, width=7)
 
         self.lbl_source_credential = ttk.Label(setting, text="转出钱包私钥/助记词*")
-        self.ent_source_credential = ttk.Entry(setting, textvariable=self.source_credential_var, width=34)
+        self.ent_source_credential = ttk.Entry(setting, textvariable=self.source_credential_var, width=34, show="*")
+        self.btn_toggle_source_credential = ttk.Button(setting, text="显示", command=self.toggle_source_credential_visibility)
+        self.chk_one_to_many_source_ephemeral = ttk.Checkbutton(
+            setting,
+            text="不保存，仅本次使用",
+            variable=self.one_to_many_source_ephemeral_var,
+        )
         self.btn_query_source_balance = ttk.Button(setting, text="查询", command=self.query_current_source_balance)
         self.lbl_source_balance_title = ttk.Label(setting, text="转出钱包余额")
         self.lbl_source_balance_val = ttk.Label(setting, textvariable=self.source_balance_var, style="Value.TLabel")
@@ -477,6 +485,7 @@ class OnchainTransferPageBase:
         self.use_config_proxy_var.trace_add("write", self._on_proxy_config_changed)
         self.onchain_proxy_var.trace_add("write", self._on_proxy_config_changed)
         self.source_credential_var.trace_add("write", self._on_source_or_target_changed)
+        self.one_to_many_source_ephemeral_var.trace_add("write", self._on_one_to_many_source_security_changed)
         self.target_address_var.trace_add("write", self._on_source_or_target_changed)
         self.relay_enabled_var.trace_add("write", self._on_relay_settings_changed)
 
@@ -783,6 +792,30 @@ class OnchainTransferPageBase:
             self.lbl_relay_fee_reserve.configure(text=self._relay_fee_reserve_label_text())
         except Exception:
             pass
+    def _refresh_source_credential_security_controls(self) -> None:
+        try:
+            self.ent_source_credential.configure(show="" if self._source_credential_visible else "*")
+        except Exception:
+            pass
+        try:
+            self.btn_toggle_source_credential.configure(text="隐藏" if self._source_credential_visible else "显示")
+        except Exception:
+            pass
+    def toggle_source_credential_visibility(self) -> None:
+        self._source_credential_visible = not bool(self._source_credential_visible)
+        self._refresh_source_credential_security_controls()
+    def _on_one_to_many_source_security_changed(self, *_args) -> None:
+        if bool(self.one_to_many_source_ephemeral_var.get()):
+            self._clear_source_private_key_cache()
+    def _clear_source_private_key_cache(self) -> None:
+        try:
+            with self.wallet_cache_lock:
+                self.source_private_key_cache.clear()
+        except Exception:
+            try:
+                self.source_private_key_cache.clear()
+            except Exception:
+                pass
     @staticmethod
     def _mask(value: str, head: int = 6, tail: int = 4) -> str:
         return mask_text(value, head=head, tail=tail)
@@ -1029,6 +1062,9 @@ class OnchainTransferPageBase:
     def _display_credential(credential: str) -> str:
         s = credential.strip()
         return s if s else "-"
+    def _display_one_to_many_source_credential(self, credential: str) -> str:
+        s = credential.strip()
+        return self._mask_credential(s) if s else "-"
     @staticmethod
     def _status_text(status: str) -> str:
         if status == "waiting":
@@ -1602,7 +1638,7 @@ class OnchainTransferPageBase:
             values = (
                 checked,
                 idx + 1,
-                self._display_credential(source),
+                self._display_one_to_many_source_credential(source),
                 target,
                 self._status_text_for_row(row_key, status),
                 self._recovery_status_text_for_row(row_key, recovery_status),
@@ -1746,6 +1782,7 @@ class OnchainTransferPageBase:
             self._close_wallet_generator()
         except Exception:
             pass
+        self._clear_source_private_key_cache()
         self._shutdown_confirmation_executor()
         self._join_managed_threads(timeout_total=1.0)
         try:
@@ -2004,7 +2041,7 @@ class OnchainTransferPageBase:
                     values=(
                         checked,
                         i,
-                        self._display_credential(source),
+                        self._display_one_to_many_source_credential(source),
                         target,
                         self._status_text_for_row(key, st),
                         self._recovery_status_text_for_row(key, self._display_recovery_status(key)),
@@ -2158,6 +2195,7 @@ class OnchainTransferPageBase:
         if layout_mode not in {"wide", "medium", "narrow"}:
             layout_mode = "wide"
         self._layout_mode = layout_mode
+        self._refresh_source_credential_security_controls()
         if layout_mode == "wide":
             self.mode_box.configure(width=8)
             self.network_box.configure(width=6)
@@ -2205,6 +2243,8 @@ class OnchainTransferPageBase:
             self.ent_confirm_timeout,
             self.lbl_source_credential,
             self.ent_source_credential,
+            self.btn_toggle_source_credential,
+            self.chk_one_to_many_source_ephemeral,
             self.btn_query_source_balance,
             self.lbl_source_balance_title,
             self.lbl_source_balance_val,
@@ -2263,9 +2303,11 @@ class OnchainTransferPageBase:
             if show_source:
                 self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
                 self.ent_source_credential.grid(row=row, column=1, columnspan=4, sticky="ew", padx=(4, 8), pady=(8, 0))
-                self.btn_query_source_balance.grid(row=row, column=5, sticky=W, padx=(0, 8), pady=(8, 0))
-                self.lbl_source_balance_title.grid(row=row, column=6, sticky=W, pady=(8, 0))
-                self.lbl_source_balance_val.grid(row=row, column=7, columnspan=3, sticky=W, padx=(4, 0), pady=(8, 0))
+                self.btn_toggle_source_credential.grid(row=row, column=5, sticky=W, padx=(0, 6), pady=(8, 0))
+                self.btn_query_source_balance.grid(row=row, column=6, sticky=W, padx=(0, 8), pady=(8, 0))
+                self.chk_one_to_many_source_ephemeral.grid(row=row, column=7, sticky=W, padx=(0, 8), pady=(8, 0))
+                self.lbl_source_balance_title.grid(row=row, column=8, sticky=W, pady=(8, 0))
+                self.lbl_source_balance_val.grid(row=row, column=9, columnspan=3, sticky=W, padx=(4, 0), pady=(8, 0))
                 row += 1
 
             if show_relay:
@@ -2316,9 +2358,11 @@ class OnchainTransferPageBase:
             if show_source:
                 self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
                 self.ent_source_credential.grid(row=row, column=1, columnspan=3, sticky="ew", padx=(4, 8), pady=(8, 0))
-                self.btn_query_source_balance.grid(row=row, column=4, sticky=W, padx=(0, 8), pady=(8, 0))
-                self.lbl_source_balance_title.grid(row=row, column=5, sticky=W, pady=(8, 0))
-                self.lbl_source_balance_val.grid(row=row, column=6, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
+                self.btn_toggle_source_credential.grid(row=row, column=4, sticky=W, padx=(0, 6), pady=(8, 0))
+                self.btn_query_source_balance.grid(row=row, column=5, sticky=W, padx=(0, 8), pady=(8, 0))
+                self.chk_one_to_many_source_ephemeral.grid(row=row, column=6, sticky=W, padx=(0, 8), pady=(8, 0))
+                self.lbl_source_balance_title.grid(row=row, column=7, sticky=W, pady=(8, 0))
+                self.lbl_source_balance_val.grid(row=row, column=8, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
                 row += 1
 
             if show_relay:
@@ -2387,9 +2431,12 @@ class OnchainTransferPageBase:
         if show_source:
             self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
             self.ent_source_credential.grid(row=row, column=1, sticky="ew", padx=(4, 6), pady=(8, 0))
-            self.btn_query_source_balance.grid(row=row, column=2, sticky=W, padx=(0, 6), pady=(8, 0))
-            self.lbl_source_balance_title.grid(row=row, column=3, sticky=W, pady=(8, 0))
-            self.lbl_source_balance_val.grid(row=row, column=4, sticky=W, padx=(4, 0), pady=(8, 0))
+            self.btn_toggle_source_credential.grid(row=row, column=2, sticky=W, padx=(0, 6), pady=(8, 0))
+            self.btn_query_source_balance.grid(row=row, column=3, sticky=W, padx=(0, 6), pady=(8, 0))
+            row += 1
+            self.chk_one_to_many_source_ephemeral.grid(row=row, column=1, sticky=W, padx=(4, 6), pady=(4, 0))
+            self.lbl_source_balance_title.grid(row=row, column=2, sticky=W, pady=(4, 0))
+            self.lbl_source_balance_val.grid(row=row, column=3, columnspan=2, sticky=W, padx=(4, 0), pady=(4, 0))
             row += 1
 
         if show_relay:
@@ -2551,6 +2598,7 @@ class OnchainTransferPageBase:
         self._refresh_onchain_proxy_summary()
     def _on_source_or_target_changed(self, *_args):
         if self._is_mode_1m():
+            self._clear_source_private_key_cache()
             source = self.source_credential_var.get().strip()
             bal = self._balance_text_for_source(source) if source else "-"
             self.source_balance_var.set(bal)

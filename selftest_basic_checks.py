@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import queue
+import tempfile
+from pathlib import Path
 
 from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_logging import (
@@ -12,7 +14,7 @@ from exchange_logging import (
     logger,
     set_exchange_account_log_index,
 )
-from secret_box import SECRET_BOX
+from secret_box import SecretBox
 from sensitive_data import mask_api_key, redact_sensitive_text
 from shared_utils import log_amount_value_spans
 
@@ -27,19 +29,21 @@ def drain_exchange_log_queue() -> list[str]:
 
 
 def _run_secret_box_selftest_checks(checks: list[str]) -> None:
-    secret_backend = SECRET_BOX.modern_encryption_backend_name()
-    if secret_backend == "missing":
-        raise RuntimeError("安全存储新版密文后端不可用：缺少 cryptography / pycryptodome")
-    probe_text = "selftest-secret-box"
-    v2_cipher = SECRET_BOX.encrypt(probe_text)
-    if not str(v2_cipher).startswith(SECRET_BOX.PREFIX_V2):
-        raise RuntimeError("安全存储自检失败：未生成新版密文")
-    if SECRET_BOX.decrypt(v2_cipher) != probe_text:
-        raise RuntimeError("安全存储自检失败：新版密文回读不一致")
-    v1_cipher = SECRET_BOX._encrypt_v1(probe_text)
-    if SECRET_BOX.decrypt(v1_cipher) != probe_text:
-        raise RuntimeError("安全存储自检失败：旧版密文兼容回读失败")
-    checks.append(f"secret-box={secret_backend}")
+    with tempfile.TemporaryDirectory(prefix="xiaojun-secret-box-selftest-") as tmpdir:
+        secret_box = SecretBox(Path(tmpdir) / ".secret.key")
+        secret_backend = secret_box.modern_encryption_backend_name()
+        if secret_backend == "missing":
+            raise RuntimeError("安全存储新版密文后端不可用：缺少 cryptography / pycryptodome")
+        probe_text = "selftest-secret-box"
+        v2_cipher = secret_box.encrypt(probe_text)
+        if not str(v2_cipher).startswith(secret_box.PREFIX_V2):
+            raise RuntimeError("安全存储自检失败：未生成新版密文")
+        if secret_box.decrypt(v2_cipher) != probe_text:
+            raise RuntimeError("安全存储自检失败：新版密文回读不一致")
+        v1_cipher = secret_box._encrypt_v1(probe_text)
+        if secret_box.decrypt(v1_cipher) != probe_text:
+            raise RuntimeError("安全存储自检失败：旧版密文兼容回读失败")
+        checks.append(f"secret-box={secret_backend}")
 
 
 def _run_sensitive_redaction_selftest_checks(checks: list[str]) -> None:

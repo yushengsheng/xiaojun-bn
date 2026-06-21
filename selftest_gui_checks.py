@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -48,6 +49,18 @@ def pump_tk_events(app, *, timeout: float = 20.0, predicate=None) -> None:
 
 
 def run_gui_selftest_checks(checks: list[str]) -> None:
+    previous_lock_bypass = os.environ.get("XIAOJUN_APP_LOCK_BYPASS")
+    os.environ["XIAOJUN_APP_LOCK_BYPASS"] = "1"
+    try:
+        _run_gui_selftest_checks_unlocked(checks)
+    finally:
+        if previous_lock_bypass is None:
+            os.environ.pop("XIAOJUN_APP_LOCK_BYPASS", None)
+        else:
+            os.environ["XIAOJUN_APP_LOCK_BYPASS"] = previous_lock_bypass
+
+
+def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
     from tkinter import messagebox
 
     import exchange_app_base
@@ -66,11 +79,13 @@ def run_gui_selftest_checks(checks: list[str]) -> None:
 
     with tempfile.TemporaryDirectory(prefix="xiaojun-selftest-gui-") as tmpdir:
         tmp_root = Path(tmpdir)
+        accounts_path = tmp_root / "accounts.json"
         strategy_path = tmp_root / "exchange_strategy_settings.json"
         proxy_path = tmp_root / "exchange_proxy_settings.json"
         onchain_path = tmp_root / "onchain.json"
         patches = [
             (exchange_app_base.ExchangeAppBase, "update_ip", lambda self, schedule_next=True: None),
+            (exchange_app_base, "DATA_FILE", accounts_path),
             (exchange_app_base, "STRATEGY_CONFIG_FILE", strategy_path),
             (exchange_app_base, "EXCHANGE_PROXY_CONFIG_FILE", proxy_path),
             (exchange_app_config, "STRATEGY_CONFIG_FILE", strategy_path),

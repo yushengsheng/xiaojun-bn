@@ -2615,6 +2615,7 @@ def run_relay_fee_recovery(
         if use_progress:
             dispatch_ui(lambda: owner._finish_progress("recovery", 0, 1))
     finally:
+        owner._clear_source_private_key_cache()
         if manage_running_state:
             owner.is_running = False
 
@@ -3352,4 +3353,5 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
             lambda s=success if "success" in locals() else 0, f=failed if "failed" in locals() else 0: owner._finish_progress("transfer", s, f),
         )
     finally:
+        owner._clear_source_private_key_cache()
         owner.is_running = False

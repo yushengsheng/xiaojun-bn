@@ -267,7 +267,8 @@ class OnchainStore:
 
     def _build_settings_payload(self) -> dict:
         settings_payload = asdict(self.settings)
-        settings_payload["one_to_many_source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
+        one_to_many_source = "" if self.settings.one_to_many_source_ephemeral else self.settings.one_to_many_source
+        settings_payload["one_to_many_source"] = SECRET_BOX.encrypt(one_to_many_source)
         settings_payload["proxy_url"] = SECRET_BOX.encrypt(self.settings.proxy_url)
         return settings_payload
 
@@ -383,9 +384,12 @@ class OnchainStore:
         self.multi_to_multi_drafts = drafts
         self.one_to_many_addresses = one_many_list
         self.many_to_one_sources = many_one_list
-        source_raw = one_many_raw.get("source", "")
-        if not source_raw:
-            source_raw = settings_raw.get("one_to_many_source", "")
+        one_to_many_source_ephemeral = bool(settings_raw.get("one_to_many_source_ephemeral", False))
+        source_raw = ""
+        if not one_to_many_source_ephemeral:
+            source_raw = one_many_raw.get("source", "")
+            if not source_raw:
+                source_raw = settings_raw.get("one_to_many_source", "")
         target_raw = many_one_raw.get("target", "")
         if not target_raw:
             target_raw = settings_raw.get("many_to_one_target", "")
@@ -418,6 +422,7 @@ class OnchainStore:
             use_config_proxy=bool(settings_raw.get("use_config_proxy", False)),
             proxy_url=SECRET_BOX.decrypt(str(settings_raw.get("proxy_url", "") or "").strip()).strip(),
             one_to_many_source=SECRET_BOX.decrypt(str(source_raw or "").strip()).strip(),
+            one_to_many_source_ephemeral=one_to_many_source_ephemeral,
             many_to_one_target=str(target_raw or "").strip(),
             relay_enabled=bool(settings_raw.get("relay_enabled", False)),
             relay_fee_reserve=str(settings_raw.get("relay_fee_reserve", "") or "").strip(),
@@ -436,7 +441,10 @@ class OnchainStore:
             "settings": self._build_settings_payload(),
         }
         payload.update(self._build_transfer_rows_payload())
-        payload["one_to_many"]["source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
+        if self.settings.one_to_many_source_ephemeral:
+            payload["one_to_many"].pop("source", None)
+        else:
+            payload["one_to_many"]["source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
         payload["many_to_one"]["target"] = self.settings.many_to_one_target
         _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
 
@@ -450,7 +458,11 @@ class OnchainStore:
 
         payload["settings"] = self._build_settings_payload()
         payload.setdefault("multi_to_multi", [])
-        payload.setdefault("one_to_many", {})
+        payload["one_to_many"] = dict(payload.get("one_to_many") or {})
+        if self.settings.one_to_many_source_ephemeral:
+            payload["one_to_many"].pop("source", None)
+        else:
+            payload["one_to_many"]["source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
         payload.setdefault("many_to_one", {})
         _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
 

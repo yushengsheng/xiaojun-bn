@@ -14,6 +14,7 @@ from pathlib import Path
 
 SENSITIVE_EXACT_NAMES = {
     ".secret.key",
+    "app_lock.json",
     "bot_log.txt",
     "total_asset_result.txt",
     "withdraw_success.txt",

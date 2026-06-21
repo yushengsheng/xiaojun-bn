@@ -94,6 +94,7 @@ class OnchainSettings:
     use_config_proxy: bool = False
     proxy_url: str = ""
     one_to_many_source: str = ""
+    one_to_many_source_ephemeral: bool = False
     many_to_one_target: str = ""
     relay_enabled: bool = False
     relay_fee_reserve: str = ""

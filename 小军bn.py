@@ -19,6 +19,7 @@ if __name__ == '__main__':
     selftest_online = '--selftest-online' in sys.argv or os.environ.get('XIAOJUN_SELFTEST_ONLINE', '').strip() == '1'
     selftest_gui = '--selftest-gui' in sys.argv or os.environ.get('XIAOJUN_SELFTEST_GUI', '').strip() == '1'
     if '--selftest' in sys.argv or '--selftest-online' in sys.argv or '--selftest-gui' in sys.argv:
+        os.environ.setdefault('XIAOJUN_APP_LOCK_BYPASS', '1')
         raise SystemExit(run_selftest(include_online_checks=selftest_online, include_gui_checks=selftest_gui))
 
     app = App()

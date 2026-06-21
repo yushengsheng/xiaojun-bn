@@ -568,6 +568,7 @@ class OnchainQueryMixin(object):
             dispatch_ui(lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
         finally:
             self._query_row_keys_by_source = {}
+            self._clear_source_private_key_cache()
             self.is_running = False
     def _run_query_balance_one_to_many(self, network: str, token: EvmToken, source: str, targets: list[str]):
         dispatch_ui = self._dispatch_ui
@@ -693,6 +694,7 @@ class OnchainQueryMixin(object):
             dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
             dispatch_ui(lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
         finally:
+            self._clear_source_private_key_cache()
             self.is_running = False
     def _run_query_balance_many_to_one(self, network: str, token: EvmToken, target: str, sources: list[str]):
         dispatch_ui = self._dispatch_ui
@@ -816,4 +818,5 @@ class OnchainQueryMixin(object):
             dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
             dispatch_ui(lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
         finally:
+            self._clear_source_private_key_cache()
             self.is_running = False
