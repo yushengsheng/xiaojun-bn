@@ -61,7 +61,7 @@ class PinnedProxyRuntimeTests(unittest.TestCase):
         ) as run:
             ExchangeProxyRuntime._prepare_darwin_runtime(executable)
         run.assert_called_once_with(
-            ["/usr/bin/codesign", "--force", "--sign", "-", str(executable)],
+            [str(Path("/usr/bin/codesign")), "--force", "--sign", "-", str(executable)],
             capture_output=True,
             text=True,
             timeout=45,
