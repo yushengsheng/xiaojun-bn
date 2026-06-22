@@ -1,4 +1,4 @@
-annotated-types==0.6.0
+annotated-types==0.7.0
 bitarray==3.8.1
 certifi==2025.11.12
 cffi==2.0.0
