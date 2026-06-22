@@ -81,6 +81,7 @@ jobs:
           }
           $env:XRAY_PATH = $xrayExe.FullName
           $env:SING_BOX_PATH = $singBoxExe.FullName
+          $env:PYTHONUTF8 = "1"
           python tools\run_regression.py --gui --strict-pip-check
 
   source-check-macos:

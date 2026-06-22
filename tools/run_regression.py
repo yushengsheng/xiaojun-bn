@@ -12,9 +12,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _display_command(command: list[str]) -> str:
+    """Return an ASCII-safe command representation for legacy Windows consoles."""
+    return " ".join(item.encode("ascii", errors="backslashreplace").decode("ascii") for item in command)
+
+
 def _run(label: str, command: list[str]) -> None:
     print(f"\n==> {label}", flush=True)
-    print(" ".join(command), flush=True)
+    print(_display_command(command), flush=True)
     subprocess.run(command, cwd=ROOT, check=True)
 
 
