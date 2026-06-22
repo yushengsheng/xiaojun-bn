@@ -28,6 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--online", action="store_true", help="Include ETH/BSC public RPC checks.")
     parser.add_argument("--skip-app-selftest", action="store_true", help="Skip 小军bn.py --selftest.")
     parser.add_argument("--skip-pip-check", action="store_true", help="Skip python -m pip check in environment check.")
+    parser.add_argument("--skip-vulnerability-audit", action="store_true", help="Skip locked dependency vulnerability audit.")
     parser.add_argument("--strict-pip-check", action="store_true", help="Fail on pip check dependency conflicts.")
     args = parser.parse_args(argv)
 
@@ -45,6 +46,15 @@ def main(argv: list[str] | None = None) -> int:
         _run("diff whitespace", ["git", "diff", "--check"])
     _run("sensitive artifact check", [python, "tools/check_sensitive_artifacts.py", "--git-only"])
     _run("pyinstaller args", [python, "tools/pyinstaller_common_args.py"])
+    if not args.skip_vulnerability_audit:
+        _run(
+            "runtime dependency vulnerability audit",
+            [python, "-m", "pip_audit", "--strict", "--disable-pip", "-r", "requirements.lock"],
+        )
+        _run(
+            "build dependency vulnerability audit",
+            [python, "-m", "pip_audit", "--strict", "--disable-pip", "-r", "requirements-build.lock"],
+        )
 
     if not args.skip_app_selftest:
         selftest_args = [python, "小军bn.py", "--selftest"]

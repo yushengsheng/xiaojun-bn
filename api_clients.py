@@ -237,11 +237,11 @@ class EvmClient:
 
     @classmethod
     def _dependency_install_command(cls, package_names: list[str]) -> str:
-        req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
-        if os.path.exists(req_path):
-            return f'"{sys.executable}" -m pip install --user -r "{req_path}"'
-        pkg_list = " ".join(str(name).strip() for name in package_names if str(name).strip())
-        return f'"{sys.executable}" -m pip install --user {pkg_list}'.strip()
+        root_dir = os.path.dirname(os.path.abspath(__file__))
+        lock_path = os.path.join(root_dir, "requirements.lock")
+        if os.path.exists(lock_path):
+            return f'"{sys.executable}" -m pip install --user --require-hashes -r "{lock_path}"'
+        return f"无法生成安全安装命令：依赖锁文件 {lock_path} 缺失，请从正式安装包或源码仓库恢复该文件后重试"
 
     @classmethod
     def _missing_dependency_error(cls, package_names: list[str]) -> RuntimeError:

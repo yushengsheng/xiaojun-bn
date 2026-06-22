@@ -22,7 +22,7 @@ End If
 If Not EnsureRuntimeDependencies(pythonCmd) Then
     MsgBox "Auto-installing runtime dependencies failed." & vbCrLf & _
            "Please run:" & vbCrLf & _
-           CliPythonCommand(pythonCmd) & " -m pip install --user -r requirements.txt", _
+           CliPythonCommand(pythonCmd) & " -m pip install --user --require-hashes -r requirements.lock", _
            vbCritical, "Launch Failed"
     WScript.Quit 1
 End If
@@ -150,7 +150,7 @@ Function EnsureRuntimeDependencies(pyExe)
         Exit Function
     End If
 
-    installCmd = Quote(cliPy) & " -m pip install --user -r " & Quote(fso.BuildPath(scriptDir, "requirements.txt"))
+    installCmd = Quote(cliPy) & " -m pip install --user --require-hashes -r " & Quote(fso.BuildPath(scriptDir, "requirements.lock"))
     rc = RunHiddenAndWait(installCmd)
     If rc <> 0 Then
         EnsureRuntimeDependencies = False

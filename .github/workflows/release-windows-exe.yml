@@ -12,8 +12,10 @@ permissions:
 env:
   XRAY_TAG: v26.3.27
   XRAY_ASSET: Xray-windows-64.zip
+  XRAY_SHA256: d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad
   SING_BOX_TAG: v1.13.5
   SING_BOX_ASSET: sing-box-1.13.5-windows-amd64.zip
+  SING_BOX_SHA256: 841a46ab1fef823fefd4248229db5220f09535c883b4cfc6d4fbe5903bc3f1d1
 
 jobs:
   build-windows:
@@ -21,22 +23,21 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Check tracked sensitive artifacts
         shell: pwsh
         run: python tools/check_sensitive_artifacts.py --root . --git-only
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: '3.11'
 
       - name: Install build dependencies
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-build.txt
+          pip install --require-hashes -r requirements-build.lock
 
       - name: Download proxy runtimes
         shell: pwsh
@@ -53,6 +54,7 @@ jobs:
           $xrayAsset = "${{ env.XRAY_ASSET }}"
           Write-Host "Using pinned xray runtime: $xrayTag ($xrayAsset)"
           gh release download $xrayTag --repo XTLS/Xray-core --pattern $xrayAsset --dir $proxyRoot
+          if ((Get-FileHash (Join-Path $proxyRoot $xrayAsset) -Algorithm SHA256).Hash.ToLower() -ne "${{ env.XRAY_SHA256 }}".ToLower()) { throw "xray asset digest mismatch." }
           Expand-Archive -Path (Join-Path $proxyRoot $xrayAsset) -DestinationPath $xrayDir -Force
           Remove-Item (Join-Path $proxyRoot $xrayAsset) -Force
 
@@ -60,6 +62,7 @@ jobs:
           $singBoxAsset = "${{ env.SING_BOX_ASSET }}"
           Write-Host "Using pinned sing-box runtime: $singBoxTag ($singBoxAsset)"
           gh release download $singBoxTag --repo SagerNet/sing-box --pattern $singBoxAsset --dir $proxyRoot
+          if ((Get-FileHash (Join-Path $proxyRoot $singBoxAsset) -Algorithm SHA256).Hash.ToLower() -ne "${{ env.SING_BOX_SHA256 }}".ToLower()) { throw "sing-box asset digest mismatch." }
           Expand-Archive -Path (Join-Path $proxyRoot $singBoxAsset) -DestinationPath $singBoxDir -Force
           Remove-Item (Join-Path $proxyRoot $singBoxAsset) -Force
 
@@ -72,7 +75,7 @@ jobs:
             throw "sing-box.exe was not found after extraction."
           }
 
-      - name: Run source regression checks
+      - name: Run source regression checks and locked dependency audit
         shell: pwsh
         run: |
           $xrayExe = Get-ChildItem "build-proxy/xray" -Filter "xray.exe" -File -Recurse | Select-Object -First 1
@@ -186,7 +189,7 @@ jobs:
           Remove-Item $portableStage -Recurse -Force
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: xiaojun-bn-windows
           path: release/*

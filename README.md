@@ -23,8 +23,7 @@ Binance 自动化工具（Tkinter GUI）。
 
 ```powershell
 py -3 -m venv .venv
-.\.venv\Scripts\python -m pip install --upgrade pip
-.\.venv\Scripts\python -m pip install -r requirements.txt
+.\.venv\Scripts\python -m pip install --require-hashes -r requirements.lock
 .\.venv\Scripts\python 小军bn.py
 ```
 
@@ -51,9 +50,11 @@ py -3 -m venv .venv
 - 安全存储：`cryptography`
 - 链上模块：`eth-account`、`eth-utils`
 
-- 源码运行前请先安装依赖
+- 源码运行前请使用 `requirements.lock` 安装带哈希校验的依赖
 - macOS 一键启动脚本会在启动前按需自动安装依赖
 - 建议源码运行使用项目内 `.venv`，避免全局 Python 依赖冲突影响交易所、链上或打包自检
+- 发布回归会审计运行锁和构建锁中的已知漏洞；本地完整回归请按 `requirements-build.lock` 安装依赖
+- 若通过 `SING_BOX_PATH` 指定外部 `sing-box`，可同时设置 `SING_BOX_EXECUTABLE_SHA256` 为该可执行文件的 SHA-256；项目内已认证缓存和随包运行时会优先于普通 `PATH` 程序
 
 ## 发布包说明
 

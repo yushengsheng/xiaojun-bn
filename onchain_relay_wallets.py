@@ -13,9 +13,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from app_paths import RELAY_WALLET_FILE
+from app_paths import CONFIG_BACKUP_SUFFIX, RELAY_WALLET_FILE
 from core_models import EvmToken, GeneratedWalletEntry
+from secure_config import config_context as secure_config_context, seal_config_payload, unseal_config_payload
 from secret_box import SECRET_BOX
+from stores import _atomic_write_text_with_backup
 
 RELAY_RETENTION_HOURS = 72
 RELAY_TRACKED_BALANCE_SYMBOLS = {"USDT", "USDC"}
@@ -154,22 +156,61 @@ class RelayWalletFileStore:
     def ensure_file(self) -> None:
         with self._lock:
             self.file_path.parent.mkdir(parents=True, exist_ok=True)
-            if self.file_path.exists():
+            backup_path = self.file_path.with_name(f"{self.file_path.name}{CONFIG_BACKUP_SUFFIX}")
+            if self.file_path.exists() or backup_path.exists():
                 return
             _atomic_write_text(self.file_path, "", encoding="utf-8")
 
     def _load_records_locked(self) -> list[RelayWalletRecord]:
         self.ensure_file()
-        text = self.file_path.read_text(encoding="utf-8")
-        records: list[RelayWalletRecord] = []
-        for line_no, line in enumerate(text.splitlines(), start=1):
-            raw_line = str(line or "").strip()
-            if not raw_line or raw_line.startswith("#"):
+        backup_path = self.file_path.with_name(f"{self.file_path.name}{CONFIG_BACKUP_SUFFIX}")
+        errors: list[str] = []
+        for candidate in (self.file_path, backup_path):
+            if not candidate.exists():
                 continue
             try:
-                raw = json.loads(raw_line)
+                candidate_text = candidate.read_text(encoding="utf-8")
+                records = self._parse_records_text(candidate_text)
+                if candidate == backup_path:
+                    _atomic_write_text_with_backup(self.file_path, candidate_text, encoding="utf-8")
+                return records
             except Exception as exc:
-                raise RuntimeError(f"中转钱包.txt 第 {line_no} 行 JSON 解析失败：{exc}") from exc
+                errors.append(f"{candidate.name}: {exc}")
+        raise RuntimeError("中转钱包文件读取失败：" + "；".join(errors))
+
+    def _parse_records_text(self, text: str) -> list[RelayWalletRecord]:
+        whole_text = text.strip()
+        if whole_text:
+            try:
+                envelope = json.loads(whole_text)
+                payload, protected = unseal_config_payload(
+                    envelope,
+                    secret_box=SECRET_BOX,
+                    context=secure_config_context(self.file_path),
+                )
+                if protected:
+                    if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+                        raise RuntimeError("中转钱包认证配置结构无效")
+                    raw_rows = payload["records"]
+                else:
+                    raw_rows = None
+            except json.JSONDecodeError:
+                raw_rows = None
+        else:
+            raw_rows = []
+        records: list[RelayWalletRecord] = []
+        rows = raw_rows if raw_rows is not None else text.splitlines()
+        for line_no, row in enumerate(rows, start=1):
+            if isinstance(row, dict):
+                raw = row
+            else:
+                raw_line = str(row or "").strip()
+                if not raw_line or raw_line.startswith("#"):
+                    continue
+                try:
+                    raw = json.loads(raw_line)
+                except Exception as exc:
+                    raise RuntimeError(f"中转钱包.txt 第 {line_no} 行 JSON 解析失败：{exc}") from exc
             if not isinstance(raw, dict):
                 raise RuntimeError(f"中转钱包.txt 第 {line_no} 行格式无效")
             record = RelayWalletRecord.from_raw(raw)
@@ -180,16 +221,19 @@ class RelayWalletFileStore:
         return records
 
     def _save_records_locked(self, records: list[RelayWalletRecord]) -> None:
-        lines: list[str] = []
+        rows: list[dict[str, object]] = []
         for record in records:
             payload = asdict(record)
             private_key = str(payload.get("private_key") or "").strip()
             payload["private_key"] = SECRET_BOX.encrypt(private_key) if private_key else ""
-            lines.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-        content = "\n".join(lines)
-        if content:
-            content += "\n"
-        _atomic_write_text(self.file_path, content, encoding="utf-8")
+            rows.append(payload)
+        envelope = seal_config_payload(
+            {"records": rows},
+            secret_box=SECRET_BOX,
+            context=secure_config_context(self.file_path),
+        )
+        content = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
+        _atomic_write_text_with_backup(self.file_path, content, encoding="utf-8")
 
     def load_records(self) -> list[RelayWalletRecord]:
         with self._lock:

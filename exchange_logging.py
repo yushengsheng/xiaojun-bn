@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from app_paths import LOG_DIR, LOG_FILE_PATH
+from secure_delete import SecureDeleteReport, secure_unlink_all
 from sensitive_data import redact_sensitive_text
 from shared_utils import LOG_MAX_ROWS
 
@@ -86,6 +87,7 @@ _tk_formatter = SensitiveFormatter(_LOG_RECORD_FORMAT, datefmt="%H:%M:%S")
 logger = logging.getLogger("bot")
 logger.setLevel(logging.INFO)
 logger.propagate = False
+_file_handler_lock = threading.RLock()
 
 
 class TkLogHandler(logging.Handler):
@@ -147,33 +149,89 @@ _tk_handler.setFormatter(_tk_formatter)
 logger.addHandler(_tk_handler)
 
 runtime_log_path: Path | None = None
-try:
-    _prune_runtime_logs()
-    runtime_log_path = _create_runtime_log_path()
-    _runtime_file_handler = RotatingFileHandler(
-        runtime_log_path,
-        maxBytes=LOG_FILE_MAX_BYTES,
-        backupCount=LOG_FILE_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    _runtime_file_handler.setFormatter(_formatter)
-    logger.addHandler(_runtime_file_handler)
-    _prune_runtime_logs(runtime_log_path)
-except Exception as exc:
-    print(f"无法创建日志文件: {exc}")
+_runtime_file_handler: RotatingFileHandler | None = None
+_compat_file_handler: RotatingFileHandler | None = None
 
-try:
-    _compat_file_handler = RotatingFileHandler(
-        LOG_FILE_PATH,
-        mode="w",
-        maxBytes=COMPAT_LOG_MAX_BYTES,
-        backupCount=COMPAT_LOG_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    _compat_file_handler.setFormatter(_formatter)
-    logger.addHandler(_compat_file_handler)
-except Exception as exc:
-    print(f"无法创建兼容日志文件: {exc}")
 
-if runtime_log_path is not None:
-    logger.info("当前运行日志文件：%s", runtime_log_path)
+def _close_file_handler(handler: logging.Handler | None) -> None:
+    if handler is None:
+        return
+    try:
+        logger.removeHandler(handler)
+    except Exception:
+        pass
+    try:
+        handler.close()
+    except Exception:
+        pass
+
+
+def _configure_file_handlers(*, announce_runtime_path: bool) -> None:
+    global runtime_log_path, _runtime_file_handler, _compat_file_handler
+    runtime_log_path = None
+    _runtime_file_handler = None
+    _compat_file_handler = None
+    try:
+        _prune_runtime_logs()
+        runtime_log_path = _create_runtime_log_path()
+        _runtime_file_handler = RotatingFileHandler(
+            runtime_log_path,
+            maxBytes=LOG_FILE_MAX_BYTES,
+            backupCount=LOG_FILE_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        _runtime_file_handler.setFormatter(_formatter)
+        logger.addHandler(_runtime_file_handler)
+        _prune_runtime_logs(runtime_log_path)
+    except Exception as exc:
+        print(f"无法创建日志文件: {exc}")
+
+    try:
+        _compat_file_handler = RotatingFileHandler(
+            LOG_FILE_PATH,
+            mode="w",
+            maxBytes=COMPAT_LOG_MAX_BYTES,
+            backupCount=COMPAT_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        _compat_file_handler.setFormatter(_formatter)
+        logger.addHandler(_compat_file_handler)
+    except Exception as exc:
+        print(f"无法创建兼容日志文件: {exc}")
+
+    if announce_runtime_path and runtime_log_path is not None:
+        logger.info("当前运行日志文件：%s", runtime_log_path)
+
+
+def _exchange_log_artifact_paths() -> set[Path]:
+    paths: set[Path] = {LOG_FILE_PATH}
+    paths.update(LOG_FILE_PATH.parent.glob(f"{LOG_FILE_PATH.name}.*"))
+    if LOG_DIR.exists():
+        paths.update(LOG_DIR.glob(f"{LOG_FILE_RUNTIME_PREFIX}_*.log*"))
+    return paths
+
+
+def clear_exchange_log_queue() -> None:
+    while True:
+        try:
+            log_queue.get_nowait()
+        except queue.Empty:
+            return
+
+
+def purge_exchange_file_logs() -> SecureDeleteReport:
+    """Close active exchange log handles, directly erase old logs, then start fresh files."""
+
+    global runtime_log_path, _runtime_file_handler, _compat_file_handler
+    with _file_handler_lock:
+        _close_file_handler(_runtime_file_handler)
+        _close_file_handler(_compat_file_handler)
+        _runtime_file_handler = None
+        _compat_file_handler = None
+        runtime_log_path = None
+        report = secure_unlink_all(_exchange_log_artifact_paths())
+        _configure_file_handlers(announce_runtime_path=False)
+        return report
+
+
+_configure_file_handlers(announce_runtime_path=True)

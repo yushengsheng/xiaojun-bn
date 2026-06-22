@@ -26,8 +26,10 @@ import requests
 
 from app_paths import APP_DIR, BUNDLE_DIR, DATA_DIR
 from exchange_logging import logger
+from secure_config import config_context as secure_config_context
+from secret_box import SECRET_BOX
 from sensitive_data import redact_sensitive_text
-from stores import _atomic_write_text
+from stores import _atomic_write_json_with_backup, _atomic_write_text, _load_json_with_backup
 
 
 def _json_dump_text(payload: object) -> str:
@@ -52,7 +54,18 @@ class ExchangeProxyRuntime:
         "https://ifconfig.me/ip",
         "https://ipinfo.io/ip",
     )
-    _SING_BOX_RELEASE_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+    _SING_BOX_TAG = "v1.13.5"
+    _SING_BOX_ASSET_SHA256 = {
+        "sing-box-1.13.5-darwin-amd64.tar.gz": "ca37fa11955950c3484bd3365e6d7ed479b8fdd2e41c26a6b4d60faa2283fd3f",
+        "sing-box-1.13.5-darwin-arm64.tar.gz": "7700717680c2aa6eb9b034d7114fd16d6f205039255ea406fdd6eb7e3b93d991",
+        "sing-box-1.13.5-linux-386.tar.gz": "ddceeb0d4014e5a968a1607dd50b14467621e4c1094277dd24dae55e392fa055",
+        "sing-box-1.13.5-linux-amd64.tar.gz": "645d2f30bc984177dc48c749d2e856ccad915df412dc364ca0b312385b3ef255",
+        "sing-box-1.13.5-linux-arm64.tar.gz": "d6ca578ed8de5c4dacbd8931fa0bd5dfd940a5767dd6992504f121dbb664bbc9",
+        "sing-box-1.13.5-windows-386.zip": "c1644083fc9439b442a063534cd0fc7a1243cce6e9aff2f83b4585342ade01b9",
+        "sing-box-1.13.5-windows-amd64.zip": "841a46ab1fef823fefd4248229db5220f09535c883b4cfc6d4fbe5903bc3f1d1",
+        "sing-box-1.13.5-windows-arm64.zip": "b9c7eda0ce0f511cf8433181319f983a864f2316c4c1c3a949f5abe447316d71",
+    }
+    _RUNTIME_MANIFEST_VERSION = 1
 
     def __init__(self, work_dir: Path, runtime_name: str = "exchange"):
         self.work_dir = Path(work_dir)
@@ -148,6 +161,133 @@ class ExchangeProxyRuntime:
     @staticmethod
     def _runtime_cache_dir(backend: str) -> Path:
         return DATA_DIR / "proxy_runtimes" / backend
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        hasher = hashlib.sha256()
+        with Path(path).open("rb") as handle:
+            while True:
+                chunk = handle.read(262144)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @classmethod
+    def _sing_box_manifest_path(cls, executable: Path) -> Path:
+        candidate = Path(executable)
+        return candidate.with_name(f".{candidate.name}.manifest.json")
+
+    @classmethod
+    def _sing_box_manifest_context(cls, executable: Path) -> str:
+        candidate = Path(executable)
+        return f"proxy-runtime:sing-box:{cls._SING_BOX_TAG}:{candidate.parent.name}:{candidate.name}"
+
+    @classmethod
+    def _is_cached_sing_box_path(cls, executable: Path) -> bool:
+        return cls._path_is_within(Path(executable), cls._runtime_cache_dir("sing-box"))
+
+    @classmethod
+    def _validate_sing_box_manifest(cls, payload: object, executable: Path) -> None:
+        if not isinstance(payload, dict):
+            raise RuntimeError("sing-box 运行时清单格式无效")
+        if int(payload.get("version", 0) or 0) != cls._RUNTIME_MANIFEST_VERSION:
+            raise RuntimeError("sing-box 运行时清单版本不支持")
+        if str(payload.get("backend") or "") != "sing-box":
+            raise RuntimeError("sing-box 运行时清单后端不匹配")
+        if str(payload.get("runtime_tag") or "") != cls._SING_BOX_TAG:
+            raise RuntimeError("sing-box 运行时版本不匹配")
+        if str(payload.get("executable") or "") != Path(executable).name:
+            raise RuntimeError("sing-box 运行时文件名不匹配")
+        digest = str(payload.get("sha256") or "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise RuntimeError("sing-box 运行时清单哈希无效")
+
+    @classmethod
+    def _write_sing_box_manifest(cls, executable: Path) -> None:
+        candidate = Path(executable)
+        payload = {
+            "version": cls._RUNTIME_MANIFEST_VERSION,
+            "backend": "sing-box",
+            "runtime_tag": cls._SING_BOX_TAG,
+            "executable": candidate.name,
+            "sha256": cls._file_sha256(candidate),
+        }
+        manifest_path = cls._sing_box_manifest_path(candidate)
+        _atomic_write_json_with_backup(
+            manifest_path,
+            payload,
+            secret_box=SECRET_BOX,
+            config_context=cls._sing_box_manifest_context(candidate),
+        )
+
+    @staticmethod
+    def _prepare_darwin_runtime(executable: Path) -> None:
+        """Apply a local ad-hoc signature after the downloaded archive hash is verified.
+
+        macOS can leave a downloaded command-line Mach-O blocked before it reaches
+        its listener, even when the release archive itself passed SHA-256 checks.
+        Re-signing locally changes only the code-signature envelope and preserves
+        the verified executable content.
+        """
+        if sys.platform != "darwin":
+            return
+        codesign = Path("/usr/bin/codesign")
+        if not codesign.is_file():
+            raise RuntimeError("macOS 缺少 codesign，无法准备已验证的 sing-box 运行时")
+        try:
+            result = subprocess.run(
+                [str(codesign), "--force", "--sign", "-", str(executable)],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"macOS sing-box 本机签名失败：{exc}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "未知错误").strip()
+            raise RuntimeError(f"macOS sing-box 本机签名失败：{detail}")
+
+    @classmethod
+    def _verify_cached_sing_box(cls, executable: Path) -> bool:
+        candidate = Path(executable)
+        if not candidate.is_file():
+            return False
+        manifest_path = cls._sing_box_manifest_path(candidate)
+        try:
+            payload, _recovered = _load_json_with_backup(
+                manifest_path,
+                validator=lambda value: cls._validate_sing_box_manifest(value, candidate),
+                secret_box=SECRET_BOX,
+                config_context=cls._sing_box_manifest_context(candidate),
+            )
+            expected_digest = str(payload["sha256"]).strip().lower()
+            return cls._file_sha256(candidate).lower() == expected_digest
+        except Exception as exc:
+            logger.warning("已忽略未通过认证的 sing-box 缓存运行时 %s：%s", candidate, exc)
+            return False
+
+    @classmethod
+    def _trusted_sing_box_candidate(cls, executable: Path) -> Path | None:
+        candidate = Path(executable)
+        if cls._is_cached_sing_box_path(candidate) and not cls._verify_cached_sing_box(candidate):
+            return None
+        return candidate
+
+    @classmethod
+    def _verify_external_sing_box_override(cls, executable: Path) -> None:
+        """Optionally bind an explicit external override to a caller-supplied hash."""
+        expected = str(os.environ.get("SING_BOX_EXECUTABLE_SHA256", "") or "").strip().lower()
+        if expected.startswith("sha256:"):
+            expected = expected.split(":", 1)[1].strip()
+        if not expected:
+            return
+        if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+            raise RuntimeError("SING_BOX_EXECUTABLE_SHA256 格式无效，应为 64 位 SHA-256")
+        actual = cls._file_sha256(Path(executable)).lower()
+        if actual != expected:
+            raise RuntimeError("显式 sing-box 运行时哈希校验失败")
 
     @staticmethod
     def _runtime_platform_tag() -> str:
@@ -281,41 +421,20 @@ class ExchangeProxyRuntime:
             unique.append(path)
         return unique
 
-    @staticmethod
-    def _download_release_json(url: str) -> dict[str, object]:
-        resp = requests.get(url, headers=ExchangeProxyRuntime._RUNTIME_HTTP_HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, dict):
-            raise RuntimeError("上游发布信息格式异常")
-        return data
-
     @classmethod
-    def _select_sing_box_asset(cls, assets: object) -> dict[str, object]:
-        if not isinstance(assets, list):
-            raise RuntimeError("sing-box 发布资产列表无效")
+    def _pinned_sing_box_asset(cls) -> tuple[str, str, str]:
         platform_tag = cls._runtime_platform_tag()
         arch_tag = cls._runtime_arch_tag()
         archive_suffix = ".zip" if platform_tag == "windows" else ".tar.gz"
-        matches: list[dict[str, object]] = []
-        legacy_matches: list[dict[str, object]] = []
-        for asset in assets:
-            if not isinstance(asset, dict):
-                continue
-            name = str(asset.get("name") or "").strip()
-            if not name.startswith("sing-box-") or not name.endswith(archive_suffix):
-                continue
-            if f"-{platform_tag}-{arch_tag}" not in name:
-                continue
-            if "legacy-" in name:
-                legacy_matches.append(asset)
-                continue
-            matches.append(asset)
-        candidates = matches or legacy_matches
-        if not candidates:
-            raise RuntimeError(f"官方发布中未找到适配当前系统的 sing-box 资产（platform={platform_tag}, arch={arch_tag}）")
-        candidates.sort(key=lambda item: (len(str(item.get("name") or "")), str(item.get("name") or "")))
-        return candidates[0]
+        version = cls._SING_BOX_TAG.removeprefix("v")
+        asset_name = f"sing-box-{version}-{platform_tag}-{arch_tag}{archive_suffix}"
+        digest = cls._SING_BOX_ASSET_SHA256.get(asset_name)
+        if not digest:
+            raise RuntimeError(
+                f"当前系统没有受支持的固定 sing-box 运行时（platform={platform_tag}, arch={arch_tag}）。"
+            )
+        url = f"https://github.com/SagerNet/sing-box/releases/download/{cls._SING_BOX_TAG}/{asset_name}"
+        return asset_name, url, f"sha256:{digest}"
 
     @staticmethod
     def _download_asset(url: str, destination: Path, *, digest: str = "") -> None:
@@ -358,6 +477,8 @@ class ExchangeProxyRuntime:
         with tarfile.open(archive_path, "r:gz") as archive:
             base_dir = destination.resolve()
             for member in archive.getmembers():
+                if member.issym() or member.islnk() or member.isdev():
+                    raise RuntimeError(f"压缩包包含不安全链接或设备文件：{member.name}")
                 member_path = (destination / member.name).resolve()
                 if os.path.commonpath([str(base_dir), str(member_path)]) != str(base_dir):
                     raise RuntimeError(f"压缩包包含非法路径：{member.name}")
@@ -379,19 +500,14 @@ class ExchangeProxyRuntime:
         with cls._RUNTIME_PREPARE_LOCK:
             for path in cls._candidate_sing_box_paths():
                 if path.exists():
-                    return path
+                    trusted = cls._trusted_sing_box_candidate(path)
+                    if trusted is not None:
+                        return trusted
 
-            release = cls._download_release_json(cls._SING_BOX_RELEASE_API)
-            asset = cls._select_sing_box_asset(release.get("assets"))
-            asset_name = str(asset.get("name") or "").strip()
-            download_url = str(asset.get("browser_download_url") or "").strip()
-            if not asset_name or not download_url:
-                raise RuntimeError("sing-box 发布资产缺少下载地址")
-
-            tag = str(release.get("tag_name") or "latest").strip() or "latest"
-            install_dir = cls._runtime_cache_dir("sing-box") / tag
+            asset_name, download_url, digest = cls._pinned_sing_box_asset()
+            install_dir = cls._runtime_cache_dir("sing-box") / cls._SING_BOX_TAG
             install_path = install_dir / cls._executable_name("sing-box")
-            if install_path.exists():
+            if install_path.exists() and cls._verify_cached_sing_box(install_path):
                 return install_path
 
             logger.info("未找到 sing-box，开始下载项目内运行时：%s", asset_name)
@@ -401,7 +517,7 @@ class ExchangeProxyRuntime:
                 archive_path = tmp_root / asset_name
                 extract_dir = tmp_root / "extract"
                 extract_dir.mkdir(parents=True, exist_ok=True)
-                cls._download_asset(download_url, archive_path, digest=str(asset.get("digest") or ""))
+                cls._download_asset(download_url, archive_path, digest=digest)
                 cls._extract_archive(archive_path, extract_dir)
                 extracted = cls._find_extracted_executable(extract_dir, "sing-box")
                 if extracted is None:
@@ -409,6 +525,8 @@ class ExchangeProxyRuntime:
                 shutil.copy2(extracted, install_path)
             if os.name != "nt":
                 install_path.chmod(install_path.stat().st_mode | 0o755)
+            cls._prepare_darwin_runtime(install_path)
+            cls._write_sing_box_manifest(install_path)
             logger.info("sing-box 已缓存到项目目录：%s", install_path)
             return install_path
 
@@ -418,14 +536,23 @@ class ExchangeProxyRuntime:
         if env_path:
             p = Path(env_path)
             if p.exists():
-                return cls._stage_bundled_runtime_if_needed(p, "sing-box")
+                cls._verify_external_sing_box_override(p)
+                trusted = cls._trusted_sing_box_candidate(p)
+                if trusted is not None:
+                    return cls._stage_bundled_runtime_if_needed(trusted, "sing-box")
+        for p in cls._candidate_sing_box_paths():
+            if p.exists():
+                trusted = cls._trusted_sing_box_candidate(p)
+                if trusted is not None:
+                    return cls._stage_bundled_runtime_if_needed(trusted, "sing-box")
         for exe_name in cls._candidate_executable_names("sing-box"):
             which_path = shutil.which(exe_name)
             if which_path:
-                return cls._stage_bundled_runtime_if_needed(Path(which_path), "sing-box")
-        for p in cls._candidate_sing_box_paths():
-            if p.exists():
-                return cls._stage_bundled_runtime_if_needed(p, "sing-box")
+                candidate = Path(which_path)
+                cls._verify_external_sing_box_override(candidate)
+                trusted = cls._trusted_sing_box_candidate(candidate)
+                if trusted is not None:
+                    return cls._stage_bundled_runtime_if_needed(trusted, "sing-box")
         try:
             return cls._stage_bundled_runtime_if_needed(cls._ensure_sing_box_runtime(), "sing-box")
         except Exception as exc:
@@ -522,6 +649,10 @@ class ExchangeProxyRuntime:
     def _open_runtime_log(self):
         log_path = self._runtime_log_path()
         handle = open(log_path, "ab")
+        try:
+            os.chmod(log_path, 0o600)
+        except Exception:
+            pass
         self._log_path = log_path
         return handle
 
@@ -796,7 +927,7 @@ class ExchangeProxyRuntime:
         with self._lock:
             return {
                 "backend": self._backend,
-                "raw_source": self._raw_source,
+                "source_configured": bool(self._raw_source),
                 "local_proxy_url": self._local_proxy_url,
             }
 

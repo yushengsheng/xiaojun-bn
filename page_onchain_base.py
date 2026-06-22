@@ -27,6 +27,7 @@ from app_defaults import (
 )
 from app_paths import (
     ONCHAIN_DATA_FILE,
+    ONCHAIN_OPERATION_JOURNAL_FILE,
     RELAY_FAILED_EXPORT_FILE,
     RELAY_MANUAL_EXPORT_FILE,
     RELAY_WALLET_FILE,
@@ -34,6 +35,7 @@ from app_paths import (
 from core_models import EvmToken, GeneratedWalletEntry, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
 from exchange_logging import logger
 from onchain_relay_wallets import RelayWalletFileStore
+from operation_journal import OperationJournal
 from shared_utils import (
     LOG_MAX_ROWS,
     SolidButton,
@@ -139,6 +141,7 @@ class OnchainTransferPageBase:
             allow_system_proxy_provider=self._allow_onchain_system_proxy,
         )
         self.relay_wallet_store = RelayWalletFileStore(RELAY_WALLET_FILE)
+        self.operation_journal = OperationJournal(ONCHAIN_OPERATION_JOURNAL_FILE)
         self._closing = False
         self.is_running = False
         self.stop_requested = threading.Event()
@@ -315,7 +318,7 @@ class OnchainTransferPageBase:
         self.ent_relay_fee_reserve = ttk.Entry(setting, textvariable=self.relay_fee_reserve_var, width=12)
         self.lbl_relay_wallet_file = ttk.Label(
             setting,
-            text=f"中转钱包明文保存在：{RELAY_WALLET_FILE.name}；仅清理超过 72 小时且余额已清空的钱包。",
+            text=f"中转钱包受程序密码认证加密保护：{RELAY_WALLET_FILE.name}；仅清理超过 72 小时且余额已清空的钱包。",
             style="Subtle.TLabel",
             justify="left",
             wraplength=920,
@@ -1058,10 +1061,9 @@ class OnchainTransferPageBase:
         if len(words) >= 2:
             return f"{words[0]} {words[1]} ... ({len(words)}词)"
         return self._mask(s, head=4, tail=4)
-    @staticmethod
-    def _display_credential(credential: str) -> str:
+    def _display_credential(self, credential: str) -> str:
         s = credential.strip()
-        return s if s else "-"
+        return self._mask_credential(s) if s else "-"
     def _display_one_to_many_source_credential(self, credential: str) -> str:
         s = credential.strip()
         return self._mask_credential(s) if s else "-"

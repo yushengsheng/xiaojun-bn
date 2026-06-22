@@ -20,7 +20,7 @@ try:
 except Exception:
     CRYPTO_AES = None
 
-from app_paths import APP_LOCK_FILE, SECRET_KEY_FILE
+from app_paths import APP_LOCK_BACKUP_FILE, APP_LOCK_FILE, SECRET_KEY_FILE
 
 
 def _atomic_write_secret_text(path: Path, content: str, encoding: str = "utf-8") -> None:
@@ -61,6 +61,7 @@ class SecretBox:
 
     PREFIX_V1 = "enc::v1::"
     PREFIX_V2 = "enc::v2::"
+    PREFIX_V3 = "enc::v3::"
     LOCKED_MARKER = "locked::v1"
     ENV_KEY = "WITHDRAW_SECRET_KEY"
     TEST_BYPASS_ENV = "XIAOJUN_APP_LOCK_BYPASS"
@@ -89,7 +90,7 @@ class SecretBox:
     @classmethod
     def is_encrypted(cls, text: str) -> bool:
         raw = str(text or "")
-        return raw.startswith(cls.PREFIX_V1) or raw.startswith(cls.PREFIX_V2)
+        return raw.startswith(cls.PREFIX_V1) or raw.startswith(cls.PREFIX_V2) or raw.startswith(cls.PREFIX_V3)
 
     @staticmethod
     def _xor_bytes(a: bytes, b: bytes) -> bytes:
@@ -113,7 +114,7 @@ class SecretBox:
 
     def _load_or_create_key(self) -> bytes:
         env_key = os.environ.get(self.ENV_KEY, "").strip()
-        if env_key and not APP_LOCK_FILE.exists():
+        if env_key and not APP_LOCK_FILE.exists() and not APP_LOCK_BACKUP_FILE.exists():
             return self._decode_key(env_key)
 
         if self.key_file.exists():
@@ -213,24 +214,24 @@ class SecretBox:
         except Exception as exc:
             raise RuntimeError("密文解码失败") from exc
 
-    def _encrypt_v2(self, text: str) -> str:
+    def _encrypt_aes_gcm(self, text: str, *, aad: bytes, prefix: str) -> str:
         backend, cipher_impl = self._require_modern_cipher()
         key = self._key()
         nonce = os.urandom(12)
         plain = text.encode("utf-8")
         if backend == "cryptography":
-            cipher = cipher_impl(key).encrypt(nonce, plain, b"secret-box-v2")
+            cipher = cipher_impl(key).encrypt(nonce, plain, aad)
         else:
             aes = cipher_impl.new(key, cipher_impl.MODE_GCM, nonce=nonce)
-            aes.update(b"secret-box-v2")
+            aes.update(aad)
             encrypted, tag = aes.encrypt_and_digest(plain)
             cipher = encrypted + tag
-        return f"{self.PREFIX_V2}{self._b64_encode(nonce)}.{self._b64_encode(cipher)}"
+        return f"{prefix}{self._b64_encode(nonce)}.{self._b64_encode(cipher)}"
 
-    def _decrypt_v2(self, text: str) -> str:
+    def _decrypt_aes_gcm(self, text: str, *, aad: bytes, prefix: str) -> str:
         backend, cipher_impl = self._require_modern_cipher()
         key = self._key()
-        body = text[len(self.PREFIX_V2) :]
+        body = text[len(prefix) :]
         parts = body.split(".")
         if len(parts) != 2:
             raise RuntimeError("密文格式错误")
@@ -238,14 +239,14 @@ class SecretBox:
         cipher = self._b64_decode(parts[1])
         try:
             if backend == "cryptography":
-                plain = cipher_impl(key).decrypt(nonce, cipher, b"secret-box-v2")
+                plain = cipher_impl(key).decrypt(nonce, cipher, aad)
             else:
                 if len(cipher) < 16:
                     raise RuntimeError("密文格式错误")
                 encrypted = cipher[:-16]
                 tag = cipher[-16:]
                 aes = cipher_impl.new(key, cipher_impl.MODE_GCM, nonce=nonce)
-                aes.update(b"secret-box-v2")
+                aes.update(aad)
                 plain = aes.decrypt_and_verify(encrypted, tag)
         except Exception as exc:
             raise RuntimeError("密文校验失败（密钥不匹配或文件损坏）") from exc
@@ -253,6 +254,33 @@ class SecretBox:
             return plain.decode("utf-8")
         except Exception as exc:
             raise RuntimeError("密文解码失败") from exc
+
+    def _encrypt_v2(self, text: str) -> str:
+        return self._encrypt_aes_gcm(text, aad=b"secret-box-v2", prefix=self.PREFIX_V2)
+
+    def _decrypt_v2(self, text: str) -> str:
+        return self._decrypt_aes_gcm(text, aad=b"secret-box-v2", prefix=self.PREFIX_V2)
+
+    @staticmethod
+    def _bound_aad(context: str) -> bytes:
+        text = str(context or "").strip()
+        if not text:
+            raise RuntimeError("认证加密上下文不能为空")
+        return b"secret-box-v3|" + text.encode("utf-8")
+
+    def encrypt_bound(self, plain_text: str, context: str) -> str:
+        text = str(plain_text or "")
+        if not text:
+            return ""
+        return self._encrypt_aes_gcm(text, aad=self._bound_aad(context), prefix=self.PREFIX_V3)
+
+    def decrypt_bound(self, cipher_text: str, context: str) -> str:
+        text = str(cipher_text or "")
+        if not text:
+            return ""
+        if not text.startswith(self.PREFIX_V3):
+            raise RuntimeError("认证配置密文版本不支持")
+        return self._decrypt_aes_gcm(text, aad=self._bound_aad(context), prefix=self.PREFIX_V3)
 
     def encrypt(self, plain_text: str) -> str:
         text = str(plain_text or "")
@@ -274,6 +302,8 @@ class SecretBox:
             return self._decrypt_v2(text)
         if text.startswith(self.PREFIX_V1):
             return self._decrypt_v1(text)
+        if text.startswith(self.PREFIX_V3):
+            raise RuntimeError("认证配置密文必须使用绑定上下文解密")
         raise RuntimeError("不支持的密文版本")
 
 

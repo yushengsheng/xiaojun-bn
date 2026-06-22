@@ -3,6 +3,12 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+VERSION_FILE_NAME = "version.txt"
 
 HIDDEN_IMPORTS = (
     "page_onchain",
@@ -16,6 +22,12 @@ HIDDEN_IMPORTS = (
     "shared_utils",
     "stores",
     "secret_box",
+    "secure_config",
+    "operation_journal",
+    "operation_recovery",
+    "exchange_order_recovery",
+    "exchange_account_destruction",
+    "secure_delete",
     "selftest_basic_checks",
     "selftest_gui_checks",
     "selftest_online_checks",
@@ -49,7 +61,8 @@ COLLECT_ALL = (
 )
 
 
-def common_pyinstaller_args() -> list[str]:
+def common_pyinstaller_args(*, version_file: Path | None = None) -> list[str]:
+    """Return portable build arguments without requiring a local release tag file."""
     args = [
         "--noconfirm",
         "--clean",
@@ -60,7 +73,9 @@ def common_pyinstaller_args() -> list[str]:
         args.extend(("--hidden-import", module_name))
     for package_name in COLLECT_ALL:
         args.extend(("--collect-all", package_name))
-    args.extend(("--add-data", "version.txt;."))
+    candidate = Path(version_file) if version_file is not None else ROOT / VERSION_FILE_NAME
+    if candidate.is_file():
+        args.extend(("--add-data", f"{candidate}{os.pathsep}."))
     return args
 
 

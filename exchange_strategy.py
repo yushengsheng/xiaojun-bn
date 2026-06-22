@@ -73,6 +73,8 @@ class Strategy:
         futures_leverage: int = FUTURES_LEVERAGE_DEFAULT,
         futures_margin_type: str = FUTURES_MARGIN_TYPE_DEFAULT,
         futures_side: str = FUTURES_SIDE_DEFAULT,
+        operation_journal=None,
+        operation_scope: str = "",
     ):
         self.c = client
         self.spot_rounds = spot_rounds
@@ -103,12 +105,36 @@ class Strategy:
         self.futures_leverage = max(1, int(futures_leverage or FUTURES_LEVERAGE_DEFAULT))
         self.futures_margin_type = _normalize_futures_margin_type(futures_margin_type)
         self.futures_side = str(futures_side or FUTURES_SIDE_DEFAULT).strip()
+        self.operation_journal = operation_journal
+        self.operation_scope = str(operation_scope or "").strip()
+        self._journal_order_entries: dict[str, str] = {}
         if self.futures_margin_type not in FUTURES_MARGIN_TYPE_OPTIONS:
             self.futures_margin_type = FUTURES_MARGIN_TYPE_DEFAULT
         if self.futures_side not in FUTURES_SIDE_OPTIONS:
             self.futures_side = FUTURES_SIDE_DEFAULT
         self.trade_error = ""
         self.trade_error_stage = ""
+
+    def _journal_open_order(self, order_id: int | str, side: str) -> str:
+        key = str(order_id or "").strip()
+        if not key or self.operation_journal is None:
+            return ""
+        entry_id = self._journal_order_entries.get(key)
+        if entry_id:
+            return entry_id
+        entry_id = self.operation_journal.begin(
+            "exchange-order",
+            self.operation_scope,
+            {"symbol": self.spot_symbol.upper(), "order_id": key, "side": str(side or "").upper()},
+        )
+        self.operation_journal.update(entry_id, "open")
+        self._journal_order_entries[key] = entry_id
+        return entry_id
+
+    def _journal_order_state(self, order_id: int | str, side: str, state: str, **changes: object) -> None:
+        entry_id = self._journal_open_order(order_id, side)
+        if entry_id:
+            self.operation_journal.update(entry_id, state, **changes)
 
     def ensure_base_sold(self):
         try:
@@ -354,11 +380,13 @@ class Strategy:
     ) -> tuple[str, dict | None]:
         symbol_u = self.spot_symbol.upper()
         side_u = str(side or "").strip().upper()
+        self._journal_open_order(order_id, side_u)
 
         while True:
             if stop_event and stop_event.is_set():
                 try:
                     self.c.cancel_order(symbol_u, order_id)
+                    self._journal_order_state(order_id, side_u, "cancelled", reason="stop")
                     logger.info("停止时已尝试撤销未完成订单 %s #%s", symbol_u, order_id)
                 except Exception as cancel_exc:
                     logger.warning("停止时撤销订单失败 %s #%s: %s", symbol_u, order_id, cancel_exc)
@@ -367,8 +395,10 @@ class Strategy:
             order = self.c.get_order(symbol_u, order_id)
             status = str(order.get("status") or "").upper()
             if status == "FILLED":
+                self._journal_order_state(order_id, side_u, "completed", exchange_status=status)
                 return "filled", order
             if status in {"CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+                self._journal_order_state(order_id, side_u, "cancelled", exchange_status=status)
                 raise RuntimeError(f"订单未成交，状态={status}")
 
             if status == "NEW":
@@ -377,6 +407,7 @@ class Strategy:
                 if should_reprice:
                     try:
                         self.c.cancel_order(symbol_u, order_id)
+                        self._journal_order_state(order_id, side_u, "cancelled", reason="reprice")
                         logger.info(
                             "%s模式%s单价格偏离超过 %s，已撤单重挂：旧价=%s，当前参考价=%s",
                             mode_name,
@@ -391,12 +422,14 @@ class Strategy:
                         latest_order = self.c.get_order(symbol_u, order_id)
                         latest_status = str(latest_order.get("status") or "").upper()
                         if latest_status == "FILLED":
+                            self._journal_order_state(order_id, side_u, "completed", exchange_status=latest_status)
                             return "filled", latest_order
                         raise
 
             if stop_event and stop_event.wait(max(0.2, float(poll_interval))):
                 try:
                     self.c.cancel_order(symbol_u, order_id)
+                    self._journal_order_state(order_id, side_u, "cancelled", reason="stop")
                     logger.info("停止时已尝试撤销未完成订单 %s #%s", symbol_u, order_id)
                 except Exception:
                     pass
@@ -596,11 +629,13 @@ class Strategy:
         symbol_u = self.spot_symbol.upper()
         active_orders: dict[str, dict[str, object]] = {}
         if buy_order and buy_order.get("orderId"):
+            self._journal_open_order(buy_order.get("orderId"), "BUY")
             active_orders["BUY"] = {
                 "order_id": buy_order.get("orderId"),
                 "price": self._order_price_decimal(buy_order, Decimal("0")),
             }
         if sell_order and sell_order.get("orderId"):
+            self._journal_open_order(sell_order.get("orderId"), "SELL")
             active_orders["SELL"] = {
                 "order_id": sell_order.get("orderId"),
                 "price": self._order_price_decimal(sell_order, Decimal("0")),
@@ -825,6 +860,7 @@ class Strategy:
             order_id = order.get("orderId")
             if not order_id:
                 raise RuntimeError(f"溢价单部分成交循环{side_text}单返回缺少 orderId")
+            self._journal_open_order(order_id, "BUY" if side_text == "买" else "SELL")
             order_price = self._order_price_decimal(order, fallback_price)
             state: dict[str, object] = {
                 "order_id": order_id,

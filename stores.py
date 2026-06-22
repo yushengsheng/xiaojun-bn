@@ -23,6 +23,7 @@ from core_models import (
     OnchainPairEntry,
     OnchainSettings,
 )
+from secure_config import config_context as secure_config_context, seal_config_payload, unseal_config_payload
 from secret_box import SECRET_BOX
 
 def _fsync_parent_dir(path: Path) -> None:
@@ -50,6 +51,10 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> Non
             fp.flush()
             os.fsync(fp.fileno())
         os.replace(tmp_name, path)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
         _fsync_parent_dir(path)
     except Exception:
         try:
@@ -61,6 +66,11 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> Non
 
 def _config_backup_path(path: Path) -> Path:
     return path.with_name(f"{path.name}{CONFIG_BACKUP_SUFFIX}")
+
+
+def config_or_backup_exists(path: Path) -> bool:
+    candidate = Path(path)
+    return candidate.exists() or _config_backup_path(candidate).exists()
 
 
 def _safe_write_backup_text(path: Path, content: str, encoding: str = "utf-8") -> None:
@@ -75,8 +85,18 @@ def _atomic_write_text_with_backup(path: Path, content: str, encoding: str = "ut
     _safe_write_backup_text(path, content, encoding=encoding)
 
 
-def _atomic_write_json_with_backup(path: Path, payload: object, encoding: str = "utf-8") -> None:
-    _atomic_write_text_with_backup(path, json.dumps(payload, ensure_ascii=False, indent=2), encoding=encoding)
+def _atomic_write_json_with_backup(
+    path: Path,
+    payload: object,
+    encoding: str = "utf-8",
+    *,
+    secret_box=None,
+    config_context: str = "",
+) -> None:
+    data = payload
+    if secret_box is not None:
+        data = seal_config_payload(payload, secret_box=secret_box, context=config_context)
+    _atomic_write_text_with_backup(path, json.dumps(data, ensure_ascii=False, indent=2), encoding=encoding)
 
 
 def _load_json_with_backup(
@@ -84,6 +104,9 @@ def _load_json_with_backup(
     *,
     encoding: str = "utf-8",
     validator: Callable[[object], None] | None = None,
+    secret_box=None,
+    config_context: str = "",
+    migrate_legacy: bool = False,
 ) -> tuple[object, bool]:
     backup_path = _config_backup_path(path)
     candidates: list[tuple[Path, bool]] = []
@@ -99,20 +122,71 @@ def _load_json_with_backup(
         try:
             text = candidate_path.read_text(encoding=encoding)
             raw = json.loads(text)
+            payload, protected = (
+                unseal_config_payload(raw, secret_box=secret_box, context=config_context)
+                if secret_box is not None
+                else (raw, False)
+            )
             if validator is not None:
-                validator(raw)
+                validator(payload)
             if is_backup:
-                try:
-                    _atomic_write_text(path, text, encoding=encoding)
-                except Exception:
-                    pass
+                if secret_box is not None:
+                    _atomic_write_json_with_backup(
+                        path,
+                        payload,
+                        encoding=encoding,
+                        secret_box=secret_box,
+                        config_context=config_context,
+                    )
+                else:
+                    try:
+                        _atomic_write_text(path, text, encoding=encoding)
+                    except Exception:
+                        pass
             elif not backup_path.exists():
-                _safe_write_backup_text(path, text, encoding=encoding)
-            return raw, is_backup
+                if secret_box is not None:
+                    _atomic_write_json_with_backup(
+                        path,
+                        payload,
+                        encoding=encoding,
+                        secret_box=secret_box,
+                        config_context=config_context,
+                    )
+                else:
+                    _safe_write_backup_text(path, text, encoding=encoding)
+            elif secret_box is not None and migrate_legacy and not protected:
+                _atomic_write_json_with_backup(
+                    path,
+                    payload,
+                    encoding=encoding,
+                    secret_box=secret_box,
+                    config_context=config_context,
+                )
+            return payload, is_backup
         except Exception as exc:
             source_name = "备份文件" if is_backup else "主文件"
             errors.append(f"{source_name} {candidate_path.name}: {exc}")
     raise RuntimeError("配置文件读取失败；" + "；".join(errors))
+
+
+def _save_authenticated_config(path: Path, payload: object, encoding: str = "utf-8") -> None:
+    _atomic_write_json_with_backup(
+        path,
+        payload,
+        encoding=encoding,
+        secret_box=SECRET_BOX,
+        config_context=secure_config_context(path),
+    )
+
+
+def _load_authenticated_config(path: Path, *, validator: Callable[[object], None] | None = None) -> tuple[object, bool]:
+    return _load_json_with_backup(
+        path,
+        validator=validator,
+        secret_box=SECRET_BOX,
+        config_context=secure_config_context(path),
+        migrate_legacy=True,
+    )
 
 
 def _allow_list_or_dict(raw: object) -> None:
@@ -139,7 +213,7 @@ class AccountStore:
 
     def load(self) -> None:
         self.last_load_notice = ""
-        if not self.file_path.exists():
+        if not config_or_backup_exists(self.file_path):
             self.accounts = []
             self.one_to_many_addresses = []
             self.one_to_many_source_api_key = ""
@@ -147,7 +221,7 @@ class AccountStore:
             self.settings = GlobalSettings()
             return
 
-        raw, recovered = _load_json_with_backup(self.file_path, validator=_allow_list_or_dict)
+        raw, recovered = _load_authenticated_config(self.file_path, validator=_allow_list_or_dict)
         if recovered:
             self.last_load_notice = f"检测到 {self.file_path.name} 损坏，已自动从备份恢复。"
 
@@ -227,7 +301,7 @@ class AccountStore:
                 "addresses": self.one_to_many_addresses,
             },
         }
-        _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
+        _save_authenticated_config(self.file_path, payload, encoding="utf-8")
 
     def upsert_many(self, items: list[AccountEntry]) -> tuple[int, int]:
         """返回 (新增数, 更新数)"""
@@ -299,7 +373,7 @@ class OnchainStore:
 
     def load(self) -> None:
         self.last_load_notice = ""
-        if not self.file_path.exists():
+        if not config_or_backup_exists(self.file_path):
             self.multi_to_multi_pairs = []
             self.multi_to_multi_drafts = []
             self.one_to_many_addresses = []
@@ -307,7 +381,7 @@ class OnchainStore:
             self.settings = OnchainSettings()
             return
 
-        raw, recovered = _load_json_with_backup(self.file_path, validator=_require_dict)
+        raw, recovered = _load_authenticated_config(self.file_path, validator=_require_dict)
         if recovered:
             self.last_load_notice = f"检测到 {self.file_path.name} 损坏，已自动从备份恢复。"
 
@@ -446,12 +520,12 @@ class OnchainStore:
         else:
             payload["one_to_many"]["source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
         payload["many_to_one"]["target"] = self.settings.many_to_one_target
-        _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
+        _save_authenticated_config(self.file_path, payload, encoding="utf-8")
 
     def save_settings_only(self) -> None:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            raw, _recovered = _load_json_with_backup(self.file_path, validator=_require_dict)
+            raw, _recovered = _load_authenticated_config(self.file_path, validator=_require_dict)
             payload = dict(raw) if isinstance(raw, dict) else {}
         except FileNotFoundError:
             payload = {}
@@ -464,12 +538,12 @@ class OnchainStore:
         else:
             payload["one_to_many"]["source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
         payload.setdefault("many_to_one", {})
-        _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
+        _save_authenticated_config(self.file_path, payload, encoding="utf-8")
 
     def save_transfer_lists_only(self) -> None:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            raw, _recovered = _load_json_with_backup(self.file_path, validator=_require_dict)
+            raw, _recovered = _load_authenticated_config(self.file_path, validator=_require_dict)
             payload = dict(raw) if isinstance(raw, dict) else {}
         except FileNotFoundError:
             payload = {"settings": self._build_settings_payload()}
@@ -482,7 +556,7 @@ class OnchainStore:
         payload["one_to_many"]["addresses"] = rows_payload["one_to_many"]["addresses"]
         payload["many_to_one"] = dict(payload.get("many_to_one") or {})
         payload["many_to_one"]["sources"] = rows_payload["many_to_one"]["sources"]
-        _atomic_write_json_with_backup(self.file_path, payload, encoding="utf-8")
+        _save_authenticated_config(self.file_path, payload, encoding="utf-8")
 
     def upsert_multi_to_multi(self, rows: list[OnchainPairEntry]) -> int:
         existing = {(x.source, x.target) for x in self.multi_to_multi_pairs}

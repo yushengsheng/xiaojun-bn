@@ -30,6 +30,7 @@ from app_version import get_app_window_title
 from app_paths import (
     CONFIG_BACKUP_SUFFIX,
     DATA_FILE,
+    EXCHANGE_OPERATION_JOURNAL_FILE,
     EXCHANGE_PROXY_CONFIG_FILE,
     RELAY_WALLET_FILE,
     STRATEGY_CONFIG_FILE,
@@ -89,13 +90,16 @@ from exchange_constants import (
 )
 from exchange_logging import (
     EXCHANGE_LOG_MAX_ROWS,
+    clear_exchange_log_queue,
     clear_exchange_account_log_index,
     log_queue,
     logger,
+    purge_exchange_file_logs,
     set_exchange_account_log_index,
 )
 from exchange_proxy_runtime import ExchangeProxyRuntime, http_get_via_proxy
 from exchange_strategy import CombinedStopEvent, Strategy
+from operation_journal import OperationJournal
 from secret_box import SECRET_BOX
 from shared_utils import (
     SolidButton,
@@ -108,7 +112,16 @@ from shared_utils import (
     start_ui_bridge,
     stop_ui_bridge,
 )
-from stores import AccountStore, _atomic_write_text, _atomic_write_text_with_backup, _load_json_with_backup
+from secure_config import config_context as secure_config_context
+from stores import (
+    AccountStore,
+    _atomic_write_json_with_backup,
+    _atomic_write_text,
+    _atomic_write_text_with_backup,
+    _load_authenticated_config,
+    _load_json_with_backup,
+    config_or_backup_exists,
+)
 
 _ONCHAIN_IMPORT_ERROR = None
 _ONCHAIN_PAGE_CLASS = None
@@ -149,7 +162,13 @@ def _restore_text_snapshot(path: Path, snapshot: str | None) -> None:
 def _atomic_write_json(path: Path, payload: object) -> None:
     _atomic_write_text(path, _json_dump_text(payload), encoding="utf-8")
 def _atomic_write_config_json(path: Path, payload: object) -> None:
-    _atomic_write_text_with_backup(path, _json_dump_text(payload), encoding="utf-8")
+    _atomic_write_json_with_backup(
+        path,
+        payload,
+        encoding="utf-8",
+        secret_box=SECRET_BOX,
+        config_context=secure_config_context(path),
+    )
 def _require_dict_payload(raw: object) -> None:
     if isinstance(raw, dict):
         return
@@ -194,6 +213,7 @@ class ExchangeAppBase(tk.Tk):
         self.exchange_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="exchange")
         self.onchain_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="onchain")
         self.account_store = AccountStore(DATA_FILE)
+        self.exchange_operation_journal = OperationJournal(EXCHANGE_OPERATION_JOURNAL_FILE)
 
         self.accounts = []
         self.total_asset_results = {}
@@ -461,6 +481,16 @@ class ExchangeAppBase(tk.Tk):
         self.btn_search_accounts.pack(side="left", padx=(0, 4))
         self.btn_clear_account_search = ttk.Button(frame_acc_header, text="清空", command=self.clear_account_search)
         self.btn_clear_account_search.pack(side="left", padx=(0, 6))
+        self.btn_destroy_all_accounts = tk.Button(
+            frame_acc_header,
+            text="销毁所有",
+            command=self.destroy_all_exchange_accounts,
+            fg="#C62828",
+            activeforeground="#8E1B1B",
+            highlightthickness=0,
+            cursor="hand2",
+        )
+        self.btn_destroy_all_accounts.pack(side="left", padx=(0, 6))
         ttk.Label(frame_acc_header, textvariable=self.account_search_result_var, foreground="#666666").pack(side="left")
         frame_acc.configure(labelwidget=frame_acc_header)
 
@@ -1408,6 +1438,7 @@ _STAR_EXPORT_NAMES = {
     "_atomic_write_text",
     "_atomic_write_text_with_backup",
     "_load_json_with_backup",
+    "_load_authenticated_config",
     "_read_text_snapshot",
     "_require_dict_payload",
     "_restore_text_snapshot",

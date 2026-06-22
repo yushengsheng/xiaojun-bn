@@ -31,6 +31,75 @@ def _requirements_are_pinned(path: Path) -> tuple[bool, list[str]]:
     return not issues, issues
 
 
+def _lock_has_hashes(path: Path) -> tuple[bool, list[str]]:
+    """Validate the generated pip lock without requiring network access."""
+    if not path.exists():
+        return False, [f"{path.name} is missing"]
+    issues: list[str] = []
+    current_requirement = ""
+    current_has_hash = False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line and not raw_line.startswith((" ", "\t", "#")) and "==" in line:
+            if current_requirement and not current_has_hash:
+                issues.append(f"{path.name}: missing hash for {current_requirement}")
+            current_requirement = line.split("==", 1)[0].strip()
+            current_has_hash = False
+        elif current_requirement and "--hash=sha256:" in line:
+            current_has_hash = True
+    if current_requirement and not current_has_hash:
+        issues.append(f"{path.name}: missing hash for {current_requirement}")
+    return not issues, issues
+
+
+def _pinned_requirements(path: Path, *, visited: set[Path] | None = None) -> dict[str, str]:
+    visited = visited or set()
+    target = path.resolve()
+    if target in visited:
+        return {}
+    visited.add(target)
+    result: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("-r "):
+            result.update(_pinned_requirements(path.parent / line[3:].strip(), visited=visited))
+            continue
+        if "==" not in line:
+            continue
+        name, version = line.split("==", 1)
+        normalized_name = name.split("[", 1)[0].strip().lower().replace("_", "-")
+        result[normalized_name] = version.strip()
+    return result
+
+
+def _lock_versions(path: Path) -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or raw_line.startswith((" ", "\t", "#")) or "==" not in line:
+            continue
+        name, version = line.split("==", 1)
+        versions[name.strip().lower().replace("_", "-")] = version.split("\\", 1)[0].strip()
+    return versions
+
+
+def _lock_matches_sources(lock_path: Path, sources: tuple[Path, ...]) -> tuple[bool, list[str]]:
+    if not lock_path.exists():
+        return False, [f"{lock_path.name} is missing"]
+    expected: dict[str, str] = {}
+    for source in sources:
+        expected.update(_pinned_requirements(source))
+    actual = _lock_versions(lock_path)
+    issues = [
+        f"{lock_path.name}: {name}=={version} does not match lock"
+        for name, version in expected.items()
+        if actual.get(name) != version
+    ]
+    return not issues, issues
+
+
 def _run_pip_check() -> tuple[int, str]:
     proc = subprocess.run(
         [sys.executable, "-m", "pip", "check"],
@@ -61,6 +130,24 @@ def main(argv: list[str] | None = None) -> int:
         for issue in issues:
             print(f"warning={issue}")
         ok = ok and pinned
+
+    for lock_file in (ROOT / "requirements.lock", ROOT / "requirements-build.lock"):
+        hashed, issues = _lock_has_hashes(lock_file)
+        print(f"{lock_file.name}-hashes={'yes' if hashed else 'no'}")
+        for issue in issues:
+            print(f"warning={issue}")
+        ok = ok and hashed
+
+    lock_pairs = (
+        (ROOT / "requirements.lock", (ROOT / "requirements.txt",)),
+        (ROOT / "requirements-build.lock", (ROOT / "requirements-build.txt",)),
+    )
+    for lock_file, sources in lock_pairs:
+        matches, issues = _lock_matches_sources(lock_file, sources)
+        print(f"{lock_file.name}-sources={'yes' if matches else 'no'}")
+        for issue in issues:
+            print(f"warning={issue}")
+        ok = ok and matches
 
     if not args.skip_pip_check:
         code, output = _run_pip_check()

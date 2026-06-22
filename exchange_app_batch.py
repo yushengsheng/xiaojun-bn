@@ -38,9 +38,17 @@ from exchange_app_base import (
     tk,
     ttk,
 )
+from exchange_order_recovery import exchange_operation_scope, reconcile_exchange_orders
 
 
 class ExchangeAppBatchMixin(object):
+    @staticmethod
+    def _exchange_operation_scope(api_key: str) -> str:
+        return exchange_operation_scope(api_key)
+
+    def _reconcile_exchange_orders(self, client, api_key: str) -> None:
+        reconcile_exchange_orders(getattr(self, "exchange_operation_journal", None), client, api_key)
+
     def _set_account_manage_buttons_state(self, state):
         for name in (
             "btn_add_account",
@@ -49,6 +57,7 @@ class ExchangeAppBatchMixin(object):
             "btn_export_accounts",
             "btn_import_accounts",
             "btn_paste_accounts",
+            "btn_destroy_all_accounts",
         ):
             btn = getattr(self, name, None)
             if btn is not None:
@@ -353,6 +362,7 @@ class ExchangeAppBatchMixin(object):
                     )
                 else:
                     effective_reprice_threshold = Decimal("0")
+            self._reconcile_exchange_orders(client, key)
         except Exception as e:
             self._close_binance_client_instance(client)
             messagebox.showerror("错误", "Binance 连接初始化失败: %s" % e)
@@ -418,6 +428,8 @@ class ExchangeAppBatchMixin(object):
             futures_leverage=futures_leverage,
             futures_margin_type=futures_margin_type,
             futures_side=futures_side,
+            operation_journal=self.exchange_operation_journal,
+            operation_scope=self._exchange_operation_scope(key),
         )
 
         def progress_cb(step, total, text):
@@ -428,6 +440,7 @@ class ExchangeAppBatchMixin(object):
             self._dispatch_ui(_update)
 
         def worker():
+            failure_text = ""
             try:
                 zero_round_spot_conversion = (
                     trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and spot_rounds == 0
@@ -503,9 +516,10 @@ class ExchangeAppBatchMixin(object):
                     )
                 strategy.run(self.stop_event, progress_cb=progress_cb)
             except Exception as e:
+                failure_text = str(e)
                 logger.error("运行过程中出现异常: %s", e)
             finally:
-                self._dispatch_ui(self._on_worker_finished)
+                self._dispatch_ui(lambda error=failure_text: self._on_worker_finished(error))
 
         self.worker_thread = self._start_managed_thread(worker, name="exchange-single-run")
     def _restore_batch_ui_to_idle(self, *, status_text: str, finish_summary: bool) -> None:
@@ -528,8 +542,9 @@ class ExchangeAppBatchMixin(object):
             self.after(80, self._set_retry_failed_button_state)
         self.status_var.set(str(status_text or "状态：已完成/已停止"))
         self.progress["value"] = 0
-    def _on_worker_finished(self):
-        self._restore_batch_ui_to_idle(status_text="状态：已完成/已停止", finish_summary=True)
+    def _on_worker_finished(self, failure_text: str = ""):
+        status_text = "状态：已完成/已停止" if not failure_text else f"状态：失败：{failure_text[:80]}"
+        self._restore_batch_ui_to_idle(status_text=status_text, finish_summary=True)
         if self.api_key_var.get().strip() and self.api_secret_var.get().strip():
             self.refresh_balances(silent=True)
     def stop_bot(self):
@@ -2315,6 +2330,7 @@ class ExchangeAppBatchMixin(object):
                             if amt > 0:
                                 self.record_withdraw(idx_local, api_key, address, amt)
 
+                        self._reconcile_exchange_orders(client, acc["api_key"])
                         strategy = Strategy(
                             client=client,
                             spot_rounds=spot_rounds,
@@ -2341,6 +2357,8 @@ class ExchangeAppBatchMixin(object):
                             futures_leverage=futures_leverage,
                             futures_margin_type=futures_margin_type,
                             futures_side=futures_side,
+                            operation_journal=self.exchange_operation_journal,
+                            operation_scope=self._exchange_operation_scope(acc["api_key"]),
                         )
 
                         strategy_result = strategy.run(combined_stop, progress_cb=progress_cb)

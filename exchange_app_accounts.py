@@ -5,21 +5,31 @@ from __future__ import annotations
 
 from exchange_app_base import (
     AccountEntry,
+    DATA_FILE,
     Decimal,
+    EXCHANGE_OPERATION_JOURNAL_FILE,
+    STRATEGY_CONFIG_FILE,
     TOTAL_ASSET_RESULT_FILE,
     WITHDRAW_NETWORK_DEFAULT,
     WITHDRAW_SUCCESS_FILE,
     csv,
+    clear_exchange_log_queue,
+    config_or_backup_exists,
     filedialog,
     logger,
     messagebox,
     random,
     re,
+    purge_exchange_file_logs,
     schedule_ui_callback,
     sys,
     threading,
     time,
     tk,
+)
+from exchange_account_destruction import (
+    destroy_exchange_account_artifacts,
+    scrub_exchange_strategy_account_credentials,
 )
 from sensitive_data import mask_api_key
 
@@ -195,6 +205,124 @@ class ExchangeAppAccountsMixin(object):
                 entry.focus_set()
             except Exception:
                 pass
+    def _clear_exchange_account_ui_state(self) -> None:
+        self._cancel_after_token("_accounts_save_after_token")
+        self._loading_accounts = True
+        try:
+            tree = getattr(self, "account_tree", None)
+            if tree is not None:
+                try:
+                    tree.delete(*tree.get_children())
+                except Exception:
+                    pass
+            self.accounts.clear()
+            self._account_tree_row_to_account.clear()
+            set_context_account = getattr(self, "_set_context_account", None)
+            if callable(set_context_account):
+                set_context_account(None)
+            store = getattr(self, "account_store", None)
+            if store is not None:
+                store.accounts = []
+                store.one_to_many_addresses = []
+                store.one_to_many_source_api_key = ""
+                store.one_to_many_source_api_secret = ""
+            self.total_asset_results.clear()
+            self._current_batch_summary = None
+            self._last_batch_retry = None
+            summary_var = getattr(self, "exchange_batch_summary_var", None)
+            if summary_var is not None:
+                summary_var.set("结果汇总：成功0 | 失败0 | 提现总额=- | 余额总额=-")
+            for name in (
+                "api_key_var",
+                "api_secret_var",
+                "withdraw_addr_var",
+                "acc_api_key_var",
+                "acc_api_secret_var",
+                "acc_withdraw_addr_var",
+            ):
+                value_var = getattr(self, name, None)
+                if value_var is not None:
+                    value_var.set("")
+            self.clear_account_search()
+            try:
+                self.clipboard_clear()
+            except tk.TclError:
+                pass
+        finally:
+            self._loading_accounts = False
+        self._reindex_accounts()
+        self._update_toggle_select_button_text()
+        self._refresh_account_list_hint()
+
+    def _clear_exchange_log_widgets(self) -> None:
+        for name in ("text_log", "text_error_log"):
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+            except Exception:
+                pass
+            finally:
+                try:
+                    widget.configure(state="disabled")
+                except Exception:
+                    pass
+
+    def destroy_all_exchange_accounts(self) -> None:
+        if self._batch_task_active or (self.worker_thread and self.worker_thread.is_alive()):
+            messagebox.showwarning("无法销毁", "请先停止当前交易所任务后再销毁账号信息", parent=self)
+            return
+        warning = (
+            "将直接销毁本机交易所账号、1对多来源账号、提现/资产结果、交易恢复账本、"
+            "交易所运行日志及运行时代理临时文件。\n\n"
+            "共享策略的交易参数和代理设置会保留，但其中 API Key、Secret 和提现地址会清空。\n\n"
+            "此操作不会使用回收站，程序无法恢复。已导出的账号文件、系统备份、云同步副本不在本次范围。"
+        )
+        if not messagebox.askyesno("确认销毁所有", warning, parent=self):
+            return
+        try:
+            scrub_exchange_strategy_account_credentials(STRATEGY_CONFIG_FILE)
+        except Exception as exc:
+            logger.error("销毁前清空策略账号凭据失败: %s", exc)
+            messagebox.showerror("销毁失败", f"共享策略中的账号凭据无法安全清空，未执行销毁：{exc}", parent=self)
+            return
+
+        try:
+            runtime = getattr(self, "exchange_proxy_runtime", None)
+            if runtime is not None:
+                runtime.stop()
+            clear_current_client = getattr(self, "_clear_current_binance_client", None)
+            if callable(clear_current_client):
+                clear_current_client()
+            report = destroy_exchange_account_artifacts(
+                accounts_file=DATA_FILE,
+                operation_journal_file=EXCHANGE_OPERATION_JOURNAL_FILE,
+                withdraw_result_file=WITHDRAW_SUCCESS_FILE,
+                total_asset_result_file=TOTAL_ASSET_RESULT_FILE,
+                runtime_dir=DATA_FILE.parent,
+            )
+            report.merge(purge_exchange_file_logs())
+            clear_exchange_log_queue()
+            self._clear_exchange_account_ui_state()
+            self._clear_exchange_log_widgets()
+        except Exception as exc:
+            logger.exception("销毁交易所账号信息时发生异常")
+            messagebox.showerror("销毁异常", f"销毁过程中发生异常，请重启程序后检查：{exc}", parent=self)
+            return
+
+        if report.ok:
+            logger.info("交易所账号信息已销毁；共享策略参数和代理设置已保留")
+            messagebox.showinfo("销毁完成", "交易所账号相关信息已销毁；共享策略参数和代理设置已保留。", parent=self)
+            return
+        failed_names = "、".join(path.name for path in report.failed)
+        logger.error("部分交易所账号文件未能销毁：%s", failed_names)
+        messagebox.showwarning(
+            "部分销毁失败",
+            f"账号列表已从程序中清空，但以下文件未能确认销毁：{failed_names}\n请关闭程序后检查文件权限。",
+            parent=self,
+        )
     def _copy_account_field(self, acc: dict | None, field_name: str, field_label: str) -> None:
         if acc is None:
             messagebox.showinfo("提示", "请先右键选择一个账号")
@@ -464,13 +592,13 @@ class ExchangeAppAccountsMixin(object):
             )
         return entries
     def _save_accounts_silently(self) -> bool:
-        self._accounts_save_after_token = None
+        self._cancel_after_token("_accounts_save_after_token")
         store = getattr(self, "account_store", None)
         if store is None:
             return False
         try:
             entries = self._account_store_entries()
-            if not entries and not store.file_path.exists():
+            if not entries and not config_or_backup_exists(store.file_path):
                 return False
             store.accounts = entries
             store.settings.network = self._normalize_account_network_text(self.acc_network_var.get())
@@ -482,7 +610,7 @@ class ExchangeAppAccountsMixin(object):
     def _schedule_accounts_save(self) -> None:
         if self._loading_accounts:
             return
-        if not self.accounts and not self.account_store.file_path.exists():
+        if not self.accounts and not config_or_backup_exists(self.account_store.file_path):
             return
         if self._closing:
             self._save_accounts_silently()
@@ -537,7 +665,7 @@ class ExchangeAppAccountsMixin(object):
             if "network_var" in acc:
                 acc["network_var"].set(net)
             self._refresh_account_tree_row(acc)
-        if self.accounts or self.account_store.file_path.exists():
+        if self.accounts or config_or_backup_exists(self.account_store.file_path):
             self._schedule_accounts_save()
     @staticmethod
     def _account_row_color_by_status(status_text: str) -> str:

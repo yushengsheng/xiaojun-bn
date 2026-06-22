@@ -12,6 +12,7 @@ from pathlib import Path
 from core_models import OnchainPairEntry
 from exchange_logging import logger
 from selftest_basic_checks import drain_exchange_log_queue
+from secure_delete import SecureDeleteReport
 from stores import OnchainStore
 
 
@@ -63,6 +64,7 @@ def run_gui_selftest_checks(checks: list[str]) -> None:
 def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
     from tkinter import messagebox
 
+    import exchange_app_accounts
     import exchange_app_base
     import exchange_app_config
     import onchain_imports
@@ -80,14 +82,25 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
     with tempfile.TemporaryDirectory(prefix="xiaojun-selftest-gui-") as tmpdir:
         tmp_root = Path(tmpdir)
         accounts_path = tmp_root / "accounts.json"
+        exchange_journal_path = tmp_root / "exchange_operations.json"
         strategy_path = tmp_root / "exchange_strategy_settings.json"
         proxy_path = tmp_root / "exchange_proxy_settings.json"
         onchain_path = tmp_root / "onchain.json"
+        withdraw_result_path = tmp_root / "withdraw_success.txt"
+        total_asset_result_path = tmp_root / "total_asset_result.txt"
         patches = [
             (exchange_app_base.ExchangeAppBase, "update_ip", lambda self, schedule_next=True: None),
             (exchange_app_base, "DATA_FILE", accounts_path),
+            (exchange_app_base, "EXCHANGE_OPERATION_JOURNAL_FILE", exchange_journal_path),
             (exchange_app_base, "STRATEGY_CONFIG_FILE", strategy_path),
             (exchange_app_base, "EXCHANGE_PROXY_CONFIG_FILE", proxy_path),
+            (exchange_app_accounts, "DATA_FILE", accounts_path),
+            (exchange_app_accounts, "EXCHANGE_OPERATION_JOURNAL_FILE", exchange_journal_path),
+            (exchange_app_accounts, "STRATEGY_CONFIG_FILE", strategy_path),
+            (exchange_app_accounts, "WITHDRAW_SUCCESS_FILE", withdraw_result_path),
+            (exchange_app_accounts, "TOTAL_ASSET_RESULT_FILE", total_asset_result_path),
+            (exchange_app_accounts, "purge_exchange_file_logs", lambda: SecureDeleteReport()),
+            (exchange_app_accounts, "clear_exchange_log_queue", lambda: None),
             (exchange_app_config, "STRATEGY_CONFIG_FILE", strategy_path),
             (exchange_app_config, "EXCHANGE_PROXY_CONFIG_FILE", proxy_path),
             (page_onchain_base, "ONCHAIN_DATA_FILE", onchain_path),
@@ -105,6 +118,14 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 pump_tk_events(app, timeout=5.0)
                 if int(app.account_tree.cget("height")) != 10:
                     raise RuntimeError("GUI 自检失败：交易所账号列表高度不是10行")
+                if str(app.btn_destroy_all_accounts.cget("text")) != "销毁所有":
+                    raise RuntimeError("GUI 自检失败：交易所账号销毁按钮缺失")
+                if str(app.btn_destroy_all_accounts.cget("fg")).lower() != "#c62828":
+                    raise RuntimeError("GUI 自检失败：交易所账号销毁按钮未使用红色字体")
+                header_children = list(app.btn_clear_account_search.master.pack_slaves())
+                if header_children.index(app.btn_destroy_all_accounts) != header_children.index(app.btn_clear_account_search) + 1:
+                    raise RuntimeError("GUI 自检失败：交易所账号销毁按钮未紧随清空按钮")
+                checks.append("exchange-destroy-control-gui=ok")
 
                 drain_exchange_log_queue()
                 logger.info("GUI日志拆分普通日志自检")
@@ -124,11 +145,46 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：普通日志错误进入报错日志")
                 checks.append("exchange-log-split-gui=ok")
 
+                app.api_key_var.set("selftest-api-key")
+                app.api_secret_var.set("selftest-api-secret")
+                app.withdraw_addr_var.set("selftest-withdraw-address")
+                app.spot_symbol_var.set("BNBUSDT")
                 app.save_strategy_config()
                 if not strategy_path.exists():
                     raise RuntimeError("GUI 自检失败：未生成交易所策略配置文件")
                 if not proxy_path.exists():
                     raise RuntimeError("GUI 自检失败：未生成交易所代理配置文件")
+                app._append_account_row(
+                    "selftest-account-key",
+                    "selftest-account-secret",
+                    "selftest-account-address",
+                    "BSC",
+                )
+                app._save_accounts_silently()
+                app.exchange_operation_journal.begin("exchange-order", "selftest", {"order_id": "selftest-order"})
+                withdraw_result_path.write_text("selftest-withdraw", encoding="utf-8")
+                total_asset_result_path.write_text("selftest-asset", encoding="utf-8")
+                (tmp_root / "exchange_ss_proxy_1_selftest.json").write_text("selftest-proxy", encoding="utf-8")
+                (tmp_root / "exchange_proxy_runtime_1.log").write_text("selftest-runtime", encoding="utf-8")
+                confirm_destroy = messagebox.askyesno
+                messagebox.askyesno = lambda *_args, **_kwargs: False
+                app.destroy_all_exchange_accounts()
+                if not accounts_path.exists() or not exchange_journal_path.exists():
+                    raise RuntimeError("GUI 自检失败：确认框取消后仍执行了交易所账号销毁")
+                messagebox.askyesno = confirm_destroy
+                app.destroy_all_exchange_accounts()
+                if app.accounts or accounts_path.exists() or exchange_journal_path.exists():
+                    raise RuntimeError("GUI 自检失败：交易所账号或恢复账本未销毁")
+                if withdraw_result_path.exists() or total_asset_result_path.exists():
+                    raise RuntimeError("GUI 自检失败：交易所结果文件未销毁")
+                if (tmp_root / "exchange_ss_proxy_1_selftest.json").exists() or (tmp_root / "exchange_proxy_runtime_1.log").exists():
+                    raise RuntimeError("GUI 自检失败：交易所代理运行时文件未销毁")
+                strategy_payload, _recovered = exchange_app_config._load_authenticated_config(strategy_path)
+                if any(strategy_payload.get(field) for field in ("api_key", "api_secret", "withdraw_address")):
+                    raise RuntimeError("GUI 自检失败：共享策略仍保留交易所账号凭据")
+                if strategy_payload.get("spot_symbol") != "BNBUSDT" or not proxy_path.exists():
+                    raise RuntimeError("GUI 自检失败：销毁误删共享策略参数或代理配置")
+                checks.append("exchange-destroy-execution-gui=ok")
 
                 app._show_main_page("onchain")
                 pump_tk_events(app, timeout=5.0, predicate=lambda: getattr(app, "onchain_page", None) is not None)

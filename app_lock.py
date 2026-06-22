@@ -20,7 +20,7 @@ try:
 except Exception:
     CRYPTO_AES = None
 
-from app_paths import APP_LOCK_FILE
+from app_paths import APP_LOCK_BACKUP_FILE, APP_LOCK_FILE
 from secret_box import SECRET_BOX, SecretBox
 
 
@@ -48,7 +48,7 @@ def _utc_text() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+def _atomic_write_json_file(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
@@ -71,6 +71,15 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
         except OSError:
             pass
         raise
+
+
+def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    _atomic_write_json_file(path, payload)
+    backup_path = APP_LOCK_BACKUP_FILE if path == APP_LOCK_FILE else path.with_name(f"{path.name}.bak")
+    try:
+        _atomic_write_json_file(backup_path, payload)
+    except Exception:
+        pass
 
 
 class AppLockManager:
@@ -107,7 +116,10 @@ class AppLockManager:
         return str(os.environ.get(APP_LOCK_PASSWORD_ENV, "") or "")
 
     def is_configured(self) -> bool:
-        return self.lock_file.exists()
+        return self.lock_file.exists() or self._backup_path().exists()
+
+    def _backup_path(self) -> Path:
+        return APP_LOCK_BACKUP_FILE if self.lock_file == APP_LOCK_FILE else self.lock_file.with_name(f"{self.lock_file.name}.bak")
 
     def is_unlocked(self) -> bool:
         return self.secret_box.has_cached_key()
@@ -169,19 +181,27 @@ class AppLockManager:
             raise RuntimeError("程序密码错误，或密码文件已损坏") from exc
 
     def _load_config(self) -> dict[str, object]:
-        if not self.lock_file.exists():
+        candidates = (self.lock_file, self._backup_path())
+        if not any(path.exists() for path in candidates):
             raise RuntimeError("尚未设置程序密码")
-        try:
-            raw = json.loads(self.lock_file.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise RuntimeError("程序密码文件读取失败") from exc
-        if not isinstance(raw, dict):
-            raise RuntimeError("程序密码文件格式无效")
-        if int(raw.get("version", 0) or 0) != self.VERSION:
-            raise RuntimeError("程序密码文件版本不支持")
-        if str(raw.get("kdf", "") or "") != self.KDF_NAME:
-            raise RuntimeError("程序密码 KDF 不支持")
-        return raw
+        errors: list[str] = []
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise RuntimeError("程序密码文件格式无效")
+                if int(raw.get("version", 0) or 0) != self.VERSION:
+                    raise RuntimeError("程序密码文件版本不支持")
+                if str(raw.get("kdf", "") or "") != self.KDF_NAME:
+                    raise RuntimeError("程序密码 KDF 不支持")
+                if path != self.lock_file:
+                    _atomic_write_json(self.lock_file, raw)
+                return raw
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+        raise RuntimeError("程序密码文件读取失败：" + "；".join(errors))
 
     def _build_config(self, password: str, raw_secret_key: bytes) -> dict[str, object]:
         self.validate_new_password(password)

@@ -36,7 +36,8 @@ from exchange_app_base import (
     WITHDRAW_FEE_BUFFER_DEFAULT,
     WITHDRAW_NETWORK_DEFAULT,
     _atomic_write_config_json,
-    _load_json_with_backup,
+    config_or_backup_exists,
+    _load_authenticated_config,
     _read_text_snapshot,
     _require_dict_payload,
     _restore_text_snapshot,
@@ -343,9 +344,9 @@ class ExchangeAppConfigMixin(object):
     def _load_exchange_proxy_config(self):
         proxy_text = ""
         use_proxy = EXCHANGE_USE_CONFIG_PROXY_DEFAULT
-        if EXCHANGE_PROXY_CONFIG_FILE.exists():
+        if config_or_backup_exists(EXCHANGE_PROXY_CONFIG_FILE):
             try:
-                raw, recovered = _load_json_with_backup(EXCHANGE_PROXY_CONFIG_FILE, validator=_require_dict_payload)
+                raw, recovered = _load_authenticated_config(EXCHANGE_PROXY_CONFIG_FILE, validator=_require_dict_payload)
                 proxy_text, use_proxy = self._proxy_config_from_payload(raw)
                 if recovered:
                     logger.warning("交易所代理配置损坏，已自动从备份恢复：%s", EXCHANGE_PROXY_CONFIG_FILE)
@@ -353,9 +354,9 @@ class ExchangeAppConfigMixin(object):
                     logger.info("已加载代理配置：%s", EXCHANGE_PROXY_CONFIG_FILE)
             except Exception as e:
                 logger.error("加载代理配置失败: %s", e)
-        elif STRATEGY_CONFIG_FILE.exists():
+        elif config_or_backup_exists(STRATEGY_CONFIG_FILE):
             try:
-                raw, recovered = _load_json_with_backup(STRATEGY_CONFIG_FILE, validator=_require_dict_payload)
+                raw, recovered = _load_authenticated_config(STRATEGY_CONFIG_FILE, validator=_require_dict_payload)
                 proxy_text, use_proxy = self._proxy_config_from_payload(raw)
                 if recovered:
                     logger.warning("旧版策略配置损坏，已自动从备份恢复：%s", STRATEGY_CONFIG_FILE)
@@ -372,10 +373,10 @@ class ExchangeAppConfigMixin(object):
         self.exchange_proxy_var.set(proxy_text)
         self.use_exchange_config_proxy_var.set(use_proxy)
     def _load_strategy_config(self):
-        if not STRATEGY_CONFIG_FILE.exists():
+        if not config_or_backup_exists(STRATEGY_CONFIG_FILE):
             return
         try:
-            raw, recovered = _load_json_with_backup(STRATEGY_CONFIG_FILE, validator=_require_dict_payload)
+            raw, recovered = _load_authenticated_config(STRATEGY_CONFIG_FILE, validator=_require_dict_payload)
             if recovered:
                 logger.warning("交易所策略配置损坏，已自动从备份恢复：%s", STRATEGY_CONFIG_FILE)
 

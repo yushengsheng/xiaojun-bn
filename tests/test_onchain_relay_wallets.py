@@ -93,6 +93,22 @@ class RelayWalletCleanupTests(unittest.TestCase):
             self.assertIn("enc::", raw_text)
             self.assertEqual(store.load_records()[0].private_key, private_key)
 
+    def test_relay_wallet_file_recovers_from_authenticated_backup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-relay-wallet-secret-test-") as tmpdir:
+            path = Path(tmpdir) / "relay.txt"
+            store = RelayWalletFileStore(path)
+            record = _expired_record(4)
+            record.private_key = "4" * 64
+            store.append_records([record])
+            backup_path = path.with_name(f"{path.name}.bak")
+            self.assertTrue(backup_path.exists())
+            path.write_text("tampered", encoding="utf-8")
+
+            loaded = store.load_records()
+
+            self.assertEqual(loaded[0].private_key, "4" * 64)
+            self.assertEqual(path.read_text(encoding="utf-8"), backup_path.read_text(encoding="utf-8"))
+
     def test_cleanup_logs_balance_query_progress(self) -> None:
         with tempfile.TemporaryDirectory(prefix="xiaojun-relay-cleanup-test-") as tmpdir:
             store = RelayWalletFileStore(Path(tmpdir) / "relay.txt")
