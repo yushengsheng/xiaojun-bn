@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from app_defaults import (
     EXCHANGE_WORKER_THREADS_DEFAULT,
+    ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT,
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
     ONCHAIN_DELAY_SECONDS_DEFAULT,
     ONCHAIN_WORKER_THREADS_DEFAULT,
@@ -44,6 +45,7 @@ class WithdrawRuntimeParams:
     delay: float
     threads: int
     confirm_timeout_seconds: float = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
+    confirm_poll_interval_seconds: float = ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT
     random_enabled: bool = False
     random_min: Decimal | None = None
     random_max: Decimal | None = None
@@ -90,6 +92,7 @@ class OnchainSettings:
     delay_seconds: float = ONCHAIN_DELAY_SECONDS_DEFAULT
     worker_threads: int = ONCHAIN_WORKER_THREADS_DEFAULT
     confirm_timeout_seconds: float = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
+    confirm_poll_interval_seconds: float = ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT
     dry_run: bool = True
     use_config_proxy: bool = False
     proxy_url: str = ""

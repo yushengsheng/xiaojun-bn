@@ -197,6 +197,39 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：链上日志未使用 Text 控件")
                 if page._confirmation_worker_limit() < 1:
                     raise RuntimeError("GUI 自检失败：链上确认线程池限制异常")
+                if str(page.lbl_confirm_poll_interval.cget("text")) != "确认轮询(秒)":
+                    raise RuntimeError("GUI 自检失败：链上确认轮询配置控件缺失")
+                page.confirm_poll_interval_var.set("0.5")
+                if abs(page._runtime_confirmation_poll_interval_seconds() - 0.5) > 0.0001:
+                    raise RuntimeError("GUI 自检失败：链上确认轮询配置未同步到运行时")
+
+                def _assert_confirmation_poll_layout(layout_mode: str, *, relay_visible: bool) -> None:
+                    page._apply_setting_layout(layout_mode)
+                    timeout_info = page.ent_confirm_timeout.grid_info()
+                    poll_info = page.ent_confirm_poll_interval.grid_info()
+                    if not timeout_info or not poll_info:
+                        raise RuntimeError("GUI 自检失败：链上确认轮询配置未参与布局")
+                    timeout_row = int(timeout_info["row"])
+                    poll_row = int(poll_info["row"])
+                    timeout_column = int(timeout_info["column"])
+                    poll_column = int(poll_info["column"])
+                    if layout_mode == "narrow":
+                        if poll_row != timeout_row + 1:
+                            raise RuntimeError("GUI 自检失败：窄屏确认轮询控件未紧随确认超时")
+                    elif poll_row != timeout_row or poll_column <= timeout_column:
+                        raise RuntimeError("GUI 自检失败：确认轮询控件未紧随确认超时")
+                    if relay_visible != page._relay_controls_visible():
+                        raise RuntimeError("GUI 自检失败：中转确认轮询布局状态异常")
+
+                for layout_mode in ("wide", "medium", "narrow"):
+                    _assert_confirmation_poll_layout(layout_mode, relay_visible=False)
+                page.mode_var.set(page.MODE_1M)
+                pump_tk_events(app, timeout=5.0)
+                for layout_mode in ("wide", "medium", "narrow"):
+                    _assert_confirmation_poll_layout(layout_mode, relay_visible=True)
+                page.mode_var.set(page.MODE_M2M)
+                pump_tk_events(app, timeout=5.0)
+                page._apply_setting_layout(page._layout_mode_for_width(app.winfo_width()))
                 confirm_probe: list[str] = []
                 confirm_future = page._submit_confirmation_task(lambda: confirm_probe.append("ok"), name="selftest-confirm")
                 if confirm_future is None:
@@ -278,6 +311,9 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：多对多数量配置未保存")
                 if saved_store.settings.mode_amounts.get("one_to_many", {}).get("amount") != "0.01":
                     raise RuntimeError("GUI 自检失败：1对多独立数量配置未保存")
+                if abs(float(saved_store.settings.confirm_poll_interval_seconds) - 0.5) > 0.0001:
+                    raise RuntimeError("GUI 自检失败：链上确认轮询配置未保存")
+                checks.append("onchain-confirm-poll-config-gui=ok")
                 if saved_store.settings.mode_amounts.get("many_to_one", {}).get("amount_mode") != page.AMOUNT_MODE_ALL:
                     raise RuntimeError("GUI 自检失败：多对1独立数量配置未保存")
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from dataclasses import asdict
@@ -12,6 +13,8 @@ from typing import Callable
 
 from app_defaults import (
     EXCHANGE_WORKER_THREADS_DEFAULT,
+    ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT,
+    ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_MIN,
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
     ONCHAIN_DELAY_SECONDS_DEFAULT,
     ONCHAIN_WORKER_THREADS_DEFAULT,
@@ -449,10 +452,21 @@ class OnchainStore:
             confirm_timeout_seconds = float(
                 settings_raw.get("confirm_timeout_seconds", ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)
             )
-            if confirm_timeout_seconds <= 0:
+            if not math.isfinite(confirm_timeout_seconds) or confirm_timeout_seconds <= 0:
                 confirm_timeout_seconds = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
         except Exception:
             confirm_timeout_seconds = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
+        try:
+            confirm_poll_interval_seconds = float(
+                settings_raw.get("confirm_poll_interval_seconds", ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT)
+            )
+            if (
+                not math.isfinite(confirm_poll_interval_seconds)
+                or confirm_poll_interval_seconds < ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_MIN
+            ):
+                confirm_poll_interval_seconds = ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT
+        except Exception:
+            confirm_poll_interval_seconds = ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT
 
         self.multi_to_multi_pairs = pairs
         self.multi_to_multi_drafts = drafts
@@ -492,6 +506,7 @@ class OnchainStore:
             delay_seconds=delay,
             worker_threads=threads,
             confirm_timeout_seconds=confirm_timeout_seconds,
+            confirm_poll_interval_seconds=confirm_poll_interval_seconds,
             dry_run=bool(settings_raw.get("dry_run", True)),
             use_config_proxy=bool(settings_raw.get("use_config_proxy", False)),
             proxy_url=SECRET_BOX.decrypt(str(settings_raw.get("proxy_url", "") or "").strip()).strip(),

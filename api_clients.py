@@ -405,9 +405,22 @@ class EvmClient:
         with ThreadPoolExecutor(max_workers=min(workers, total)) as executor:
             return list(executor.map(lambda _idx: self.create_wallet(), range(total)))
 
-    def _rpc_call(self, network: str, method: str, params: list) -> object:
+    def _rpc_call(
+        self,
+        network: str,
+        method: str,
+        params: list,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_attempts: int | None = None,
+    ) -> object:
         info = self._network_info(network)
-        max_attempts = 2
+        attempts = 2 if max_attempts is None else max(1, int(max_attempts))
+        timeout = (
+            self.RPC_CONNECT_TIMEOUT if connect_timeout is None else max(0.2, float(connect_timeout)),
+            self.RPC_READ_TIMEOUT if read_timeout is None else max(0.2, float(read_timeout)),
+        )
         payload = {
             "jsonrpc": "2.0",
             "id": int(time.time() * 1000),
@@ -419,7 +432,7 @@ class EvmClient:
         last_err = ""
         rpc_urls = self._ordered_rpc_urls(network, list(info["rpc_urls"]))
         for url in rpc_urls:
-            for attempt in range(1, max_attempts + 1):
+            for attempt in range(1, attempts + 1):
                 session = None
                 proxy_url = ""
                 try:
@@ -428,7 +441,7 @@ class EvmClient:
                         url,
                         data=body,
                         headers={"Content-Type": "application/json"},
-                        timeout=(self.RPC_CONNECT_TIMEOUT, self.RPC_READ_TIMEOUT),
+                        timeout=timeout,
                     )
                     text = resp.text
                     if resp.status_code >= 400:
@@ -451,7 +464,7 @@ class EvmClient:
                     if proxy_url and "Missing dependencies for SOCKS support" in err_text:
                         err_text = f"当前代理为 SOCKS，但运行环境缺少 PySocks：{proxy_url}"
                     last_err = err_text
-                    if attempt < max_attempts:
+                    if attempt < attempts:
                         time.sleep(0.4 * attempt)
                         continue
                     break
@@ -589,11 +602,26 @@ class EvmClient:
         result = self._rpc_call(network, "eth_getTransactionCount", [address, "pending"])
         return self._int_from_hex(result)
 
-    def get_transaction_receipt(self, network: str, tx_hash: str) -> dict | None:
+    def get_transaction_receipt(
+        self,
+        network: str,
+        tx_hash: str,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_attempts: int | None = None,
+    ) -> dict | None:
         txid = self._ensure_hex_prefixed(str(tx_hash or "").strip())
         if not re.fullmatch(r"0x[a-fA-F0-9]{64}", txid):
             raise RuntimeError(f"交易哈希格式错误：{tx_hash}")
-        result = self._rpc_call(network, "eth_getTransactionReceipt", [txid])
+        result = self._rpc_call(
+            network,
+            "eth_getTransactionReceipt",
+            [txid],
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_attempts=max_attempts,
+        )
         if result is None:
             return None
         if not isinstance(result, dict):

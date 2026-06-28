@@ -420,6 +420,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                 amount_mode="固定数量",
                 amount="1",
                 confirm_timeout_seconds=240.0,
+                confirm_poll_interval_seconds=0.5,
                 relay_enabled=True,
                 relay_fee_reserve="0.0012",
                 relay_sweep_enabled=True,
@@ -434,6 +435,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                 raise RuntimeError("中转钱包自检失败：配置中的手续费预留未恢复")
             if abs(float(relay_loaded_store.settings.confirm_timeout_seconds) - 240.0) > 0.0001:
                 raise RuntimeError("中转钱包自检失败：配置中的确认超时未恢复")
+            if abs(float(relay_loaded_store.settings.confirm_poll_interval_seconds) - 0.5) > 0.0001:
+                raise RuntimeError("中转钱包自检失败：配置中的确认轮询间隔未恢复")
             relay_onchain_store.settings.mode = "多对1"
             relay_onchain_store.settings.relay_enabled = True
             relay_onchain_store.save_settings_only()

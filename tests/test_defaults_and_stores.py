@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from app_defaults import (
     EXCHANGE_WORKER_THREADS_DEFAULT,
+    ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT,
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
     ONCHAIN_DELAY_SECONDS_DEFAULT,
     ONCHAIN_WORKER_THREADS_DEFAULT,
@@ -68,6 +69,7 @@ class StoreDefaultTests(unittest.TestCase):
             self.assertEqual(store.settings.worker_threads, ONCHAIN_WORKER_THREADS_DEFAULT)
             self.assertEqual(store.settings.delay_seconds, ONCHAIN_DELAY_SECONDS_DEFAULT)
             self.assertEqual(store.settings.confirm_timeout_seconds, ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)
+            self.assertEqual(store.settings.confirm_poll_interval_seconds, ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT)
 
     def test_onchain_store_recovers_when_only_backup_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -89,7 +91,7 @@ class StoreDefaultTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "onchain.json"
             path.write_text(
-                '{"settings":{"worker_threads":"bad","delay_seconds":-5,"confirm_timeout_seconds":0}}',
+                '{"settings":{"worker_threads":"bad","delay_seconds":-5,"confirm_timeout_seconds":0,"confirm_poll_interval_seconds":"nan"}}',
                 encoding="utf-8",
             )
             store = OnchainStore(path)
@@ -97,7 +99,20 @@ class StoreDefaultTests(unittest.TestCase):
             self.assertEqual(store.settings.worker_threads, ONCHAIN_WORKER_THREADS_DEFAULT)
             self.assertEqual(store.settings.delay_seconds, 0.0)
             self.assertEqual(store.settings.confirm_timeout_seconds, ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)
+            self.assertEqual(store.settings.confirm_poll_interval_seconds, ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT)
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")).get("format"), "xiaojun-authenticated-config-v1")
+
+    def test_onchain_store_persists_confirmation_poll_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "onchain.json"
+            source = OnchainStore(path)
+            source.settings = OnchainSettings(confirm_poll_interval_seconds=0.5)
+            source.save_settings_only()
+
+            loaded = OnchainStore(path)
+            loaded.load()
+
+            self.assertEqual(loaded.settings.confirm_poll_interval_seconds, 0.5)
 
     def test_onchain_store_does_not_persist_ephemeral_one_to_many_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

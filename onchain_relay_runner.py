@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 import threading
 import time
@@ -11,6 +12,8 @@ from decimal import Decimal
 from tkinter import messagebox
 
 from app_defaults import (
+    ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT,
+    ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_MIN,
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
     ONCHAIN_RELAY_SWEEP_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
 )
@@ -22,7 +25,7 @@ from shared_utils import set_ui_batch_size
 RELAY_CONFIRM_TIMEOUT_SECONDS = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
 RELAY_BALANCE_TIMEOUT_SECONDS = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
 RELAY_SWEEP_CONFIRM_TIMEOUT_SECONDS = ONCHAIN_RELAY_SWEEP_CONFIRM_TIMEOUT_SECONDS_DEFAULT
-RELAY_POLL_INTERVAL_SECONDS = 2.0
+RELAY_POLL_INTERVAL_SECONDS = ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT
 RELAY_SWEEP_SAFETY_GAS_MULTIPLIER = 1
 RELAY_SWEEP_TERMINAL_RESOLUTIONS = {"manual_empty", "dust_left"}
 RELAY_TRACKED_TOKEN_SYMBOLS = {"USDT", "USDC"}
@@ -49,6 +52,24 @@ def _relay_sweep_timeout_seconds(base_timeout_seconds: float | None = None) -> f
     except Exception:
         base_value = 0.0
     return max(RELAY_SWEEP_CONFIRM_TIMEOUT_SECONDS, max(1.0, base_value))
+
+
+def _relay_poll_interval_seconds(owner, configured_value: object | None = None) -> float:
+    value = configured_value
+    if value is None:
+        getter = getattr(owner, "_runtime_confirmation_poll_interval_seconds", None)
+        if callable(getter):
+            try:
+                value = getter()
+            except Exception:
+                value = None
+    try:
+        interval = float(value) if value is not None else RELAY_POLL_INTERVAL_SECONDS
+    except Exception:
+        interval = RELAY_POLL_INTERVAL_SECONDS
+    if not math.isfinite(interval) or interval < ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_MIN:
+        return RELAY_POLL_INTERVAL_SECONDS
+    return interval
 
 
 def _append_relay_sweep_log(event: str, **fields: object) -> None:
@@ -693,8 +714,17 @@ def _schedule_background_relay_sweep_recovery(
     return True
 
 
-def _wait_for_transaction_success(owner, network: str, txid: str, *, label: str, timeout_seconds: float | None = None) -> dict:
+def _wait_for_transaction_success(
+    owner,
+    network: str,
+    txid: str,
+    *,
+    label: str,
+    timeout_seconds: float | None = None,
+    poll_interval_seconds: float | None = None,
+) -> dict:
     timeout_value = max(1.0, float(timeout_seconds if timeout_seconds is not None else RELAY_CONFIRM_TIMEOUT_SECONDS))
+    poll_interval = _relay_poll_interval_seconds(owner, poll_interval_seconds)
     deadline = time.time() + timeout_value
     while True:
         if owner.stop_requested.is_set():
@@ -710,7 +740,7 @@ def _wait_for_transaction_success(owner, network: str, txid: str, *, label: str,
             return receipt
         if time.time() >= deadline:
             raise RuntimeError(f"{label}超时：等待链上确认超过 {timeout_value:g} 秒，txid={txid}")
-        if owner.stop_requested.wait(RELAY_POLL_INTERVAL_SECONDS):
+        if owner.stop_requested.wait(poll_interval):
             raise RuntimeError("任务已停止")
 
 
@@ -722,8 +752,10 @@ def _wait_for_token_balance_at_least(
     *,
     label: str,
     timeout_seconds: float | None = None,
+    poll_interval_seconds: float | None = None,
 ) -> int:
     timeout_value = max(1.0, float(timeout_seconds if timeout_seconds is not None else RELAY_BALANCE_TIMEOUT_SECONDS))
+    poll_interval = _relay_poll_interval_seconds(owner, poll_interval_seconds)
     deadline = time.time() + timeout_value
     while True:
         if owner.stop_requested.is_set():
@@ -733,7 +765,7 @@ def _wait_for_token_balance_at_least(
             return current_units
         if time.time() >= deadline:
             raise RuntimeError(f"{label}超时：等待余额达到目标值超过 {timeout_value:g} 秒")
-        if owner.stop_requested.wait(RELAY_POLL_INTERVAL_SECONDS):
+        if owner.stop_requested.wait(poll_interval):
             raise RuntimeError("任务已停止")
 
 
@@ -745,8 +777,10 @@ def _wait_for_native_balance_at_most(
     *,
     label: str,
     timeout_seconds: float | None = None,
+    poll_interval_seconds: float | None = None,
 ) -> int:
     timeout_value = max(1.0, float(timeout_seconds if timeout_seconds is not None else RELAY_BALANCE_TIMEOUT_SECONDS))
+    poll_interval = _relay_poll_interval_seconds(owner, poll_interval_seconds)
     deadline = time.time() + timeout_value
     while True:
         if owner.stop_requested.is_set():
@@ -756,7 +790,7 @@ def _wait_for_native_balance_at_most(
             return current_units
         if time.time() >= deadline:
             raise RuntimeError(f"{label}超时：等待原生币余额降至目标值以下超过 {timeout_value:g} 秒")
-        if owner.stop_requested.wait(RELAY_POLL_INTERVAL_SECONDS):
+        if owner.stop_requested.wait(poll_interval):
             raise RuntimeError("任务已停止")
 
 
@@ -2914,6 +2948,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                             delay=params.delay,
                             threads=params.threads,
                             confirm_timeout_seconds=params.confirm_timeout_seconds,
+                            confirm_poll_interval_seconds=params.confirm_poll_interval_seconds,
                             token_contract=params.token_contract,
                             token_decimals=params.token_decimals,
                             token_is_native=params.token_is_native,
@@ -2975,6 +3010,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                             delay=0.0,
                             threads=1,
                             confirm_timeout_seconds=confirm_timeout_seconds,
+                            confirm_poll_interval_seconds=stage_params.confirm_poll_interval_seconds,
                             token_decimals=18,
                             token_is_native=True,
                         )

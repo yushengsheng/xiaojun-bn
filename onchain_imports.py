@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
-from app_defaults import ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
+from app_defaults import (
+    ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT,
+    ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
+)
 from page_onchain_base import (
     Decimal,
     InvalidOperation,
@@ -363,6 +366,13 @@ class OnchainImportMixin(object):
         except Exception:
             messagebox.showerror("参数错误", "确认超时必须是大于 0 的数字")
             return False
+        try:
+            confirm_poll_interval_seconds = self._parse_confirm_poll_interval_seconds(
+                self.confirm_poll_interval_var.get()
+            )
+        except ValueError as exc:
+            messagebox.showerror("参数错误", str(exc))
+            return False
         proxy_text = self.onchain_proxy_var.get().strip()
         if self.use_config_proxy_var.get():
             try:
@@ -426,6 +436,7 @@ class OnchainImportMixin(object):
             delay_seconds=delay,
             worker_threads=threads,
             confirm_timeout_seconds=confirm_timeout_seconds,
+            confirm_poll_interval_seconds=confirm_poll_interval_seconds,
             dry_run=bool(self.dry_run_var.get()),
             use_config_proxy=bool(self.use_config_proxy_var.get()),
             proxy_url=proxy_text,
@@ -494,6 +505,11 @@ class OnchainImportMixin(object):
             self.threads_var.set(str(max(1, int(st.worker_threads or 1))))
             self.confirm_timeout_var.set(
                 self._decimal_to_text(Decimal(str(st.confirm_timeout_seconds or ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)))
+            )
+            self.confirm_poll_interval_var.set(
+                self._decimal_to_text(
+                    Decimal(str(st.confirm_poll_interval_seconds or ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT))
+                )
             )
             self.dry_run_var.set(st.dry_run)
             self.use_config_proxy_var.set(bool(st.use_config_proxy))

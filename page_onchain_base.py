@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import queue
 import re
@@ -20,6 +21,8 @@ import requests
 
 from api_clients import EvmClient
 from app_defaults import (
+    ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT,
+    ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_MIN,
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
     ONCHAIN_CONFIRM_WORKER_LIMIT_MAX,
     ONCHAIN_DELAY_SECONDS_DEFAULT,
@@ -172,7 +175,10 @@ class OnchainTransferPageBase:
         self._onchain_proxy_state_lock = threading.Lock()
         self._onchain_proxy_state = {"use_config_proxy": False, "raw_proxy": ""}
         self._runtime_state_lock = threading.Lock()
-        self._runtime_state = {"threads_raw": str(ONCHAIN_WORKER_THREADS_DEFAULT)}
+        self._runtime_state = {
+            "threads_raw": str(ONCHAIN_WORKER_THREADS_DEFAULT),
+            "confirm_poll_interval_raw": str(ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT),
+        }
         self._confirmation_executor_lock = threading.Lock()
         self._confirmation_executor: ThreadPoolExecutor | None = None
         self._confirmation_executor_max_workers = 0
@@ -190,6 +196,7 @@ class OnchainTransferPageBase:
         self.delay_var = DoubleVar(value=ONCHAIN_DELAY_SECONDS_DEFAULT)
         self.threads_var = StringVar(value=str(ONCHAIN_WORKER_THREADS_DEFAULT))
         self.confirm_timeout_var = StringVar(value=str(int(ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)))
+        self.confirm_poll_interval_var = StringVar(value=str(int(ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT)))
         self.dry_run_var = BooleanVar(value=False)
         self.use_config_proxy_var = BooleanVar(value=False)
         self.onchain_proxy_var = StringVar(value="")
@@ -301,6 +308,8 @@ class OnchainTransferPageBase:
         self.spin_threads = ttk.Spinbox(setting, from_=1, to=64, textvariable=self.threads_var, width=6)
         self.lbl_confirm_timeout = ttk.Label(setting, text="确认超时(秒)")
         self.ent_confirm_timeout = ttk.Entry(setting, textvariable=self.confirm_timeout_var, width=7)
+        self.lbl_confirm_poll_interval = ttk.Label(setting, text="确认轮询(秒)")
+        self.ent_confirm_poll_interval = ttk.Entry(setting, textvariable=self.confirm_poll_interval_var, width=6)
 
         self.lbl_source_credential = ttk.Label(setting, text="转出钱包私钥/助记词*")
         self.ent_source_credential = ttk.Entry(setting, textvariable=self.source_credential_var, width=34, show="*")
@@ -485,6 +494,7 @@ class OnchainTransferPageBase:
         self.coin_var.trace_add("write", self._on_coin_changed)
         self.amount_mode_var.trace_add("write", self._on_amount_mode_changed)
         self.threads_var.trace_add("write", self._on_runtime_settings_changed)
+        self.confirm_poll_interval_var.trace_add("write", self._on_runtime_settings_changed)
         self.use_config_proxy_var.trace_add("write", self._on_proxy_config_changed)
         self.onchain_proxy_var.trace_add("write", self._on_proxy_config_changed)
         self.source_credential_var.trace_add("write", self._on_source_or_target_changed)
@@ -860,11 +870,36 @@ class OnchainTransferPageBase:
     def _runtime_worker_threads(self) -> int:
         raw = self._runtime_state_snapshot().get("threads_raw", ONCHAIN_WORKER_THREADS_DEFAULT)
         return parse_worker_threads(raw, default=ONCHAIN_WORKER_THREADS_DEFAULT)
+    @staticmethod
+    def _parse_confirm_poll_interval_seconds(value: object) -> float:
+        try:
+            interval = float(str(value).strip())
+        except Exception as exc:
+            raise ValueError("确认轮询间隔格式错误") from exc
+        if not math.isfinite(interval) or interval < ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_MIN:
+            raise ValueError(f"确认轮询间隔必须是不小于 {ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_MIN:g} 秒的有限数字")
+        return interval
+    def _runtime_confirmation_poll_interval_seconds(self) -> float:
+        raw = self._runtime_state_snapshot().get(
+            "confirm_poll_interval_raw",
+            ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT,
+        )
+        try:
+            return self._parse_confirm_poll_interval_seconds(raw)
+        except ValueError:
+            return ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT
     def _sync_runtime_state(self) -> None:
         threads_var = getattr(self, "threads_var", None)
         threads_raw = str(threads_var.get() if threads_var is not None else ONCHAIN_WORKER_THREADS_DEFAULT)
+        poll_interval_var = getattr(self, "confirm_poll_interval_var", None)
+        poll_interval_raw = str(
+            poll_interval_var.get() if poll_interval_var is not None else ONCHAIN_CONFIRM_POLL_INTERVAL_SECONDS_DEFAULT
+        )
         with self._runtime_state_lock:
-            self._runtime_state = {"threads_raw": threads_raw}
+            self._runtime_state = {
+                "threads_raw": threads_raw,
+                "confirm_poll_interval_raw": poll_interval_raw,
+            }
     def _runtime_state_snapshot(self) -> dict[str, object]:
         with self._runtime_state_lock:
             return dict(self._runtime_state)
@@ -2243,6 +2278,8 @@ class OnchainTransferPageBase:
             self.spin_threads,
             self.lbl_confirm_timeout,
             self.ent_confirm_timeout,
+            self.lbl_confirm_poll_interval,
+            self.ent_confirm_poll_interval,
             self.lbl_source_credential,
             self.ent_source_credential,
             self.btn_toggle_source_credential,
@@ -2263,7 +2300,7 @@ class OnchainTransferPageBase:
         for w in widgets:
             w.grid_forget()
 
-        for c in range(14):
+        for c in range(16):
             self.setting_frame.columnconfigure(c, weight=0)
 
         show_source = self._is_mode_1m()
@@ -2293,6 +2330,8 @@ class OnchainTransferPageBase:
             if not show_relay:
                 self.lbl_confirm_timeout.grid(row=1, column=12, sticky=W, pady=(8, 0))
                 self.ent_confirm_timeout.grid(row=1, column=13, sticky=W, padx=(4, 0), pady=(8, 0))
+                self.lbl_confirm_poll_interval.grid(row=1, column=14, sticky=W, padx=(10, 0), pady=(8, 0))
+                self.ent_confirm_poll_interval.grid(row=1, column=15, sticky=W, padx=(4, 0), pady=(8, 0))
             self.setting_frame.columnconfigure(1, weight=1)
             self.setting_frame.columnconfigure(3, weight=1)
             self.setting_frame.columnconfigure(5, weight=1)
@@ -2300,6 +2339,7 @@ class OnchainTransferPageBase:
             self.setting_frame.columnconfigure(11, weight=1)
             if not show_relay:
                 self.setting_frame.columnconfigure(13, weight=1)
+                self.setting_frame.columnconfigure(15, weight=1)
 
             row = 2
             if show_source:
@@ -2318,6 +2358,8 @@ class OnchainTransferPageBase:
                 self.ent_relay_fee_reserve.grid(row=row, column=2, sticky=W, padx=(4, 10), pady=(8, 0))
                 self.lbl_confirm_timeout.grid(row=row, column=3, sticky=W, pady=(8, 0))
                 self.ent_confirm_timeout.grid(row=row, column=4, sticky=W, padx=(4, 10), pady=(8, 0))
+                self.lbl_confirm_poll_interval.grid(row=row, column=5, sticky=W, pady=(8, 0))
+                self.ent_confirm_poll_interval.grid(row=row, column=6, sticky=W, padx=(4, 10), pady=(8, 0))
                 row += 1
                 self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=11, sticky=W, pady=(6, 0))
                 row += 1
@@ -2355,6 +2397,8 @@ class OnchainTransferPageBase:
             if not show_relay:
                 self.lbl_confirm_timeout.grid(row=row, column=7, sticky=W, padx=(10, 0), pady=(8, 0))
                 self.ent_confirm_timeout.grid(row=row, column=8, sticky=W, padx=(4, 10), pady=(8, 0))
+                self.lbl_confirm_poll_interval.grid(row=row, column=9, sticky=W, pady=(8, 0))
+                self.ent_confirm_poll_interval.grid(row=row, column=10, sticky=W, padx=(4, 0), pady=(8, 0))
                 row += 1
 
             if show_source:
@@ -2373,6 +2417,8 @@ class OnchainTransferPageBase:
                 self.ent_relay_fee_reserve.grid(row=row, column=2, sticky=W, padx=(4, 8), pady=(8, 0))
                 self.lbl_confirm_timeout.grid(row=row, column=3, sticky=W, pady=(8, 0))
                 self.ent_confirm_timeout.grid(row=row, column=4, sticky=W, padx=(4, 8), pady=(8, 0))
+                self.lbl_confirm_poll_interval.grid(row=row, column=5, sticky=W, pady=(8, 0))
+                self.ent_confirm_poll_interval.grid(row=row, column=6, sticky=W, padx=(4, 8), pady=(8, 0))
                 row += 1
                 self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=10, sticky=W, pady=(6, 0))
                 row += 1
@@ -2423,6 +2469,9 @@ class OnchainTransferPageBase:
             self.lbl_confirm_timeout.grid(row=row, column=0, sticky=W, pady=(8, 0))
             self.ent_confirm_timeout.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
             row += 1
+            self.lbl_confirm_poll_interval.grid(row=row, column=0, sticky=W, pady=(8, 0))
+            self.ent_confirm_poll_interval.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+            row += 1
 
         self.chk_dry_run.grid(row=row, column=0, columnspan=2, sticky=W, pady=(8, 0))
         row += 1
@@ -2448,6 +2497,9 @@ class OnchainTransferPageBase:
             row += 1
             self.lbl_confirm_timeout.grid(row=row, column=0, sticky=W, pady=(8, 0))
             self.ent_confirm_timeout.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+            row += 1
+            self.lbl_confirm_poll_interval.grid(row=row, column=0, sticky=W, pady=(8, 0))
+            self.ent_confirm_poll_interval.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
             row += 1
             self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=5, sticky=W, pady=(6, 0))
             row += 1
