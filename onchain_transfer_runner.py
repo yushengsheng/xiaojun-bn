@@ -3,6 +3,12 @@
 
 from __future__ import annotations
 
+from onchain_rpc_runtime import (
+    ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS,
+    is_transient_rpc_error,
+    onchain_record_retry_delay_seconds,
+    run_onchain_record_rpc_with_retries,
+)
 from onchain_relay_runner import run_relay_batch, run_relay_fee_recovery
 from operation_recovery import build_onchain_recovery_plan
 from page_onchain_base import (
@@ -26,6 +32,24 @@ class OnchainTransferRunnerMixin(object):
     def _raise_if_transfer_stopped(self) -> None:
         if self._transfer_stop_requested():
             raise RuntimeError("任务已停止")
+
+    def _onchain_transfer_retry_delay_seconds(self, params: WithdrawRuntimeParams | None = None) -> float:
+        return onchain_record_retry_delay_seconds(self, params)
+
+    def _run_onchain_transfer_rpc_with_retries(
+        self,
+        action,
+        *,
+        prefix: str,
+        params: WithdrawRuntimeParams | None = None,
+    ):
+        return run_onchain_record_rpc_with_retries(
+            self,
+            action,
+            prefix=prefix,
+            params=params,
+            dispatch_ui=False,
+        )
 
     def _prepare_onchain_recovery_batch(
         self,
@@ -108,16 +132,32 @@ class OnchainTransferRunnerMixin(object):
             entry_id = str(entry.get("id") or "")
             txid = str(payload.get("txid") or "").strip()
             try:
-                try:
-                    receipt = self.client.get_transaction_receipt(
-                        network,
-                        txid,
-                        read_timeout=3.0,
-                        max_attempts=1,
-                    ) if txid else None
-                except TypeError:
-                    receipt = self.client.get_transaction_receipt(network, txid) if txid else None
+                masked_source = self._mask(source_addr, head=8, tail=6)
             except Exception:
+                masked_source = source_addr[-10:] if source_addr else "unknown"
+            try:
+                if txid:
+                    def read_receipt():
+                        try:
+                            return self.client.get_transaction_receipt(
+                                network,
+                                txid,
+                                connect_timeout=3.0,
+                                read_timeout=3.0,
+                                max_attempts=1,
+                            )
+                        except TypeError:
+                            return self.client.get_transaction_receipt(network, txid)
+
+                    receipt = self._run_onchain_transfer_rpc_with_retries(
+                        read_receipt,
+                        prefix=f"链上转账账本对账[{masked_source}]",
+                    )
+                else:
+                    receipt = None
+            except Exception as exc:
+                if str(exc) == "任务已停止":
+                    raise
                 receipt = None
             if receipt is not None:
                 status_value = receipt.get("status")
@@ -128,8 +168,25 @@ class OnchainTransferRunnerMixin(object):
                 continue
             try:
                 nonce = int(payload.get("nonce"))
-                pending_nonce = self.client.get_nonce(network, source_addr)
-            except Exception:
+                def read_nonce():
+                    try:
+                        return self.client.get_nonce(
+                            network,
+                            source_addr,
+                            connect_timeout=3.0,
+                            read_timeout=3.0,
+                            max_attempts=1,
+                        )
+                    except TypeError:
+                        return self.client.get_nonce(network, source_addr)
+
+                pending_nonce = self._run_onchain_transfer_rpc_with_retries(
+                    read_nonce,
+                    prefix=f"链上转账账本对账[{masked_source}]",
+                )
+            except Exception as exc:
+                if str(exc) == "任务已停止":
+                    raise
                 pending.append(entry_id)
                 continue
             if pending_nonce > nonce:
@@ -880,10 +937,10 @@ class OnchainTransferRunnerMixin(object):
             nonce_next_map: dict[str, int] = {}
             nonce_guard = threading.Lock()
 
-            jobs_q: queue.Queue[tuple[int, str, str, str]] = queue.Queue()
+            jobs_q: queue.Queue[tuple[int, str, str, str, int, int | None, str, str]] = queue.Queue()
             for i, item in enumerate(jobs_data, start=1):
                 row_key, source, target = item
-                jobs_q.put((i, row_key, source, target))
+                jobs_q.put((i, row_key, source, target, 1, None, "", ""))
 
             def alloc_nonce(source_addr: str) -> int:
                 with nonce_guard:
@@ -968,11 +1025,6 @@ class OnchainTransferRunnerMixin(object):
                 else:
                     timeout_worker()
 
-            def target_balance_units(target_address: str) -> int:
-                if params.token_is_native:
-                    return self.client.get_balance_wei(params.network, target_address)
-                return self.client.get_erc20_balance(params.network, params.token_contract, target_address)
-
             def schedule_submitted_confirmation(
                 row_key: str,
                 prefix: str,
@@ -980,28 +1032,27 @@ class OnchainTransferRunnerMixin(object):
                 txid: str,
                 amount_text: str,
                 gas_fee_wei: int,
-                *,
-                source_addr: str,
-                target_addr: str,
-                used_nonce: int | None,
-                value_units: int,
-                target_balance_before_units: int | None,
-            ) -> bool:
+            ):
                 tx_hash = str(txid or "").strip()
                 if not tx_hash:
                     schedule_submitted_timeout(row_key, prefix, submitted_timeout_seconds)
-                    return True
+                    return
                 confirm_deadline = time.time() + max(0.1, float(submitted_timeout_seconds))
-                source_addr_norm = str(source_addr or "").strip().lower()
-                target_addr_norm = str(target_addr or "").strip().lower()
-                balance_confirmation_enabled = (
-                    target_balance_before_units is not None
-                    and int(value_units) > 0
-                    and source_addr_norm
-                    and target_addr_norm
-                    and source_addr_norm != target_addr_norm
-                )
-                receipt_read_timeout = min(5.0, max(1.0, float(params.confirm_poll_interval_seconds)))
+                try:
+                    parser = getattr(self, "_parse_confirm_poll_interval_seconds", None)
+                    if callable(parser):
+                        poll_interval = parser(params.confirm_poll_interval_seconds)
+                    else:
+                        poll_interval = float(getattr(params, "confirm_poll_interval_seconds", 1.0) or 1.0)
+                    poll_interval = max(0.2, float(poll_interval))
+                except Exception:
+                    poll_interval = max(0.2, float(getattr(params, "confirm_poll_interval_seconds", 1.0) or 1.0))
+                read_timeout = min(3.0, max(1.0, float(poll_interval)))
+                receipt_timeout_kwargs = {
+                    "connect_timeout": min(3.0, read_timeout),
+                    "read_timeout": read_timeout,
+                    "max_attempts": 1,
+                }
 
                 def confirm_worker():
                     last_error = ""
@@ -1013,8 +1064,7 @@ class OnchainTransferRunnerMixin(object):
                                 receipt = self.client.get_transaction_receipt(
                                     params.network,
                                     tx_hash,
-                                    read_timeout=receipt_read_timeout,
-                                    max_attempts=1,
+                                    **receipt_timeout_kwargs,
                                 )
                             except TypeError:
                                 receipt = self.client.get_transaction_receipt(params.network, tx_hash)
@@ -1039,25 +1089,6 @@ class OnchainTransferRunnerMixin(object):
                                 return
                         except Exception as exc:
                             last_error = str(exc)
-                        if balance_confirmation_enabled:
-                            try:
-                                target_after_units = target_balance_units(target_addr)
-                                nonce_after = self.client.get_nonce(params.network, source_addr)
-                                if (
-                                    int(nonce_after) > int(used_nonce if used_nonce is not None else -1)
-                                    and int(target_after_units) >= int(target_balance_before_units) + int(value_units)
-                                ):
-                                    finalize_job(
-                                        row_key,
-                                        "success",
-                                        f"{prefix} 转账确认完成：余额已到账，txid={tx_hash}",
-                                        amount_text=amount_text,
-                                        gas_fee_wei=gas_fee_wei,
-                                        journal_state="completed",
-                                    )
-                                    return
-                            except Exception as exc:
-                                last_error = str(exc)
                         if time.time() >= confirm_deadline:
                             detail = f"，最后错误：{last_error}" if last_error else ""
                             finalize_job(
@@ -1067,20 +1098,99 @@ class OnchainTransferRunnerMixin(object):
                                 journal_state="submitted",
                             )
                             return
-                        if self.stop_requested.wait(params.confirm_poll_interval_seconds):
+                        if self.stop_requested.wait(poll_interval):
                             return
 
                 timeout_name = f"onchain-submitted-confirm-{str(row_key or '')[-8:] or 'job'}"
-                future = self._submit_confirmation_task(confirm_worker, name=timeout_name)
-                if future is None:
-                    finalize_job(
-                        row_key,
-                        "failed",
-                        f"{prefix} 确认任务提交失败，交易可能已广播，txid={tx_hash}",
-                        journal_state="submitted",
-                    )
-                    return False
-                return True
+                self._submit_confirmation_task(confirm_worker, name=timeout_name)
+
+            def schedule_success_ledger_confirmation(
+                row_key: str,
+                prefix: str,
+                submitted_timeout_seconds: float,
+                txid: str,
+                journal_entry_id: str,
+            ):
+                tx_hash = str(txid or "").strip()
+                entry_id = str(journal_entry_id or "").strip()
+                if dry_run or not tx_hash or not entry_id:
+                    return
+                confirm_deadline = time.time() + max(0.1, float(submitted_timeout_seconds))
+                try:
+                    parser = getattr(self, "_parse_confirm_poll_interval_seconds", None)
+                    if callable(parser):
+                        poll_interval = parser(params.confirm_poll_interval_seconds)
+                    else:
+                        poll_interval = float(getattr(params, "confirm_poll_interval_seconds", 1.0) or 1.0)
+                    poll_interval = max(0.2, float(poll_interval))
+                except Exception:
+                    poll_interval = max(0.2, float(getattr(params, "confirm_poll_interval_seconds", 1.0) or 1.0))
+                read_timeout = min(3.0, max(1.0, float(poll_interval)))
+                receipt_timeout_kwargs = {
+                    "connect_timeout": min(3.0, read_timeout),
+                    "read_timeout": read_timeout,
+                    "max_attempts": 1,
+                }
+
+                def confirm_worker():
+                    last_error = ""
+                    while True:
+                        if self.stop_requested.is_set() or self._closing or bool(getattr(self.root, "_closing", False)):
+                            return
+                        try:
+                            try:
+                                receipt = self.client.get_transaction_receipt(
+                                    params.network,
+                                    tx_hash,
+                                    **receipt_timeout_kwargs,
+                                )
+                            except TypeError:
+                                receipt = self.client.get_transaction_receipt(params.network, tx_hash)
+                            if receipt is not None:
+                                status_raw = receipt.get("status")
+                                if status_raw is not None and self.client._int_from_hex(status_raw) != 1:
+                                    self.operation_journal.update(
+                                        entry_id,
+                                        "failed",
+                                        background_confirmation="receipt-failed",
+                                    )
+                                    dispatch_ui(
+                                        lambda m=(
+                                            f"{prefix} 广播成功后的后台确认失败：链上执行状态异常，txid={tx_hash}"
+                                        ): self.log(m)
+                                    )
+                                else:
+                                    self.operation_journal.update(
+                                        entry_id,
+                                        "completed",
+                                        background_confirmation="receipt-success",
+                                    )
+                                    dispatch_ui(
+                                        lambda m=f"{prefix} 广播成功后的后台确认完成：txid={tx_hash}": self.log(m)
+                                    )
+                                return
+                        except Exception as exc:
+                            last_error = str(exc)
+                        if time.time() >= confirm_deadline:
+                            self.operation_journal.update(
+                                entry_id,
+                                "submitted",
+                                background_confirmation="timeout",
+                                background_last_error=last_error,
+                            )
+                            detail = f"，最后错误：{last_error}" if last_error else ""
+                            dispatch_ui(
+                                lambda m=(
+                                    f"{prefix} 广播成功，后台确认超过 {submitted_timeout_seconds:g} 秒仍未拿到 receipt，"
+                                    f"账本保持待确认，txid={tx_hash}{detail}"
+                                ): self.log(m)
+                            )
+                            return
+                        if self.stop_requested.wait(poll_interval):
+                            return
+
+                timeout_name = f"onchain-ledger-confirm-{str(row_key or '')[-8:] or 'job'}"
+                self._submit_confirmation_task(confirm_worker, name=timeout_name)
 
             def worker():
                 total = len(jobs_data)
@@ -1088,22 +1198,21 @@ class OnchainTransferRunnerMixin(object):
                     if self.stop_requested.is_set():
                         return
                     try:
-                        i, row_key, source, target = jobs_q.get_nowait()
+                        i, row_key, source, target, attempt_no, queued_nonce, queued_source_addr, queued_journal_id = jobs_q.get_nowait()
                     except queue.Empty:
                         return
 
                     result_status = "failed"
                     msg = ""
                     amount_text = ""
-                    used_nonce: int | None = None
-                    source_addr = ""
+                    used_nonce: int | None = queued_nonce
+                    source_addr = queued_source_addr
                     gas_fee_wei = 0
                     tx_sent = False
                     txid = ""
-                    journal_entry_id = ""
+                    journal_entry_id = queued_journal_id
                     journal_terminal_state = ""
-                    value_units = 0
-                    target_balance_before_units: int | None = None
+                    retry_scheduled = False
                     self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                     dispatch_ui(lambda k=row_key: self._set_status(k, "running"))
                     submitted_timeout_seconds = max(0.0, float(params.confirm_timeout_seconds))
@@ -1133,14 +1242,13 @@ class OnchainTransferRunnerMixin(object):
                             value_units, gas_price_wei, gas_limit, amount_text = self._resolve_amount_and_gas(
                                 params, source_addr, target
                             )
-                            try:
-                                target_balance_before_units = target_balance_units(target)
-                            except Exception:
-                                target_balance_before_units = None
-                            nonce = alloc_nonce(source_addr)
-                            used_nonce = nonce
+                            if used_nonce is None:
+                                nonce = alloc_nonce(source_addr)
+                                used_nonce = nonce
+                            else:
+                                nonce = int(used_nonce)
                             journal = getattr(self, "operation_journal", None)
-                            if journal is not None:
+                            if journal is not None and not journal_entry_id:
                                 journal_entry_id = journal.begin(
                                     "onchain-transfer",
                                     f"{params.network}:{source_addr.lower()}",
@@ -1155,6 +1263,9 @@ class OnchainTransferRunnerMixin(object):
                                         "task_key": task_key_by_row_key.get(row_key, ""),
                                     },
                                 )
+                                journal_entry_ids[row_key] = journal_entry_id
+                                journal.update(journal_entry_id, "broadcasting")
+                            elif journal is not None and journal_entry_id:
                                 journal_entry_ids[row_key] = journal_entry_id
                                 journal.update(journal_entry_id, "broadcasting")
                             recovery_timeout_seconds = min(max(6.0, float(params.confirm_timeout_seconds) / 3.0), 20.0)
@@ -1215,10 +1326,13 @@ class OnchainTransferRunnerMixin(object):
                                     result_status = "submitted"
                                 else:
                                     msg = (
-                                        f"{prefix} 转账广播完成，等待确认：金额={params.coin} {amount_text}，预估gas={gas_text}，"
-                                        f"from={source_addr}，to={target}，txid={txid}"
+                                        f"{prefix} 金额={params.coin} {amount_text}，预估gas={gas_text}，"
+                                        f"from={source_addr}，to={target}，txid={txid}，后台确认中"
                                     )
-                                    result_status = "submitted"
+                                    result_status = "success"
+                                    # A successful RPC response is only a broadcast result.
+                                    # Keep the ledger active until a receipt is reconciled.
+                                    journal_terminal_state = "submitted"
                             else:
                                 msg = (
                                     f"{prefix} 转账确认中：未拿到 txid，"
@@ -1226,6 +1340,38 @@ class OnchainTransferRunnerMixin(object):
                                 )
                                 result_status = "submitted"
                     except Exception as exc:
+                        if (
+                            is_transient_rpc_error(exc)
+                            and attempt_no < ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS
+                            and not self.stop_requested.is_set()
+                            and not tx_sent
+                        ):
+                            next_attempt = attempt_no + 1
+                            retry_scheduled = True
+                            retry_delay = self._onchain_transfer_retry_delay_seconds(params)
+                            dispatch_ui(
+                                lambda m=(
+                                    f"{prefix} 链上转账遇到临时RPC错误，"
+                                    f"准备重试 {next_attempt}/{ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS}：{exc}"
+                                ): self.log(m)
+                            )
+                            if self.stop_requested.wait(retry_delay):
+                                retry_scheduled = False
+                                msg = f"{prefix} 已停止"
+                            else:
+                                jobs_q.put(
+                                    (
+                                        i,
+                                        row_key,
+                                        source,
+                                        target,
+                                        next_attempt,
+                                        used_nonce,
+                                        source_addr,
+                                        journal_entry_id,
+                                    )
+                                )
+                                continue
                         if used_nonce is not None and source_addr and not tx_sent:
                             rollback_nonce(source_addr, used_nonce)
                         if journal_entry_id and not tx_sent:
@@ -1233,24 +1379,20 @@ class OnchainTransferRunnerMixin(object):
                         msg = f"{prefix} 转账失败：{exc}"
                     finally:
                         jobs_q.task_done()
+                        close_session = getattr(self.client, "_close_thread_rpc_session", None)
+                        if callable(close_session):
+                            try:
+                                close_session()
+                            except Exception:
+                                pass
 
+                    if retry_scheduled:
+                        continue
                     if result_status == "submitted":
                         dispatch_ui(lambda m=msg: self.log(m))
                         self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                         dispatch_ui(lambda k=row_key: self._set_status(k, "submitted"))
-                        schedule_submitted_confirmation(
-                            row_key,
-                            prefix,
-                            submitted_timeout_seconds,
-                            txid,
-                            amount_text,
-                            gas_fee_wei,
-                            source_addr=source_addr,
-                            target_addr=target,
-                            used_nonce=used_nonce,
-                            value_units=value_units,
-                            target_balance_before_units=target_balance_before_units,
-                        )
+                        schedule_submitted_confirmation(row_key, prefix, submitted_timeout_seconds, txid, amount_text, gas_fee_wei)
                     else:
                         finalize_job(
                             row_key,
@@ -1260,6 +1402,14 @@ class OnchainTransferRunnerMixin(object):
                             gas_fee_wei=gas_fee_wei,
                             journal_state=(journal_terminal_state or ("failed" if result_status == "failed" else "")),
                         )
+                        if result_status == "success" and journal_terminal_state == "submitted":
+                            schedule_success_ledger_confirmation(
+                                row_key,
+                                prefix,
+                                submitted_timeout_seconds,
+                                txid,
+                                journal_entry_id,
+                            )
                     if params.delay > 0:
                         if self.stop_requested.wait(params.delay):
                             return

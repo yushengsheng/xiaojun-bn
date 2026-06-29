@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from onchain_rpc_runtime import (
+    onchain_record_retry_delay_seconds,
+    run_onchain_record_rpc_with_retries,
+)
 from page_onchain_base import (
     Decimal,
     EvmToken,
@@ -28,6 +32,10 @@ class OnchainQueryMixin(object):
             return
         self.stop_requested.set()
         self.log("已收到停止请求，正在停止当前链上任务...")
+    def _onchain_record_retry_delay_seconds(self) -> float:
+        return onchain_record_retry_delay_seconds(self)
+    def _run_onchain_record_rpc_with_retries(self, action, *, prefix: str):
+        return run_onchain_record_rpc_with_retries(self, action, prefix=prefix, dispatch_ui=True)
     def query_current_source_balance(self):
         try:
             if not self._is_mode_1m():
@@ -188,7 +196,10 @@ class OnchainQueryMixin(object):
         )
     def _run_search_contract_token(self, network: str, contract: str):
         try:
-            token = self.client.get_erc20_token_info(network, contract)
+            token = self._run_onchain_record_rpc_with_retries(
+                lambda: self.client.get_erc20_token_info(network, contract),
+                prefix="[合约搜索]",
+            )
             self.custom_tokens_by_network.setdefault(network, {})[token.contract.lower()] = token
             self._dispatch_ui(lambda n=network, t=token: self._apply_found_token(n, t))
         except Exception as exc:
@@ -519,11 +530,15 @@ class OnchainQueryMixin(object):
                     prefix = self._row_group_log_prefix(row_keys, i, len(sources), row_number_by_key)
                     dispatch_ui(lambda keys=row_keys: self._set_query_statuses(keys, "running"))
                     try:
-                        addr = self._resolve_source_address(source)
-                        if token.is_native:
-                            units = self.client.get_balance_wei(network, addr)
-                        else:
-                            units = self.client.get_erc20_balance(network, token.contract, addr)
+                        def query_balance():
+                            addr_value = self._resolve_source_address(source)
+                            if token.is_native:
+                                units_value = self.client.get_balance_wei(network, addr_value)
+                            else:
+                                units_value = self.client.get_erc20_balance(network, token.contract, addr_value)
+                            return addr_value, units_value
+
+                        addr, units = self._run_onchain_record_rpc_with_retries(query_balance, prefix=prefix)
                         amount = self._units_to_amount(units, token.decimals)
                         with lock:
                             self.source_balance_cache[source] = amount
@@ -591,11 +606,18 @@ class OnchainQueryMixin(object):
             source_query_state = "skip"
             if source:
                 try:
-                    source_addr = self._resolve_source_address(source)
-                    if token.is_native:
-                        src_units = self.client.get_balance_wei(network, source_addr)
-                    else:
-                        src_units = self.client.get_erc20_balance(network, token.contract, source_addr)
+                    def query_source_balance():
+                        source_addr_value = self._resolve_source_address(source)
+                        if token.is_native:
+                            src_units_value = self.client.get_balance_wei(network, source_addr_value)
+                        else:
+                            src_units_value = self.client.get_erc20_balance(network, token.contract, source_addr_value)
+                        return source_addr_value, src_units_value
+
+                    source_addr, src_units = self._run_onchain_record_rpc_with_retries(
+                        query_source_balance,
+                        prefix="[SRC]",
+                    )
                     src_amount = self._units_to_amount(src_units, token.decimals)
                     self.source_balance_cache[source] = src_amount
                     src_text = f"{symbol}:{self._decimal_to_text(src_amount)}"
@@ -636,10 +658,12 @@ class OnchainQueryMixin(object):
                         self._mark_query_status_context(row_key, context_sig)
                         dispatch_ui(lambda k=row_key: self._set_query_status(k, "running"))
                     try:
-                        if token.is_native:
-                            units = self.client.get_balance_wei(network, addr)
-                        else:
-                            units = self.client.get_erc20_balance(network, token.contract, addr)
+                        def query_target_balance():
+                            if token.is_native:
+                                return self.client.get_balance_wei(network, addr)
+                            return self.client.get_erc20_balance(network, token.contract, addr)
+
+                        units = self._run_onchain_record_rpc_with_retries(query_target_balance, prefix=prefix)
                         amount = self._units_to_amount(units, token.decimals)
                         with lock:
                             self.target_balance_cache[addr] = amount
@@ -715,10 +739,15 @@ class OnchainQueryMixin(object):
             target_query_state = "skip"
             if target:
                 try:
-                    if token.is_native:
-                        target_units = self.client.get_balance_wei(network, target)
-                    else:
-                        target_units = self.client.get_erc20_balance(network, token.contract, target)
+                    def query_target_summary():
+                        if token.is_native:
+                            return self.client.get_balance_wei(network, target)
+                        return self.client.get_erc20_balance(network, token.contract, target)
+
+                    target_units = self._run_onchain_record_rpc_with_retries(
+                        query_target_summary,
+                        prefix="[DST]",
+                    )
                     target_amount = self._units_to_amount(target_units, token.decimals)
                     self.target_balance_cache[target] = target_amount
                     target_text = f"{symbol}:{self._decimal_to_text(target_amount)}"
@@ -759,11 +788,15 @@ class OnchainQueryMixin(object):
                         self._mark_query_status_context(row_key, context_sig)
                         dispatch_ui(lambda k=row_key: self._set_query_status(k, "running"))
                     try:
-                        addr = self._resolve_source_address(source)
-                        if token.is_native:
-                            units = self.client.get_balance_wei(network, addr)
-                        else:
-                            units = self.client.get_erc20_balance(network, token.contract, addr)
+                        def query_source_balance():
+                            addr_value = self._resolve_source_address(source)
+                            if token.is_native:
+                                units_value = self.client.get_balance_wei(network, addr_value)
+                            else:
+                                units_value = self.client.get_erc20_balance(network, token.contract, addr_value)
+                            return addr_value, units_value
+
+                        addr, units = self._run_onchain_record_rpc_with_retries(query_source_balance, prefix=prefix)
                         amount = self._units_to_amount(units, token.decimals)
                         with lock:
                             self.source_balance_cache[source] = amount

@@ -2,6 +2,8 @@
 
 This project must be released from GitHub Actions on a clean `windows-latest` runner.
 
+`RELEASE_GUARDRAILS.md` is mandatory. Any crash such as `Python 意外退出`, exit code `134`, failed GUI selftest, proxy runtime authentication failure, or failed GitHub Actions release is a blocking release issue, not a warning.
+
 Rules:
 - Do not build release packages only from a local machine.
 - Tag the target commit with `v*` and push the tag to trigger `.github/workflows/release-windows-exe.yml`.

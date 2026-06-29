@@ -15,6 +15,7 @@ from pathlib import Path
 
 from app_paths import CONFIG_BACKUP_SUFFIX, RELAY_WALLET_FILE
 from core_models import EvmToken, GeneratedWalletEntry
+from onchain_rpc_runtime import ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS, call_with_transient_rpc_retries
 from secure_config import config_context as secure_config_context, seal_config_payload, unseal_config_payload
 from secret_box import SECRET_BOX
 from stores import _atomic_write_text_with_backup
@@ -345,9 +346,16 @@ class RelayWalletFileStore:
 
             def inspect_record(record: RelayWalletRecord) -> tuple[bool, list[int] | Exception]:
                 try:
-                    balances: list[int] = [int(client.get_balance_wei(record.network, record.relay_address))]
-                    for contract in tracked_contracts_by_network.get(str(record.network or "").strip().upper(), []):
-                        balances.append(int(client.get_erc20_balance(record.network, contract, record.relay_address)))
+                    def read_balances() -> list[int]:
+                        values: list[int] = [int(client.get_balance_wei(record.network, record.relay_address))]
+                        for contract in tracked_contracts_by_network.get(str(record.network or "").strip().upper(), []):
+                            values.append(int(client.get_erc20_balance(record.network, contract, record.relay_address)))
+                        return values
+
+                    balances = call_with_transient_rpc_retries(
+                        read_balances,
+                        attempts=ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS,
+                    )
                     return True, balances
                 except Exception as exc:
                     return False, exc

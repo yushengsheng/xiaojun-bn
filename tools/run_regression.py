@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     if _git_available():
         _run("diff whitespace", ["git", "diff", "--check"])
     _run("sensitive artifact check", [python, "tools/check_sensitive_artifacts.py", "--git-only"])
+    _run("release guardrails", [python, "tools/check_release_guardrails.py"])
     _run("pyinstaller args", [python, "tools/pyinstaller_common_args.py"])
     if not args.skip_vulnerability_audit:
         _run(

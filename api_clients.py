@@ -22,6 +22,85 @@ import requests
 from core_models import EvmToken, GeneratedWalletEntry
 
 
+ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS = 10
+
+
+def is_transient_rpc_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    if not text:
+        return False
+    non_transient_markers = (
+        "insufficient funds",
+        "nonce too low",
+        "replacement transaction underpriced",
+        "execution reverted",
+        "invalid sender",
+        "intrinsic gas too low",
+        "invalid account",
+        "invalid argument",
+        "invalid params",
+    )
+    if any(marker in text for marker in non_transient_markers):
+        return False
+    transient_markers = (
+        "rpc 请求失败",
+        "read timed out",
+        "timed out",
+        "timeout",
+        "ssleoferror",
+        "ssl",
+        "eof occurred",
+        "max retries exceeded",
+        "connection aborted",
+        "connection reset",
+        "connection refused",
+        "remote disconnected",
+        "remote end closed",
+        "proxyerror",
+        "temporarily unavailable",
+        "service unavailable",
+        "too many requests",
+        "429",
+        "502",
+        "503",
+        "504",
+    )
+    return any(marker in text for marker in transient_markers)
+
+
+def call_with_transient_rpc_retries(
+    action: Callable[[], object],
+    *,
+    attempts: int = ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS,
+    should_stop: Callable[[], bool] | None = None,
+    wait: Callable[[float], bool] | None = None,
+    retry_delay_seconds: float = 1.0,
+    on_retry: Callable[[int, int, Exception], None] | None = None,
+) -> object:
+    total_attempts = max(1, int(attempts))
+    delay_seconds = max(0.0, float(retry_delay_seconds))
+    for attempt_no in range(1, total_attempts + 1):
+        if should_stop is not None and should_stop():
+            raise RuntimeError("任务已停止")
+        try:
+            return action()
+        except Exception as exc:
+            if (
+                attempt_no >= total_attempts
+                or not is_transient_rpc_error(exc)
+                or (should_stop is not None and should_stop())
+            ):
+                raise
+            if callable(on_retry):
+                on_retry(attempt_no + 1, total_attempts, exc)
+            if callable(wait):
+                if wait(delay_seconds):
+                    raise RuntimeError("任务已停止") from exc
+            elif delay_seconds > 0:
+                time.sleep(delay_seconds)
+    raise RuntimeError("RPC 重试异常结束")
+
+
 @dataclass(frozen=True)
 class PreparedSignedTransaction:
     tx: dict
@@ -46,8 +125,11 @@ class EvmClient:
     }
     NATIVE_GAS_LIMIT = 21000
     ERC20_DEFAULT_GAS_LIMIT = 70000
-    RPC_CONNECT_TIMEOUT = 6
-    RPC_READ_TIMEOUT = 20
+    RPC_CONNECT_TIMEOUT = 3
+    RPC_READ_TIMEOUT = 3
+    RPC_DEFAULT_MAX_ATTEMPTS = 1
+    RPC_RECOVERY_CONNECT_TIMEOUT = 3
+    RPC_RECOVERY_READ_TIMEOUT = 3
     NETWORKS = {
         "ETH": {
             "chain_id": 1,
@@ -101,6 +183,8 @@ class EvmClient:
         self._rpc_sessions: dict[int, requests.Session] = {}
         self._preferred_rpc_urls_lock = threading.Lock()
         self._preferred_rpc_urls: dict[str, str] = {}
+        self._rpc_quality_lock = threading.Lock()
+        self._rpc_quality: dict[str, dict[str, dict[str, float]]] = {}
 
     def _allow_system_proxy_now(self) -> bool:
         if self._allow_system_proxy_provider is None:
@@ -210,18 +294,48 @@ class EvmClient:
             return ordered
         with self._preferred_rpc_urls_lock:
             preferred_url = str(self._preferred_rpc_urls.get(net) or "").strip()
-        if preferred_url and preferred_url in ordered:
-            ordered.remove(preferred_url)
-            ordered.insert(0, preferred_url)
-        return ordered
+        with self._rpc_quality_lock:
+            metrics = {
+                str(url): dict(value)
+                for url, value in (self._rpc_quality.get(net) or {}).items()
+                if isinstance(value, dict)
+            }
+        index_by_url = {url: idx for idx, url in enumerate(ordered)}
 
-    def _remember_preferred_rpc_url(self, network: str, url: str) -> None:
+        def sort_key(url: str) -> tuple[float, float, int, int]:
+            item = metrics.get(url) or {}
+            score = float(item.get("score", 0.0) or 0.0)
+            latency = float(item.get("latency", 999999.0) or 999999.0)
+            preferred_rank = 0 if preferred_url and url == preferred_url else 1
+            return (-score, latency, preferred_rank, index_by_url.get(url, 999999))
+
+        return sorted(ordered, key=sort_key)
+
+    def _remember_preferred_rpc_url(self, network: str, url: str, *, latency_seconds: float | None = None) -> None:
         net = str(network or "").strip().upper()
         normalized_url = str(url or "").strip()
         if not net or not normalized_url:
             return
         with self._preferred_rpc_urls_lock:
             self._preferred_rpc_urls[net] = normalized_url
+        with self._rpc_quality_lock:
+            net_quality = self._rpc_quality.setdefault(net, {})
+            item = net_quality.setdefault(normalized_url, {"score": 0.0, "latency": 999999.0})
+            item["score"] = min(100.0, float(item.get("score", 0.0) or 0.0) + 3.0)
+            if latency_seconds is not None:
+                latency = max(0.001, float(latency_seconds))
+                previous = float(item.get("latency", 999999.0) or 999999.0)
+                item["latency"] = latency if previous >= 999999.0 else (previous * 0.7 + latency * 0.3)
+
+    def _record_rpc_failure(self, network: str, url: str) -> None:
+        net = str(network or "").strip().upper()
+        normalized_url = str(url or "").strip()
+        if not net or not normalized_url:
+            return
+        with self._rpc_quality_lock:
+            net_quality = self._rpc_quality.setdefault(net, {})
+            item = net_quality.setdefault(normalized_url, {"score": 0.0, "latency": 999999.0})
+            item["score"] = max(-50.0, float(item.get("score", 0.0) or 0.0) - 2.0)
 
     def get_default_tokens(self, network: str) -> list[EvmToken]:
         net = network.strip().upper()
@@ -416,7 +530,7 @@ class EvmClient:
         max_attempts: int | None = None,
     ) -> object:
         info = self._network_info(network)
-        attempts = 2 if max_attempts is None else max(1, int(max_attempts))
+        attempts = self.RPC_DEFAULT_MAX_ATTEMPTS if max_attempts is None else max(1, int(max_attempts))
         timeout = (
             self.RPC_CONNECT_TIMEOUT if connect_timeout is None else max(0.2, float(connect_timeout)),
             self.RPC_READ_TIMEOUT if read_timeout is None else max(0.2, float(read_timeout)),
@@ -437,6 +551,7 @@ class EvmClient:
                 proxy_url = ""
                 try:
                     session, proxy_url = self._rpc_session()
+                    started_at = time.monotonic()
                     resp = session.post(
                         url,
                         data=body,
@@ -455,10 +570,11 @@ class EvmClient:
                         code = err.get("code")
                         msg = err.get("message")
                         raise RuntimeError(f"RPC({url}) code={code} msg={msg}")
-                    self._remember_preferred_rpc_url(network, url)
+                    self._remember_preferred_rpc_url(network, url, latency_seconds=time.monotonic() - started_at)
                     return j.get("result")
                 except Exception as exc:
                     err_text = str(exc)
+                    self._record_rpc_failure(network, url)
                     if session is not None and isinstance(exc, requests.exceptions.RequestException):
                         self._close_thread_rpc_session(session)
                     if proxy_url and "Missing dependencies for SOCKS support" in err_text:
@@ -513,7 +629,16 @@ class EvmClient:
             raise RuntimeError("uint 不能为负数")
         return cls._pad_32_hex(hex(value))
 
-    def _erc20_call(self, network: str, contract: str, data: str) -> str:
+    def _erc20_call(
+        self,
+        network: str,
+        contract: str,
+        data: str,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_attempts: int | None = None,
+    ) -> str:
         contract_n = self.normalize_address(contract)
         if not self.is_address(contract_n):
             raise RuntimeError(f"代币合约地址格式错误：{contract}")
@@ -521,7 +646,14 @@ class EvmClient:
             "to": contract_n,
             "data": self._ensure_hex_prefixed(data),
         }
-        result = self._rpc_call(network, "eth_call", [payload, "latest"])
+        result = self._rpc_call(
+            network,
+            "eth_call",
+            [payload, "latest"],
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_attempts=max_attempts,
+        )
         if result is None:
             raise RuntimeError("代币合约调用返回为空")
         return self._ensure_hex_prefixed(str(result))
@@ -567,10 +699,25 @@ class EvmClient:
             raise RuntimeError(f"{network} RPC chainId 异常：返回 {chain_id}，期望 {expected_chain_id}")
         return chain_id
 
-    def get_balance_wei(self, network: str, address: str) -> int:
+    def get_balance_wei(
+        self,
+        network: str,
+        address: str,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_attempts: int | None = None,
+    ) -> int:
         if not self.is_address(address):
             raise RuntimeError(f"地址格式错误：{address}")
-        result = self._rpc_call(network, "eth_getBalance", [address, "latest"])
+        result = self._rpc_call(
+            network,
+            "eth_getBalance",
+            [address, "latest"],
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_attempts=max_attempts,
+        )
         return self._int_from_hex(result)
 
     def get_erc20_decimals(self, network: str, contract: str) -> int:
@@ -585,9 +732,25 @@ class EvmClient:
         symbol = self._decode_symbol_result(result).upper().strip()
         return symbol or "TOKEN"
 
-    def get_erc20_balance(self, network: str, contract: str, address: str) -> int:
+    def get_erc20_balance(
+        self,
+        network: str,
+        contract: str,
+        address: str,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_attempts: int | None = None,
+    ) -> int:
         data = "0x70a08231" + self._abi_encode_address(address)
-        result = self._erc20_call(network, contract, data)
+        result = self._erc20_call(
+            network,
+            contract,
+            data,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_attempts=max_attempts,
+        )
         return self._int_from_hex(result)
 
     def get_erc20_token_info(self, network: str, contract: str) -> EvmToken:
@@ -596,10 +759,25 @@ class EvmClient:
         decimals = self.get_erc20_decimals(network, contract_n)
         return EvmToken(symbol=symbol, contract=contract_n, decimals=decimals, is_native=False)
 
-    def get_nonce(self, network: str, address: str) -> int:
+    def get_nonce(
+        self,
+        network: str,
+        address: str,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_attempts: int | None = None,
+    ) -> int:
         if not self.is_address(address):
             raise RuntimeError(f"地址格式错误：{address}")
-        result = self._rpc_call(network, "eth_getTransactionCount", [address, "pending"])
+        result = self._rpc_call(
+            network,
+            "eth_getTransactionCount",
+            [address, "pending"],
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_attempts=max_attempts,
+        )
         return self._int_from_hex(result)
 
     def get_transaction_receipt(
@@ -628,14 +806,39 @@ class EvmClient:
             raise RuntimeError(f"交易回执格式异常：{result}")
         return dict(result)
 
-    def get_gas_price_wei(self, network: str) -> int:
-        result = self._rpc_call(network, "eth_gasPrice", [])
+    def get_gas_price_wei(
+        self,
+        network: str,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_attempts: int | None = None,
+    ) -> int:
+        result = self._rpc_call(
+            network,
+            "eth_gasPrice",
+            [],
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_attempts=max_attempts,
+        )
         val = self._int_from_hex(result)
         if val <= 0:
             raise RuntimeError("读取 gasPrice 失败")
         return val
 
-    def estimate_erc20_transfer_gas(self, network: str, from_address: str, contract: str, to_address: str, amount_units: int) -> int:
+    def estimate_erc20_transfer_gas(
+        self,
+        network: str,
+        from_address: str,
+        contract: str,
+        to_address: str,
+        amount_units: int,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_attempts: int | None = None,
+    ) -> int:
         data = "0xa9059cbb" + self._abi_encode_address(to_address) + self._abi_encode_uint(amount_units)
         payload = {
             "from": self.normalize_address(from_address),
@@ -644,7 +847,14 @@ class EvmClient:
             "value": "0x0",
         }
         try:
-            result = self._rpc_call(network, "eth_estimateGas", [payload])
+            result = self._rpc_call(
+                network,
+                "eth_estimateGas",
+                [payload],
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                max_attempts=max_attempts,
+            )
             val = self._int_from_hex(result)
             if val > 0:
                 padded = int(val * 1.2)
@@ -709,11 +919,26 @@ class EvmClient:
         prepared = self._sign_transaction(tx, private_key, error_prefix)
         return prepared.raw_transaction
 
-    def get_transaction_by_hash(self, network: str, tx_hash: str) -> dict | None:
+    def get_transaction_by_hash(
+        self,
+        network: str,
+        tx_hash: str,
+        *,
+        connect_timeout: float | None = None,
+        read_timeout: float | None = None,
+        max_attempts: int | None = None,
+    ) -> dict | None:
         txid = self._ensure_hex_prefixed(str(tx_hash or "").strip())
         if not re.fullmatch(r"0x[a-fA-F0-9]{64}", txid):
             raise RuntimeError(f"交易哈希格式错误：{tx_hash}")
-        result = self._rpc_call(network, "eth_getTransactionByHash", [txid])
+        result = self._rpc_call(
+            network,
+            "eth_getTransactionByHash",
+            [txid],
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            max_attempts=max_attempts,
+        )
         if result is None:
             return None
         if not isinstance(result, dict):
@@ -738,29 +963,39 @@ class EvmClient:
     ) -> tuple[bool, str]:
         deadline = time.time() + max(0.5, float(recovery_timeout_seconds))
         source_addr = str(source_address or "").strip()
+
+        def timeout_kwargs() -> dict[str, object]:
+            remaining = max(0.2, deadline - time.time())
+            read_timeout = min(float(self.RPC_RECOVERY_READ_TIMEOUT), remaining)
+            return {
+                "connect_timeout": min(float(self.RPC_RECOVERY_CONNECT_TIMEOUT), read_timeout),
+                "read_timeout": read_timeout,
+                "max_attempts": 1,
+            }
+
         while True:
             try:
-                receipt = self.get_transaction_receipt(network, tx_hash)
+                receipt = self.get_transaction_receipt(network, tx_hash, **timeout_kwargs())
                 if receipt is not None:
                     return True, "receipt"
             except Exception:
                 pass
             try:
-                tx = self.get_transaction_by_hash(network, tx_hash)
+                tx = self.get_transaction_by_hash(network, tx_hash, **timeout_kwargs())
                 if tx is not None:
                     return True, "tx-hash"
             except Exception:
                 pass
             if source_addr and nonce is not None:
                 try:
-                    pending_nonce = self.get_nonce(network, source_addr)
+                    pending_nonce = self.get_nonce(network, source_addr, **timeout_kwargs())
                     if pending_nonce > int(nonce):
                         return True, "source-nonce"
                 except Exception:
                     pass
             if time.time() >= deadline:
                 return False, ""
-            time.sleep(1.0)
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
     def submit_prepared_transaction(
         self,
