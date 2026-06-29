@@ -121,18 +121,27 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
     TREE_COL_MIN_WIDTHS = {
         "checked": 42,
         "idx": 42,
-        "source": 330,
-        "target": 420,
-        "status": 110,
-        "recovery": 96,
-        "balance": 80,
+        "source": 78,
+        "target": 96,
+        "status": 86,
+        "recovery": 82,
+        "balance": 82,
+    }
+    TREE_COL_MAX_WIDTHS = {
+        "checked": 46,
+        "idx": 64,
+        "source": 260,
+        "target": 360,
+        "status": 300,
+        "recovery": 190,
+        "balance": 210,
     }
     TREE_COL_WEIGHTS = {
         "checked": 1,
         "idx": 1,
-        "source": 5,
-        "target": 7,
-        "status": 2,
+        "source": 4,
+        "target": 6,
+        "status": 3,
         "recovery": 2,
         "balance": 1,
     }
@@ -381,11 +390,11 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
 
         self.tree.column("checked", width=42, anchor="center")
         self.tree.column("idx", width=42, anchor="center")
-        self.tree.column("source", width=360, anchor="w")
-        self.tree.column("target", width=420, anchor="w")
-        self.tree.column("status", width=110, anchor="center")
-        self.tree.column("recovery", width=96, anchor="center")
-        self.tree.column("balance", width=100, anchor="w")
+        self.tree.column("source", width=120, anchor="w")
+        self.tree.column("target", width=160, anchor="w")
+        self.tree.column("status", width=120, anchor="center")
+        self.tree.column("recovery", width=92, anchor="center")
+        self.tree.column("balance", width=92, anchor="w")
         self.tree.tag_configure("st_waiting", foreground="#8a6d3b", background="#fff7e0")
         self.tree.tag_configure("st_running", foreground="#1d5fbf", background="#eaf2ff")
         self.tree.tag_configure("st_success", foreground="#1b7f3b", background="#eaf8ef")
@@ -1434,6 +1443,7 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
             )
 
         self.tree.item(row_id, values=values)
+        self._schedule_tree_column_resize()
         tag = self._status_tag(status)
         self.tree.item(row_id, tags=((tag,) if tag else ()))
     def _update_rows_view(self, row_keys: list[str]):
@@ -1663,6 +1673,7 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
                 )
             self._apply_import_target_view()
             self._update_empty_hint()
+            self._schedule_tree_column_resize()
             return
 
         if mode == self.MODE_1M:
@@ -1693,6 +1704,7 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
                 )
             self._apply_import_target_view()
             self._update_empty_hint()
+            self._schedule_tree_column_resize()
             return
 
         target = self.target_address_var.get().strip()
@@ -1722,6 +1734,7 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
             )
         self._apply_import_target_view()
         self._update_empty_hint()
+        self._schedule_tree_column_resize()
     def _selected_indices(self) -> list[int]:
         idxs: list[int] = []
         for row_id in self.tree.selection():

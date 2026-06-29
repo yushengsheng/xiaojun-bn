@@ -11,6 +11,7 @@ from decimal import Decimal
 from onchain_rpc_runtime import (
     ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS,
     close_owner_thread_rpc_session,
+    format_onchain_failure_status,
     is_transient_rpc_error,
     onchain_poll_interval_seconds,
     onchain_rpc_call,

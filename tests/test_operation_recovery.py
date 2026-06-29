@@ -527,6 +527,63 @@ class OnchainRecoveryIntegrationTests(unittest.TestCase):
             self.assertTrue(any("准备重试 2/10" in line for line in runner.logs))
             self.assertIn(("row-1", "success", "USDT 1.5"), runner.statuses)
 
+    def test_direct_transfer_failure_status_shows_balance_reason(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-recovery-runner-test-") as tmpdir:
+            root = Path(tmpdir)
+            journal = OperationJournal(root / "journal.json", secret_box=SecretBox(root / ".secret.key"))
+            runner = _DirectTransferRunner(journal)
+            runner.client.source_token_balance = 0
+            params = SimpleNamespace(
+                network="BSC",
+                coin="USDT",
+                amount="1.5",
+                delay=0,
+                threads=1,
+                confirm_timeout_seconds=3.0,
+                confirm_poll_interval_seconds=0.2,
+                random_enabled=False,
+                random_min=None,
+                random_max=None,
+                token_contract="0x0000000000000000000000000000000000000011",
+                token_decimals=18,
+                token_is_native=False,
+                relay_enabled=False,
+            )
+            jobs = [("row-1", "private-credential", runner.client.target)]
+
+            runner._run_batch_transfer(jobs, params, dry_run=False)
+
+            self.assertIn(("row-1", "failed", "❌代币余额不足"), runner.statuses)
+
+    def test_direct_transfer_failure_status_shows_network_reason_after_retries(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-recovery-runner-test-") as tmpdir:
+            root = Path(tmpdir)
+            journal = OperationJournal(root / "journal.json", secret_box=SecretBox(root / ".secret.key"))
+            runner = _DirectTransferRunner(journal)
+            runner._onchain_transfer_retry_delay_seconds = lambda _params=None: 0  # type: ignore[method-assign]
+            runner.client.gas_failures_remaining = 20
+            params = SimpleNamespace(
+                network="BSC",
+                coin="USDT",
+                amount="1.5",
+                delay=0,
+                threads=1,
+                confirm_timeout_seconds=3.0,
+                confirm_poll_interval_seconds=0.2,
+                random_enabled=False,
+                random_min=None,
+                random_max=None,
+                token_contract="0x0000000000000000000000000000000000000011",
+                token_decimals=18,
+                token_is_native=False,
+                relay_enabled=False,
+            )
+            jobs = [("row-1", "private-credential", runner.client.target)]
+
+            runner._run_batch_transfer(jobs, params, dry_run=False)
+
+            self.assertIn(("row-1", "failed", "❌网络异常：Read timed out"), runner.statuses)
+
     def test_batch_preflight_shows_preparing_and_stops_cleanly(self) -> None:
         with tempfile.TemporaryDirectory(prefix="xiaojun-recovery-runner-test-") as tmpdir:
             root = Path(tmpdir)

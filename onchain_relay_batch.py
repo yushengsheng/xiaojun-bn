@@ -131,6 +131,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
             amount_text: str = "",
             gas_fee_wei: int = 0,
             success_text: str = "",
+            status_text: str = "",
             warning: bool = False,
         ):
             nonlocal success, failed, warnings, resolved, total_amount, total_gas_fee_wei
@@ -152,6 +153,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                             pass
                 else:
                     failed += 1
+                    row_status_text = str(status_text or "").strip() or format_onchain_failure_status(msg)
                 final_result_by_row_key[row_key] = result_status
                 total_gas_fee_wei += gas_fee_wei
                 amount_total_text = owner._token_amount_text(params.coin, total_amount)
@@ -228,6 +230,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                 success_text = ""
                 warning = False
                 retry_scheduled = False
+                failure_status_text = ""
                 owner._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                 dispatch_ui(lambda k=row_key: owner._set_status(k, "running"))
                 prefix = job_prefix(i, row_key)
@@ -686,6 +689,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                         except Exception:
                             pass
                     msg = f"{prefix} 中转失败：{exc}"
+                    failure_status_text = format_onchain_failure_status(exc)
                 finally:
                     jobs_q.task_done()
                     _close_owner_thread_rpc_session(owner)
@@ -699,6 +703,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                     amount_text=amount_text,
                     gas_fee_wei=gas_fee_wei,
                     success_text=success_text,
+                    status_text=(failure_status_text if result_status == "failed" else ""),
                     warning=warning,
                 )
                 if params.delay > 0 and owner.stop_requested.wait(params.delay):
@@ -772,6 +777,17 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
         dispatch_ui(lambda s=success, f=failed: owner._finish_progress("transfer", s, f))
     except Exception as exc:
         err_text = str(exc)
+        failed_reason = format_onchain_failure_status(err_text)
+        if "progress_keys" in locals():
+            try:
+                for row_key in progress_keys:
+                    if "final_result_by_row_key" in locals() and final_result_by_row_key.get(row_key) in {"success", "failed"}:
+                        continue
+                    if "context_by_row_key" in locals():
+                        owner._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
+                    dispatch_ui(lambda k=row_key, reason=failed_reason: owner._set_status(k, "failed", reason))
+            except Exception:
+                pass
         dispatch_ui(lambda m=f"链上中转任务异常终止：{err_text}": owner.log(m))
         dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
         dispatch_ui(

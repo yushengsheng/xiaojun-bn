@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import tkinter.font as tkfont
 from tkinter import LEFT, W
 
 
@@ -334,10 +335,99 @@ class OnchainLayoutMixin(object):
         self._resize_tree_columns()
         self._apply_import_target_view()
         self._update_empty_hint()
+    def _schedule_tree_column_resize(self) -> None:
+        try:
+            from shared_utils import schedule_ui_callback
+
+            schedule_ui_callback(
+                self,
+                "onchain_tree_columns",
+                self._resize_tree_columns,
+                root=getattr(self, "root", None),
+            )
+        except Exception:
+            try:
+                self._resize_tree_columns()
+            except Exception:
+                pass
+    @staticmethod
+    def _fallback_text_pixel_width(text: str) -> int:
+        width = 0
+        for ch in str(text or ""):
+            width += 13 if ord(ch) > 127 else 7
+        return width
+    def _tree_text_pixel_width(self, text: str, *, heading: bool = False) -> int:
+        value = str(text or "")
+        if not value:
+            return 0
+        try:
+            font_name = "TkHeadingFont" if heading else "TkDefaultFont"
+            return int(tkfont.nametofont(font_name).measure(value))
+        except Exception:
+            return self._fallback_text_pixel_width(value)
+    def _tree_column_content_widths(self, cols: tuple[str, ...]) -> dict[str, int]:
+        headings = getattr(self, "_tree_heading_base_texts", {}) or {}
+        widths: dict[str, int] = {}
+        for column in cols:
+            heading_text = str(headings.get(column, column) or "")
+            widths[column] = self._tree_text_pixel_width(heading_text, heading=True) + 22
+
+        tree = getattr(self, "tree", None)
+        if tree is None:
+            return widths
+        try:
+            row_ids = list(tree.get_children(""))
+        except Exception:
+            row_ids = []
+        for row_id in row_ids:
+            try:
+                values = list(tree.item(row_id, "values") or [])
+            except Exception:
+                continue
+            for index, column in enumerate(cols):
+                text = values[index] if index < len(values) else ""
+                padding = 26 if column in {"source", "target", "status", "recovery", "balance"} else 18
+                widths[column] = max(widths[column], self._tree_text_pixel_width(str(text), heading=False) + padding)
+        return widths
+    @staticmethod
+    def _shrink_tree_widths_to_fit(
+        widths: dict[str, int],
+        min_widths: dict[str, int],
+        cols: tuple[str, ...],
+        available_width: int,
+    ) -> dict[str, int]:
+        fitted = dict(widths)
+        overflow = sum(fitted[c] for c in cols) - max(0, int(available_width))
+        if overflow <= 0:
+            return fitted
+        shrinkable = sum(max(0, fitted[c] - min_widths[c]) for c in cols)
+        if shrinkable <= 0:
+            return {c: min_widths[c] for c in cols}
+        remaining = overflow
+        for column in sorted(cols, key=lambda c: fitted[c] - min_widths[c], reverse=True):
+            room = max(0, fitted[column] - min_widths[column])
+            if room <= 0:
+                continue
+            share = min(room, max(1, int(overflow * room / shrinkable)))
+            fitted[column] -= share
+            remaining -= share
+            if remaining <= 0:
+                break
+        if remaining > 0:
+            for column in sorted(cols, key=lambda c: fitted[c] - min_widths[c], reverse=True):
+                room = max(0, fitted[column] - min_widths[column])
+                if room <= 0:
+                    continue
+                cut = min(room, remaining)
+                fitted[column] -= cut
+                remaining -= cut
+                if remaining <= 0:
+                    break
+        return {c: max(min_widths[c], fitted[c]) for c in cols}
     def _resize_tree_columns(self):
         if not hasattr(self, "tree"):
             return
-        cols = ("checked", "idx", "source", "target", "status", "recovery", "balance")
+        cols = tuple(getattr(self, "_tree_column_ids", ()) or ("checked", "idx", "source", "target", "status", "recovery", "balance"))
         width = self.tree.winfo_width()
         if width <= 1 and hasattr(self, "table_wrap"):
             width = self.table_wrap.winfo_width() - 20
@@ -345,31 +435,20 @@ class OnchainLayoutMixin(object):
             return
 
         min_widths = dict(self.TREE_COL_MIN_WIDTHS)
-        weights = dict(self.TREE_COL_WEIGHTS)
-        if width < 820:
-            min_widths.update({"source": 150, "target": 220, "status": 92, "recovery": 84, "balance": 68})
-            weights.update({"source": 3, "target": 6, "status": 2, "recovery": 2, "balance": 1})
-        elif width < 980:
-            min_widths.update({"source": 170, "target": 250, "status": 96, "recovery": 86, "balance": 72})
-            weights.update({"source": 3, "target": 6, "status": 2, "recovery": 2, "balance": 1})
-        elif width < 1220:
-            min_widths.update({"source": 210, "target": 300, "status": 100, "recovery": 90, "balance": 76})
-            weights.update({"source": 4, "target": 6, "status": 2, "recovery": 2, "balance": 1})
+        max_widths = dict(getattr(self, "TREE_COL_MAX_WIDTHS", {}))
+        content_widths = self._tree_column_content_widths(cols)
+        desired_widths: dict[str, int] = {}
+        for column in cols:
+            min_w = max(24, int(min_widths.get(column, 80)))
+            max_w = max(min_w, int(max_widths.get(column, max(min_w, content_widths.get(column, min_w)))))
+            desired_widths[column] = min(max_w, max(min_w, int(content_widths.get(column, min_w))))
 
-        total_min = sum(min_widths[c] for c in cols)
+        available_width = max(0, int(width) - 4)
+        if sum(desired_widths[c] for c in cols) > available_width:
+            desired_widths = self._shrink_tree_widths_to_fit(desired_widths, min_widths, cols, available_width)
 
-        if width <= total_min:
-            for c in cols:
-                self.tree.column(c, width=min_widths[c], stretch=False)
-            return
-
-        extra = width - total_min
-        total_weight = sum(weights[c] for c in cols)
-        used = 0
-        for i, c in enumerate(cols):
-            add = extra - used if i == len(cols) - 1 else int(extra * weights[c] / total_weight)
-            used += add
-            self.tree.column(c, width=min_widths[c] + max(0, add), stretch=True)
+        for column in cols:
+            self.tree.column(column, width=max(1, int(desired_widths[column])), stretch=False)
     def _on_log_resize(self, _event=None):
         if not hasattr(self, "log_text"):
             return

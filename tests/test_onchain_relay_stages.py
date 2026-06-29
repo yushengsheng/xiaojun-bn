@@ -273,6 +273,39 @@ class RelayStageRetryTests(unittest.TestCase):
         self.assertIn(("row-1", "success", "✅1usdt"), owner.statuses)
         self.assertEqual(owner.relay_wallet_store.record.status, "completed")
 
+    def test_relay_batch_failure_status_shows_balance_reason(self) -> None:
+        record = _relay_record()
+        owner = _RelayOwner(record)
+        owner.client.gas_failures_remaining = 0
+
+        def fail_amount_and_gas(*_args, **_kwargs):
+            raise RuntimeError("源钱包原生币余额不足，无法支付 gas")
+
+        owner._resolve_amount_and_gas = fail_amount_and_gas  # type: ignore[method-assign]
+        params = WithdrawRuntimeParams(
+            coin="USDT",
+            amount="1",
+            network="BSC",
+            delay=0,
+            threads=1,
+            confirm_timeout_seconds=3.0,
+            confirm_poll_interval_seconds=0.2,
+            token_contract=TOKEN_CONTRACT,
+            token_decimals=18,
+            token_is_native=False,
+            relay_enabled=True,
+            relay_fee_reserve=Decimal("1"),
+        )
+        jobs = [("row-1", "source-private-key", TARGET_ADDR)]
+
+        with patch("onchain_relay_runner._resolve_job_source_wallets", return_value={"row-1": ("source-private-key", SOURCE_ADDR)}), \
+            patch("onchain_relay_runner._build_resume_candidates", return_value={}), \
+            patch("onchain_relay_runner._pick_or_create_relay_records", return_value=({"row-1": record}, 0, record.batch_id)), \
+            patch("onchain_relay_runner._reconcile_relay_record_stage", side_effect=lambda _owner, rec, *_args, **_kwargs: rec):
+            run_relay_batch(owner, jobs, params, dry_run=False)
+
+        self.assertIn(("row-1", "failed", "❌源钱包原生币不足"), owner.statuses)
+
 
 if __name__ == "__main__":
     unittest.main()

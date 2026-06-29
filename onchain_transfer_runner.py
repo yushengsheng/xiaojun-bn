@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from onchain_rpc_runtime import (
     ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS,
+    format_onchain_failure_status,
     is_transient_rpc_error,
     onchain_record_retry_delay_seconds,
     run_onchain_record_rpc_with_retries,
@@ -969,6 +970,7 @@ class OnchainTransferRunnerMixin(object):
                 amount_text: str = "",
                 gas_fee_wei: int = 0,
                 journal_state: str = "",
+                status_text: str = "",
             ):
                 nonlocal success, failed, resolved, total_amount, total_gas_fee_wei
                 context_sig = context_by_row_key.get(row_key, "")
@@ -987,6 +989,7 @@ class OnchainTransferRunnerMixin(object):
                                 pass
                     else:
                         failed += 1
+                        row_status_text = str(status_text or "").strip() or format_onchain_failure_status(msg)
                     total_gas_fee_wei += gas_fee_wei
                     amount_total_text = self._token_amount_text(params.coin, total_amount) if track_amount_total else "-"
                     gas_total_text = "-" if dry_run else self._estimated_gas_fee_text(params.network, total_gas_fee_wei)
@@ -1213,6 +1216,7 @@ class OnchainTransferRunnerMixin(object):
                     journal_entry_id = queued_journal_id
                     journal_terminal_state = ""
                     retry_scheduled = False
+                    failure_status_text = ""
                     self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                     dispatch_ui(lambda k=row_key: self._set_status(k, "running"))
                     submitted_timeout_seconds = max(0.0, float(params.confirm_timeout_seconds))
@@ -1377,6 +1381,7 @@ class OnchainTransferRunnerMixin(object):
                         if journal_entry_id and not tx_sent:
                             self.operation_journal.update(journal_entry_id, "failed", error=str(exc))
                         msg = f"{prefix} 转账失败：{exc}"
+                        failure_status_text = format_onchain_failure_status(exc)
                     finally:
                         jobs_q.task_done()
                         close_session = getattr(self.client, "_close_thread_rpc_session", None)
@@ -1401,6 +1406,7 @@ class OnchainTransferRunnerMixin(object):
                             amount_text=amount_text,
                             gas_fee_wei=gas_fee_wei,
                             journal_state=(journal_terminal_state or ("failed" if result_status == "failed" else "")),
+                            status_text=(failure_status_text if result_status == "failed" else ""),
                         )
                         if result_status == "success" and journal_terminal_state == "submitted":
                             schedule_success_ledger_confirmation(
@@ -1489,6 +1495,13 @@ class OnchainTransferRunnerMixin(object):
                     dispatch_ui(lambda k=row_key: self._set_status(k, "failed", "已停止"))
                 dispatch_ui(lambda: self.log("链上转账任务已停止"))
             else:
+                failed_reason = format_onchain_failure_status(err_text)
+                failed = max(failed, len(initial_progress_keys) - success)
+                for row_key in initial_progress_keys:
+                    if str(getattr(self, "row_status", {}).get(row_key, "") or "") in {"success", "failed"}:
+                        continue
+                    self._mark_row_status_context(row_key, initial_context_by_row_key.get(row_key, ""))
+                    dispatch_ui(lambda k=row_key, reason=failed_reason: self._set_status(k, "failed", reason))
                 dispatch_ui(lambda m=f"链上转账任务异常终止：{err_text}": self.log(m))
                 dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
             dispatch_ui(
