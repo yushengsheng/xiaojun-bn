@@ -122,6 +122,7 @@ from stores import (
     _load_json_with_backup,
     config_or_backup_exists,
 )
+from system_proxy import refresh_system_proxy_cache
 
 _ONCHAIN_IMPORT_ERROR = None
 _ONCHAIN_PAGE_CLASS = None
@@ -199,6 +200,7 @@ class ExchangeAppBase(tk.Tk):
         self._log_poll_after_token = None
         self._accounts_save_after_token = None
         self._update_ip_after_token = None
+        self._exchange_system_proxy_refresh_after_token = None
         self._ip_refresh_inflight = False
         self._ip_refresh_lock = threading.Lock()
         self._result_file_lock = threading.Lock()
@@ -225,6 +227,7 @@ class ExchangeAppBase(tk.Tk):
         self._load_strategy_config()
         self._load_exchange_proxy_config()
         self._load_accounts()
+        self._warm_startup_system_proxy_cache()
         self._log_poll_after_token = self.after(100, self._poll_log_queue)
         self.update_ip()
     def _prompt_app_password(self, title: str, prompt: str) -> str | None:
@@ -304,6 +307,20 @@ class ExchangeAppBase(tk.Tk):
                 logger.info("已加密迁移中转钱包文件：%s，记录=%d", RELAY_WALLET_FILE, count)
         except Exception as exc:
             logger.error("中转钱包文件加密迁移失败: %s", exc)
+    @staticmethod
+    def _warm_startup_system_proxy_cache() -> None:
+        try:
+            urls = [
+                "https://api.binance.com/api/v3/time",
+                "https://gateway.tenderly.co/public/mainnet",
+            ]
+            for network in EvmClient.NETWORKS.values():
+                urls.extend(str(url or "") for url in network.get("rpc_urls", []))
+            refresh_system_proxy_cache(
+                tuple(dict.fromkeys(url for url in urls if url))
+            )
+        except Exception as exc:
+            logger.debug("系统代理启动预热失败: %s", exc)
     def change_app_password(self):
         if self._batch_task_active or (self.worker_thread and self.worker_thread.is_alive()):
             messagebox.showwarning("提示", "请先停止当前交易所任务后再修改程序密码")
@@ -526,10 +543,10 @@ class ExchangeAppBase(tk.Tk):
         self.account_tree.heading("status", text="状态")
         self.account_tree.column("checked", width=52, minwidth=52, stretch=False, anchor="center")
         self.account_tree.column("idx", width=52, minwidth=52, stretch=False, anchor="center")
-        self.account_tree.column("api_key", width=220, minwidth=180, anchor="w")
-        self.account_tree.column("address", width=330, minwidth=260, anchor="w")
+        self.account_tree.column("api_key", width=170, minwidth=135, stretch=False, anchor="w")
+        self.account_tree.column("address", width=210, minwidth=160, stretch=False, anchor="w")
         self.account_tree.column("network", width=76, minwidth=68, stretch=False, anchor="center")
-        self.account_tree.column("status", width=500, minwidth=240, anchor="w")
+        self.account_tree.column("status", width=760, minwidth=220, stretch=True, anchor="w")
         self.account_tree.tag_configure("acc_ready", foreground="#111111", background="#F2F2F2")
         self.account_tree.tag_configure("acc_running", foreground="#111111", background="#CFE3FF")
         self.account_tree.tag_configure("acc_warn", foreground="#111111", background="#FFE3B8")
@@ -557,8 +574,14 @@ class ExchangeAppBase(tk.Tk):
         self.account_tree.bind("<Button-3>", self._on_account_tree_right_click, add="+")
         self.account_tree.bind("<Control-Button-1>", self._on_account_tree_right_click, add="+")
         self.frame_list_canvas.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
+        self.frame_list_canvas.bind(
+            "<Configure>",
+            lambda _event: getattr(self, "_schedule_account_status_column_resize", lambda: None)(),
+            add="+",
+        )
         self.account_list_hint.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
         self._refresh_account_list_hint()
+        getattr(self, "_schedule_account_status_column_resize", lambda: None)()
 
         self.account_row_menu = tk.Menu(self, tearoff=0)
         self.account_row_menu.add_command(label="复制 API KEY", command=self.copy_context_account_api_key)
@@ -1324,6 +1347,7 @@ class ExchangeAppBase(tk.Tk):
         self._cancel_after_token("_accounts_save_after_token")
         self._save_accounts_silently()
         self._cancel_after_token("_update_ip_after_token")
+        self._cancel_after_token("_exchange_system_proxy_refresh_after_token")
         self._cancel_after_token("_log_poll_after_token")
         try:
             self.stop_bot()
@@ -1404,6 +1428,7 @@ class ExchangeAppBase(tk.Tk):
         self._cancel_after_token("_accounts_save_after_token")
         self._cancel_after_token("_close_wait_after_token")
         self._cancel_after_token("_update_ip_after_token")
+        self._cancel_after_token("_exchange_system_proxy_refresh_after_token")
         self._cancel_after_token("_log_poll_after_token")
         page = getattr(self, "onchain_page", None)
         if page is not None:

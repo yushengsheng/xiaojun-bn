@@ -72,7 +72,7 @@ class EvmClientDependencyCommandTests(unittest.TestCase):
                 raise requests.exceptions.ReadTimeout("slow rpc")
 
         client._network_info = lambda _network: {"rpc_urls": ["https://rpc.example"]}  # type: ignore[method-assign]
-        client._rpc_session = lambda: (_Session(), "")  # type: ignore[method-assign]
+        client._rpc_session = lambda _target_url="": (_Session(), "")  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(RuntimeError, "RPC 请求失败"):
             client.get_balance_wei("BSC", "0x00000000000000000000000000000000000000aa")

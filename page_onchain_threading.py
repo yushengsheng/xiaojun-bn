@@ -135,6 +135,13 @@ class OnchainThreadingMixin(object):
             return
         self._closing = True
         self.stop_requested.set()
+        token = getattr(self, "_onchain_system_proxy_refresh_after_token", None)
+        if token is not None:
+            setattr(self, "_onchain_system_proxy_refresh_after_token", None)
+            try:
+                self.root.after_cancel(token)
+            except Exception:
+                pass
         try:
             self._close_wallet_generator()
         except Exception:

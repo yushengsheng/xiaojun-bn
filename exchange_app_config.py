@@ -46,6 +46,7 @@ from exchange_app_base import (
     requests,
 )
 from sensitive_data import redact_sensitive_text
+from system_proxy import refresh_system_proxy_cache, system_proxy_map
 
 
 class ExchangeAppConfigMixin(object):
@@ -68,6 +69,21 @@ class ExchangeAppConfigMixin(object):
         return self._normalize_proxy_text(proxy_text)
     def _on_exchange_proxy_config_changed(self, *_args) -> None:
         self._sync_exchange_proxy_state()
+        self._schedule_exchange_system_proxy_cache_refresh()
+    @staticmethod
+    def _refresh_exchange_system_proxy_cache(*, background: bool = False) -> dict[str, str]:
+        return refresh_system_proxy_cache("https://api.binance.com/api/v3/time", background=background)
+    def _schedule_exchange_system_proxy_cache_refresh(self) -> None:
+        def _refresh() -> None:
+            setattr(self, "_exchange_system_proxy_refresh_after_token", None)
+            self._refresh_exchange_system_proxy_cache(background=True)
+
+        try:
+            self._cancel_after_token("_exchange_system_proxy_refresh_after_token")
+            token = self.after(300, _refresh)
+            setattr(self, "_exchange_system_proxy_refresh_after_token", token)
+        except Exception:
+            self._refresh_exchange_system_proxy_cache(background=True)
     def _sync_exchange_proxy_state(self) -> None:
         use_var = getattr(self, "use_exchange_config_proxy_var", None)
         proxy_var = getattr(self, "exchange_proxy_var", None)
@@ -183,17 +199,8 @@ class ExchangeAppConfigMixin(object):
     def _requests_proxy_map(self) -> dict[str, str]:
         return self._requests_proxy_map_from_state()
     @staticmethod
-    def _system_proxy_map() -> dict[str, str]:
-        try:
-            proxies = requests.utils.get_environ_proxies("https://api.binance.com/api/v3/time") or {}
-        except Exception:
-            return {}
-        result = {}
-        for key in ("http", "https"):
-            value = str(proxies.get(key) or "").strip()
-            if value:
-                result[key] = value
-        return result
+    def _system_proxy_map(*, refresh: bool = False) -> dict[str, str]:
+        return system_proxy_map("https://api.binance.com/api/v3/time", refresh=refresh)
     def _exchange_proxy_route_text_from_state(self, state: dict[str, object] | None = None) -> str:
         snapshot = dict(state or self._exchange_proxy_state_snapshot())
         raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
@@ -204,6 +211,9 @@ class ExchangeAppConfigMixin(object):
                 return redact_sensitive_text(f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}")
             return "direct"
         if not raw_proxy:
+            system_proxy = self._system_proxy_map()
+            if system_proxy:
+                return redact_sensitive_text(f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}")
             return "direct"
         if raw_proxy.lower().startswith("ss://"):
             snap = self.exchange_proxy_runtime.snapshot()

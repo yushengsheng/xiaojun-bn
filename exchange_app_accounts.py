@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import tkinter.font as tkfont
+
 from exchange_app_base import (
     AccountEntry,
     DATA_FILE,
@@ -35,6 +37,121 @@ from sensitive_data import mask_api_key
 
 
 class ExchangeAppAccountsMixin(object):
+    @staticmethod
+    def _status_is_partial_completion_failure(status_text: str) -> bool:
+        text = str(status_text or "").strip()
+        return "轮完成" in text and "失败" in text
+
+    def _account_status_column_font(self):
+        tree = getattr(self, "account_tree", None)
+        try:
+            style_name = str(tree.cget("style") or "Treeview") if tree is not None else "Treeview"
+            style_font = self.tk.call("ttk::style", "lookup", style_name, "-font")
+            if style_font:
+                return tkfont.nametofont(str(style_font))
+        except Exception:
+            pass
+        try:
+            return tkfont.nametofont("TkDefaultFont")
+        except Exception:
+            return None
+
+    def _account_status_column_available_width(self) -> int:
+        tree = getattr(self, "account_tree", None)
+        frame = getattr(self, "frame_list_canvas", None)
+        if tree is None:
+            return 760
+        width_candidates: list[int] = []
+        for width_source in (
+            lambda: int(frame.winfo_width()) if frame is not None else 0,
+            lambda: int(tree.winfo_width()),
+            lambda: int(self.winfo_width()),
+        ):
+            try:
+                width_value = int(width_source())
+            except Exception:
+                width_value = 0
+            if width_value > 1:
+                width_candidates.append(width_value)
+        try:
+            match = re.match(r"^(\d+)x", str(self.geometry() or ""))
+            if match:
+                width_candidates.append(int(match.group(1)))
+        except Exception:
+            pass
+        container_width = max(width_candidates or [1320])
+
+        fixed_width = 0
+        for col in ("checked", "idx", "api_key", "address", "network"):
+            try:
+                fixed_width += int(tree.column(col, option="width") or 0)
+            except Exception:
+                continue
+        return max(220, int(container_width) - fixed_width - 36)
+
+    def _resize_account_status_column(self) -> None:
+        tree = getattr(self, "account_tree", None)
+        if tree is None:
+            return
+        try:
+            if not tree.winfo_exists():
+                return
+        except Exception:
+            return
+
+        font_obj = self._account_status_column_font()
+        status_texts = ["状态"]
+        last_status_text = str(getattr(self, "_account_status_column_last_text", "") or "").strip()
+        if last_status_text:
+            status_texts.append(last_status_text)
+        for acc in list(getattr(self, "accounts", []) or []):
+            try:
+                status_texts.append(str(acc.get("status_var").get() or ""))
+            except Exception:
+                continue
+
+        if font_obj is not None:
+            try:
+                measured_width = max(font_obj.measure(text) for text in status_texts)
+            except Exception:
+                measured_width = 0
+        else:
+            measured_width = 0
+        length_floor_width = max((len(text) for text in status_texts), default=0) * 12
+        measured_width = max(measured_width, length_floor_width)
+
+        desired_width = max(260, int(measured_width) + 56)
+        target_width = min(desired_width, self._account_status_column_available_width())
+        target_width = max(220, int(target_width))
+        try:
+            current_width = int(tree.column("status", option="width") or 0)
+        except Exception:
+            current_width = 0
+        if target_width > current_width or abs(current_width - target_width) >= 8:
+            try:
+                tree.column("status", width=target_width)
+            except Exception:
+                pass
+
+    def _schedule_account_status_column_resize(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        token = getattr(self, "_account_status_column_after_token", None)
+        if token:
+            try:
+                self.after_cancel(token)
+            except Exception:
+                pass
+
+        def _run():
+            self._account_status_column_after_token = None
+            self._resize_account_status_column()
+
+        try:
+            self._account_status_column_after_token = self.after_idle(_run)
+        except Exception:
+            self._account_status_column_after_token = None
+
     def _setup_account_list_mousewheel_bindings(self):
         # 账号列表区域内，鼠标滚轮可直接滚动，无需命中右侧滚动条
         self.bind_all("<MouseWheel>", self._on_account_list_mousewheel, add="+")
@@ -676,6 +793,8 @@ class ExchangeAppAccountsMixin(object):
             return "#ffe3b8"
         if any(k in s for k in ("已停止", "已请求停止")):
             return "#ffe3b8"
+        if ExchangeAppAccountsMixin._status_is_partial_completion_failure(s):
+            return "#ffe3b8"
         if s.startswith("×") or any(k in s for k in ("失败", "异常")):
             return "#f8c7c7"
         if s.startswith("✔") or any(k in s for k in ("成功", "完成", "总资产", "无可提", "提现额度")):
@@ -690,6 +809,8 @@ class ExchangeAppAccountsMixin(object):
         if not s or s == "就绪":
             return "acc_ready"
         if "未到账" in s or any(k in s for k in ("已停止", "已请求停止")):
+            return "acc_warn"
+        if self._status_is_partial_completion_failure(s):
             return "acc_warn"
         if s.startswith("×") or any(k in s for k in ("失败", "异常")):
             return "acc_failed"
@@ -715,6 +836,7 @@ class ExchangeAppAccountsMixin(object):
             tree.item(tree_id, values=self._account_tree_values(acc), tags=(self._account_row_style_tag(acc),))
         except Exception:
             pass
+        self._schedule_account_status_column_resize()
     def _insert_account_tree_row(self, acc: dict) -> None:
         tree = getattr(self, "account_tree", None)
         if tree is None:
@@ -722,6 +844,7 @@ class ExchangeAppAccountsMixin(object):
         tree_id = tree.insert("", "end", values=self._account_tree_values(acc), tags=(self._account_row_style_tag(acc),))
         acc["tree_id"] = tree_id
         self._account_tree_row_to_account[tree_id] = acc
+        self._schedule_account_status_column_resize()
     def _account_from_tree_row_id(self, row_id: str) -> dict | None:
         return self._account_tree_row_to_account.get(str(row_id or "").strip())
     def _apply_account_row_style(self, acc: dict):
@@ -738,7 +861,10 @@ class ExchangeAppAccountsMixin(object):
         if current == status_text:
             return
         status_var.set(status_text)
+        self._account_status_column_last_text = status_text
         self._apply_account_row_style(acc)
+        self._resize_account_status_column()
+        self._schedule_account_status_column_resize()
     def _schedule_account_status(self, acc: dict, text: str) -> None:
         if self._closing:
             return

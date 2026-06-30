@@ -1039,6 +1039,12 @@ class ExchangeBatchFlowMixin(object):
                             callback_amount = withdraw_state.get("amount")
                             result_amount = float((strategy_result or {}).get("withdraw_amount", 0.0)) if isinstance(strategy_result, dict) else 0.0
                             final_amount = callback_amount if callback_amount is not None else result_amount
+                            if isinstance(strategy_result, dict):
+                                self._record_batch_count_metric(
+                                    acc,
+                                    "market_failed_rounds_by_account",
+                                    strategy_result.get("market_round_failed_count", 0),
+                                )
 
                             trade_error = strategy_result.get("trade_error") if isinstance(strategy_result, dict) else ""
                             if trade_error:
@@ -1052,13 +1058,21 @@ class ExchangeBatchFlowMixin(object):
                                 op_success = False
                             elif isinstance(strategy_result, dict) and strategy_result.get("withdraw_error") and (final_amount or 0) <= 0:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
-                                set_status(
-                                    self._exchange_error_status_text(
-                                        "提现失败",
-                                        strategy_result.get("withdraw_error", ""),
-                                        fallback="提现失败",
-                                    )
+                                withdraw_failure_status = self._exchange_error_status_text(
+                                    "提现失败",
+                                    strategy_result.get("withdraw_error", ""),
+                                    fallback="提现失败",
                                 )
+                                round_status = self._format_market_round_failure_status(strategy_result)
+                                if round_status:
+                                    set_status(
+                                        self._exchange_failed_status_text(
+                                            f"{round_status}；{self._plain_exchange_status_text(withdraw_failure_status)}",
+                                            fallback="提现失败",
+                                        )
+                                    )
+                                else:
+                                    set_status(withdraw_failure_status)
                                 op_success = False
                             else:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
@@ -1066,6 +1080,7 @@ class ExchangeBatchFlowMixin(object):
                                     float(final_amount or 0.0),
                                     withdraw_coin,
                                     enable_withdraw=enable_withdraw,
+                                    strategy_result=strategy_result if isinstance(strategy_result, dict) else None,
                                 )
                                 if status_text is not None:
                                     set_status(status_text)

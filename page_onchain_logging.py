@@ -9,6 +9,7 @@ from pathlib import Path
 from tkinter import messagebox
 
 from app_paths import RELAY_FAILED_EXPORT_FILE, RELAY_MANUAL_EXPORT_FILE
+from onchain_diagnostics import append_onchain_runtime_log
 from shared_utils import LOG_MAX_ROWS, append_log_row, queue_log_row, queue_ui_render
 
 ONCHAIN_PROBLEM_LOG_KEYWORDS = (
@@ -67,6 +68,7 @@ class OnchainLoggingMixin(object):
             return
         append_log_row(error_log_text, text, max_rows=LOG_MAX_ROWS)
     def log(self, text: str):
+        append_onchain_runtime_log(text)
         queue_log_row(self, self.log_text, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
         if self._is_problem_log_text(text):
             queue_ui_render(
@@ -76,25 +78,30 @@ class OnchainLoggingMixin(object):
             )
     def test_onchain_proxy(self):
         snapshot = self._onchain_proxy_state_snapshot()
-        route_text = self._onchain_proxy_route_text(state=snapshot)
         selected_network = str(self.network_var.get() or "").strip().upper()
 
         def worker():
             test_ok = False
+            route_text = ""
             try:
+                self._refresh_onchain_system_proxy_cache(background=False)
+                route_text = self._onchain_proxy_route_text(state=snapshot)
                 status, exit_ip, target = self._test_onchain_proxy_once(state=snapshot, selected_network=selected_network)
                 test_ok = True
                 log_text = f"链上代理测试成功：status={status}，exit_ip={exit_ip}，target={target}，route={route_text}"
             except Exception as exc:
                 use_config_proxy = bool(snapshot.get("use_config_proxy"))
                 raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
-                if use_config_proxy and raw_proxy:
+                has_config_proxy = bool(use_config_proxy and raw_proxy)
+                if has_config_proxy:
                     status = "连接失败"
-                elif (not use_config_proxy) and self._onchain_system_proxy_map():
+                elif (not has_config_proxy) and self._onchain_system_proxy_map():
                     status = "系统代理异常"
                 else:
                     status = "直连异常"
                 exit_ip = "--"
+                if not route_text:
+                    route_text = self._onchain_proxy_route_text(state=snapshot)
                 log_text = f"链上代理测试失败：{exc}，route={route_text}"
 
             def _update():

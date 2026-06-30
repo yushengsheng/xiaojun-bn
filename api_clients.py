@@ -20,6 +20,7 @@ from typing import Callable
 import requests
 
 from core_models import EvmToken, GeneratedWalletEntry
+from system_proxy import configure_requests_session_for_proxy, resolve_proxy_route
 
 
 ONCHAIN_TRANSIENT_RPC_RETRY_ATTEMPTS = 10
@@ -204,18 +205,23 @@ class EvmClient:
         return str(value or "").strip()
 
     @staticmethod
-    def _rpc_session_signature(proxy_url: str, allow_system_proxy: bool) -> tuple[str, bool]:
-        return (str(proxy_url or "").strip(), bool(allow_system_proxy))
+    def _rpc_session_signature(proxy_url: str, allow_system_proxy: bool, target_url: str = "") -> tuple[object, ...]:
+        route, proxies = resolve_proxy_route(
+            explicit_proxy=proxy_url,
+            target_url=target_url,
+            allow_system_proxy=allow_system_proxy,
+        )
+        return (str(proxy_url or "").strip(), bool(allow_system_proxy), route, tuple(sorted(proxies.items())))
 
     @staticmethod
-    def _build_rpc_session(proxy_url: str, allow_system_proxy: bool) -> requests.Session:
+    def _build_rpc_session(proxy_url: str, allow_system_proxy: bool, target_url: str = "") -> requests.Session:
         session = requests.Session()
-        session.trust_env = bool(allow_system_proxy)
-        if proxy_url:
-            session.proxies = {
-                "http": proxy_url,
-                "https": proxy_url,
-            }
+        configure_requests_session_for_proxy(
+            session,
+            explicit_proxy=proxy_url,
+            target_url=target_url,
+            allow_system_proxy=allow_system_proxy,
+        )
         return session
 
     def _close_thread_rpc_session(self, session: requests.Session | None = None) -> None:
@@ -252,22 +258,23 @@ class EvmClient:
             except Exception:
                 pass
 
-    def _rpc_session(self) -> tuple[requests.Session, str]:
+    def _rpc_session(self, target_url: str = "") -> tuple[requests.Session, str]:
         proxy_url = self._current_proxy_url()
         allow_system_proxy = self._allow_system_proxy_now() and not bool(proxy_url)
-        signature = self._rpc_session_signature(proxy_url, allow_system_proxy)
+        signature = self._rpc_session_signature(proxy_url, allow_system_proxy, target_url)
         local = self._rpc_session_local
         session = getattr(local, "session", None)
         cached_signature = getattr(local, "signature", None)
         if session is not None and cached_signature == signature:
-            return session, proxy_url
+            return session, (proxy_url or str(dict(signature[-1]).get("https") or dict(signature[-1]).get("http") or ""))
         self._close_thread_rpc_session()
-        session = self._build_rpc_session(proxy_url, allow_system_proxy)
+        session = self._build_rpc_session(proxy_url, allow_system_proxy, target_url)
         local.session = session
         local.signature = signature
         with self._rpc_sessions_lock:
             self._rpc_sessions[threading.get_ident()] = session
-        return session, proxy_url
+        resolved = dict(signature[-1])
+        return session, (proxy_url or str(resolved.get("https") or resolved.get("http") or ""))
 
     def _network_info(self, network: str) -> dict:
         net = network.strip().upper()
@@ -550,7 +557,7 @@ class EvmClient:
                 session = None
                 proxy_url = ""
                 try:
-                    session, proxy_url = self._rpc_session()
+                    session, proxy_url = self._rpc_session(url)
                     started_at = time.monotonic()
                     resp = session.post(
                         url,

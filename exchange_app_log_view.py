@@ -79,17 +79,18 @@ class ExchangeAppLogViewMixin(object):
         proxies = self._requests_proxy_map_from_state(snapshot)
         proxy_text = str(snapshot.get("raw_proxy") or "").strip()
         use_config_proxy = bool(snapshot.get("use_config_proxy"))
-        system_proxy = self._system_proxy_map() if not use_config_proxy else {}
+        has_config_proxy = bool(use_config_proxy and proxy_text)
+        system_proxy = self._system_proxy_map() if not has_config_proxy else {}
         proxy_status = "跟随系统代理" if system_proxy else "未启用"
         proxy_exit_ip = "--"
-        if use_config_proxy and proxy_text:
+        if has_config_proxy:
             proxy_status = "SS代理连接中..." if proxy_text.lower().startswith("ss://") else "代理连接中..."
-        allow_system_proxy = bool(system_proxy) and not use_config_proxy
+        allow_system_proxy = bool(system_proxy) and not has_config_proxy
         target = self._test_exchange_target_connectivity(
             proxies=proxies or None,
             allow_system_proxy=allow_system_proxy,
         )
-        if use_config_proxy and proxy_text:
+        if has_config_proxy:
             proxy_status = "SS代理已连接" if proxy_text.lower().startswith("ss://") else "代理已连接"
             if include_exit_ip:
                 proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=True, allow_system_proxy=False)
@@ -105,7 +106,9 @@ class ExchangeAppLogViewMixin(object):
     def _resolve_exchange_ip_refresh_state(self, snapshot: dict[str, object] | None = None) -> tuple[str, str, str]:
         current = dict(snapshot or self._exchange_proxy_state_snapshot())
         use_config_proxy = bool(current.get("use_config_proxy"))
-        system_proxy = self._system_proxy_map() if not use_config_proxy else {}
+        proxy_text = str(current.get("raw_proxy") or "").strip()
+        has_config_proxy = bool(use_config_proxy and proxy_text)
+        system_proxy = self._system_proxy_map() if not has_config_proxy else {}
         proxy_status = "跟随系统代理" if system_proxy else "未启用"
         proxy_exit_ip = "--"
 
@@ -113,7 +116,7 @@ class ExchangeAppLogViewMixin(object):
             ip_text = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=False)
         except Exception as exc:
             ip_text = f"获取失败: {exc}"
-            if use_config_proxy:
+            if has_config_proxy:
                 proxy_status = "连接失败"
             elif system_proxy:
                 proxy_status = "系统代理异常"
@@ -121,11 +124,11 @@ class ExchangeAppLogViewMixin(object):
                 proxy_status = "直连异常"
             return ip_text, proxy_status, proxy_exit_ip
 
-        if use_config_proxy or system_proxy:
+        if has_config_proxy or system_proxy:
             try:
                 proxy_status, proxy_exit_ip, _target = self._test_exchange_proxy_once(include_exit_ip=True, state=current)
             except Exception:
-                if use_config_proxy:
+                if has_config_proxy:
                     proxy_status = "连接失败"
                 elif system_proxy:
                     proxy_status = "系统代理异常"
@@ -137,12 +140,14 @@ class ExchangeAppLogViewMixin(object):
         return ip_text, proxy_status, proxy_exit_ip
     def test_exchange_proxy(self):
         snapshot = self._exchange_proxy_state_snapshot()
-        route_text = self._exchange_proxy_route_text_from_state(snapshot)
 
         def worker():
             test_ok = False
             save_err = ""
+            route_text = ""
             try:
+                self._refresh_exchange_system_proxy_cache(background=False)
+                route_text = self._exchange_proxy_route_text_from_state(snapshot)
                 status, exit_ip, target = self._test_exchange_proxy_once(state=snapshot)
                 try:
                     self._save_exchange_proxy_config_only(state=snapshot)
@@ -157,12 +162,15 @@ class ExchangeAppLogViewMixin(object):
             except Exception as e:
                 use_config_proxy = bool(snapshot.get("use_config_proxy"))
                 raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
-                status = "连接失败" if (use_config_proxy and raw_proxy) else "未启用"
-                if (not use_config_proxy) and self._system_proxy_map():
+                has_config_proxy = bool(use_config_proxy and raw_proxy)
+                status = "连接失败" if has_config_proxy else "未启用"
+                if (not has_config_proxy) and self._system_proxy_map():
                     status = "系统代理异常"
-                elif not use_config_proxy:
+                elif not has_config_proxy:
                     status = "直连异常"
                 exit_ip = "--"
+                if not route_text:
+                    route_text = self._exchange_proxy_route_text_from_state(snapshot)
                 log_text = f"交易所代理测试失败：{e}，route={route_text}"
 
             def _update():

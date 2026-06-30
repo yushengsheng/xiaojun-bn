@@ -30,6 +30,7 @@ from secure_config import config_context as secure_config_context
 from secret_box import SECRET_BOX
 from sensitive_data import redact_sensitive_text
 from stores import _atomic_write_json_with_backup, _atomic_write_text, _load_json_with_backup
+from system_proxy import configure_requests_session_for_proxy
 
 
 def _json_dump_text(payload: object) -> str:
@@ -443,20 +444,25 @@ class ExchangeProxyRuntime:
         if digest_text.startswith("sha256:"):
             expected_sha256 = digest_text.split(":", 1)[1].strip().lower()
         hasher = hashlib.sha256() if expected_sha256 else None
-        with requests.get(
-            url,
-            headers=ExchangeProxyRuntime._RUNTIME_HTTP_HEADERS,
-            timeout=(15, 120),
-            stream=True,
-        ) as resp:
-            resp.raise_for_status()
-            with open(destination, "wb") as handle:
-                for chunk in resp.iter_content(chunk_size=262144):
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    if hasher is not None:
-                        hasher.update(chunk)
+        session = requests.Session()
+        try:
+            configure_requests_session_for_proxy(session, target_url=url, allow_system_proxy=True)
+            with session.get(
+                url,
+                headers=ExchangeProxyRuntime._RUNTIME_HTTP_HEADERS,
+                timeout=(5, 120),
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                with open(destination, "wb") as handle:
+                    for chunk in resp.iter_content(chunk_size=262144):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        if hasher is not None:
+                            hasher.update(chunk)
+        finally:
+            session.close()
         if hasher is not None and hasher.hexdigest().lower() != expected_sha256:
             raise RuntimeError("下载的 sing-box 运行时校验失败")
 
@@ -941,9 +947,15 @@ def http_get_via_proxy(
 ):
     session = requests.Session()
     try:
-        session.trust_env = bool(allow_system_proxy) and not bool(proxies)
         if proxies:
+            session.trust_env = False
             session.proxies.update(proxies)
+        else:
+            configure_requests_session_for_proxy(
+                session,
+                target_url=url,
+                allow_system_proxy=allow_system_proxy,
+            )
         return session.get(url, timeout=timeout, headers=headers or {})
     finally:
         session.close()

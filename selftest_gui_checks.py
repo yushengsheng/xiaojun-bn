@@ -118,6 +118,12 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 pump_tk_events(app, timeout=5.0)
                 if int(app.account_tree.cget("height")) != 10:
                     raise RuntimeError("GUI 自检失败：交易所账号列表高度不是10行")
+                api_key_col_width = int(app.account_tree.column("api_key", option="width") or 0)
+                address_col_width = int(app.account_tree.column("address", option="width") or 0)
+                if api_key_col_width > 190:
+                    raise RuntimeError(f"GUI 自检失败：API KEY列宽未收窄（{api_key_col_width}）")
+                if address_col_width > 230:
+                    raise RuntimeError(f"GUI 自检失败：提现地址列宽未收窄（{address_col_width}）")
                 if str(app.btn_destroy_all_accounts.cget("text")) != "销毁所有":
                     raise RuntimeError("GUI 自检失败：交易所账号销毁按钮缺失")
                 if str(app.btn_destroy_all_accounts.cget("fg")).lower() != "#c62828":
@@ -160,6 +166,24 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     "selftest-account-address",
                     "BSC",
                 )
+                app._set_account_status(app.accounts[-1], "✔6轮完成，失败1轮；提现1.25 USDT")
+                pump_tk_events(app, timeout=5.0)
+                status_col_width = int(app.account_tree.column("status", option="width") or 0)
+                status_col_max_width = int(app._account_status_column_available_width())
+                if status_col_width <= 260:
+                    current_status = str(app.accounts[-1]["status_var"].get() or "")
+                    last_status = str(getattr(app, "_account_status_column_last_text", "") or "")
+                    raise RuntimeError(
+                        "GUI 自检失败：交易所账号状态列未按内容扩展"
+                        f"（width={status_col_width}, max={status_col_max_width}, "
+                        f"status={current_status}, last={last_status}, len={len(last_status)}）"
+                    )
+                if status_col_width > status_col_max_width:
+                    raise RuntimeError(
+                        f"GUI 自检失败：交易所账号状态列超过可用宽度（{status_col_width}>{status_col_max_width}）"
+                    )
+                if app._account_row_style_tag(app.accounts[-1]) != "acc_warn":
+                    raise RuntimeError("GUI 自检失败：完成但有失败轮次的状态未显示为警示状态")
                 app._save_accounts_silently()
                 app.exchange_operation_journal.begin("exchange-order", "selftest", {"order_id": "selftest-order"})
                 withdraw_result_path.write_text("selftest-withdraw", encoding="utf-8")

@@ -37,6 +37,7 @@ from app_paths import (
 )
 from core_models import EvmToken, GeneratedWalletEntry, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
 from exchange_logging import logger
+from onchain_diagnostics import append_onchain_activity
 from onchain_relay_wallets import RelayWalletFileStore
 from page_onchain_runtime import OnchainRuntimeMixin
 from page_onchain_threading import OnchainThreadingMixin
@@ -187,6 +188,7 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
         self.wallet_cache_lock = threading.Lock()
         self._onchain_proxy_state_lock = threading.Lock()
         self._onchain_proxy_state = {"use_config_proxy": False, "raw_proxy": ""}
+        self._onchain_system_proxy_refresh_after_token = None
         self._runtime_state_lock = threading.Lock()
         self._runtime_state = {
             "threads_raw": str(ONCHAIN_WORKER_THREADS_DEFAULT),
@@ -1533,6 +1535,7 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
             self.row_status_text_map[row_key] = text
         else:
             self.row_status_text_map.pop(row_key, None)
+        append_onchain_activity("transfer_status", row=self._safe_activity_row_key(row_key), status=status, text=text)
         queue_ui_render(self, lambda k=row_key: self._update_row_view(k), root=getattr(self, "root", None))
         self._refresh_progress_if_active("transfer", row_key)
     def _set_recovery_status(self, row_key: str, status: str, status_text: str = ""):
@@ -1542,10 +1545,12 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
             self.row_recovery_text_map[row_key] = text
         else:
             self.row_recovery_text_map.pop(row_key, None)
+        append_onchain_activity("recovery_status", row=self._safe_activity_row_key(row_key), status=status, text=text)
         queue_ui_render(self, lambda k=row_key: self._update_row_view(k), root=getattr(self, "root", None))
         self._refresh_progress_if_active("recovery", row_key)
     def _set_query_status(self, row_key: str, status: str):
         self._ensure_query_status_store()[row_key] = status
+        append_onchain_activity("query_status", row=self._safe_activity_row_key(row_key), status=status)
         queue_ui_render(self, lambda k=row_key: self._update_row_view(k), root=getattr(self, "root", None))
         self._refresh_progress_if_active("query", row_key)
     def _set_query_statuses(self, row_keys: list[str], status: str):
@@ -1563,6 +1568,23 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
     def _clear_target_balance_summary(self, context_sig: str) -> None:
         if context_sig == self._normalize_context_target(self.target_address_var.get().strip()):
             self.target_balance_var.set("-")
+    def _safe_activity_row_key(self, row_key: str) -> str:
+        key = str(row_key or "").strip()
+        if not key:
+            return ""
+        try:
+            number = self._row_number_by_key_snapshot().get(key)
+            if number is not None:
+                return f"#{number}"
+        except Exception:
+            pass
+        if key.startswith("m2m:"):
+            return "m2m"
+        if key.startswith("1m:"):
+            return "1m"
+        if key.startswith("m1:"):
+            return "m1"
+        return key[:12]
     def _active_row_keys(self) -> list[str]:
         if self._is_mode_m2m():
             return [self._m2m_key(x) for x in self.store.multi_to_multi_pairs]
@@ -1884,6 +1906,7 @@ class OnchainTransferPageBase(OnchainRuntimeMixin, OnchainThreadingMixin, Onchai
         self._refresh_tree()
     def _on_proxy_config_changed(self, *_args):
         self._sync_onchain_proxy_state()
+        self._schedule_onchain_system_proxy_cache_refresh()
         self._refresh_onchain_proxy_summary()
     def _on_source_or_target_changed(self, *_args):
         if self._is_mode_1m():

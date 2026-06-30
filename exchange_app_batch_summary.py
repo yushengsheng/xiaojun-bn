@@ -282,6 +282,35 @@ class ExchangeBatchSummaryMixin(object):
         while body[:1] in {"✔", "×"}:
             body = body[1:].strip()
         return body or str(fallback or "").strip()
+    @staticmethod
+    def _market_round_failed_count(strategy_result: dict | None) -> int:
+        if not isinstance(strategy_result, dict):
+            return 0
+        try:
+            return max(0, int(strategy_result.get("market_round_failed_count") or 0))
+        except Exception:
+            return 0
+    @staticmethod
+    def _market_round_total_count(strategy_result: dict | None) -> int:
+        if not isinstance(strategy_result, dict):
+            return 0
+        for key in ("market_round_total", "market_round_completed"):
+            try:
+                value = max(0, int(strategy_result.get(key) or 0))
+            except Exception:
+                value = 0
+            if value > 0:
+                return value
+        return 0
+    @classmethod
+    def _format_market_round_failure_status(cls, strategy_result: dict | None) -> str:
+        failed_count = cls._market_round_failed_count(strategy_result)
+        if failed_count <= 0:
+            return ""
+        total_count = cls._market_round_total_count(strategy_result)
+        if total_count > 0:
+            return f"{total_count}轮完成，失败{failed_count}轮"
+        return f"失败{failed_count}轮"
     @classmethod
     def _format_withdraw_amount_status(cls, amount: float, coin: str, *, enable_withdraw: bool) -> tuple[str, bool]:
         coin_u = str(coin or "").strip().upper()
@@ -297,10 +326,21 @@ class ExchangeBatchSummaryMixin(object):
         coin: str,
         *,
         enable_withdraw: bool,
+        strategy_result: dict | None = None,
     ) -> tuple[str | None, bool]:
+        round_status = cls._format_market_round_failure_status(strategy_result)
         if not enable_withdraw:
+            if round_status:
+                return cls._exchange_success_status_text(round_status), True
             return None, True
-        return cls._format_withdraw_amount_status(amount, coin, enable_withdraw=enable_withdraw)
+        withdraw_status, withdraw_success = cls._format_withdraw_amount_status(amount, coin, enable_withdraw=enable_withdraw)
+        if round_status:
+            withdraw_text = cls._plain_exchange_status_text(withdraw_status)
+            status_text = f"{round_status}；{withdraw_text}" if withdraw_text else round_status
+            if withdraw_success:
+                return cls._exchange_success_status_text(status_text), True
+            return cls._exchange_failed_status_text(status_text), False
+        return withdraw_status, withdraw_success
     @classmethod
     def _format_trade_failure_status(cls, stage: str, err: object) -> str:
         stage_text = str(stage or "").strip()
@@ -451,7 +491,16 @@ class ExchangeBatchSummaryMixin(object):
             )
         withdraw_text = self._format_batch_metric_totals(data.get("withdraw_by_account") or {})
         balance_text = self._format_batch_metric_totals(data.get("balance_by_account") or {})
-        return f"结果汇总：成功{success_count} | 失败{failed_count} | 提现总额={withdraw_text} | 余额总额={balance_text}"
+        market_failed_by_account = data.get("market_failed_rounds_by_account") or {}
+        market_failed_rounds = self._sum_batch_count_metrics(market_failed_by_account)
+        market_failed_accounts = self._count_positive_batch_metrics(market_failed_by_account)
+        market_failed_text = ""
+        if market_failed_rounds > 0:
+            market_failed_text = f" | 现货市价失败轮次={market_failed_rounds}(账号{market_failed_accounts})"
+        return (
+            f"结果汇总：成功{success_count} | 失败{failed_count}{market_failed_text} | "
+            f"提现总额={withdraw_text} | 余额总额={balance_text}"
+        )
     def _set_batch_summary_text(self, text: str) -> None:
         var = getattr(self, "exchange_batch_summary_var", None)
         if var is not None:
@@ -497,6 +546,16 @@ class ExchangeBatchSummaryMixin(object):
             except Exception:
                 continue
         return total
+    @staticmethod
+    def _count_positive_batch_metrics(metrics_by_account: dict[str, int] | None) -> int:
+        count = 0
+        for value in dict(metrics_by_account or {}).values():
+            try:
+                if int(value or 0) > 0:
+                    count += 1
+            except Exception:
+                continue
+        return count
     def _record_batch_count_metric(self, acc: dict, field_name: str, value: int) -> None:
         summary_text = ""
         with self._batch_summary_lock:
@@ -584,7 +643,16 @@ class ExchangeBatchSummaryMixin(object):
             success_count=success_count,
             failed_count=failed_count,
             total_count=total_count,
+            extra_lines=self._build_batch_result_extra_lines(summary),
         )
+    def _build_batch_result_extra_lines(self, summary: dict | None) -> list[str]:
+        data = summary if isinstance(summary, dict) else {}
+        market_failed_by_account = data.get("market_failed_rounds_by_account") or {}
+        market_failed_rounds = self._sum_batch_count_metrics(market_failed_by_account)
+        if market_failed_rounds <= 0:
+            return []
+        market_failed_accounts = self._count_positive_batch_metrics(market_failed_by_account)
+        return [f"现货市价失败轮次：{market_failed_rounds}（涉及账号 {market_failed_accounts} 个）"]
     def _show_batch_result_dialog(
         self,
         *,
@@ -593,6 +661,7 @@ class ExchangeBatchSummaryMixin(object):
         success_count: int,
         failed_count: int,
         total_count: int,
+        extra_lines: list[str] | None = None,
     ) -> None:
         dialog = tk.Toplevel(self)
         dialog.title(str(title or "执行完成"))
@@ -612,6 +681,9 @@ class ExchangeBatchSummaryMixin(object):
         tk.Label(counts, text=str(int(success_count)), fg="#1E8449").pack(side="left")
         ttk.Label(counts, text="   失败：").pack(side="left")
         tk.Label(counts, text=str(int(failed_count)), fg="#C62828").pack(side="left")
+
+        for line in list(extra_lines or []):
+            tk.Label(body, text=str(line), fg="#B26A00", justify="left").pack(anchor="w", pady=(8, 0))
 
         hint_text = "失败账号可点击“失败重试”继续执行上一次批量操作。" if failed_count > 0 else "本次批量操作没有失败账号。"
         ttk.Label(body, text=hint_text, foreground="#666666", wraplength=320, justify="left").pack(anchor="w", pady=(10, 0))

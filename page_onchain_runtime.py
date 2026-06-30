@@ -18,6 +18,7 @@ from app_defaults import (
 )
 from shared_utils import decimal_to_text, mask_text, parse_worker_threads
 from sensitive_data import redact_sensitive_text
+from system_proxy import configure_requests_session_for_proxy, refresh_system_proxy_cache, system_proxy_map
 
 ONCHAIN_MAX_TOKEN_DECIMALS = 36
 
@@ -109,15 +110,21 @@ class OnchainRuntimeMixin(object):
     ):
         session = requests.Session()
         try:
-            session.trust_env = bool(allow_system_proxy) and not bool(proxies)
             if proxies:
+                session.trust_env = False
                 session.proxies.update(proxies)
+            else:
+                configure_requests_session_for_proxy(
+                    session,
+                    target_url=url,
+                    allow_system_proxy=allow_system_proxy,
+                )
             return session.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
         finally:
             session.close()
     def _allow_onchain_system_proxy(self) -> bool:
         state = self._onchain_proxy_state_snapshot()
-        return not bool(state.get("use_config_proxy"))
+        return not bool(state.get("use_config_proxy") and str(state.get("raw_proxy") or "").strip())
     def _sync_onchain_proxy_state(self) -> None:
         use_var = getattr(self, "use_config_proxy_var", None)
         proxy_var = getattr(self, "onchain_proxy_var", None)
@@ -162,17 +169,34 @@ class OnchainRuntimeMixin(object):
             return {}
         return {"http": proxy_url, "https": proxy_url}
     @staticmethod
-    def _onchain_system_proxy_map() -> dict[str, str]:
+    def _onchain_system_proxy_targets() -> tuple[str, ...]:
+        urls = ["https://gateway.tenderly.co/public/mainnet"]
+        for network in EvmClient.NETWORKS.values():
+            urls.extend(str(url or "") for url in network.get("rpc_urls", []))
+        return tuple(dict.fromkeys(url for url in urls if url))
+    @classmethod
+    def _refresh_onchain_system_proxy_cache(cls, *, background: bool = False) -> dict[str, str]:
+        return refresh_system_proxy_cache(cls._onchain_system_proxy_targets(), background=background)
+    @staticmethod
+    def _onchain_system_proxy_map(*, refresh: bool = False) -> dict[str, str]:
+        return system_proxy_map("https://gateway.tenderly.co/public/mainnet", refresh=refresh)
+    def _schedule_onchain_system_proxy_cache_refresh(self) -> None:
+        root = getattr(self, "root", None) or self
+
+        def _refresh() -> None:
+            setattr(self, "_onchain_system_proxy_refresh_after_token", None)
+            self._refresh_onchain_system_proxy_cache(background=True)
+
+        token = getattr(self, "_onchain_system_proxy_refresh_after_token", None)
+        if token is not None:
+            try:
+                root.after_cancel(token)
+            except Exception:
+                pass
         try:
-            proxies = requests.utils.get_environ_proxies("https://gateway.tenderly.co/public/mainnet") or {}
+            setattr(self, "_onchain_system_proxy_refresh_after_token", root.after(300, _refresh))
         except Exception:
-            return {}
-        result = {}
-        for key in ("http", "https"):
-            value = str(proxies.get(key) or "").strip()
-            if value:
-                result[key] = value
-        return result
+            self._refresh_onchain_system_proxy_cache(background=True)
     def _onchain_proxy_route_text(self, state: dict[str, object] | None = None) -> str:
         snapshot = dict(state or self._onchain_proxy_state_snapshot())
         raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
@@ -183,6 +207,9 @@ class OnchainRuntimeMixin(object):
                 return redact_sensitive_text(f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}")
             return "direct"
         if not raw_proxy:
+            system_proxy = self._onchain_system_proxy_map()
+            if system_proxy:
+                return redact_sensitive_text(f"system-proxy -> {system_proxy.get('https') or system_proxy.get('http')}")
             return "direct"
         if raw_proxy.lower().startswith("ss://"):
             return "builtin-ss"
@@ -249,22 +276,23 @@ class OnchainRuntimeMixin(object):
         snapshot = dict(state or self._onchain_proxy_state_snapshot())
         use_config_proxy = bool(snapshot.get("use_config_proxy"))
         raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
-        system_proxy = self._onchain_system_proxy_map() if not use_config_proxy else {}
+        has_config_proxy = bool(use_config_proxy and raw_proxy)
+        system_proxy = self._onchain_system_proxy_map() if not has_config_proxy else {}
         status = "跟随系统代理" if system_proxy else "未启用"
         exit_ip = "--"
-        if use_config_proxy and raw_proxy:
+        if has_config_proxy:
             status = "SS代理连接中..." if raw_proxy.lower().startswith("ss://") else "代理连接中..."
-        if use_config_proxy:
+        if has_config_proxy:
             # 触发代理规范化/内置 SS runtime 初始化
             self._onchain_proxy_map(state=snapshot)
         target = self._test_onchain_target_connectivity(selected_network)
-        if use_config_proxy and raw_proxy:
+        if has_config_proxy:
             status = "SS代理已连接" if raw_proxy.lower().startswith("ss://") else "代理已连接"
         elif system_proxy:
             status = "系统代理已连接"
         else:
             status = "直连可用"
-        if use_config_proxy:
+        if has_config_proxy:
             if include_exit_ip:
                 exit_ip = self._fetch_onchain_public_ip(use_config_proxy=True, allow_system_proxy=False, state=snapshot)
         elif system_proxy:
@@ -275,9 +303,10 @@ class OnchainRuntimeMixin(object):
                 exit_ip = self._fetch_onchain_public_ip(use_config_proxy=False, allow_system_proxy=False)
         return status, exit_ip, target
     def _refresh_onchain_proxy_summary(self) -> None:
-        if self.use_config_proxy_var.get():
-            raw_proxy = str(self.onchain_proxy_var.get() or "").strip()
-            status = "待测试" if raw_proxy else "未启用"
+        raw_proxy = str(self.onchain_proxy_var.get() or "").strip()
+        has_config_proxy = bool(self.use_config_proxy_var.get() and raw_proxy)
+        if has_config_proxy:
+            status = "待测试"
         else:
             status = "跟随系统代理" if self._onchain_system_proxy_map() else "未启用"
         self.onchain_proxy_status_var.set(status)
