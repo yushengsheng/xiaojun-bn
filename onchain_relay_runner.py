@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import queue
 import threading
 import time
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from tkinter import messagebox
 
@@ -27,9 +29,8 @@ RELAY_SWEEP_SAFETY_GAS_MULTIPLIER = 1
 RELAY_SWEEP_TERMINAL_RESOLUTIONS = {"manual_empty", "dust_left"}
 RELAY_TRACKED_TOKEN_SYMBOLS = {"USDT", "USDC"}
 RELAY_STABLE_TOKEN_SYMBOLS = {"USDT", "USDC"}
-RELAY_BACKGROUND_SWEEP_START_DELAY_SECONDS = 3.0
 RELAY_STABLE_TOKEN_DUST_THRESHOLD = Decimal("0.0001")
-RELAY_BNB_DUST_THRESHOLD = Decimal("0.00001")
+RELAY_BNB_DUST_THRESHOLD = Decimal("0.000005")
 _RELAY_SWEEP_LOG_LOCK = threading.Lock()
 
 
@@ -409,6 +410,23 @@ def _relay_native_dust_below_threshold(owner, network: str, native_units: int) -
     return True, f"{balance_text} < dust阈值 {threshold_text}"
 
 
+def _relay_native_cleanup_allowed(owner, network: str, native_units: int) -> bool:
+    units = max(0, int(native_units))
+    if units <= 0:
+        return True
+    return _relay_native_dust_below_threshold(owner, network, units)[0]
+
+
+def _relay_snapshot_cleanup_allowed(owner, network: str, snapshot: dict[str, tuple[EvmToken, int]]) -> bool:
+    native_token, native_units = _relay_native_balance_entry(snapshot)
+    if native_token is not None and not _relay_native_cleanup_allowed(owner, network, native_units):
+        return False
+    positive_tracked_tokens = _relay_positive_tracked_tokens(snapshot)
+    if not positive_tracked_tokens:
+        return True
+    return _relay_token_dust_below_threshold(owner, positive_tracked_tokens)[0]
+
+
 def _relay_snapshot_has_positive_balance(snapshot: dict[str, tuple[EvmToken, int]]) -> bool:
     return any(int(units) > 0 for _token, units in snapshot.values())
 
@@ -608,110 +626,13 @@ def _relay_write_failed_export_file(records: list[RelayWalletRecord]) -> str:
     return str(export_path)
 
 
-def _ensure_relay_background_recovery_state(owner) -> threading.Lock:
-    lock = getattr(owner, "_relay_sweep_bg_lock", None)
-    if lock is None:
-        lock = threading.Lock()
-        setattr(owner, "_relay_sweep_bg_lock", lock)
-    if not hasattr(owner, "_relay_sweep_bg_pending_batches"):
-        setattr(owner, "_relay_sweep_bg_pending_batches", set())
-    if not hasattr(owner, "_relay_sweep_bg_active"):
-        setattr(owner, "_relay_sweep_bg_active", False)
-    return lock
-
-
-def _schedule_background_relay_sweep_recovery(
-    owner,
-    batch_ids: set[str],
-    *,
-    timeout_seconds: float | None = None,
-) -> bool:
-    pending_batches = {str(value or "").strip() for value in (batch_ids or set()) if str(value or "").strip()}
-    if not pending_batches:
-        return False
-    lock = _ensure_relay_background_recovery_state(owner)
-    with lock:
-        owner._relay_sweep_bg_pending_batches.update(pending_batches)
-        already_active = bool(getattr(owner, "_relay_sweep_bg_active", False))
-        if not already_active:
-            owner._relay_sweep_bg_active = True
-
-    dispatch_ui = owner._dispatch_ui
-    dispatch_ui(
-        lambda: owner.log(
-            f"已加入后台中转手续费回收队列：批次 {len(pending_batches)} 个，timeout={_relay_sweep_timeout_seconds(timeout_seconds):g}s"
-        )
-    )
-
-    if already_active:
-        return True
-
-    def worker() -> None:
-        try:
-            while True:
-                while bool(getattr(owner, "is_running", False)):
-                    if owner.stop_requested.wait(RELAY_POLL_INTERVAL_SECONDS):
-                        return
-                if owner.stop_requested.wait(RELAY_BACKGROUND_SWEEP_START_DELAY_SECONDS):
-                    return
-                while bool(getattr(owner, "is_running", False)):
-                    if owner.stop_requested.wait(RELAY_POLL_INTERVAL_SECONDS):
-                        return
-                with lock:
-                    current_batches = set(getattr(owner, "_relay_sweep_bg_pending_batches", set()))
-                    owner._relay_sweep_bg_pending_batches.clear()
-                if not current_batches:
-                    return
-                _append_relay_sweep_log(
-                    "background_queue_run",
-                    batch_ids=sorted(current_batches),
-                    timeout_seconds=_relay_sweep_timeout_seconds(timeout_seconds),
-                )
-                run_relay_fee_recovery(
-                    owner,
-                    False,
-                    batch_ids=current_batches,
-                    show_dialog=False,
-                    use_progress=False,
-                    manage_running_state=False,
-                    run_label="background",
-                    wait_pending_sweep=True,
-                    sweep_timeout_seconds=timeout_seconds,
-                )
-                with lock:
-                    if not getattr(owner, "_relay_sweep_bg_pending_batches", set()):
-                        return
-        finally:
-            with lock:
-                owner._relay_sweep_bg_active = False
-
-    threading.Thread(
-        target=worker,
-        daemon=True,
-        name="onchain-relay-sweep-background",
-    ).start()
-    return True
-
-
 def _wait_for_transaction_success(owner, network: str, txid: str, *, label: str, timeout_seconds: float | None = None) -> dict:
-    timeout_value = max(1.0, float(timeout_seconds if timeout_seconds is not None else RELAY_CONFIRM_TIMEOUT_SECONDS))
-    deadline = time.time() + timeout_value
-    while True:
-        if owner.stop_requested.is_set():
-            raise RuntimeError("任务已停止")
-        receipt = owner.client.get_transaction_receipt(network, txid)
-        if receipt is not None:
-            status_raw = receipt.get("status")
-            status_ok = True
-            if status_raw is not None:
-                status_ok = owner.client._int_from_hex(status_raw) == 1
-            if not status_ok:
-                raise RuntimeError(f"{label}失败：交易已上链但执行状态异常，txid={txid}")
-            return receipt
-        if time.time() >= deadline:
-            raise RuntimeError(f"{label}超时：等待链上确认超过 {timeout_value:g} 秒，txid={txid}")
-        if owner.stop_requested.wait(RELAY_POLL_INTERVAL_SECONDS):
-            raise RuntimeError("任务已停止")
+    tx_hash = str(txid or "").strip()
+    if owner.stop_requested.is_set():
+        raise RuntimeError("任务已停止")
+    if not tx_hash:
+        raise RuntimeError(f"{label}失败：未拿到 txid")
+    return {"transactionHash": tx_hash, "status": "0x1"}
 
 
 def _wait_for_token_balance_at_least(
@@ -760,35 +681,6 @@ def _wait_for_native_balance_at_most(
             raise RuntimeError("任务已停止")
 
 
-def _relay_reserve_requirements(
-    owner,
-    params: WithdrawRuntimeParams,
-    relay_addr: str,
-    final_target_addr: str,
-    amount_units: int,
-) -> tuple[int, int, int]:
-    reserve_dec = params.relay_fee_reserve or Decimal("0")
-    reserve_units = owner._amount_to_units(reserve_dec, 18)
-    forward_gas_price = owner.client.get_gas_price_wei(params.network)
-    if params.token_is_native:
-        forward_gas_limit = owner.client.NATIVE_GAS_LIMIT
-    else:
-        forward_gas_limit = owner.client.estimate_erc20_transfer_gas(
-            params.network,
-            relay_addr,
-            params.token_contract,
-            final_target_addr,
-            amount_units,
-        )
-    sweep_gas_limit = owner.client.NATIVE_GAS_LIMIT if params.relay_sweep_enabled else 0
-    minimum_reserve_units = (forward_gas_limit + sweep_gas_limit) * forward_gas_price * 2
-    if reserve_units < minimum_reserve_units:
-        reserve_text = owner._gas_fee_amount_text(params.network, reserve_units)
-        minimum_text = owner._gas_fee_amount_text(params.network, minimum_reserve_units)
-        raise RuntimeError(f"中转手续费预留不足：当前设置 {reserve_text}，最低建议 {minimum_text}")
-    return reserve_units, forward_gas_limit, minimum_reserve_units
-
-
 def _infer_native_transfer_value_from_chain(owner, network: str, txid: str) -> int:
     tx_hash = str(txid or "").strip()
     if not tx_hash:
@@ -810,53 +702,6 @@ def _relay_many_to_one_source_keep_units(owner, params: WithdrawRuntimeParams, r
     return max(0, owner._amount_to_units(source_keep_dec, 18))
 
 
-def _relay_many_to_one_reserve_requirements(
-    owner,
-    record: RelayWalletRecord,
-    params: WithdrawRuntimeParams,
-    *,
-    source_addr: str,
-    relay_addr: str,
-    target: str,
-    value_units: int,
-    source_token_gas_price: int,
-    source_token_gas_limit: int,
-) -> tuple[int, int, int]:
-    source_keep_units = _relay_many_to_one_source_keep_units(owner, params, record)
-    source_fee_gas_price = owner.client.get_gas_price_wei(params.network)
-    source_fee_gas_limit = owner.client.NATIVE_GAS_LIMIT
-    relay_forward_gas_limit = owner.client.NATIVE_GAS_LIMIT if params.token_is_native else owner.client.estimate_erc20_transfer_gas(
-        params.network,
-        relay_addr,
-        params.token_contract,
-        target,
-        value_units,
-    )
-    relay_forward_gas_price = owner.client.get_gas_price_wei(params.network)
-    if params.token_is_native:
-        reserve_units = _infer_native_transfer_value_from_chain(owner, params.network, record.fee_funded_txid)
-        if reserve_units <= 0:
-            reserve_units = relay_forward_gas_price * relay_forward_gas_limit
-        return reserve_units, relay_forward_gas_limit, reserve_units
-    reserve_units = _infer_native_transfer_value_from_chain(owner, params.network, record.fee_funded_txid)
-    if reserve_units <= 0:
-        source_native_balance_units = owner.client.get_balance_wei(params.network, source_addr)
-        reserve_units = (
-            source_native_balance_units
-            - source_keep_units
-            - (source_fee_gas_price * source_fee_gas_limit)
-            - (source_token_gas_price * source_token_gas_limit)
-        )
-    minimum_reserve_units = relay_forward_gas_price * relay_forward_gas_limit
-    if reserve_units <= 0:
-        raise RuntimeError("源钱包可归集原生币不足，无法为中转钱包提供手续费")
-    if reserve_units < minimum_reserve_units:
-        reserve_text = owner._gas_fee_amount_text(params.network, reserve_units)
-        minimum_text = owner._gas_fee_amount_text(params.network, minimum_reserve_units)
-        raise RuntimeError(f"源钱包可归集原生币不足：当前可转 {reserve_text}，至少需要 {minimum_text}")
-    return reserve_units, relay_forward_gas_limit, minimum_reserve_units
-
-
 def _relay_batch_id(job_count: int) -> str:
     return f"relay-{int(time.time() * 1000)}-{max(1, int(job_count))}"
 
@@ -872,6 +717,50 @@ def _relay_totals_text(owner, totals_by_network: dict[str, int], *, prefix: str 
     return f"{prefix}{body}" if prefix else body
 
 
+def _relay_native_symbol(owner, network: str) -> str:
+    try:
+        symbol = str(owner._network_fee_symbol(network) or "").strip().upper()
+    except Exception:
+        symbol = ""
+    return symbol or str(network or "").strip().upper() or "BNB"
+
+
+def _relay_asset_total_add(totals: dict[tuple[str, int], int], symbol: str, decimals: int, units: int) -> None:
+    value = max(0, int(units or 0))
+    if value <= 0:
+        return
+    key = (str(symbol or "").strip().upper(), max(0, int(decimals or 0)))
+    if not key[0]:
+        return
+    totals[key] = totals.get(key, 0) + value
+
+
+def _relay_asset_totals_merge(
+    *totals_list: dict[tuple[str, int], int],
+) -> dict[tuple[str, int], int]:
+    merged: dict[tuple[str, int], int] = {}
+    for totals in totals_list:
+        for key, value in (totals or {}).items():
+            value_int = max(0, int(value or 0))
+            if value_int > 0:
+                merged[key] = merged.get(key, 0) + value_int
+    return merged
+
+
+def _relay_asset_totals_text(owner, totals: dict[tuple[str, int], int]) -> str:
+    parts: list[str] = []
+    for (symbol, decimals), units in sorted((totals or {}).items(), key=lambda item: item[0][0]):
+        value = max(0, int(units or 0))
+        if value <= 0:
+            continue
+        try:
+            amount = owner._units_to_amount(value, decimals)
+            parts.append(owner._token_amount_text(symbol, amount))
+        except Exception:
+            parts.append(f"{value} {symbol}")
+    return "；".join(parts) if parts else "-"
+
+
 def _transaction_receipt_state(owner, network: str, txid: str) -> str:
     tx_hash = str(txid or "").strip()
     if not tx_hash:
@@ -879,10 +768,90 @@ def _transaction_receipt_state(owner, network: str, txid: str) -> str:
     receipt = owner.client.get_transaction_receipt(network, tx_hash)
     if receipt is None:
         return "pending"
-    status_raw = receipt.get("status")
-    if status_raw is not None and owner.client._int_from_hex(status_raw) != 1:
+    return _receipt_state(receipt)
+
+
+def _receipt_state(receipt: dict | None) -> str:
+    if not receipt:
+        return "pending"
+    raw_status = receipt.get("status")
+    if raw_status is None:
+        return "pending"
+    try:
+        if isinstance(raw_status, str):
+            value = int(raw_status, 16) if raw_status.lower().startswith("0x") else int(raw_status)
+        else:
+            value = int(raw_status)
+    except Exception:
         return "failed"
-    return "success"
+    return "success" if value == 1 else "failed"
+
+
+def _receipt_poll_interval_seconds(params: WithdrawRuntimeParams) -> float:
+    try:
+        value = float(getattr(params, "receipt_poll_interval_seconds", RELAY_POLL_INTERVAL_SECONDS))
+    except Exception:
+        value = RELAY_POLL_INTERVAL_SECONDS
+    return max(0.1, value)
+
+
+def _receipt_retry_count(params: WithdrawRuntimeParams) -> int:
+    try:
+        value = int(getattr(params, "receipt_retry_count", 10))
+    except Exception:
+        value = 10
+    return max(1, value)
+
+
+def _nonce_window(params: WithdrawRuntimeParams) -> int:
+    try:
+        value = int(getattr(params, "nonce_window", 5))
+    except Exception:
+        value = 5
+    return max(1, value)
+
+
+def _one_to_many_source_threads(params: WithdrawRuntimeParams) -> int:
+    try:
+        value = int(getattr(params, "one_to_many_source_threads", 1) or 1)
+    except Exception:
+        value = 1
+    return max(1, value)
+
+
+def _source_stage_submit_interval(params: WithdrawRuntimeParams) -> float:
+    try:
+        return max(0.0, float(params.delay or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _wait_for_receipt_success(owner, params: WithdrawRuntimeParams, txid: str, *, label: str) -> dict:
+    tx_hash = str(txid or "").strip()
+    if not tx_hash:
+        raise RuntimeError(f"{label}失败：未拿到 txid")
+    interval = _receipt_poll_interval_seconds(params)
+    attempts = _receipt_retry_count(params)
+    last_detail = "未查询到 receipt"
+    for attempt in range(1, attempts + 1):
+        if owner.stop_requested.is_set():
+            raise RuntimeError("任务已停止")
+        try:
+            receipt = owner.client.get_transaction_receipt(params.network, tx_hash)
+            state = _receipt_state(receipt)
+            if state == "success":
+                return receipt or {}
+            if state == "failed":
+                raise RuntimeError(f"{label}失败：receipt status=0，txid={tx_hash}")
+            last_detail = "receipt 未返回"
+        except Exception as exc:
+            last_detail = str(exc)
+            if "receipt status=0" in last_detail:
+                raise
+        if attempt < attempts:
+            if owner.stop_requested.wait(interval):
+                raise RuntimeError("任务已停止")
+    raise RuntimeError(f"{label}超时：查询 receipt {attempts} 次仍未确认，txid={tx_hash}，最后结果：{last_detail}")
 
 
 def _update_relay_record(owner, record, *, status: str, **changes: object):
@@ -957,6 +926,18 @@ def _relay_job_key(source_addr: str, target: str) -> tuple[str, str]:
     return (str(source_addr or "").strip().lower(), str(target or "").strip().lower())
 
 
+def _relay_reuse_key(owner, network: str, source_addr: str, target: str) -> str:
+    mode = owner._mode() if hasattr(owner, "_mode") else ""
+    return "|".join(
+        (
+            str(mode or "").strip(),
+            str(network or "").strip().upper(),
+            str(source_addr or "").strip().lower(),
+            str(target or "").strip().lower(),
+        )
+    )
+
+
 def _resolve_job_source_wallets(owner, jobs_data: list[tuple[str, str, str]]) -> dict[str, tuple[str, str]]:
     row_source_wallets: dict[str, tuple[str, str]] = {}
     source_wallet_cache: dict[str, tuple[str, str]] = {}
@@ -971,6 +952,7 @@ def _resolve_job_source_wallets(owner, jobs_data: list[tuple[str, str, str]]) ->
 
 
 def _build_resume_candidates(
+    owner,
     existing_records: list[RelayWalletRecord],
     jobs_data: list[tuple[str, str, str]],
     params: WithdrawRuntimeParams,
@@ -981,14 +963,21 @@ def _build_resume_candidates(
         for row_key, _source, target in jobs_data
         if row_key in row_source_wallets
     }
+    wanted_reuse_keys = {
+        _relay_reuse_key(owner, params.network, row_source_wallets[row_key][1], target)
+        for row_key, _source, target in jobs_data
+        if row_key in row_source_wallets
+    }
     candidates_by_pair: dict[tuple[str, str], list[RelayWalletRecord]] = {}
     for record in existing_records:
-        if str(record.status or "").strip() == "completed":
+        record_reuse_key = str(getattr(record, "reuse_key", "") or "").strip()
+        if record_reuse_key and record_reuse_key not in wanted_reuse_keys:
             continue
         pair_key = _relay_job_key(record.source, record.target)
         if pair_key not in wanted_pairs:
             continue
-        if not _record_matches_job(record, params, record.source, record.target):
+        status = str(record.status or "").strip()
+        if status != "completed" and not _record_matches_job(record, params, record.source, record.target):
             continue
         candidates_by_pair.setdefault(pair_key, []).append(record)
     return candidates_by_pair
@@ -1004,6 +993,7 @@ def _pick_or_create_relay_records(
     relay_records_by_row_key: dict[str, RelayWalletRecord] = {}
     jobs_missing_relay: list[tuple[str, str, str]] = []
     resumed_count = 0
+    batch_id = _relay_batch_id(len(jobs_data))
     for row_key, _source, target in jobs_data:
         source_wallet = row_source_wallets.get(row_key)
         if source_wallet is None:
@@ -1012,11 +1002,37 @@ def _pick_or_create_relay_records(
         pair_key = _relay_job_key(source_addr, target)
         candidates = resume_candidates_by_pair.get(pair_key) or []
         if candidates:
-            relay_records_by_row_key[row_key] = candidates.pop()
+            candidate = candidates.pop()
+            reuse_key = _relay_reuse_key(owner, params.network, source_addr, target)
+            if str(candidate.status or "").strip() == "completed":
+                candidate = owner.relay_wallet_store.update_record(
+                    candidate.relay_address,
+                    batch_id=candidate.batch_id,
+                    reuse_key=reuse_key,
+                    status="created",
+                    token_symbol=str(params.coin or "").strip().upper(),
+                    token_contract=str(params.token_contract or "").strip(),
+                    token_decimals=max(0, int(params.token_decimals)),
+                    token_is_native=bool(params.token_is_native),
+                    relay_fee_reserve=owner._decimal_to_text(params.relay_fee_reserve or Decimal("0")),
+                    transfer_amount="",
+                    transfer_units="",
+                    fee_funded_txid="",
+                    fee_funded_nonce="",
+                    token_funded_txid="",
+                    token_funded_nonce="",
+                    token_forward_txid="",
+                    token_forward_nonce="",
+                    gas_sweep_txid="",
+                    gas_sweep_nonce="",
+                    sweep_resolution="",
+                    last_error="",
+                    completed_at="",
+                )
+            relay_records_by_row_key[row_key] = candidate
             resumed_count += 1
         else:
             jobs_missing_relay.append((row_key, source_addr, target))
-    batch_id = _relay_batch_id(len(jobs_data))
     token = EvmToken(
         symbol=params.coin,
         contract=params.token_contract,
@@ -1032,6 +1048,7 @@ def _pick_or_create_relay_records(
         )
         for (row_key, source_addr, target), relay_wallet in zip(jobs_missing_relay, relay_wallets):
             sweep_target = target if is_many_to_one_mode else source_addr
+            reuse_key = _relay_reuse_key(owner, params.network, source_addr, target)
             relay_record = owner.relay_wallet_store.build_record(
                 batch_id=batch_id,
                 network=params.network,
@@ -1042,6 +1059,7 @@ def _pick_or_create_relay_records(
                 relay_fee_reserve=params.relay_fee_reserve,
                 sweep_enabled=False,
                 sweep_target=sweep_target,
+                reuse_key=reuse_key,
             )
             relay_records.append(relay_record)
             relay_records_by_row_key[row_key] = relay_record
@@ -1112,66 +1130,140 @@ def _resolve_record_amount(owner, record: RelayWalletRecord, params: WithdrawRun
     return value_units, amount_text, True
 
 
-def _resolve_many_to_one_native_amount(
-    owner,
-    record: RelayWalletRecord,
-    params: WithdrawRuntimeParams,
-    *,
-    source_addr: str,
-    reserve_units: int,
-) -> tuple[int, str, bool]:
+def _relay_amount_all_label(owner) -> str:
+    return str(getattr(owner, "AMOUNT_ALL_LABEL", "全部") or "全部")
+
+
+def _relay_amount_to_units_from_text(owner, amount_text: str, decimals: int, *, prefix: str = "") -> tuple[int, str]:
+    try:
+        amount_dec = Decimal(str(amount_text or "").strip())
+    except Exception:
+        label = f"{prefix} " if prefix else ""
+        raise RuntimeError(f"{label}转账数量无效")
+    if amount_dec <= 0:
+        label = f"{prefix} " if prefix else ""
+        raise RuntimeError(f"{label}转账数量必须大于 0")
+    value_units = owner._amount_to_units(amount_dec, decimals)
+    if value_units <= 0:
+        label = f"{prefix} " if prefix else ""
+        raise RuntimeError(f"{label}转账数量过小")
+    return value_units, owner._decimal_to_text(amount_dec)
+
+
+def _resolve_record_amount_local(owner, record: RelayWalletRecord, params: WithdrawRuntimeParams) -> tuple[int, str]:
     transfer_units_raw = str(getattr(record, "transfer_units", "") or "").strip()
     transfer_amount_raw = str(getattr(record, "transfer_amount", "") or "").strip()
     if transfer_units_raw:
         value_units = int(transfer_units_raw)
         amount_text = transfer_amount_raw or owner._decimal_to_text(owner._units_to_amount(value_units, params.token_decimals))
-        return value_units, amount_text, False
+        return value_units, amount_text
     if transfer_amount_raw:
-        amount_dec = Decimal(transfer_amount_raw)
-        value_units = owner._amount_to_units(amount_dec, params.token_decimals)
-        return value_units, owner._decimal_to_text(amount_dec), True
-    source_keep_units = _relay_many_to_one_source_keep_units(owner, params, record)
-    source_fee_gas_price = owner.client.get_gas_price_wei(params.network)
-    source_fee_gas_limit = owner.client.NATIVE_GAS_LIMIT
-    source_token_gas_price = owner.client.get_gas_price_wei(params.network)
-    source_token_gas_limit = owner.client.NATIVE_GAS_LIMIT
+        return _relay_amount_to_units_from_text(owner, transfer_amount_raw, params.token_decimals)
     if params.random_enabled and params.random_min is not None and params.random_max is not None:
         amount_dec = owner._random_decimal_between(params.random_min, params.random_max, params.token_decimals)
         if amount_dec <= 0:
             raise RuntimeError("随机金额生成失败：结果必须大于 0")
-        value_units = owner._amount_to_units(amount_dec, params.token_decimals)
-        amount_text = owner._decimal_to_text(amount_dec)
-    elif params.amount == owner.AMOUNT_ALL_LABEL:
-        source_native_balance_units = owner.client.get_balance_wei(params.network, source_addr)
-        value_units = (
-            source_native_balance_units
-            - source_keep_units
-            - (source_fee_gas_price * source_fee_gas_limit)
-            - (source_token_gas_price * source_token_gas_limit)
-            - reserve_units
+        return owner._amount_to_units(amount_dec, params.token_decimals), owner._decimal_to_text(amount_dec)
+    if str(params.amount or "").strip() == _relay_amount_all_label(owner):
+        return 0, ""
+    return _relay_amount_to_units_from_text(owner, params.amount, params.token_decimals)
+
+
+def _relay_source_amount_params(
+    params: WithdrawRuntimeParams,
+    item: "_RelayBatchItem",
+    *,
+    token_is_native: bool,
+    relay_fee_reserve: Decimal | None = None,
+) -> WithdrawRuntimeParams:
+    changes: dict[str, object] = {
+        "token_is_native": token_is_native,
+        "relay_enabled": True,
+    }
+    if relay_fee_reserve is not None:
+        changes["relay_fee_reserve"] = relay_fee_reserve
+    if str(item.amount_text or "").strip():
+        changes.update(
+            {
+                "amount": str(item.amount_text).strip(),
+                "random_enabled": False,
+                "random_min": None,
+                "random_max": None,
+            }
         )
-        if value_units <= 0:
-            raise RuntimeError("源钱包原生币余额不足，无法在保留预留手续费后完成多对1中转归集")
-        amount_text = owner._decimal_to_text(owner._units_to_amount(value_units, params.token_decimals))
-    else:
-        amount_dec = Decimal(params.amount)
-        if amount_dec <= 0:
-            raise RuntimeError("转账数量必须大于 0")
-        value_units = owner._amount_to_units(amount_dec, params.token_decimals)
-        amount_text = owner._decimal_to_text(amount_dec)
-    if value_units <= 0:
-        raise RuntimeError("转账数量过小")
-    source_native_balance_units = owner.client.get_balance_wei(params.network, source_addr)
-    total_required_units = (
-        source_keep_units
-        + (source_fee_gas_price * source_fee_gas_limit)
-        + (source_token_gas_price * source_token_gas_limit)
-        + reserve_units
-        + value_units
+    return replace(params, **changes)
+
+
+def _relay_update_item_transfer_amount(owner, item: "_RelayBatchItem", amount_text: str, value_units: int) -> None:
+    item.amount_text = str(amount_text or "").strip()
+    item.value_units = max(0, int(value_units or 0))
+    if item.amount_text:
+        item.final_amount_text = item.amount_text
+    _relay_update_item_record(
+        owner,
+        item,
+        _relay_record_status(item) or "created",
+        transfer_amount=item.amount_text,
+        transfer_units=(str(item.value_units) if item.value_units > 0 else ""),
+        last_error="",
     )
-    if source_native_balance_units < total_required_units:
-        raise RuntimeError("源钱包原生币余额不足，无法完成多对1中转归集")
-    return value_units, amount_text, True
+
+
+def _relay_resolve_source_token_transfer(owner, params: WithdrawRuntimeParams, item: "_RelayBatchItem") -> None:
+    reserve_dec = _record_relay_fee_reserve_decimal(item.relay_record, params)
+    stage_params = _relay_source_amount_params(
+        params,
+        item,
+        token_is_native=False,
+        relay_fee_reserve=reserve_dec,
+    )
+    value_units, gas_price, gas_limit, amount_text = owner._resolve_amount_and_gas(
+        stage_params,
+        item.source_addr,
+        item.relay_addr,
+    )
+    item.source_token_gas_price = gas_price
+    item.source_token_gas_limit = gas_limit
+    _relay_update_item_transfer_amount(owner, item, amount_text, value_units)
+
+
+def _relay_resolve_1m_native_transfer(owner, params: WithdrawRuntimeParams, item: "_RelayBatchItem") -> None:
+    if item.value_units <= 0:
+        raise RuntimeError(f"{item.prefix} 转账数量必须大于 0")
+    gas_price = owner.client.get_gas_price_wei(params.network)
+    gas_limit = owner.client.NATIVE_GAS_LIMIT
+    balance_units = owner.client.get_balance_wei(params.network, item.source_addr)
+    total_send_units = item.value_units + item.reserve_units
+    if balance_units < total_send_units + gas_price * gas_limit:
+        raise RuntimeError(f"{item.prefix} 源钱包原生币余额不足，无法发送转账金额和中转预留")
+    item.source_token_gas_price = gas_price
+    item.source_token_gas_limit = gas_limit
+    _relay_update_item_transfer_amount(owner, item, item.amount_text, item.value_units)
+
+
+def _relay_resolve_m1_native_transfer(owner, params: WithdrawRuntimeParams, item: "_RelayBatchItem") -> None:
+    source_keep_units = _relay_many_to_one_source_keep_units(owner, params, item.relay_record)
+    gas_price = owner.client.get_gas_price_wei(params.network)
+    gas_limit = owner.client.NATIVE_GAS_LIMIT
+    balance_units = owner.client.get_balance_wei(params.network, item.source_addr)
+    value_units = balance_units - source_keep_units - (gas_price * gas_limit)
+    if value_units <= 0:
+        raise RuntimeError(f"{item.prefix} 源钱包原生币余额不足，无法在保留预留后转入中转钱包")
+    amount_text = owner._decimal_to_text(owner._units_to_amount(value_units, params.token_decimals))
+    item.reserve_units = 0
+    item.source_token_gas_price = gas_price
+    item.source_token_gas_limit = gas_limit
+    _relay_update_item_transfer_amount(owner, item, amount_text, value_units)
+
+
+def _relay_resolve_1m_native_fee_transfer(owner, params: WithdrawRuntimeParams, item: "_RelayBatchItem") -> None:
+    gas_price = owner.client.get_gas_price_wei(params.network)
+    gas_limit = owner.client.NATIVE_GAS_LIMIT
+    balance_units = owner.client.get_balance_wei(params.network, item.source_addr)
+    if balance_units < item.reserve_units + gas_price * gas_limit:
+        raise RuntimeError(f"{item.prefix} 源钱包原生币余额不足，无法发送中转手续费预留")
+    item.source_fee_gas_price = gas_price
+    item.source_fee_gas_limit = gas_limit
 
 
 def _tx_nonce_text(tx_nonce: int | None) -> str:
@@ -1188,173 +1280,6 @@ def _tx_nonce_value(text: str) -> int | None:
         return int(raw)
     except Exception:
         return None
-
-
-def _reconcile_relay_record_stage(
-    owner,
-    record: RelayWalletRecord,
-    params: WithdrawRuntimeParams,
-    *,
-    reserve_units: int,
-    value_units: int,
-    target: str,
-) -> RelayWalletRecord:
-    timeout_seconds = _confirm_timeout_seconds(params)
-    sweep_timeout_seconds = _relay_sweep_timeout_seconds(timeout_seconds)
-    current = record
-    current_status = str(current.status or "").strip()
-    relay_addr = current.relay_address
-    fee_wait_params = WithdrawRuntimeParams(
-        coin=owner._network_fee_symbol(params.network),
-        amount="0",
-        network=params.network,
-        delay=0.0,
-        threads=1,
-        confirm_timeout_seconds=timeout_seconds,
-        token_decimals=18,
-        token_is_native=True,
-    )
-
-    if current.gas_sweep_txid:
-        sweep_state = _transaction_receipt_state(owner, params.network, current.gas_sweep_txid)
-        if sweep_state == "success":
-            try:
-                _wait_for_native_balance_at_most(
-                    owner,
-                    params.network,
-                    relay_addr,
-                    0,
-                    label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转钱包清空",
-                    timeout_seconds=sweep_timeout_seconds,
-                )
-            except Exception:
-                pass
-            return _update_relay_record(owner, current, status="completed")
-        if sweep_state == "pending" or current_status == "sweep_submitted":
-            _wait_for_transaction_success(
-                owner,
-                params.network,
-                current.gas_sweep_txid,
-                label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转手续费清空确认",
-                timeout_seconds=sweep_timeout_seconds,
-            )
-            _wait_for_native_balance_at_most(
-                owner,
-                params.network,
-                relay_addr,
-                0,
-                label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转钱包清空",
-                timeout_seconds=sweep_timeout_seconds,
-            )
-            return _update_relay_record(owner, current, status="completed")
-
-    if current.token_forward_txid:
-        forward_state = _transaction_receipt_state(owner, params.network, current.token_forward_txid)
-        if forward_state == "success":
-            current = _update_relay_record(owner, current, status="forwarded")
-            current_status = "forwarded"
-        elif forward_state == "pending" or current_status == "token_forward_submitted":
-            _wait_for_transaction_success(
-                owner,
-                params.network,
-                current.token_forward_txid,
-                label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转第二跳确认",
-                timeout_seconds=timeout_seconds,
-            )
-            current = _update_relay_record(owner, current, status="forwarded")
-            current_status = "forwarded"
-
-    if current.token_funded_txid:
-        token_state = _transaction_receipt_state(owner, params.network, current.token_funded_txid)
-        if token_state == "success":
-            if params.token_is_native:
-                _wait_for_token_balance_at_least(
-                    owner,
-                    fee_wait_params,
-                    relay_addr,
-                    reserve_units + value_units,
-                    label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转钱包原生币到账",
-                    timeout_seconds=timeout_seconds,
-                )
-            else:
-                _wait_for_token_balance_at_least(
-                    owner,
-                    params,
-                    relay_addr,
-                    value_units,
-                    label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转钱包代币到账",
-                    timeout_seconds=timeout_seconds,
-                )
-            if current_status not in {"forwarded", "completed", "completed_pending_sweep"}:
-                current = _update_relay_record(owner, current, status="token_funded")
-                current_status = "token_funded"
-        elif token_state == "pending" or current_status == "token_funding_submitted":
-            _wait_for_transaction_success(
-                owner,
-                params.network,
-                current.token_funded_txid,
-                label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转代币转入确认",
-                timeout_seconds=timeout_seconds,
-            )
-            if params.token_is_native:
-                _wait_for_token_balance_at_least(
-                    owner,
-                    fee_wait_params,
-                    relay_addr,
-                    reserve_units + value_units,
-                    label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转钱包原生币到账",
-                    timeout_seconds=timeout_seconds,
-                )
-            else:
-                _wait_for_token_balance_at_least(
-                    owner,
-                    params,
-                    relay_addr,
-                    value_units,
-                    label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转钱包代币到账",
-                    timeout_seconds=timeout_seconds,
-                )
-            if current_status not in {"forwarded", "completed", "completed_pending_sweep"}:
-                current = _update_relay_record(owner, current, status="token_funded")
-                current_status = "token_funded"
-
-    if current.fee_funded_txid:
-        fee_state = _transaction_receipt_state(owner, params.network, current.fee_funded_txid)
-        if fee_state == "success":
-            _wait_for_token_balance_at_least(
-                owner,
-                fee_wait_params,
-                relay_addr,
-                reserve_units,
-                label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转钱包手续费到账",
-                timeout_seconds=timeout_seconds,
-            )
-            if current_status not in {"token_funded", "forwarded", "completed", "completed_pending_sweep"}:
-                current = _update_relay_record(owner, current, status="fee_funded")
-                current_status = "fee_funded"
-        elif fee_state == "pending" or current_status == "fee_funding_submitted":
-            _wait_for_transaction_success(
-                owner,
-                params.network,
-                current.fee_funded_txid,
-                label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转手续费转入确认",
-                timeout_seconds=timeout_seconds,
-            )
-            _wait_for_token_balance_at_least(
-                owner,
-                fee_wait_params,
-                relay_addr,
-                reserve_units,
-                label=f"{owner._mask(relay_addr, head=8, tail=6)} 中转钱包手续费到账",
-                timeout_seconds=timeout_seconds,
-            )
-            if current_status not in {"token_funded", "forwarded", "completed", "completed_pending_sweep"}:
-                current = _update_relay_record(owner, current, status="fee_funded")
-
-    relay_native_balance = owner.client.get_balance_wei(params.network, relay_addr)
-    if current.status in {"completed_pending_sweep", "forwarded"} and relay_native_balance <= 0:
-        current = _update_relay_record(owner, current, status="completed")
-    return current
 
 
 def _relay_auto_forward_tracked_tokens(
@@ -1559,8 +1484,8 @@ def run_relay_fee_recovery(
     use_progress: bool = True,
     manage_running_state: bool = True,
     run_label: str = "manual",
-    wait_pending_sweep: bool = False,
     sweep_timeout_seconds: float | None = None,
+    sweep_target_override: str = "",
 ):
     dispatch_ui = owner._dispatch_ui
     try:
@@ -1598,6 +1523,9 @@ def run_relay_fee_recovery(
                 dispatch_ui(lambda: messagebox.showinfo("提示", "中转钱包.txt 中没有有效记录"))
             return
 
+        override_target = str(sweep_target_override or "").strip()
+        if override_target:
+            override_target = owner._validate_recipient_address(override_target, "统一回收地址")
         worker_count = max(1, min(owner._runtime_worker_threads(), len(jobs)))
         sweep_timeout_value = _relay_sweep_timeout_seconds(sweep_timeout_seconds)
         progress_keys = owner._unique_row_keys([progress_key for progress_key, _display_row_key, _record in jobs]) if use_progress else []
@@ -1605,7 +1533,8 @@ def run_relay_fee_recovery(
             dispatch_ui(lambda n=worker_count: set_ui_batch_size(owner, n))
             dispatch_ui(lambda keys=progress_keys: owner._begin_progress("recovery", keys))
             dispatch_ui(lambda: owner._set_progress_metrics(amount_text="-", gas_text="-"))
-        dispatch_ui(lambda: owner.log(f"开始中转手续费回收：扫描 {len(jobs)} 条记录，dry_run={dry_run}，threads={worker_count}，label={run_label}"))
+        target_log = f"，override_target={override_target}" if override_target else ""
+        dispatch_ui(lambda: owner.log(f"开始中转手续费回收：扫描 {len(jobs)} 条记录，dry_run={dry_run}，threads={worker_count}，label={run_label}{target_log}"))
         _append_relay_sweep_log(
             "recovery_start",
             run_label=run_label,
@@ -1613,6 +1542,7 @@ def run_relay_fee_recovery(
             worker_threads=worker_count,
             record_count=len(jobs),
             batch_ids=sorted(batch_id_filter),
+            sweep_target_override=override_target,
         )
 
         for progress_key, display_row_key, _record in jobs:
@@ -1635,6 +1565,8 @@ def run_relay_fee_recovery(
         manual_token_totals: dict[tuple[str, str, int], int] = {}
         manual_token_wallet_counts: dict[tuple[str, str, int], int] = {}
         manual_export_rows: list[dict[str, object]] = []
+        cleanup_enabled = (not dry_run) and str(run_label or "").strip() == "manual" and not batch_id_filter
+        cleanup_empty_record_keys: set[tuple[str, str]] = set()
         lock = threading.Lock()
         jobs_q: queue.Queue[tuple[int, str, str, RelayWalletRecord]] = queue.Queue()
         for index, (progress_key, display_row_key, record) in enumerate(jobs, start=1):
@@ -1652,6 +1584,7 @@ def run_relay_fee_recovery(
             gas_fee: int = 0,
             manual_tokens: dict[str, tuple[EvmToken, int]] | None = None,
             export_row: dict[str, object] | None = None,
+            cleanup_record: RelayWalletRecord | None = None,
         ) -> None:
             nonlocal handled, failed, recovered, skipped, already_empty, kept_margin, pending, warnings
             with lock:
@@ -1682,6 +1615,10 @@ def run_relay_fee_recovery(
                         manual_token_wallet_counts[token_key] = manual_token_wallet_counts.get(token_key, 0) + 1
                 if export_row:
                     manual_export_rows.append(dict(export_row))
+                if cleanup_enabled and cleanup_record is not None:
+                    relay_address = str(getattr(cleanup_record, "relay_address", "") or "").strip()
+                    if relay_address:
+                        cleanup_empty_record_keys.add((str(getattr(cleanup_record, "batch_id", "") or "").strip(), relay_address))
                 amount_total_text = _relay_totals_text(owner, recovered_totals)
                 gas_total_text = _relay_totals_text(owner, gas_totals, prefix="预估 ")
             dispatch_ui(lambda m=msg: owner.log(m))
@@ -1716,7 +1653,7 @@ def run_relay_fee_recovery(
                 try:
                     network = str(record.network or "").strip().upper()
                     relay_addr = owner._validate_recipient_address(record.relay_address, "中转钱包地址")
-                    sweep_target = owner._validate_recipient_address(record.sweep_target or record.source, "手续费回收地址")
+                    sweep_target = owner._validate_recipient_address(override_target or record.sweep_target or record.source, "手续费回收地址")
                     snapshot = _relay_tracked_balance_snapshot(owner, network, relay_addr, record)
                     _native_token, native_balance = _relay_native_balance_entry(snapshot)
                     positive_tracked_tokens = _relay_positive_tracked_tokens(snapshot)
@@ -1727,12 +1664,14 @@ def run_relay_fee_recovery(
                     auto_forward_gas_fee = 0
 
                     if _relay_is_terminal_dust_state(record, positive_tracked_tokens):
+                        cleanup_record = record if _relay_snapshot_cleanup_allowed(owner, network, snapshot) else None
                         finish_job(
                             progress_key,
                             display_row_key,
                             outcome="ignored",
                             msg=f"{prefix} 已核对：中转钱包已是终态，仅剩已标记的原生币边际",
                             status_text="已核对",
+                            cleanup_record=cleanup_record,
                         )
                         continue
 
@@ -1762,6 +1701,7 @@ def run_relay_fee_recovery(
                                 outcome="ignored",
                                 msg=f"{prefix} 已核对：中转钱包无 BNB/USDT/USDC 余额",
                                 status_text="已核对",
+                                cleanup_record=record,
                             )
                             continue
                         _update_relay_record(
@@ -1778,6 +1718,7 @@ def run_relay_fee_recovery(
                             outcome="already_empty",
                             msg=f"{prefix} 无需回收：中转钱包无 BNB/USDT/USDC 余额",
                             status_text="已清空",
+                            cleanup_record=record,
                         )
                         continue
 
@@ -1812,9 +1753,10 @@ def run_relay_fee_recovery(
                             )
                             continue
                         try:
-                            rescue_target = owner._validate_recipient_address(record.target, "收款地址")
+                            rescue_target = sweep_target
                             dust_below_threshold, dust_detail = _relay_token_dust_below_threshold(owner, positive_tracked_tokens)
                             if dust_below_threshold:
+                                cleanup_record = record if _relay_snapshot_cleanup_allowed(owner, network, snapshot) else None
                                 _update_relay_record(
                                     owner,
                                     record,
@@ -1829,6 +1771,7 @@ def run_relay_fee_recovery(
                                     outcome="kept_margin",
                                     msg=f"{prefix} 无需人工处理：残留资产低于 dust 阈值，已标记 dust_left（{dust_detail}）",
                                     status_text="已忽略dust",
+                                    cleanup_record=cleanup_record,
                                 )
                                 continue
                             updated_record, token_gas_fee, forwarded_parts = _relay_auto_forward_tracked_tokens(
@@ -1936,82 +1879,20 @@ def run_relay_fee_recovery(
                                 status_text="已清空",
                                 network=network,
                                 gas_fee=auto_forward_gas_fee,
+                                cleanup_record=record,
                             )
                             continue
 
                     sweep_state = _transaction_receipt_state(owner, network, record.gas_sweep_txid)
                     if sweep_state == "pending":
-                        if wait_pending_sweep and str(record.gas_sweep_txid or "").strip():
-                            _append_relay_sweep_log(
-                                "recovery_wait_pending",
-                                run_label=run_label,
-                                network=network,
-                                relay_address=relay_addr,
-                                target=str(record.target or "").strip(),
-                                txid=str(record.gas_sweep_txid or "").strip(),
-                                timeout_seconds=sweep_timeout_value,
-                            )
-                            try:
-                                _wait_for_transaction_success(
-                                    owner,
-                                    network,
-                                    str(record.gas_sweep_txid or "").strip(),
-                                    label=f"{prefix} 中转手续费回收确认",
-                                    timeout_seconds=sweep_timeout_value,
-                                )
-                            except Exception as exc:
-                                if not dry_run:
-                                    owner.relay_wallet_store.update_record(
-                                        relay_addr,
-                                        batch_id=record.batch_id,
-                                        status="completed_pending_sweep",
-                                        sweep_target=sweep_target,
-                                        last_error=str(exc),
-                                    )
-                                _append_relay_sweep_log(
-                                    "recovery_pending_timeout",
-                                    run_label=run_label,
-                                    network=network,
-                                    relay_address=relay_addr,
-                                    target=str(record.target or "").strip(),
-                                    txid=str(record.gas_sweep_txid or "").strip(),
-                                    error=str(exc),
-                                )
-                                finish_job(
-                                    progress_key,
-                                    display_row_key,
-                                    outcome="pending",
-                                    msg=f"{prefix} 等待确认：手续费回收交易仍未确认完成，后台稍后继续处理",
-                                    status_text="确认中",
-                                )
-                                continue
-                            native_balance = owner.client.get_balance_wei(network, relay_addr)
-                            if native_balance <= 0:
-                                _update_relay_record(
-                                    owner,
-                                    record,
-                                    status="completed",
-                                    sweep_target=sweep_target,
-                                    last_error="",
-                                )
-                                finish_job(
-                                    progress_key,
-                                    display_row_key,
-                                    outcome="already_empty",
-                                    msg=f"{prefix} 后台确认完成：手续费回收交易已确认，中转钱包已清空",
-                                    status_text="已清空",
-                                )
-                                continue
-                            sweep_state = "success"
-                        if sweep_state == "pending":
-                            finish_job(
-                                progress_key,
-                                display_row_key,
-                                outcome="pending",
-                                msg=f"{prefix} 等待确认：已有手续费回收交易在链上确认中，当前余额 {positive_balance_text}",
-                                status_text="确认中",
-                            )
-                            continue
+                        finish_job(
+                            progress_key,
+                            display_row_key,
+                            outcome="pending",
+                            msg=f"{prefix} 等待确认：已有手续费回收交易在链上确认中，当前余额 {positive_balance_text}",
+                            status_text="确认中",
+                        )
+                        continue
 
                     if forward_state != "success":
                         if forward_state == "pending":
@@ -2063,6 +1944,7 @@ def run_relay_fee_recovery(
                                     outcome="already_empty",
                                     msg=f"{prefix} 已清理陈旧状态：中转钱包已无 USDT/USDC 余额",
                                     status_text="已清空",
+                                    cleanup_record=record,
                                 )
                                 continue
                         else:
@@ -2076,7 +1958,7 @@ def run_relay_fee_recovery(
                                 )
                                 continue
                             try:
-                                rescue_target = owner._validate_recipient_address(record.target, "收款地址")
+                                rescue_target = sweep_target
                                 record, forward_value, native_forward_gas, _txid = _relay_auto_forward_native_balance(
                                     owner,
                                     record,
@@ -2098,6 +1980,7 @@ def run_relay_fee_recovery(
                                         raise RuntimeError(
                                             "中转原生资产余额不足以支付转账 gas，且不低于 dust 阈值，需人工确认"
                                         )
+                                    cleanup_record = record if _relay_snapshot_cleanup_allowed(owner, network, snapshot) else None
                                     _update_relay_record(
                                         owner,
                                         record,
@@ -2115,6 +1998,7 @@ def run_relay_fee_recovery(
                                             f"当前余额低于 dust 阈值，已标记 dust_left（{native_dust_detail}）"
                                         ),
                                         status_text="已留边际",
+                                        cleanup_record=cleanup_record,
                                     )
                                     continue
                                 dispatch_ui(
@@ -2289,6 +2173,7 @@ def run_relay_fee_recovery(
                             outcome="already_empty",
                             msg=f"{prefix} 无需回收：中转钱包已清空",
                             status_text="已清空",
+                            cleanup_record=record,
                         )
                         continue
 
@@ -2382,7 +2267,7 @@ def run_relay_fee_recovery(
                                 run_label=run_label,
                                 network=network,
                                 relay_address=relay_addr,
-                                target=str(record.target or "").strip(),
+                                  target=sweep_target,
                                 txid=sweep_txid,
                                 error=str(exc),
                             )
@@ -2390,7 +2275,7 @@ def run_relay_fee_recovery(
                                 progress_key,
                                 display_row_key,
                                 outcome="pending",
-                                msg=f"{prefix} 手续费回收已提交，但确认较慢；后台稍后继续处理",
+                                msg=f"{prefix} 手续费回收已提交，但余额确认较慢；请稍后重试回收或按 txid 检查",
                                 status_text="确认中",
                             )
                             continue
@@ -2427,6 +2312,7 @@ def run_relay_fee_recovery(
                             network=network,
                             recovered_value=sweep_value,
                             gas_fee=sweep_gas_cost + auto_forward_gas_fee,
+                            cleanup_record=(record if _relay_native_cleanup_allowed(owner, network, sweep_expected_remaining) else None),
                         )
                         continue
 
@@ -2474,6 +2360,7 @@ def run_relay_fee_recovery(
                             ),
                         )
                         continue
+                    cleanup_record = record if _relay_snapshot_cleanup_allowed(owner, network, snapshot) else None
                     _update_relay_record(
                         owner,
                         record,
@@ -2491,13 +2378,14 @@ def run_relay_fee_recovery(
                             f"已标记 dust_left（{native_dust_detail}）"
                         ),
                         status_text="已留边际",
+                        cleanup_record=cleanup_record,
                     )
                 except Exception as exc:
                     try:
                         _update_relay_record(
                             owner,
                             record,
-                            status=("completed_pending_sweep" if wait_pending_sweep else "failed"),
+                            status="failed",
                             last_error=str(exc),
                         )
                     except Exception:
@@ -2513,32 +2401,38 @@ def run_relay_fee_recovery(
                     finish_job(
                         progress_key,
                         display_row_key,
-                        outcome=("pending" if wait_pending_sweep else "failed"),
-                        msg=(
-                            f"{prefix} 中转手续费回收待继续处理：{exc}"
-                            if wait_pending_sweep
-                            else f"{prefix} 中转手续费回收失败：{exc}"
-                        ),
-                        status_text=("确认中" if wait_pending_sweep else "失败"),
+                        outcome="failed",
+                        msg=f"{prefix} 中转手续费回收失败：{exc}",
+                        status_text="失败",
                     )
                 finally:
                     jobs_q.task_done()
 
-        workers: list[threading.Thread] = []
-        for _ in range(worker_count):
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            workers.append(t)
-        for t in workers:
-            t.join()
+        with _relay_defer_record_writes(owner):
+            workers: list[threading.Thread] = []
+            for _ in range(worker_count):
+                t = threading.Thread(target=worker, daemon=True)
+                t.start()
+                workers.append(t)
+            for t in workers:
+                t.join()
+            _relay_flush_record_writes(owner)
 
         if owner.stop_requested.is_set():
             dispatch_ui(lambda: owner.log("中转手续费回收任务已停止"))
+
+        cleanup_removed = 0
+        if cleanup_empty_record_keys and not owner.stop_requested.is_set():
+            cleanup_removed = owner.relay_wallet_store.remove_records(cleanup_empty_record_keys)
+            if cleanup_removed > 0:
+                dispatch_ui(lambda n=cleanup_removed: owner.log(f"手动回收已清理无效中转钱包记录：{n} 条"))
 
         summary = (
             f"中转手续费回收结束：已处理 {handled}，失败 {failed}，"
             f"已回收 {recovered}，已清空 {already_empty}，已留边际 {kept_margin}，跳过 {skipped}，确认中 {pending}，待手动 {warnings}"
         )
+        if cleanup_removed > 0:
+            summary = f"{summary}，已清理无效记录 {cleanup_removed}"
         recovered_text = _relay_totals_text(owner, recovered_totals)
         gas_text = _relay_totals_text(owner, gas_totals, prefix="预估 ")
         if recovered_text != "-" or gas_text != "-":
@@ -2574,6 +2468,8 @@ def run_relay_fee_recovery(
             f"残留 USDT：{usdt_text}",
             f"残留 USDC：{usdc_text}",
         ]
+        if cleanup_removed > 0:
+            summary_lines.append(f"已清理无效记录：{cleanup_removed} 条")
         if export_path:
             summary_lines.append(f"待人工私钥导出：{export_path}")
         summary = "\n".join(summary_lines)
@@ -2591,6 +2487,7 @@ def run_relay_fee_recovery(
             warnings=warnings,
             recovered_text=recovered_text,
             gas_text=gas_text,
+            cleanup_removed=cleanup_removed,
             export_path=export_path,
         )
         if show_dialog:
@@ -2620,15 +2517,500 @@ def run_relay_fee_recovery(
             owner.is_running = False
 
 
+
+@dataclass
+class _RelayBatchItem:
+    index: int
+    row_key: str
+    source_raw: str
+    target: str
+    source_private_key: str
+    source_addr: str
+    relay_record: RelayWalletRecord
+    relay_private_key: str
+    prefix: str
+    relay_name: str
+    target_name: str
+    source_label: str
+    amount_text: str
+    value_units: int
+    reserve_units: int = 0
+    source_fee_gas_price: int = 0
+    source_fee_gas_limit: int = 0
+    source_token_gas_price: int = 0
+    source_token_gas_limit: int = 0
+    gas_fee_wei: int = 0
+    final_amount_text: str = ""
+    failed: bool = False
+    failure_reason: str = ""
+
+    @property
+    def relay_addr(self) -> str:
+        return str(self.relay_record.relay_address or "").strip()
+
+
+def _relay_record_status(item: _RelayBatchItem) -> str:
+    return str(getattr(item.relay_record, "status", "") or "").strip()
+
+
+def _relay_record_txid(item: _RelayBatchItem, attr: str) -> str:
+    return str(getattr(item.relay_record, attr, "") or "").strip()
+
+
+def _relay_defer_record_writes(owner):
+    store = getattr(owner, "relay_wallet_store", None)
+    manager = getattr(store, "defer_writes", None)
+    if callable(manager):
+        return manager()
+    return nullcontext()
+
+
+def _relay_flush_record_writes(owner) -> None:
+    store = getattr(owner, "relay_wallet_store", None)
+    flush = getattr(store, "flush", None)
+    if callable(flush):
+        flush()
+
+
+def _relay_elapsed_text(started_at: float) -> str:
+    elapsed = max(0.0, time.monotonic() - float(started_at))
+    return f"{elapsed:.3f}s"
+
+
+def _relay_update_item_record(owner, item: _RelayBatchItem, status: str, **changes: object) -> RelayWalletRecord:
+    updated = owner.relay_wallet_store.update_record(
+        item.relay_addr,
+        batch_id=item.relay_record.batch_id,
+        status=status,
+        **changes,
+    )
+    item.relay_record = updated
+    return updated
+
+
+def _relay_dispatch_row_status(owner, item: _RelayBatchItem, status: str, status_text: str = "") -> None:
+    owner._dispatch_ui(lambda k=item.row_key, s=status, t=status_text: owner._set_status(k, s, t))
+
+
+def _relay_dispatch_recovery_status(owner, item: _RelayBatchItem, status: str, status_text: str = "") -> None:
+    owner._dispatch_ui(lambda k=item.row_key, s=status, t=status_text: owner._set_recovery_status(k, s, t))
+
+
+def _relay_fail_item(owner, item: _RelayBatchItem, reason: object, *, log_prefix: str = "中转失败") -> None:
+    if item.failed:
+        return
+    text = str(reason or "未知错误").strip() or "未知错误"
+    item.failed = True
+    item.failure_reason = text
+    try:
+        _relay_update_item_record(owner, item, "failed", last_error=text)
+    except Exception:
+        pass
+    _relay_dispatch_row_status(owner, item, "failed", text)
+    owner._dispatch_ui(lambda m=f"{item.prefix} {log_prefix}：{text}": owner.log(m))
+
+
+def _relay_run_parallel(owner, units: list, worker_count: int, func) -> None:
+    if not units:
+        return
+    jobs_q: queue.Queue = queue.Queue()
+    for unit in units:
+        jobs_q.put(unit)
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def worker() -> None:
+        while not owner.stop_requested.is_set():
+            try:
+                unit = jobs_q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                func(unit)
+            except BaseException as exc:
+                with errors_lock:
+                    errors.append(exc)
+            finally:
+                jobs_q.task_done()
+
+    workers: list[threading.Thread] = []
+    count = max(1, min(int(worker_count or 1), len(units)))
+    for _ in range(count):
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        workers.append(t)
+    for t in workers:
+        t.join()
+    if errors:
+        raise errors[0]
+
+
+def _relay_submit_with_retry(owner, params: WithdrawRuntimeParams, item: _RelayBatchItem, label: str, submitter) -> str:
+    attempts = _receipt_retry_count(params)
+    interval = _receipt_poll_interval_seconds(params)
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        if owner.stop_requested.is_set():
+            raise RuntimeError("任务已停止")
+        try:
+            submission = submitter()
+            txid = str(getattr(submission, "tx_hash", "") or "").strip()
+            if txid:
+                return txid
+            last_error = "未拿到 txid"
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt < attempts:
+            owner._dispatch_ui(lambda m=f"{item.prefix} {label}提交重试 {attempt}/{attempts}：{last_error}": owner.log(m))
+            if owner.stop_requested.wait(interval):
+                raise RuntimeError("任务已停止")
+    raise RuntimeError(f"{label}提交失败：{last_error}")
+
+
+def _relay_source_stage(
+    owner,
+    params: WithdrawRuntimeParams,
+    items: list[_RelayBatchItem],
+    *,
+    stage_label: str,
+    tx_attr: str,
+    nonce_attr: str,
+    submitted_status: str,
+    done_status: str,
+    done_statuses: set[str],
+    submit_one,
+    status_text: str,
+) -> None:
+    source_groups: dict[str, list[_RelayBatchItem]] = {}
+    for item in items:
+        if item.failed:
+            continue
+        if _relay_record_status(item) in done_statuses:
+            continue
+        source_groups.setdefault(item.source_addr.lower(), []).append(item)
+    if not source_groups:
+        return
+    source_nonce_next: dict[str, int] = {}
+    source_nonce_locks: dict[str, threading.Lock] = {}
+    source_guard = threading.Lock()
+
+    def alloc_nonce(source_addr: str, stored_nonce_text: str = "") -> int:
+        stored = _tx_nonce_value(stored_nonce_text)
+        if stored is not None:
+            with source_guard:
+                source_lock = source_nonce_locks.setdefault(source_addr, threading.Lock())
+            with source_lock:
+                cached_next = source_nonce_next.get(source_addr)
+                if cached_next is None or cached_next <= stored:
+                    source_nonce_next[source_addr] = stored + 1
+            return stored
+        with source_guard:
+            source_lock = source_nonce_locks.setdefault(source_addr, threading.Lock())
+        with source_lock:
+            nonce = source_nonce_next.get(source_addr)
+            if nonce is None:
+                nonce = owner.client.get_nonce(params.network, source_addr)
+            source_nonce_next[source_addr] = nonce + 1
+            return nonce
+
+    def rollback_nonce(source_addr: str, used_nonce: int) -> None:
+        with source_guard:
+            source_lock = source_nonce_locks.setdefault(source_addr, threading.Lock())
+        with source_lock:
+            cached_next = source_nonce_next.get(source_addr)
+            if cached_next == used_nonce + 1:
+                source_nonce_next.pop(source_addr, None)
+
+    def submit_item(item: _RelayBatchItem) -> None:
+        if item.failed or _relay_record_status(item) in done_statuses:
+            return
+        txid = _relay_record_txid(item, tx_attr)
+        if txid:
+            _relay_dispatch_row_status(owner, item, "running", f"{status_text}已提交")
+            return
+        used_nonce: int | None = None
+        try:
+            used_nonce = alloc_nonce(item.source_addr, _relay_record_txid(item, nonce_attr))
+            txid = submit_one(item, used_nonce)
+            _relay_update_item_record(
+                owner,
+                item,
+                submitted_status,
+                **{tx_attr: txid, nonce_attr: _tx_nonce_text(used_nonce), "last_error": ""},
+            )
+            _relay_dispatch_row_status(owner, item, "running", f"{status_text}已提交")
+            owner._dispatch_ui(lambda m=f"{item.prefix} {stage_label}已提交：txid={txid}": owner.log(m))
+        except Exception as exc:
+            if used_nonce is not None:
+                rollback_nonce(item.source_addr, used_nonce)
+            _relay_fail_item(owner, item, exc, log_prefix=f"{stage_label}提交失败")
+
+    def confirm_item(item: _RelayBatchItem) -> None:
+        if item.failed or _relay_record_status(item) in done_statuses:
+            return
+        txid = _relay_record_txid(item, tx_attr)
+        if not txid:
+            _relay_fail_item(owner, item, f"{stage_label}未拿到 txid")
+            return
+        try:
+            _wait_for_receipt_success(owner, params, txid, label=f"{item.prefix} {stage_label}")
+            _relay_update_item_record(owner, item, done_status, last_error="")
+            _relay_dispatch_row_status(owner, item, "running", f"{status_text}已确认")
+        except Exception as exc:
+            _relay_fail_item(owner, item, exc, log_prefix=f"{stage_label}确认失败")
+
+    def run_group(group_items: list[_RelayBatchItem]) -> None:
+        active_items = [item for item in group_items if not item.failed]
+        if not active_items:
+            return
+        submit_interval = _source_stage_submit_interval(params)
+        if hasattr(owner, "_is_mode_1m") and owner._is_mode_1m():
+            worker_count = max(
+                1,
+                min(
+                    int(params.threads or 1),
+                    _one_to_many_source_threads(params),
+                    _nonce_window(params),
+                    len(active_items),
+                ),
+            )
+
+            def submit_with_delay(item: _RelayBatchItem) -> None:
+                if owner.stop_requested.is_set():
+                    raise RuntimeError("任务已停止")
+                submit_item(item)
+                if submit_interval > 0 and owner.stop_requested.wait(submit_interval):
+                    raise RuntimeError("任务已停止")
+
+            _relay_run_parallel(owner, active_items, worker_count, submit_with_delay)
+            _relay_flush_record_writes(owner)
+            return
+
+        flush_every = max(1, min(int(params.threads or 1), 20))
+        for pos, item in enumerate(active_items):
+            if owner.stop_requested.is_set():
+                raise RuntimeError("任务已停止")
+            submit_item(item)
+            if (pos + 1) % flush_every == 0:
+                _relay_flush_record_writes(owner)
+            if pos < len(active_items) - 1 and submit_interval > 0:
+                if owner.stop_requested.wait(submit_interval):
+                    raise RuntimeError("任务已停止")
+
+    with _relay_defer_record_writes(owner):
+        _relay_run_parallel(owner, list(source_groups.values()), min(params.threads, len(source_groups)), run_group)
+        _relay_flush_record_writes(owner)
+        confirm_candidates = [
+            item
+            for group_items in source_groups.values()
+            for item in group_items
+            if not item.failed and _relay_record_txid(item, tx_attr)
+        ]
+        _relay_run_parallel(owner, confirm_candidates, params.threads, confirm_item)
+        _relay_flush_record_writes(owner)
+
+
+def _relay_simple_stage(
+    owner,
+    params: WithdrawRuntimeParams,
+    items: list[_RelayBatchItem],
+    *,
+    stage_label: str,
+    tx_attr: str,
+    nonce_attr: str,
+    submitted_status: str,
+    done_status: str,
+    done_statuses: set[str],
+    submit_one,
+    status_text: str,
+    confirm_receipt: bool = True,
+) -> None:
+    stage_items = [item for item in items if not item.failed and _relay_record_status(item) not in done_statuses]
+    if not stage_items:
+        return
+
+    def submit_item(item: _RelayBatchItem) -> None:
+        if item.failed or _relay_record_status(item) in done_statuses:
+            return
+        txid = _relay_record_txid(item, tx_attr)
+        if txid:
+            _relay_dispatch_row_status(owner, item, "running", f"{status_text}已提交")
+            return
+        try:
+            stored_nonce = _tx_nonce_value(_relay_record_txid(item, nonce_attr))
+            nonce = stored_nonce if stored_nonce is not None else owner.client.get_nonce(params.network, item.relay_addr)
+            txid = submit_one(item, nonce)
+            item.gas_fee_wei += int(getattr(item, "_last_forward_gas_fee_wei", 0) or 0)
+            _relay_update_item_record(
+                owner,
+                item,
+                submitted_status,
+                **{tx_attr: txid, nonce_attr: _tx_nonce_text(nonce), "last_error": ""},
+            )
+            _relay_dispatch_row_status(owner, item, "running", f"{status_text}已提交")
+            owner._dispatch_ui(lambda m=f"{item.prefix} {stage_label}已提交：txid={txid}": owner.log(m))
+        except Exception as exc:
+            _relay_fail_item(owner, item, exc, log_prefix=f"{stage_label}提交失败")
+
+    def confirm_item(item: _RelayBatchItem) -> None:
+        if item.failed or _relay_record_status(item) in done_statuses:
+            return
+        txid = _relay_record_txid(item, tx_attr)
+        if not txid:
+            _relay_fail_item(owner, item, f"{stage_label}未拿到 txid")
+            return
+        try:
+            if confirm_receipt:
+                _wait_for_receipt_success(owner, params, txid, label=f"{item.prefix} {stage_label}")
+            _relay_update_item_record(owner, item, done_status, last_error="")
+            _relay_dispatch_row_status(owner, item, "running", f"{status_text}已确认" if confirm_receipt else f"{status_text}已提交")
+        except Exception as exc:
+            _relay_fail_item(owner, item, exc, log_prefix=f"{stage_label}确认失败")
+
+    with _relay_defer_record_writes(owner):
+        _relay_run_parallel(owner, stage_items, params.threads, submit_item)
+        _relay_flush_record_writes(owner)
+        if confirm_receipt:
+            _relay_run_parallel(owner, [item for item in stage_items if not item.failed], params.threads, confirm_item)
+            _relay_flush_record_writes(owner)
+
+
+def _relay_prepare_items(
+    owner,
+    jobs_data: list[tuple[str, str, str]],
+    params: WithdrawRuntimeParams,
+    row_number_by_key: dict[str, int],
+    relay_records_by_row_key: dict[str, RelayWalletRecord],
+    row_source_wallets: dict[str, tuple[str, str]],
+) -> list[_RelayBatchItem]:
+    is_many_to_one_mode = bool(hasattr(owner, "_is_mode_m1") and owner._is_mode_m1())
+    items: list[_RelayBatchItem] = []
+    for index, (row_key, source, target) in enumerate(jobs_data, start=1):
+        record = relay_records_by_row_key[row_key]
+        source_private_key, source_addr = row_source_wallets[row_key]
+        relay_private_key = owner.client.credential_to_private_key(record.private_key)
+        prefix = f"{owner._row_log_prefix(row_key, index, len(jobs_data), row_number_by_key)}[{owner._mask(record.relay_address, head=8, tail=6)}]"
+        relay_name = f"B{index}"
+        target_name = f"C{index}"
+        source_label = _relay_resolved_source_label(owner, source_addr, source)
+        reserve_dec = _record_relay_fee_reserve_decimal(record, params)
+        reserve_units = owner._amount_to_units(reserve_dec, 18)
+        amount_text = ""
+        value_units = 0
+        source_fee_gas_price = 0
+        source_fee_gas_limit = owner.client.NATIVE_GAS_LIMIT
+        source_token_gas_price = 0
+        source_token_gas_limit = owner.client.NATIVE_GAS_LIMIT
+
+        if params.token_is_native and is_many_to_one_mode:
+            reserve_units = 0
+        elif params.token_is_native:
+            value_units, amount_text = _resolve_record_amount_local(owner, record, params)
+        else:
+            value_units, amount_text = _resolve_record_amount_local(owner, record, params)
+
+        item = _RelayBatchItem(
+            index=index,
+            row_key=row_key,
+            source_raw=source,
+            target=target,
+            source_private_key=source_private_key,
+            source_addr=source_addr,
+            relay_record=record,
+            relay_private_key=relay_private_key,
+            prefix=prefix,
+            relay_name=relay_name,
+            target_name=target_name,
+            source_label=source_label,
+            amount_text=amount_text,
+            value_units=value_units,
+            reserve_units=reserve_units,
+            source_fee_gas_price=source_fee_gas_price,
+            source_fee_gas_limit=source_fee_gas_limit,
+            source_token_gas_price=source_token_gas_price,
+            source_token_gas_limit=source_token_gas_limit,
+            final_amount_text=amount_text,
+        )
+        item.relay_record = owner.relay_wallet_store.update_record(
+            item.relay_addr,
+            batch_id=item.relay_record.batch_id,
+            status=str(item.relay_record.status or "created") or "created",
+            reuse_key=_relay_reuse_key(owner, params.network, source_addr, target),
+            token_symbol=str(params.coin or "").strip().upper(),
+            token_contract=str(params.token_contract or "").strip(),
+            token_decimals=max(0, int(params.token_decimals)),
+            token_is_native=bool(params.token_is_native),
+            relay_fee_reserve=owner._decimal_to_text(reserve_dec),
+            transfer_amount=amount_text,
+            transfer_units=(str(value_units) if value_units > 0 else ""),
+            sweep_target=(target if is_many_to_one_mode else source_addr),
+            last_error="",
+        )
+        items.append(item)
+    return items
+
+
+def _relay_submit_auto_sweep(owner, params: WithdrawRuntimeParams, item: _RelayBatchItem, target: str) -> None:
+    setattr(item, "_auto_sweep_value_wei", 0)
+    try:
+        native_balance = owner.client.get_balance_wei(params.network, item.relay_addr)
+        gas_price = owner.client.get_gas_price_wei(params.network)
+        gas_limit = owner.client.NATIVE_GAS_LIMIT
+        sweep_value, gas_cost, _safety = _relay_sweep_plan(native_balance, gas_price, gas_limit)
+        if sweep_value <= 0:
+            _relay_update_item_record(owner, item, "completed", sweep_target=target, sweep_resolution="manual_empty", last_error="")
+            _relay_dispatch_recovery_status(owner, item, "success", "无需回收")
+            return
+        nonce = owner.client.get_nonce(params.network, item.relay_addr)
+        txid = _relay_submit_with_retry(
+            owner,
+            params,
+            item,
+            "中转原生币回收",
+            lambda: owner.client.submit_native_transfer_reliably(
+                network=params.network,
+                private_key=item.relay_private_key,
+                to_address=target,
+                value_wei=sweep_value,
+                nonce=nonce,
+                gas_price_wei=gas_price,
+                gas_limit=gas_limit,
+                source_address=item.relay_addr,
+                recovery_timeout_seconds=_broadcast_recovery_timeout_seconds(params),
+            ),
+        )
+        item.gas_fee_wei += gas_cost
+        _relay_update_item_record(
+            owner,
+            item,
+            "completed",
+            gas_sweep_txid=txid,
+            gas_sweep_nonce=_tx_nonce_text(nonce),
+            sweep_target=target,
+            sweep_resolution="submitted",
+            last_error="",
+        )
+        setattr(item, "_auto_sweep_value_wei", sweep_value)
+        _relay_dispatch_recovery_status(owner, item, "submitted", "回收已提交")
+        owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币回收已提交：to={owner._mask(target, head=8, tail=6)}，txid={txid}": owner.log(m))
+    except Exception as exc:
+        _relay_dispatch_recovery_status(owner, item, "incomplete", f"回收待处理：{exc}")
+        try:
+            _relay_update_item_record(owner, item, "completed", sweep_target=target, sweep_resolution="manual", last_error=str(exc))
+        except Exception:
+            pass
+        owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币自动回收待处理：{exc}": owner.log(m))
+
+
 def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: WithdrawRuntimeParams, dry_run: bool):
     dispatch_ui = owner._dispatch_ui
+    success = 0
+    failed = 0
+    relay_records_by_row_key: dict[str, RelayWalletRecord] = {}
+    final_result_by_row_key: dict[str, str] = {}
     try:
         set_ui_batch_size(owner, params.threads)
         row_number_by_key = owner._row_number_by_key_snapshot()
-
-        def job_prefix(index: int, row_key: str = "") -> str:
-            return owner._row_log_prefix(row_key, index, len(jobs_data), row_number_by_key)
-
         token_desc = owner._token_desc_from_params(params)
         progress_keys = owner._unique_row_keys([row_key for row_key, _source, _target in jobs_data])
         context_by_row_key = {
@@ -2645,146 +3027,90 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
         )
         dispatch_ui(
             lambda: owner.log(
-                f"开始批量链上中转：mode={owner._mode()}，任务={len(jobs_data)}，network={params.network}，"
-                f"coin={token_desc}，amount={params.amount}，delay={params.delay}，threads={params.threads}，dry_run={dry_run}"
+                  f"开始批量链上中转：mode={owner._mode()}，任务={len(jobs_data)}，network={params.network}，"
+                  f"coin={token_desc}，amount={params.amount}，delay={params.delay}，threads={params.threads}，"
+                  f"1m_source_threads={params.one_to_many_source_threads}，"
+                f"receipt_interval={params.receipt_poll_interval_seconds}，receipt_retries={params.receipt_retry_count}，"
+                f"nonce_window={params.nonce_window}，dry_run={dry_run}"
             ),
         )
-
-        fallback_prefixes: dict[str, str] = {}
-        for row_key, _source, _target in jobs_data:
-            fallback_prefixes[row_key] = job_prefix(len(fallback_prefixes) + 1, row_key)
+        for row_key, source, target in jobs_data:
             owner._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
             owner._mark_recovery_status_context(row_key, context_by_row_key.get(row_key, ""))
             dispatch_ui(lambda k=row_key: owner._set_recovery_status(k, "", ""))
             dispatch_ui(lambda k=row_key: owner._set_status(k, "waiting"))
 
-        success = 0
-        failed = 0
-        warnings = 0
-        resolved = 0
-        total_amount = Decimal("0")
-        total_gas_fee_wei = 0
-        lock = threading.Lock()
-        resolved_event = threading.Event()
-        resolved_row_keys: set[str] = set()
-        final_result_by_row_key: dict[str, str] = {}
-        nonce_lock_map: dict[str, threading.Lock] = {}
-        nonce_next_map: dict[str, int] = {}
-        nonce_guard = threading.Lock()
-
-        def alloc_nonce(source_addr: str) -> int:
-            with nonce_guard:
-                source_lock = nonce_lock_map.setdefault(source_addr, threading.Lock())
-            with source_lock:
-                nonce = nonce_next_map.get(source_addr)
-                if nonce is None:
-                    nonce = owner.client.get_nonce(params.network, source_addr)
-                nonce_next_map[source_addr] = nonce + 1
-                return nonce
-
-        def rollback_nonce(source_addr: str, used_nonce: int):
-            with nonce_guard:
-                source_lock = nonce_lock_map.setdefault(source_addr, threading.Lock())
-            with source_lock:
-                cached_next = nonce_next_map.get(source_addr)
-                if cached_next == used_nonce + 1:
-                    nonce_next_map.pop(source_addr, None)
-
-        def reuse_or_alloc_source_nonce(source_addr: str, stored_nonce_text: str, *, stage_label: str) -> int:
-            stored_nonce = _tx_nonce_value(stored_nonce_text)
-            if stored_nonce is None:
-                return alloc_nonce(source_addr)
-            pending_nonce = owner.client.get_nonce(params.network, source_addr)
-            if pending_nonce > stored_nonce:
-                raise RuntimeError(
-                    f"{stage_label}发现源钱包 nonce 已前进到 {pending_nonce}，历史 nonce={stored_nonce}，"
-                    "无法安全自动续跑，请人工核对后处理"
-                )
-            with nonce_guard:
-                source_lock = nonce_lock_map.setdefault(source_addr, threading.Lock())
-            with source_lock:
-                cached_next = nonce_next_map.get(source_addr, pending_nonce)
-                nonce_next_map[source_addr] = max(int(cached_next), stored_nonce + 1)
-            return stored_nonce
-
-        def resolve_relay_stage_nonce(relay_addr: str, stored_nonce_text: str, *, stage_label: str) -> int:
-            stored_nonce = _tx_nonce_value(stored_nonce_text)
-            pending_nonce = owner.client.get_nonce(params.network, relay_addr)
-            if stored_nonce is None:
-                return pending_nonce
-            if pending_nonce == stored_nonce:
-                return stored_nonce
-            if pending_nonce < stored_nonce:
-                raise RuntimeError(
-                    f"{stage_label}发现中转钱包 nonce 回退到 {pending_nonce}，历史 nonce={stored_nonce}，"
-                    "无法安全自动续跑，请人工核对后处理"
-                )
-            raise RuntimeError(
-                f"{stage_label}发现中转钱包 nonce 已前进到 {pending_nonce}，历史 nonce={stored_nonce}，"
-                "无法安全自动续跑，请人工核对后处理"
-            )
-
-        def finalize_job(
-            row_key: str,
-            result_status: str,
-            msg: str,
-            *,
-            amount_text: str = "",
-            gas_fee_wei: int = 0,
-            success_text: str = "",
-            warning: bool = False,
-        ):
-            nonlocal success, failed, warnings, resolved, total_amount, total_gas_fee_wei
-            context_sig = context_by_row_key.get(row_key, "")
-            row_status_text = ""
-            with lock:
-                if row_key in resolved_row_keys:
-                    return
-                resolved_row_keys.add(row_key)
-                if result_status == "success":
-                    success += 1
-                    if warning:
-                        warnings += 1
-                    row_status_text = success_text or _relay_success_status_text(owner, params, amount_text, sweep_pending=warning)
-                    if amount_text:
-                        try:
-                            total_amount += Decimal(amount_text)
-                        except Exception:
-                            pass
+        if dry_run:
+            total_amount = Decimal("0")
+            for index, (row_key, source, target) in enumerate(jobs_data, start=1):
+                if params.random_enabled and params.random_min is not None and params.random_max is not None:
+                    amount_text = owner._decimal_to_text(owner._random_decimal_between(params.random_min, params.random_max, params.token_decimals))
                 else:
-                    failed += 1
-                final_result_by_row_key[row_key] = result_status
-                total_gas_fee_wei += gas_fee_wei
-                amount_total_text = owner._token_amount_text(params.coin, total_amount)
-                gas_total_text = "-" if dry_run else owner._estimated_gas_fee_text(params.network, total_gas_fee_wei)
-                resolved += 1
-                done = resolved >= len(jobs_data)
-            if done:
-                resolved_event.set()
-            dispatch_ui(lambda m=msg: owner.log(m))
-            owner._mark_row_status_context(row_key, context_sig)
-            dispatch_ui(lambda k=row_key, s=result_status, t=row_status_text: owner._set_status(k, s, t))
-            dispatch_ui(lambda a=amount_total_text, g=gas_total_text: owner._set_progress_metrics(amount_text=a, gas_text=g))
-
-        row_source_wallets: dict[str, tuple[str, str]] = {}
-        relay_records_by_row_key: dict[str, RelayWalletRecord] = {}
-        batch_scope_ids: set[str] = set()
-        if not dry_run:
-            row_source_wallets = _resolve_job_source_wallets(owner, jobs_data)
-            cleanup_worker_threads = max(1, int(owner._runtime_worker_threads()))
-            checked, removed, kept = owner.relay_wallet_store.cleanup_expired_empty_records(
-                owner.client,
-                log=lambda message: dispatch_ui(lambda m=message: owner.log(m)),
-                worker_threads=cleanup_worker_threads,
+                    amount_text = params.amount
+                try:
+                    total_amount += Decimal(str(amount_text))
+                except Exception:
+                    pass
+                prefix = owner._row_log_prefix(row_key, index, len(jobs_data), row_number_by_key)
+                dispatch_ui(lambda k=row_key, t=_relay_success_status_text(owner, params, amount_text): owner._set_status(k, "success", t))
+                dispatch_ui(lambda k=row_key: owner._set_recovery_status(k, "success", "模拟完成"))
+                dispatch_ui(lambda m=f"{prefix} 模拟中转成功：A({owner._mask_credential(source)}) -> B{index}(中转钱包) -> C{index}({owner._mask(target, head=8, tail=6)})，金额={params.coin} {amount_text}": owner.log(m))
+            success = len(jobs_data)
+            summary = (
+                f"链上中转任务结束：总量 {len(jobs_data)}，成功 {success}，失败 0，"
+                f"余额总数={owner._token_amount_text(params.coin, total_amount)}，"
+                f"转账总数={owner._token_amount_text(params.coin, total_amount)}，"
+                "回收总数=-，预估gas=-"
             )
-            if checked > 0:
-                dispatch_ui(
-                    lambda: owner.log(
-                        f"中转钱包过期清理完成：检查 {checked}，移除 {removed}，保留 {kept}，线程数={cleanup_worker_threads}"
-                    )
+            dispatch_ui(
+                lambda a=owner._token_amount_text(params.coin, total_amount): owner._set_progress_metrics(
+                    balance_text=a,
+                    amount_text=a,
+                    recovery_text="-",
+                    gas_text="-",
                 )
-            existing_records = owner.relay_wallet_store.load_records()
-            resume_candidates_by_pair = _build_resume_candidates(existing_records, jobs_data, params, row_source_wallets)
+            )
+            dispatch_ui(lambda: owner.log(summary))
+            dispatch_ui(lambda s=success: owner._finish_progress("transfer", s, 0))
+            dispatch_ui(
+                lambda s=success, detail=summary: owner._show_result_summary_dialog(
+                    title="执行完成",
+                    summary_title="链上中转批量转账完成",
+                    success=s,
+                    failed=0,
+                    detail_text=detail,
+                    action_buttons=[],
+                )
+            )
+            return
+
+        prepare_started_at = time.monotonic()
+        stage_started_at = prepare_started_at
+        dispatch_ui(lambda: owner.log(f"中转钱包准备开始：任务={len(jobs_data)}"))
+        row_source_wallets = _resolve_job_source_wallets(owner, jobs_data)
+        source_count = len({str(address).strip().lower() for _private_key, address in row_source_wallets.values() if str(address or "").strip()})
+        dispatch_ui(
+            lambda elapsed=_relay_elapsed_text(stage_started_at), count=source_count: owner.log(
+                f"中转钱包准备：源钱包解析完成，源钱包={count}，耗时={elapsed}"
+            )
+        )
+        stage_started_at = time.monotonic()
+        existing_records = owner.relay_wallet_store.load_records()
+        dispatch_ui(
+            lambda elapsed=_relay_elapsed_text(stage_started_at), count=len(existing_records): owner.log(
+                f"中转钱包准备：历史记录读取/解密完成，记录={count}，耗时={elapsed}"
+            )
+        )
+        stage_started_at = time.monotonic()
+        resume_candidates_by_pair = _build_resume_candidates(owner, existing_records, jobs_data, params, row_source_wallets)
+        resume_candidate_count = sum(len(records) for records in resume_candidates_by_pair.values())
+        dispatch_ui(
+            lambda elapsed=_relay_elapsed_text(stage_started_at), count=resume_candidate_count: owner.log(
+                f"中转钱包准备：复用候选匹配完成，候选={count}，耗时={elapsed}"
+            )
+        )
+        stage_started_at = time.monotonic()
+        with _relay_defer_record_writes(owner):
             relay_records_by_row_key, resumed_count, batch_id = _pick_or_create_relay_records(
                 owner,
                 jobs_data,
@@ -2792,554 +3118,461 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                 row_source_wallets,
                 resume_candidates_by_pair,
             )
-            relay_records = [
-                record
-                for record in relay_records_by_row_key.values()
-                if str(record.batch_id or "").strip() == str(batch_id or "").strip()
-            ]
-            batch_scope_ids = {
-                str(record.batch_id or "").strip()
-                for record in relay_records_by_row_key.values()
-                if str(getattr(record, "batch_id", "") or "").strip()
-            }
+            created_count = len([r for r in relay_records_by_row_key.values() if str(r.batch_id or "").strip() == str(batch_id or "").strip()])
             dispatch_ui(
-                lambda generated=len(relay_records), resumed=resumed_count: owner.log(
-                    f"中转钱包准备完成：续跑 {resumed} 个，新建 {generated} 个，批次号={batch_id}"
+                lambda elapsed=_relay_elapsed_text(stage_started_at), generated=created_count, resumed=resumed_count: owner.log(
+                    f"中转钱包准备：复用/创建记录完成，复用/续跑={resumed}，新建={generated}，耗时={elapsed}"
                 )
             )
-
-        jobs_q: queue.Queue[tuple[int, str, str, str]] = queue.Queue()
-        for i, item in enumerate(jobs_data, start=1):
-            row_key, source, target = item
-            jobs_q.put((i, row_key, source, target))
-
-        def worker():
-            while True:
-                if owner.stop_requested.is_set():
-                    return
-                try:
-                    i, row_key, source, target = jobs_q.get_nowait()
-                except queue.Empty:
-                    return
-
-                result_status = "failed"
-                msg = ""
-                amount_text = ""
-                gas_fee_wei = 0
-                success_text = ""
-                warning = False
-                owner._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
-                dispatch_ui(lambda k=row_key: owner._set_status(k, "running"))
-                prefix = job_prefix(i, row_key)
-                try:
-                    if dry_run:
-                        relay_label = f"B{i}"
-                        target_label = f"C{i}"
-                        if params.random_enabled and params.random_min is not None and params.random_max is not None:
-                            amount_text = owner._decimal_to_text(
-                                owner._random_decimal_between(params.random_min, params.random_max, params.token_decimals)
-                            )
-                        else:
-                            amount_text = params.amount
-                        success_text = _relay_success_status_text(owner, params, amount_text)
-                        msg = (
-                            f"{prefix} 模拟中转成功：A({owner._mask_credential(source)}) -> "
-                            f"{relay_label}(新中转钱包) -> {target_label}({owner._mask(target, head=8, tail=6)})，"
-                            f"金额={params.coin} {amount_text}"
-                        )
-                        result_status = "success"
-                    else:
-                        relay_record = relay_records_by_row_key.get(row_key)
-                        if relay_record is None:
-                            raise RuntimeError("未找到中转钱包记录")
-                        source_wallet = row_source_wallets.get(row_key)
-                        if source_wallet is None:
-                            raise RuntimeError("未找到源钱包映射")
-                        source_private_key, source_addr = source_wallet
-                        relay_addr = relay_record.relay_address
-                        relay_private_key = owner.client.credential_to_private_key(relay_record.private_key)
-                        prefix = f"{prefix}[{owner._mask(relay_addr, head=8, tail=6)}]"
-                        relay_name = f"B{i}"
-                        target_name = f"C{i}"
-                        source_label = _relay_resolved_source_label(owner, source_addr, source)
-
-                        def update_record(status: str, **changes: object):
-                            if status == "failed":
-                                changes.setdefault("last_error", str(changes.get("last_error") or ""))
-                            else:
-                                changes.setdefault("last_error", "")
-                            if status in {"completed", "completed_pending_sweep"}:
-                                changes.setdefault("completed_at", _utc_now_text())
-                            updated = owner.relay_wallet_store.update_record(
-                                relay_addr,
-                                batch_id=relay_record.batch_id,
-                                status=status,
-                                **changes,
-                            )
-                            relay_records_by_row_key[row_key] = updated
-                            return updated
-
-                        reserve_dec = _record_relay_fee_reserve_decimal(relay_record, params)
-                        if is_many_to_one_mode and params.token_is_native:
-                            reserve_units, _forward_gas_limit_quote, _minimum_reserve_units = _relay_many_to_one_reserve_requirements(
-                                owner,
-                                relay_record,
-                                params,
-                                source_addr=source_addr,
-                                relay_addr=relay_addr,
-                                target=target,
-                                value_units=0,
-                                source_token_gas_price=owner.client.get_gas_price_wei(params.network),
-                                source_token_gas_limit=owner.client.NATIVE_GAS_LIMIT,
-                            )
-                            value_units, amount_text, amount_changed = _resolve_many_to_one_native_amount(
-                                owner,
-                                relay_record,
-                                params,
-                                source_addr=source_addr,
-                                reserve_units=reserve_units,
-                            )
-                        else:
-                            value_units, amount_text, amount_changed = _resolve_record_amount(
-                                owner,
-                                relay_record,
-                                params,
-                                source_addr,
-                                relay_addr,
-                            )
-                        stage_params = WithdrawRuntimeParams(
-                            coin=params.coin,
-                            amount=amount_text,
-                            network=params.network,
-                            delay=params.delay,
-                            threads=params.threads,
-                            confirm_timeout_seconds=params.confirm_timeout_seconds,
-                            token_contract=params.token_contract,
-                            token_decimals=params.token_decimals,
-                            token_is_native=params.token_is_native,
-                            relay_enabled=True,
-                            relay_fee_reserve=reserve_dec,
-                            relay_sweep_enabled=bool(relay_record.sweep_enabled),
-                            relay_sweep_target=str(relay_record.sweep_target or params.relay_sweep_target or (target if is_many_to_one_mode else source_addr)),
-                        )
-                        if amount_changed or relay_record.relay_fee_reserve != owner._decimal_to_text(reserve_dec):
-                            relay_record = update_record(
-                                str(relay_record.status or "created") or "created",
-                                relay_fee_reserve=owner._decimal_to_text(reserve_dec),
-                                transfer_amount=amount_text,
-                                transfer_units=str(value_units),
-                            )
-                        if is_many_to_one_mode and params.token_is_native:
-                            source_token_gas_price = owner.client.get_gas_price_wei(params.network)
-                            source_token_gas_limit = owner.client.NATIVE_GAS_LIMIT
-                        else:
-                            value_units, source_token_gas_price, source_token_gas_limit, amount_text = owner._resolve_amount_and_gas(
-                                stage_params,
-                                source_addr,
-                                relay_addr,
-                            )
-                        if is_many_to_one_mode:
-                            reserve_units, _forward_gas_limit_quote, _minimum_reserve_units = _relay_many_to_one_reserve_requirements(
-                                owner,
-                                relay_record,
-                                stage_params,
-                                source_addr=source_addr,
-                                relay_addr=relay_addr,
-                                target=target,
-                                value_units=value_units,
-                                source_token_gas_price=source_token_gas_price,
-                                source_token_gas_limit=source_token_gas_limit,
-                            )
-                        else:
-                            reserve_units, _forward_gas_limit_quote, _minimum_reserve_units = _relay_reserve_requirements(
-                                owner,
-                                stage_params,
-                                relay_addr,
-                                target,
-                                value_units,
-                            )
-                        relay_record = _reconcile_relay_record_stage(
-                            owner,
-                            relay_record,
-                            stage_params,
-                            reserve_units=reserve_units,
-                            value_units=value_units,
-                            target=target,
-                        )
-                        confirm_timeout_seconds = _confirm_timeout_seconds(stage_params)
-                        recovery_timeout_seconds = _broadcast_recovery_timeout_seconds(stage_params)
-                        fee_wait_params = WithdrawRuntimeParams(
-                            coin=owner._network_fee_symbol(params.network),
-                            amount="0",
-                            network=params.network,
-                            delay=0.0,
-                            threads=1,
-                            confirm_timeout_seconds=confirm_timeout_seconds,
-                            token_decimals=18,
-                            token_is_native=True,
-                        )
-                        current_status = str(relay_record.status or "").strip()
-                        if current_status in {"completed", "completed_pending_sweep"}:
-                            success_text = _relay_success_status_text(owner, stage_params, amount_text)
-                            msg = (
-                                f"{prefix} 检测到中转任务已完成：A({source_label}) -> "
-                                f"{relay_name}({owner._mask(relay_addr, head=8, tail=6)}) -> "
-                                f"{target_name}({owner._mask(target, head=8, tail=6)})，金额={stage_params.coin} {amount_text}"
-                            )
-                            result_status = "success"
-                            continue
-                        source_fee_gas_price = owner.client.get_gas_price_wei(params.network)
-                        source_fee_gas_limit = owner.client.NATIVE_GAS_LIMIT
-                        fee_stage_complete = current_status in {"fee_funded", "forwarded", "completed", "completed_pending_sweep"}
-                        token_stage_complete = current_status in {"token_funded", "forwarded", "completed", "completed_pending_sweep"}
-                        if is_many_to_one_mode and not stage_params.token_is_native:
-                            fee_txid = str(relay_record.fee_funded_txid or "").strip()
-                            token_txid = str(relay_record.token_funded_txid or "").strip()
-                            if fee_txid and _transaction_receipt_state(owner, params.network, fee_txid) == "success":
-                                fee_stage_complete = True
-                            if token_txid and _transaction_receipt_state(owner, params.network, token_txid) == "success":
-                                token_stage_complete = True
-                        needs_fee_stage = not fee_stage_complete
-                        needs_token_stage = not token_stage_complete
-                        fee_stage_label = "中转原生币转入" if is_many_to_one_mode else "中转手续费转入"
-                        if needs_fee_stage or needs_token_stage:
-                            source_native_balance_units = owner.client.get_balance_wei(params.network, source_addr)
-                            total_required_units = 0
-                            if is_many_to_one_mode:
-                                total_required_units += _relay_many_to_one_source_keep_units(owner, stage_params, relay_record)
-                            if needs_fee_stage:
-                                total_required_units += reserve_units + source_fee_gas_price * source_fee_gas_limit
-                            if needs_token_stage:
-                                total_required_units += source_token_gas_price * source_token_gas_limit
-                                if stage_params.token_is_native:
-                                    total_required_units += value_units
-                            if source_native_balance_units < total_required_units:
-                                raise RuntimeError("源钱包原生币余额不足，无法完成当前中转续跑阶段")
-
-                        def run_fee_stage() -> None:
-                            nonlocal gas_fee_wei, relay_record
-                            fee_nonce = reuse_or_alloc_source_nonce(
-                                source_addr,
-                                relay_record.fee_funded_nonce,
-                                stage_label=fee_stage_label,
-                            )
-                            fee_submission = owner.client.submit_native_transfer_reliably(
-                                network=params.network,
-                                private_key=source_private_key,
-                                to_address=relay_addr,
-                                value_wei=reserve_units,
-                                nonce=fee_nonce,
-                                gas_price_wei=source_fee_gas_price,
-                                gas_limit=source_fee_gas_limit,
-                                source_address=source_addr,
-                                recovery_timeout_seconds=recovery_timeout_seconds,
-                            )
-                            gas_fee_wei += source_fee_gas_price * source_fee_gas_limit
-                            relay_record = update_record(
-                                "fee_funding_submitted",
-                                fee_funded_txid=fee_submission.tx_hash,
-                                fee_funded_nonce=_tx_nonce_text(fee_nonce),
-                            )
-                            dispatch_ui(
-                                lambda m=(
-                                    f"{prefix} A({source_label}) -> "
-                                    f"{relay_name}({owner._mask(relay_addr, head=8, tail=6)}) "
-                                    f"{'原生币归集中转已提交' if is_many_to_one_mode else '手续费预留已提交'}："
-                                    f"reserve={owner._gas_fee_amount_text(params.network, reserve_units)}，"
-                                    f"txid={fee_submission.tx_hash}"
-                                ): owner.log(m)
-                            )
-                            _wait_for_transaction_success(
-                                owner,
-                                params.network,
-                                fee_submission.tx_hash,
-                                label=f"{prefix} {fee_stage_label}确认",
-                                timeout_seconds=confirm_timeout_seconds,
-                            )
-                            _wait_for_token_balance_at_least(
-                                owner,
-                                fee_wait_params,
-                                relay_addr,
-                                reserve_units,
-                                label=f"{prefix} 中转钱包手续费到账",
-                                timeout_seconds=confirm_timeout_seconds,
-                            )
-                            relay_record = update_record("fee_funded")
-
-                        def run_token_stage() -> None:
-                            nonlocal gas_fee_wei, relay_record
-                            token_nonce = reuse_or_alloc_source_nonce(
-                                source_addr,
-                                relay_record.token_funded_nonce,
-                                stage_label="中转代币转入",
-                            )
-                            if stage_params.token_is_native:
-                                token_submission = owner.client.submit_native_transfer_reliably(
-                                    network=params.network,
-                                    private_key=source_private_key,
-                                    to_address=relay_addr,
-                                    value_wei=value_units,
-                                    nonce=token_nonce,
-                                    gas_price_wei=source_token_gas_price,
-                                    gas_limit=source_token_gas_limit,
-                                    source_address=source_addr,
-                                    recovery_timeout_seconds=recovery_timeout_seconds,
-                                )
-                            else:
-                                token_submission = owner.client.submit_erc20_transfer_reliably(
-                                    network=params.network,
-                                    private_key=source_private_key,
-                                    token_contract=params.token_contract,
-                                    to_address=relay_addr,
-                                    amount_units=value_units,
-                                    nonce=token_nonce,
-                                    gas_price_wei=source_token_gas_price,
-                                    gas_limit=source_token_gas_limit,
-                                    source_address=source_addr,
-                                    recovery_timeout_seconds=recovery_timeout_seconds,
-                                )
-                            gas_fee_wei += source_token_gas_price * source_token_gas_limit
-                            relay_record = update_record(
-                                "token_funding_submitted",
-                                token_funded_txid=token_submission.tx_hash,
-                                token_funded_nonce=_tx_nonce_text(token_nonce),
-                            )
-                            dispatch_ui(
-                                lambda m=(
-                                    f"{prefix} A({source_label}) -> "
-                                    f"{relay_name}({owner._mask(relay_addr, head=8, tail=6)}) 主转账已提交："
-                                    f"金额={stage_params.coin} {amount_text}，txid={token_submission.tx_hash}"
-                                ): owner.log(m)
-                            )
-                            _wait_for_transaction_success(
-                                owner,
-                                params.network,
-                                token_submission.tx_hash,
-                                label=f"{prefix} 中转代币转入确认",
-                                timeout_seconds=confirm_timeout_seconds,
-                            )
-                            if stage_params.token_is_native:
-                                _wait_for_token_balance_at_least(
-                                    owner,
-                                    fee_wait_params,
-                                    relay_addr,
-                                    reserve_units + value_units,
-                                    label=f"{prefix} 中转钱包原生币到账",
-                                    timeout_seconds=confirm_timeout_seconds,
-                                )
-                            else:
-                                _wait_for_token_balance_at_least(
-                                    owner,
-                                    stage_params,
-                                    relay_addr,
-                                    value_units,
-                                    label=f"{prefix} 中转钱包代币到账",
-                                    timeout_seconds=confirm_timeout_seconds,
-                                )
-                            relay_record = update_record("token_funded")
-
-                        if is_many_to_one_mode and not stage_params.token_is_native:
-                            if needs_token_stage:
-                                run_token_stage()
-                            if needs_fee_stage:
-                                run_fee_stage()
-                        else:
-                            if needs_fee_stage:
-                                run_fee_stage()
-                            if needs_token_stage:
-                                run_token_stage()
-
-                        current_status = str(relay_record.status or "").strip()
-                        if current_status not in {"forwarded", "completed", "completed_pending_sweep"}:
-                            target_before_units = _token_balance_units(owner, stage_params, target)
-                            relay_nonce = resolve_relay_stage_nonce(
-                                relay_addr,
-                                relay_record.token_forward_nonce,
-                                stage_label="中转第二跳",
-                            )
-                            if stage_params.token_is_native:
-                                relay_forward_gas_limit = owner.client.NATIVE_GAS_LIMIT
-                                if is_many_to_one_mode and reserve_units > 0:
-                                    relay_forward_gas_price = max(1, reserve_units // relay_forward_gas_limit)
-                                else:
-                                    relay_forward_gas_price = owner.client.get_gas_price_wei(params.network)
-                                relay_native_balance = owner.client.get_balance_wei(params.network, relay_addr)
-                                relay_forward_gas_cost = relay_forward_gas_price * relay_forward_gas_limit
-                                if relay_native_balance < value_units + relay_forward_gas_cost:
-                                    raise RuntimeError("中转钱包原生币余额不足，无法完成第二跳转账")
-                                forward_submission = owner.client.submit_native_transfer_reliably(
-                                    network=params.network,
-                                    private_key=relay_private_key,
-                                    to_address=target,
-                                    value_wei=value_units,
-                                    nonce=relay_nonce,
-                                    gas_price_wei=relay_forward_gas_price,
-                                    gas_limit=relay_forward_gas_limit,
-                                    source_address=relay_addr,
-                                    recovery_timeout_seconds=recovery_timeout_seconds,
-                                )
-                            else:
-                                relay_forward_gas_price = owner.client.get_gas_price_wei(params.network)
-                                relay_forward_gas_limit = owner.client.estimate_erc20_transfer_gas(
-                                    params.network,
-                                    relay_addr,
-                                    params.token_contract,
-                                    target,
-                                    value_units,
-                                )
-                                relay_forward_gas_cost = relay_forward_gas_price * relay_forward_gas_limit
-                                relay_native_balance = owner.client.get_balance_wei(params.network, relay_addr)
-                                if relay_native_balance < relay_forward_gas_cost:
-                                    raise RuntimeError("中转钱包原生币余额不足，无法支付第二跳 gas")
-                                relay_token_balance = owner.client.get_erc20_balance(params.network, params.token_contract, relay_addr)
-                                if relay_token_balance < value_units:
-                                    raise RuntimeError("中转钱包代币余额不足，无法完成第二跳转账")
-                                forward_submission = owner.client.submit_erc20_transfer_reliably(
-                                    network=params.network,
-                                    private_key=relay_private_key,
-                                    token_contract=params.token_contract,
-                                    to_address=target,
-                                    amount_units=value_units,
-                                    nonce=relay_nonce,
-                                    gas_price_wei=relay_forward_gas_price,
-                                    gas_limit=relay_forward_gas_limit,
-                                    source_address=relay_addr,
-                                    recovery_timeout_seconds=recovery_timeout_seconds,
-                                )
-                            gas_fee_wei += relay_forward_gas_price * relay_forward_gas_limit
-                            relay_record = update_record(
-                                "token_forward_submitted",
-                                token_forward_txid=forward_submission.tx_hash,
-                                token_forward_nonce=_tx_nonce_text(relay_nonce),
-                            )
-                            dispatch_ui(
-                                lambda m=(
-                                    f"{prefix} {relay_name}({owner._mask(relay_addr, head=8, tail=6)}) -> "
-                                    f"{target_name}({owner._mask(target, head=8, tail=6)}) 已提交："
-                                    f"金额={stage_params.coin} {amount_text}，txid={forward_submission.tx_hash}"
-                                ): owner.log(m)
-                            )
-                            _wait_for_transaction_success(
-                                owner,
-                                params.network,
-                                forward_submission.tx_hash,
-                                label=f"{prefix} 中转第二跳确认",
-                                timeout_seconds=confirm_timeout_seconds,
-                            )
-                            _wait_for_token_balance_at_least(
-                                owner,
-                                stage_params,
-                                target,
-                                target_before_units + value_units,
-                                label=f"{prefix} 目标地址到账",
-                                timeout_seconds=confirm_timeout_seconds,
-                            )
-                            relay_record = update_record("forwarded")
-
-                        relay_record = update_record(
-                            "completed",
-                            sweep_target=(target if is_many_to_one_mode else source_addr),
-                            sweep_resolution="",
-                            last_error="",
-                        )
-                        success_text = _relay_success_status_text(owner, stage_params, amount_text)
-                        msg = (
-                            f"{prefix} 中转主流程完成："
-                            f"A({source_label}) -> "
-                            f"{relay_name}({owner._mask(relay_addr, head=8, tail=6)}) -> "
-                            f"{target_name}({owner._mask(target, head=8, tail=6)})，"
-                            f"金额={stage_params.coin} {amount_text}"
-                        )
-                        result_status = "success"
-                except Exception as exc:
-                    relay_record = relay_records_by_row_key.get(row_key)
-                    if relay_record is not None and not dry_run:
-                        try:
-                            owner.relay_wallet_store.update_record(
-                                relay_record.relay_address,
-                                batch_id=relay_record.batch_id,
-                                status="failed",
-                                last_error=str(exc),
-                            )
-                        except Exception:
-                            pass
-                    msg = f"{prefix} 中转失败：{exc}"
-                finally:
-                    jobs_q.task_done()
-
-                finalize_job(
-                    row_key,
-                    result_status,
-                    msg,
-                    amount_text=amount_text,
-                    gas_fee_wei=gas_fee_wei,
-                    success_text=success_text,
-                    warning=warning,
+            stage_started_at = time.monotonic()
+            items = _relay_prepare_items(owner, jobs_data, params, row_number_by_key, relay_records_by_row_key, row_source_wallets)
+            dispatch_ui(
+                lambda elapsed=_relay_elapsed_text(stage_started_at), count=len(items): owner.log(
+                    f"中转钱包准备：任务对象构建完成，任务={count}，耗时={elapsed}"
                 )
-                if params.delay > 0 and owner.stop_requested.wait(params.delay):
-                    return
+            )
+            stage_started_at = time.monotonic()
+            _relay_flush_record_writes(owner)
+            dispatch_ui(
+                lambda elapsed=_relay_elapsed_text(stage_started_at): owner.log(
+                    f"中转钱包准备：加密写回完成，耗时={elapsed}"
+                )
+            )
+        dispatch_ui(
+            lambda elapsed=_relay_elapsed_text(prepare_started_at), generated=created_count, resumed=resumed_count, bid=batch_id: owner.log(
+                f"中转钱包准备完成：复用/续跑 {resumed} 个，新建 {generated} 个，批次号={bid}，总耗时={elapsed}"
+            )
+        )
+        for item in items:
+            dispatch_ui(lambda k=item.row_key: owner._set_status(k, "running", "中转准备完成"))
 
-        workers: list[threading.Thread] = []
-        worker_count = max(1, min(params.threads, len(jobs_data)))
-        for _ in range(worker_count):
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            workers.append(t)
-        for t in workers:
-            t.join()
-        if owner.stop_requested.is_set():
-            with lock:
-                pending_row_keys = [row_key for row_key in progress_keys if row_key not in resolved_row_keys]
-            for row_key in pending_row_keys:
-                prefix = fallback_prefixes.get(row_key, "")
-                stop_msg = f"{prefix} 已停止" if prefix else "任务已停止"
-                finalize_job(row_key, "failed", stop_msg)
-            resolved_event.set()
-            dispatch_ui(lambda: owner.log("链上中转任务已停止"))
-        if len(jobs_data) == 0:
-            resolved_event.set()
-        if not resolved_event.wait(max(0.2, RELAY_POLL_INTERVAL_SECONDS)):
-            with lock:
-                pending_row_keys = [row_key for row_key in progress_keys if row_key not in resolved_row_keys]
-            for row_key in pending_row_keys:
-                prefix = fallback_prefixes.get(row_key, "")
-                timeout_msg = f"{prefix} 任务收尾超时，自动判定失败" if prefix else "任务收尾超时，自动判定失败"
-                finalize_job(row_key, "failed", timeout_msg)
+        if params.token_is_native and is_many_to_one_mode:
+            def submit_m1_native_to_relay(item: _RelayBatchItem, nonce: int) -> str:
+                _relay_resolve_m1_native_transfer(owner, params, item)
+                item.gas_fee_wei += item.source_token_gas_price * item.source_token_gas_limit
+                return _relay_submit_with_retry(
+                    owner,
+                    params,
+                    item,
+                    "源钱包原生币转入中转",
+                    lambda: owner.client.submit_native_transfer_reliably(
+                        network=params.network,
+                        private_key=item.source_private_key,
+                        to_address=item.relay_addr,
+                        value_wei=item.value_units,
+                        nonce=nonce,
+                        gas_price_wei=item.source_token_gas_price,
+                        gas_limit=item.source_token_gas_limit,
+                        source_address=item.source_addr,
+                        recovery_timeout_seconds=_broadcast_recovery_timeout_seconds(params),
+                    ),
+                )
 
-        summary = f"链上中转任务结束：成功 {success}，失败 {failed}"
-        batch_scope_ids = {
-            str(record.batch_id or "").strip()
-            for record in relay_records_by_row_key.values()
-            if str(getattr(record, "batch_id", "") or "").strip()
-        } or batch_scope_ids
-        failed_jobs = [job for job in jobs_data if final_result_by_row_key.get(job[0], "") == "failed"]
-        failed_export_records = [
-            relay_records_by_row_key[row_key]
-            for row_key, _source, _target in failed_jobs
-            if row_key in relay_records_by_row_key
-        ]
-        failed_export_path = _relay_write_failed_export_file(failed_export_records) if not dry_run else ""
-        if not dry_run:
-            summary = (
-                f"{summary}，转账总额={owner._token_amount_text(params.coin, total_amount)}，"
-                f"预估gas合计={owner._gas_fee_amount_text(params.network, total_gas_fee_wei)}"
+            _relay_source_stage(
+                owner,
+                params,
+                items,
+                stage_label="源钱包原生币转入中转",
+                tx_attr="token_funded_txid",
+                nonce_attr="token_funded_nonce",
+                submitted_status="token_funding_submitted",
+                done_status="token_funded",
+                done_statuses={"token_funded", "forwarded", "completed", "completed_pending_sweep"},
+                submit_one=submit_m1_native_to_relay,
+                status_text="原生币转入",
+            )
+        elif params.token_is_native:
+            def submit_1m_native_to_relay(item: _RelayBatchItem, nonce: int) -> str:
+                _relay_resolve_1m_native_transfer(owner, params, item)
+                total_units = item.value_units + item.reserve_units
+                item.gas_fee_wei += item.source_token_gas_price * item.source_token_gas_limit
+                return _relay_submit_with_retry(
+                    owner,
+                    params,
+                    item,
+                    "源钱包原生币转入中转",
+                    lambda: owner.client.submit_native_transfer_reliably(
+                        network=params.network,
+                        private_key=item.source_private_key,
+                        to_address=item.relay_addr,
+                        value_wei=total_units,
+                        nonce=nonce,
+                        gas_price_wei=item.source_token_gas_price,
+                        gas_limit=item.source_token_gas_limit,
+                        source_address=item.source_addr,
+                        recovery_timeout_seconds=_broadcast_recovery_timeout_seconds(params),
+                    ),
+                )
+
+            _relay_source_stage(
+                owner,
+                params,
+                items,
+                stage_label="源钱包原生币转入中转",
+                tx_attr="token_funded_txid",
+                nonce_attr="token_funded_nonce",
+                submitted_status="token_funding_submitted",
+                done_status="token_funded",
+                done_statuses={"token_funded", "forwarded", "completed", "completed_pending_sweep"},
+                submit_one=submit_1m_native_to_relay,
+                status_text="原生币转入",
+            )
+        elif is_many_to_one_mode:
+            def submit_m1_token_to_relay(item: _RelayBatchItem, nonce: int) -> str:
+                _relay_resolve_source_token_transfer(owner, params, item)
+                item.gas_fee_wei += item.source_token_gas_price * item.source_token_gas_limit
+                return _relay_submit_with_retry(
+                    owner,
+                    params,
+                    item,
+                    "源钱包代币转入中转",
+                    lambda: owner.client.submit_erc20_transfer_reliably(
+                        network=params.network,
+                        private_key=item.source_private_key,
+                        token_contract=params.token_contract,
+                        to_address=item.relay_addr,
+                        amount_units=item.value_units,
+                        nonce=nonce,
+                        gas_price_wei=item.source_token_gas_price,
+                        gas_limit=item.source_token_gas_limit,
+                        source_address=item.source_addr,
+                        recovery_timeout_seconds=_broadcast_recovery_timeout_seconds(params),
+                    ),
+                )
+
+            _relay_source_stage(
+                owner,
+                params,
+                items,
+                stage_label="源钱包代币转入中转",
+                tx_attr="token_funded_txid",
+                nonce_attr="token_funded_nonce",
+                submitted_status="token_funding_submitted",
+                done_status="token_funded",
+                done_statuses={"token_funded", "forwarded", "completed", "completed_pending_sweep"},
+                submit_one=submit_m1_token_to_relay,
+                status_text="代币转入",
+            )
+
+            def submit_m1_native_fee_to_relay(item: _RelayBatchItem, nonce: int) -> str:
+                source_keep_units = _relay_many_to_one_source_keep_units(owner, params, item.relay_record)
+                gas_price = owner.client.get_gas_price_wei(params.network)
+                gas_limit = owner.client.NATIVE_GAS_LIMIT
+                balance_units = owner.client.get_balance_wei(params.network, item.source_addr)
+                reserve_units = balance_units - source_keep_units - (gas_price * gas_limit)
+                if reserve_units <= 0:
+                    raise RuntimeError("源钱包可归集原生币不足，无法为中转钱包提供手续费")
+                item.reserve_units = reserve_units
+                item.source_fee_gas_price = gas_price
+                item.source_fee_gas_limit = gas_limit
+                item.gas_fee_wei += gas_price * gas_limit
+                return _relay_submit_with_retry(
+                    owner,
+                    params,
+                    item,
+                    "源钱包原生币转入中转",
+                    lambda: owner.client.submit_native_transfer_reliably(
+                        network=params.network,
+                        private_key=item.source_private_key,
+                        to_address=item.relay_addr,
+                        value_wei=reserve_units,
+                        nonce=nonce,
+                        gas_price_wei=gas_price,
+                        gas_limit=gas_limit,
+                        source_address=item.source_addr,
+                        recovery_timeout_seconds=_broadcast_recovery_timeout_seconds(params),
+                    ),
+                )
+
+            _relay_source_stage(
+                owner,
+                params,
+                items,
+                stage_label="源钱包原生币转入中转",
+                tx_attr="fee_funded_txid",
+                nonce_attr="fee_funded_nonce",
+                submitted_status="fee_funding_submitted",
+                done_status="fee_funded",
+                done_statuses={"fee_funded", "forwarded", "completed", "completed_pending_sweep"},
+                submit_one=submit_m1_native_fee_to_relay,
+                status_text="手续费转入",
             )
         else:
-            summary = f"{summary}，转账总额={owner._token_amount_text(params.coin, total_amount)}，预估gas合计=-"
-        if batch_scope_ids:
-            summary = f"{summary}，可回收批次={len(batch_scope_ids)}"
+            def submit_1m_native_fee_to_relay(item: _RelayBatchItem, nonce: int) -> str:
+                _relay_resolve_1m_native_fee_transfer(owner, params, item)
+                item.gas_fee_wei += item.source_fee_gas_price * item.source_fee_gas_limit
+                return _relay_submit_with_retry(
+                    owner,
+                    params,
+                    item,
+                    "中转手续费转入",
+                    lambda: owner.client.submit_native_transfer_reliably(
+                        network=params.network,
+                        private_key=item.source_private_key,
+                        to_address=item.relay_addr,
+                        value_wei=item.reserve_units,
+                        nonce=nonce,
+                        gas_price_wei=item.source_fee_gas_price,
+                        gas_limit=item.source_fee_gas_limit,
+                        source_address=item.source_addr,
+                        recovery_timeout_seconds=_broadcast_recovery_timeout_seconds(params),
+                    ),
+                )
+
+            _relay_source_stage(
+                owner,
+                params,
+                items,
+                stage_label="中转手续费转入",
+                tx_attr="fee_funded_txid",
+                nonce_attr="fee_funded_nonce",
+                submitted_status="fee_funding_submitted",
+                done_status="fee_funded",
+                done_statuses={"fee_funded", "token_funded", "forwarded", "completed", "completed_pending_sweep"},
+                submit_one=submit_1m_native_fee_to_relay,
+                status_text="手续费转入",
+            )
+
+            def submit_1m_token_to_relay(item: _RelayBatchItem, nonce: int) -> str:
+                _relay_resolve_source_token_transfer(owner, params, item)
+                item.gas_fee_wei += item.source_token_gas_price * item.source_token_gas_limit
+                return _relay_submit_with_retry(
+                    owner,
+                    params,
+                    item,
+                    "源钱包代币转入中转",
+                    lambda: owner.client.submit_erc20_transfer_reliably(
+                        network=params.network,
+                        private_key=item.source_private_key,
+                        token_contract=params.token_contract,
+                        to_address=item.relay_addr,
+                        amount_units=item.value_units,
+                        nonce=nonce,
+                        gas_price_wei=item.source_token_gas_price,
+                        gas_limit=item.source_token_gas_limit,
+                        source_address=item.source_addr,
+                        recovery_timeout_seconds=_broadcast_recovery_timeout_seconds(params),
+                    ),
+                )
+
+            _relay_source_stage(
+                owner,
+                params,
+                items,
+                stage_label="源钱包代币转入中转",
+                tx_attr="token_funded_txid",
+                nonce_attr="token_funded_nonce",
+                submitted_status="token_funding_submitted",
+                done_status="token_funded",
+                done_statuses={"token_funded", "forwarded", "completed", "completed_pending_sweep"},
+                submit_one=submit_1m_token_to_relay,
+                status_text="代币转入",
+            )
+
+        if params.token_is_native:
+            def submit_native_forward(item: _RelayBatchItem, nonce: int) -> str:
+                gas_price = owner.client.get_gas_price_wei(params.network)
+                gas_limit = owner.client.NATIVE_GAS_LIMIT
+                native_balance = owner.client.get_balance_wei(params.network, item.relay_addr)
+                forward_units, gas_cost, _safety = _relay_sweep_plan(native_balance, gas_price, gas_limit)
+                if forward_units <= 0:
+                    raise RuntimeError("中转钱包原生币余额不足，无法完成第二跳转账")
+                item.final_amount_text = owner._decimal_to_text(owner._units_to_amount(forward_units, params.token_decimals))
+                setattr(item, "_last_forward_gas_fee_wei", gas_cost)
+                return _relay_submit_with_retry(
+                    owner,
+                    params,
+                    item,
+                    "中转第二跳",
+                    lambda: owner.client.submit_native_transfer_reliably(
+                        network=params.network,
+                        private_key=item.relay_private_key,
+                        to_address=item.target,
+                        value_wei=forward_units,
+                        nonce=nonce,
+                        gas_price_wei=gas_price,
+                        gas_limit=gas_limit,
+                        source_address=item.relay_addr,
+                        recovery_timeout_seconds=_broadcast_recovery_timeout_seconds(params),
+                    ),
+                )
+
+            _relay_simple_stage(
+                owner,
+                params,
+                items,
+                stage_label="中转第二跳",
+                tx_attr="token_forward_txid",
+                nonce_attr="token_forward_nonce",
+                submitted_status="token_forward_submitted",
+                done_status="forwarded",
+                done_statuses={"forwarded", "completed", "completed_pending_sweep"},
+                submit_one=submit_native_forward,
+                status_text="第二跳",
+            )
+        else:
+            def submit_token_forward(item: _RelayBatchItem, nonce: int) -> str:
+                if item.value_units <= 0 or not str(item.amount_text or "").strip():
+                    value_units, amount_text, _amount_changed = _resolve_record_amount(
+                        owner,
+                        item.relay_record,
+                        params,
+                        item.source_addr,
+                        item.relay_addr,
+                    )
+                    _relay_update_item_transfer_amount(owner, item, amount_text, value_units)
+                gas_price = owner.client.get_gas_price_wei(params.network)
+                gas_limit = owner.client.estimate_erc20_transfer_gas(
+                    params.network,
+                    item.relay_addr,
+                    params.token_contract,
+                    item.target,
+                    item.value_units,
+                )
+                setattr(item, "_last_forward_gas_fee_wei", gas_price * gas_limit)
+                item.final_amount_text = item.amount_text
+                return _relay_submit_with_retry(
+                    owner,
+                    params,
+                    item,
+                    "中转第二跳",
+                    lambda: owner.client.submit_erc20_transfer_reliably(
+                        network=params.network,
+                        private_key=item.relay_private_key,
+                        token_contract=params.token_contract,
+                        to_address=item.target,
+                        amount_units=item.value_units,
+                        nonce=nonce,
+                        gas_price_wei=gas_price,
+                        gas_limit=gas_limit,
+                        source_address=item.relay_addr,
+                        recovery_timeout_seconds=_broadcast_recovery_timeout_seconds(params),
+                    ),
+                )
+
+            _relay_simple_stage(
+                owner,
+                params,
+                items,
+                stage_label="中转第二跳",
+                tx_attr="token_forward_txid",
+                nonce_attr="token_forward_nonce",
+                submitted_status="token_forward_submitted",
+                done_status="forwarded",
+                done_statuses={"forwarded", "completed", "completed_pending_sweep"},
+                submit_one=submit_token_forward,
+                status_text="第二跳",
+            )
+
+        total_amount = Decimal("0")
+        total_gas_fee_wei = 0
+        with _relay_defer_record_writes(owner):
+            for item in items:
+                if item.failed:
+                    final_result_by_row_key[item.row_key] = "failed"
+                    continue
+                try:
+                    _relay_update_item_record(
+                        owner,
+                        item,
+                        "completed",
+                        sweep_target=(item.target if is_many_to_one_mode else item.source_addr),
+                        sweep_resolution="",
+                        completed_at=_utc_now_text(),
+                        last_error="",
+                    )
+                except Exception as exc:
+                    _relay_fail_item(owner, item, exc, log_prefix="完成状态更新失败")
+                    final_result_by_row_key[item.row_key] = "failed"
+                    continue
+                final_amount_text = item.final_amount_text or item.amount_text
+                item.success_text = _relay_success_status_text(owner, params, final_amount_text)
+                final_result_by_row_key[item.row_key] = "success"
+                try:
+                    total_amount += Decimal(str(final_amount_text))
+                except Exception:
+                    pass
+                total_gas_fee_wei += item.gas_fee_wei
+                _relay_dispatch_row_status(owner, item, "success", item.success_text)
+                if params.token_is_native:
+                    _relay_dispatch_recovery_status(owner, item, "success", "随主流程完成")
+                owner._dispatch_ui(
+                    lambda m=(
+                        f"{item.prefix} 中转主流程完成：A({item.source_label}) -> "
+                        f"{item.relay_name}({owner._mask(item.relay_addr, head=8, tail=6)}) -> "
+                        f"{item.target_name}({owner._mask(item.target, head=8, tail=6)})，"
+                        f"金额={params.coin} {final_amount_text}"
+                    ): owner.log(m)
+                )
+            _relay_flush_record_writes(owner)
+
+        if not params.token_is_native:
+            sweep_items = [item for item in items if not item.failed and final_result_by_row_key.get(item.row_key) == "success"]
+            def sweep_item(item: _RelayBatchItem) -> None:
+                target = item.target if is_many_to_one_mode else item.source_addr
+                _relay_submit_auto_sweep(owner, params, item, target)
+            with _relay_defer_record_writes(owner):
+                _relay_run_parallel(owner, sweep_items, params.threads, sweep_item)
+                _relay_flush_record_writes(owner)
+            total_gas_fee_wei = sum(item.gas_fee_wei for item in items if not item.failed)
+
+        success = sum(1 for item in items if final_result_by_row_key.get(item.row_key) == "success")
+        failed = len(jobs_data) - success
+        failed_jobs = [job for job in jobs_data if final_result_by_row_key.get(job[0], "") != "success"]
+        failed_export_records = [relay_records_by_row_key[row_key] for row_key, _source, _target in failed_jobs if row_key in relay_records_by_row_key]
+        failed_export_path = _relay_write_failed_export_file(failed_export_records) if failed_export_records else ""
+        transfer_totals: dict[tuple[str, int], int] = {}
+        recovery_totals: dict[tuple[str, int], int] = {}
+        native_symbol = _relay_native_symbol(owner, params.network)
+        for item in items:
+            if final_result_by_row_key.get(item.row_key) != "success":
+                continue
+            final_amount_text = item.final_amount_text or item.amount_text
+            transfer_units = max(0, int(item.value_units or 0))
+            if final_amount_text:
+                try:
+                    transfer_units = owner._amount_to_units(Decimal(str(final_amount_text)), params.token_decimals)
+                except Exception:
+                    pass
+            _relay_asset_total_add(transfer_totals, params.coin, params.token_decimals, transfer_units)
+            if not params.token_is_native:
+                _relay_asset_total_add(
+                    recovery_totals,
+                    native_symbol,
+                    18,
+                    int(getattr(item, "_auto_sweep_value_wei", 0) or 0),
+                )
+        balance_totals = _relay_asset_totals_merge(transfer_totals, recovery_totals)
+        balance_text = _relay_asset_totals_text(owner, balance_totals)
+        transfer_text = _relay_asset_totals_text(owner, transfer_totals)
+        recovery_text = _relay_asset_totals_text(owner, recovery_totals)
+        gas_text = f"预估 {owner._gas_fee_amount_text(params.network, total_gas_fee_wei)}"
+        summary = (
+            f"链上中转任务结束：总量 {len(jobs_data)}，成功 {success}，失败 {failed}，"
+            f"余额总数={balance_text}，"
+            f"转账总数={transfer_text}，"
+            f"回收总数={recovery_text}，"
+            f"预估gas={owner._gas_fee_amount_text(params.network, total_gas_fee_wei)}"
+        )
         if failed_export_path:
             summary = f"{summary}\n失败中转钱包导出：{failed_export_path}"
+        dispatch_ui(
+            lambda b=balance_text, a=transfer_text, r=recovery_text, g=gas_text: owner._set_progress_metrics(
+                balance_text=b,
+                amount_text=a,
+                recovery_text=r,
+                gas_text=g,
+            )
+        )
         dispatch_ui(lambda: owner.log(summary))
         dispatch_ui(
-            lambda s=success, f=failed, detail=summary, batches=set(batch_scope_ids), retry_jobs=list(failed_jobs): owner._show_result_summary_dialog(
+            lambda s=success, f=failed, detail=summary, retry_jobs=list(failed_jobs): owner._show_result_summary_dialog(
                 title="执行完成",
                 summary_title="链上中转批量转账完成",
                 success=s,
                 failed=f,
                 detail_text=detail,
                 action_buttons=[
-                    ("中转手续费回收", (lambda b=set(batches): owner.start_batch_relay_fee_recovery(b)), bool(batches)),
                     ("失败重试", (lambda jobs=list(retry_jobs), p=params, d=dry_run: owner._launch_retry_jobs(jobs, p, d, confirm=False)), f > 0),
                 ],
             )
@@ -3349,9 +3582,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
         err_text = str(exc)
         dispatch_ui(lambda m=f"链上中转任务异常终止：{err_text}": owner.log(m))
         dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
-        dispatch_ui(
-            lambda s=success if "success" in locals() else 0, f=failed if "failed" in locals() else 0: owner._finish_progress("transfer", s, f),
-        )
+        dispatch_ui(lambda s=success, f=max(1, failed): owner._finish_progress("transfer", s, f))
     finally:
         owner._clear_source_private_key_cache()
         owner.is_running = False

@@ -24,7 +24,6 @@ HIDDEN_IMPORTS = (
     "secret_box",
     "secure_config",
     "operation_journal",
-    "operation_recovery",
     "exchange_order_recovery",
     "exchange_account_destruction",
     "secure_delete",
@@ -33,6 +32,8 @@ HIDDEN_IMPORTS = (
     "selftest_online_checks",
     "table_import_utils",
     "task_progress",
+    "retry_utils",
+    "system_proxy",
 )
 
 COLLECT_ALL = (

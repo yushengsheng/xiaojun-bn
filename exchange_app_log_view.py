@@ -137,12 +137,14 @@ class ExchangeAppLogViewMixin(object):
         return ip_text, proxy_status, proxy_exit_ip
     def test_exchange_proxy(self):
         snapshot = self._exchange_proxy_state_snapshot()
-        route_text = self._exchange_proxy_route_text_from_state(snapshot)
 
         def worker():
             test_ok = False
             save_err = ""
             try:
+                if not bool(snapshot.get("use_config_proxy")):
+                    self._system_proxy_map(refresh=True, include_local_probe=True)
+                route_text = self._exchange_proxy_route_text_from_state(snapshot)
                 status, exit_ip, target = self._test_exchange_proxy_once(state=snapshot)
                 try:
                     self._save_exchange_proxy_config_only(state=snapshot)
@@ -155,6 +157,7 @@ class ExchangeAppLogViewMixin(object):
                 else:
                     log_text = f"{log_text}，已自动保存配置"
             except Exception as e:
+                route_text = self._exchange_proxy_route_text_from_state(snapshot)
                 use_config_proxy = bool(snapshot.get("use_config_proxy"))
                 raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
                 status = "连接失败" if (use_config_proxy and raw_proxy) else "未启用"

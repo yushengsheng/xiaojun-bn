@@ -7,7 +7,6 @@ import functools
 import hashlib
 import hmac
 import logging
-import random
 import re
 import threading
 import time
@@ -16,6 +15,8 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
 import requests
+
+from system_proxy import configure_requests_session_for_proxy
 
 
 FUTURES_MARGIN_TYPE_DEFAULT = "CROSSED"
@@ -180,6 +181,9 @@ def retry_request(max_retries=3, delay=2):
 class BinanceClient:
     SERVER_TIME_CACHE_TTL_SECONDS = 30.0
     DEFAULT_RECV_WINDOW_MS = 20000
+    DEFAULT_REQUEST_RETRY_COUNT = 10
+    DEFAULT_REQUEST_RETRY_DELAY_SECONDS = 1.0
+    RETRYABLE_BINANCE_ERROR_CODES = {-1001, -1003, -2015}
     _shared_convert_exchange_info_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     _shared_convert_asset_info_cache: dict[str, int] | None = None
     _shared_convert_cache_lock = threading.Lock()
@@ -193,28 +197,44 @@ class BinanceClient:
 
         self.key = key
         self.secret = secret.encode()
-        self.session = requests.Session()
-        self.session.headers.update({"X-MBX-APIKEY": key})
+        self._proxy_url = str(proxy_url or "").strip()
+        self.spot = "https://api.binance.com"
+        self.um_futures = "https://fapi.binance.com"
+        self.cm_futures = "https://dapi.binance.com"
+        self.session = self._build_session()
         try:
             self.recv_window_ms = max(1000, int(self.DEFAULT_RECV_WINDOW_MS))
         except Exception:
             self.recv_window_ms = self.DEFAULT_RECV_WINDOW_MS
-        proxy = str(proxy_url or "").strip()
-        self.session.trust_env = not bool(proxy)
-        if proxy:
-            self.session.proxies.update({
-                "http": proxy,
-                "https": proxy,
-            })
-
-        self.spot = "https://api.binance.com"
-        self.um_futures = "https://fapi.binance.com"
-        self.cm_futures = "https://dapi.binance.com"
 
         self._exchange_info_cache = {}
         self._price_cache = {}
         self._um_futures_exchange_info_cache = {}
         self._um_futures_price_cache = {}
+
+    def _build_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update({"X-MBX-APIKEY": self.key})
+        configure_requests_session_for_proxy(
+            session,
+            explicit_proxy=self._proxy_url,
+            target_url=self.spot,
+            allow_system_proxy=True,
+        )
+        return session
+
+    def _reset_session_after_transport_error(self) -> None:
+        previous = getattr(self, "session", None)
+        try:
+            self.session = self._build_session()
+        except Exception:
+            self.session = previous
+            return
+        if previous is not None:
+            try:
+                previous.close()
+            except Exception:
+                pass
     def close(self) -> None:
         session = getattr(self, "session", None)
         self.session = None
@@ -305,30 +325,35 @@ class BinanceClient:
 
     def _run_request_with_retry(self, request_fn, *, max_retries: int, delay: float):
         last_exception = None
-        retry_count = max(1, int(max_retries or 1))
-        retry_delay = max(0.0, float(delay or 0))
+        retry_count = max(1, int(max_retries or self.DEFAULT_REQUEST_RETRY_COUNT))
+        retry_delay = max(0.0, float(delay if delay is not None else self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS))
 
         def sleep_before_retry() -> None:
             if retry_delay <= 0:
                 return
-            jitter = min(0.35, retry_delay * 0.5)
-            time.sleep(retry_delay + random.uniform(0.0, jitter))
+            time.sleep(retry_delay)
+
+        def retryable_binance_error_label(error_code: int) -> str:
+            if error_code == -2015:
+                return "Binance API 权限校验失败"
+            return "Binance 系统繁忙"
 
         for i in range(retry_count):
             try:
                 return request_fn()
             except (requests.exceptions.RequestException, ConnectionError, TimeoutError) as e:
                 last_exception = e
+                self._reset_session_after_transport_error()
                 if i + 1 >= retry_count:
                     break
                 logger.warning(f"网络请求失败 ({i + 1}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
                 sleep_before_retry()
             except BinanceAPIError as e:
                 last_exception = e
-                if e.code in [-1001, -1003]:
+                if e.code in self.RETRYABLE_BINANCE_ERROR_CODES:
                     if i + 1 >= retry_count:
                         break
-                    logger.warning(f"Binance 系统繁忙 ({i + 1}/{retry_count}): {e}，重试中...")
+                    logger.warning(f"{retryable_binance_error_label(e.code)} ({i + 1}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
                     sleep_before_retry()
                     continue
                 raise e
@@ -375,19 +400,26 @@ class BinanceClient:
     def request(self, base, method, path, params=None):
         return self._run_request_with_retry(
             lambda: self._request_impl(base, method, path, params, timeout=15),
-            max_retries=3,
-            delay=1,
+            max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
+            delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
         )
 
-    def request_query(self, base, method, path, params=None, *, timeout: float = 6, max_retries: int = 1):
+    def request_query(self, base, method, path, params=None, *, timeout: float = 6, max_retries: int | None = None):
         return self._run_request_with_retry(
             lambda: self._request_impl(base, method, path, params, timeout=timeout),
-            max_retries=max_retries,
-            delay=0.5,
+            max_retries=self.DEFAULT_REQUEST_RETRY_COUNT if max_retries is None else max_retries,
+            delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
         )
 
     def public_get(self, base, path, params=None):
-        return self.public_get_query(base, path, params, timeout=15, max_retries=3, delay=1)
+        return self.public_get_query(
+            base,
+            path,
+            params,
+            timeout=15,
+            max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
+            delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+        )
 
     def _public_get_impl(self, base, path, params=None, *, timeout: float = 15):
         params = params or {}
@@ -396,11 +428,11 @@ class BinanceClient:
         r.raise_for_status()
         return r.json()
 
-    def public_get_query(self, base, path, params=None, *, timeout: float = 6, max_retries: int = 1, delay: float = 0.5):
+    def public_get_query(self, base, path, params=None, *, timeout: float = 6, max_retries: int | None = None, delay: float | None = None):
         return self._run_request_with_retry(
             lambda: self._public_get_impl(base, path, params, timeout=timeout),
-            max_retries=max_retries,
-            delay=delay,
+            max_retries=self.DEFAULT_REQUEST_RETRY_COUNT if max_retries is None else max_retries,
+            delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS if delay is None else delay,
         )
 
     # -------- 余额 --------
@@ -1674,7 +1706,13 @@ class BinanceClient:
         qty = self._floor_to_step(qty, rules["stepSize"])
         return self.place_limit_order(symbol, "SELL", qty, price_dec)
 
-    def spot_buy_quote_amount(self, symbol: str, quote_amount: Decimal | str | float | int):
+    def spot_buy_quote_amount(
+        self,
+        symbol: str,
+        quote_amount: Decimal | str | float | int,
+        *,
+        assume_spot_funds_ready: bool = False,
+    ):
         symbol_u = self.normalize_trade_symbol(symbol)
         amount = Decimal(str(quote_amount))
         if amount <= 0:
@@ -1690,7 +1728,8 @@ class BinanceClient:
             return False
 
         quote_asset = self.get_spot_quote_asset(symbol_u)
-        self.collect_asset_to_spot(quote_asset, context="交易前")
+        if not assume_spot_funds_ready:
+            self.collect_asset_to_spot(quote_asset, context="交易前")
         quote_balance = self.spot_asset_balance_decimal(quote_asset)
         quote_order_qty_fraction = int(rules.get("quoteOrderQtyFraction", 8) or 8)
         amount = self._quantize_to_fraction(amount, quote_order_qty_fraction)
@@ -1963,10 +2002,11 @@ class BinanceClient:
         }
 
     # -------- 现货买入（全部 USDT） --------
-    def spot_buy_all_usdt(self, buffer=0.2, symbol="BTCUSDT"):
+    def spot_buy_all_usdt(self, buffer=0.2, symbol="BTCUSDT", *, assume_spot_funds_ready: bool = False):
         symbol_u = self.normalize_trade_symbol(symbol)
         quote_asset = self.get_spot_quote_asset(symbol_u)
-        self.collect_asset_to_spot(quote_asset, context="交易前")
+        if not assume_spot_funds_ready:
+            self.collect_asset_to_spot(quote_asset, context="交易前")
         quote_balance = self.spot_asset_balance_decimal(quote_asset)
         buffer_dec = Decimal(str(buffer or "0"))
         if quote_balance <= buffer_dec:
@@ -1983,7 +2023,7 @@ class BinanceClient:
             logger.info("可用 %s 金额太小，跳过买入", quote_asset)
             return False
 
-        return self.spot_buy_quote_amount(symbol_u, amount)
+        return self.spot_buy_quote_amount(symbol_u, amount, assume_spot_funds_ready=True)
 
     # -------- 现货卖出（全部基础币） --------
     def spot_sell_all_base(self, symbol: str, *, small_qty_log_text: str | None = None):

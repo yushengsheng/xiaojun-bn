@@ -7,23 +7,18 @@ import csv
 import importlib
 import ipaddress
 import json
-import os
-import platform
 import queue
 import random
 import re
-import socket
 import sys
 import threading
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-import requests
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from api_clients import EvmClient
 from app_defaults import EXCHANGE_USDT_TIMEOUT_SECONDS_DEFAULT
 from app_lock import APP_LOCK, APP_LOCK_MIN_PASSWORD_LENGTH
 from app_version import get_app_window_title
@@ -48,20 +43,15 @@ from exchange_constants import (
     EXCHANGE_USE_CONFIG_PROXY_DEFAULT,
     FUTURES_AMOUNT_DEFAULT,
     FUTURES_LEVERAGE_DEFAULT,
-    FUTURES_MARGIN_TYPE_CROSSED,
     FUTURES_MARGIN_TYPE_DEFAULT,
-    FUTURES_MARGIN_TYPE_ISOLATED,
     FUTURES_MARGIN_TYPE_LABEL_CROSSED,
-    FUTURES_MARGIN_TYPE_LABEL_ISOLATED,
     FUTURES_MARGIN_TYPE_LABEL_OPTIONS,
     FUTURES_MARGIN_TYPE_LABEL_TO_VALUE,
     FUTURES_MARGIN_TYPE_OPTIONS,
     FUTURES_MARGIN_TYPE_VALUE_TO_LABEL,
     FUTURES_ROUNDS_DEFAULT,
     FUTURES_SIDE_DEFAULT,
-    FUTURES_SIDE_LONG,
     FUTURES_SIDE_OPTIONS,
-    FUTURES_SIDE_SHORT,
     FUTURES_SYMBOL_DEFAULT,
     MAX_THREADS_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
@@ -103,11 +93,8 @@ from operation_journal import OperationJournal
 from secret_box import SECRET_BOX
 from shared_utils import (
     SolidButton,
-    _shift_text_view_state_after_trim,
-    capture_vertical_view_state,
     dispatch_ui_callback,
     make_scrollbar,
-    restore_vertical_view_state,
     schedule_ui_callback,
     start_ui_bridge,
     stop_ui_bridge,
@@ -119,7 +106,6 @@ from stores import (
     _atomic_write_text,
     _atomic_write_text_with_backup,
     _load_authenticated_config,
-    _load_json_with_backup,
     config_or_backup_exists,
 )
 
@@ -299,7 +285,7 @@ class ExchangeAppBase(tk.Tk):
                 return
             from onchain_relay_wallets import RelayWalletFileStore
 
-            count = RelayWalletFileStore(RELAY_WALLET_FILE).rewrite_encrypted()
+            count = RelayWalletFileStore(RELAY_WALLET_FILE).rewrite_encrypted_if_needed()
             if count:
                 logger.info("已加密迁移中转钱包文件：%s，记录=%d", RELAY_WALLET_FILE, count)
         except Exception as exc:
@@ -333,6 +319,7 @@ class ExchangeAppBase(tk.Tk):
             return
         self._cancel_after_token("_accounts_save_after_token")
         self._save_accounts_silently()
+        self._flush_runtime_sensitive_stores()
         self._app_locked = True
         self.app_lock.lock()
         self.withdraw()
@@ -344,6 +331,20 @@ class ExchangeAppBase(tk.Tk):
             return
         self._closing = True
         self._finalize_close()
+
+    def _flush_runtime_sensitive_stores(self) -> None:
+        page = getattr(self, "onchain_page", None)
+        if page is None:
+            return
+        store = getattr(page, "relay_wallet_store", None)
+        flush = getattr(store, "flush", None)
+        if not callable(flush):
+            return
+        try:
+            flush()
+        except Exception:
+            logger.exception("中转钱包运行状态加密落盘失败")
+
     def _build_ui(self):
         self.api_key_var = tk.StringVar(value=API_KEY_DEFAULT)
         self.api_secret_var = tk.StringVar(value=API_SECRET_DEFAULT)
@@ -526,10 +527,10 @@ class ExchangeAppBase(tk.Tk):
         self.account_tree.heading("status", text="状态")
         self.account_tree.column("checked", width=52, minwidth=52, stretch=False, anchor="center")
         self.account_tree.column("idx", width=52, minwidth=52, stretch=False, anchor="center")
-        self.account_tree.column("api_key", width=220, minwidth=180, anchor="w")
-        self.account_tree.column("address", width=330, minwidth=260, anchor="w")
+        self.account_tree.column("api_key", width=150, minwidth=130, stretch=False, anchor="w")
+        self.account_tree.column("address", width=310, minwidth=240, stretch=False, anchor="w")
         self.account_tree.column("network", width=76, minwidth=68, stretch=False, anchor="center")
-        self.account_tree.column("status", width=500, minwidth=240, anchor="w")
+        self.account_tree.column("status", width=620, minwidth=260, stretch=True, anchor="w")
         self.account_tree.tag_configure("acc_ready", foreground="#111111", background="#F2F2F2")
         self.account_tree.tag_configure("acc_running", foreground="#111111", background="#CFE3FF")
         self.account_tree.tag_configure("acc_warn", foreground="#111111", background="#FFE3B8")
@@ -543,6 +544,8 @@ class ExchangeAppBase(tk.Tk):
         self.account_tree.grid(row=0, column=0, sticky="nsew")
         self.account_tree_ybar.grid(row=0, column=1, sticky="ns")
         self.account_tree_xbar.grid(row=1, column=0, sticky="ew")
+        self.account_tree.bind("<Configure>", self._resize_account_tree_columns, add="+")
+        self.after_idle(self._resize_account_tree_columns)
         self.account_list_hint = ttk.Label(
             self.frame_list_canvas,
             text="账号列表为空。点击此区域后可直接 Ctrl+V / Cmd+V 粘贴导入账号。\n导入格式：每 3 段一组，依次为 API KEY / SECRET / 提现地址。",
@@ -936,6 +939,36 @@ class ExchangeAppBase(tk.Tk):
             right_frame.grid_configure(padx=(btn_width, 0))
         except Exception:
             pass
+    def _resize_account_tree_columns(self, _event=None):
+        tree = getattr(self, "account_tree", None)
+        if tree is None:
+            return
+        try:
+            width = int(tree.winfo_width())
+            if width <= 1:
+                frame = getattr(self, "frame_list_canvas", None)
+                if frame is not None:
+                    width = max(0, int(frame.winfo_width()) - 20)
+        except Exception:
+            width = 0
+        if width <= 0:
+            return
+
+        if width < 950:
+            api_width, address_width, status_min = 130, 240, 220
+        elif width < 1150:
+            api_width, address_width, status_min = 140, 280, 260
+        else:
+            api_width, address_width, status_min = 150, 310, 320
+
+        fixed = 52 + 52 + api_width + address_width + 76
+        status_width = max(status_min, width - fixed)
+        tree.column("checked", width=52, minwidth=52, stretch=False, anchor="center")
+        tree.column("idx", width=52, minwidth=52, stretch=False, anchor="center")
+        tree.column("api_key", width=api_width, minwidth=130, stretch=False, anchor="w")
+        tree.column("address", width=address_width, minwidth=240, stretch=False, anchor="w")
+        tree.column("network", width=76, minwidth=68, stretch=False, anchor="center")
+        tree.column("status", width=status_width, minwidth=status_min, stretch=True, anchor="w")
     def _on_trade_mode_changed(self, _event=None):
         self._refresh_strategy_panel_layout()
     @staticmethod
@@ -1397,6 +1430,7 @@ class ExchangeAppBase(tk.Tk):
             except Exception:
                 self._close_wait_after_token = None
         self._finalize_close()
+
     def _finalize_close(self):
         if self._close_finalized:
             return
@@ -1405,6 +1439,7 @@ class ExchangeAppBase(tk.Tk):
         self._cancel_after_token("_close_wait_after_token")
         self._cancel_after_token("_update_ip_after_token")
         self._cancel_after_token("_log_poll_after_token")
+        self._flush_runtime_sensitive_stores()
         page = getattr(self, "onchain_page", None)
         if page is not None:
             try:
@@ -1437,12 +1472,10 @@ _STAR_EXPORT_NAMES = {
     "_atomic_write_json",
     "_atomic_write_text",
     "_atomic_write_text_with_backup",
-    "_load_json_with_backup",
     "_load_authenticated_config",
     "_read_text_snapshot",
     "_require_dict_payload",
     "_restore_text_snapshot",
-    "_shift_text_view_state_after_trim",
 }
 
 

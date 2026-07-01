@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-import threading
 import time
 from decimal import Decimal
 
 from exchange_binance_client import BinanceClient
+from retry_utils import RetryAborted, RetryPolicy, run_with_retries
 from exchange_constants import (
     FUTURES_LEVERAGE_DEFAULT,
     FUTURES_MARGIN_TYPE_DEFAULT,
@@ -46,6 +46,8 @@ def _normalize_futures_margin_type(value) -> str:
 
 
 class Strategy:
+    TRADE_OPERATION_RETRY_POLICY = RetryPolicy(attempts=10, delay_seconds=1)
+
     def __init__(
         self,
         client,
@@ -114,6 +116,26 @@ class Strategy:
             self.futures_side = FUTURES_SIDE_DEFAULT
         self.trade_error = ""
         self.trade_error_stage = ""
+        self.market_round_total = 0
+        self.market_round_completed = 0
+        self.market_round_failed_rounds: list[int] = []
+        self.market_round_failure_details: list[dict[str, object]] = []
+
+    def _reset_market_round_tracking(self) -> None:
+        self.market_round_total = max(0, int(self.spot_rounds or 0))
+        self.market_round_completed = 0
+        self.market_round_failed_rounds = []
+        self.market_round_failure_details = []
+
+    def _record_market_round_failure(self, round_number: int, reason: object) -> None:
+        try:
+            round_index = max(1, int(round_number))
+        except Exception:
+            round_index = 0
+        reason_text = str(reason or "").strip() or "未知原因"
+        if round_index not in self.market_round_failed_rounds:
+            self.market_round_failed_rounds.append(round_index)
+        self.market_round_failure_details.append({"round": round_index, "reason": reason_text})
 
     def _journal_open_order(self, order_id: int | str, side: str) -> str:
         key = str(order_id or "").strip()
@@ -190,15 +212,20 @@ class Strategy:
             logger.info("检测到停止信号，跳过 0 轮现货兑换")
             return
         try:
-            result = self.c.convert_base_to_quote_all(symbol=self.spot_symbol)
+            result = self._run_trade_action_with_retry(
+                stop_event,
+                "0轮兑换 %s->%s" % (base_asset, quote_asset),
+                lambda: self.c.convert_base_to_quote_all(symbol=self.spot_symbol),
+            )
             if result:
                 logger.info("0 轮现货兑换完成：%s -> %s", base_asset, quote_asset)
             else:
                 logger.info("0 轮现货兑换未执行：可能 %s 余额不足或不满足最小闪兑金额", base_asset)
         except Exception as e:
-            logger.error("0 轮现货兑换异常: %s", e)
-            if self._pause_with_stop(stop_event, 3):
+            if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
+                logger.info("检测到停止信号，跳过 0 轮现货兑换")
                 return
+            logger.error("0 轮现货兑换异常: %s", e)
         self._emit_progress(progress_cb, 1, 1, "0轮兑换 %s->%s 完成" % (base_asset, quote_asset))
 
     def _futures_side_order(self) -> str:
@@ -294,7 +321,7 @@ class Strategy:
         threshold = self._reprice_threshold_value()
         return f"{BinanceClient._format_decimal(threshold)} {quote_asset}"
 
-    def _run_bnb_topup_if_needed(self):
+    def _run_bnb_topup_if_needed(self, stop_event=None):
         if self._is_futures_mode() or self._is_convert_mode():
             return False
         topup_amount = Decimal(str(self.bnb_topup_amount or "0"))
@@ -306,18 +333,30 @@ class Strategy:
             quote_asset,
             BinanceClient._format_decimal(topup_amount),
         )
-        spot_bnb_before = self.c.spot_asset_balance_decimal("BNB")
-        bought_order = self.c.buy_bnb_with_quote_amount(quote_asset, topup_amount, return_order=True)
+        spot_bnb_before = self._run_trade_action_with_retry(
+            stop_event,
+            "预买BNB 查询BNB余额",
+            lambda: self.c.spot_asset_balance_decimal("BNB"),
+        )
+        bought_order = self._run_trade_action_with_retry(
+            stop_event,
+            "预买BNB 买入",
+            lambda: self.c.buy_bnb_with_quote_amount(quote_asset, topup_amount, return_order=True),
+        )
         if bought_order:
             bought_bnb = self.c._decimal_from_str(bought_order.get("toAmount", "0"), "0")
             target_spot_bnb = spot_bnb_before + bought_bnb if bought_bnb > 0 else max(
                 spot_bnb_before,
                 Decimal(str(self.bnb_fee_stop_value or "0")),
             )
-            spot_bnb = self.c.ensure_bnb_fee_ready_in_spot(
-                min_spot_balance=target_spot_bnb,
-                max_transfer_amount=bought_bnb if bought_bnb > 0 else None,
-                timeout_seconds=12.0,
+            spot_bnb = self._run_trade_action_with_retry(
+                stop_event,
+                "预买BNB 确认现货余额",
+                lambda: self.c.ensure_bnb_fee_ready_in_spot(
+                    min_spot_balance=target_spot_bnb,
+                    max_transfer_amount=bought_bnb if bought_bnb > 0 else None,
+                    timeout_seconds=12.0,
+                ),
             )
             logger.info(
                 "闪兑预买 BNB 完成，交易前已确认现货 BNB 手续费余额=%s",
@@ -342,6 +381,39 @@ class Strategy:
             return bool(stop_event and stop_event.is_set())
         except Exception:
             return False
+
+    def _run_trade_action_with_retry(self, stop_event, context: str, action):
+        context_text = str(context or "交易动作").strip() or "交易动作"
+        policy = self.TRADE_OPERATION_RETRY_POLICY
+
+        def should_retry(_exc: Exception) -> bool:
+            return not bool(stop_event and stop_event.is_set())
+
+        def on_retry(failed_attempt: int, total: int, exc: Exception) -> None:
+            logger.warning(
+                "%s执行异常（%d/%d）: %s，将在 %g 秒后重试",
+                context_text,
+                failed_attempt,
+                total,
+                exc,
+                policy.delay_seconds,
+            )
+
+        def on_give_up(total: int, exc: Exception) -> None:
+            logger.error("%s执行异常，重试 %d 次后仍失败: %s", context_text, total, exc)
+
+        def retry_sleep(seconds: float) -> None:
+            if self._pause_with_stop(stop_event, seconds):
+                raise RetryAborted("检测到停止信号")
+
+        return run_with_retries(
+            action,
+            policy=policy,
+            should_retry=should_retry,
+            on_retry=on_retry,
+            on_give_up=on_give_up,
+            sleep_fn=retry_sleep,
+        )
 
     @staticmethod
     def _order_price_decimal(order_data: dict, fallback_price: Decimal) -> Decimal:
@@ -849,6 +921,9 @@ class Strategy:
         stop_reason_logged = False
         mode_logged = False
 
+        def retry(context: str, action):
+            return self._run_trade_action_with_retry(stop_event, context, action)
+
         def _add_active_order(
             active_orders: dict[str, dict[str, object]],
             order: dict,
@@ -934,12 +1009,18 @@ class Strategy:
         def _try_reprice_buy_order(order_key: str, state: dict[str, object], order_price: Decimal) -> bool:
             if stop_new_entries or self._reprice_threshold_value() <= 0:
                 return False
-            book_ticker = self.c.get_book_ticker(self.spot_symbol)
+            book_ticker = retry(
+                f"{mode_name}部分成交 读取买单重挂盘口",
+                lambda: self.c.get_book_ticker(self.spot_symbol),
+            )
             should_reprice, current_ref = self._should_reprice_open_order("BUY", order_price, book_ticker)
             if not should_reprice:
                 return False
 
-            latest_order = self._cancel_limit_order_with_fill_guard(state["order_id"], "BUY")
+            latest_order = retry(
+                f"{mode_name}部分成交 撤销买单#{state['order_id']}",
+                lambda: self._cancel_limit_order_with_fill_guard(state["order_id"], "BUY"),
+            )
             latest_status = str(latest_order.get("status") or "").upper()
             _record_buy_delta(latest_order, state)
             active_buy_orders.pop(order_key, None)
@@ -955,7 +1036,10 @@ class Strategy:
                 )
                 return True
 
-            available_quote = self.c.spot_asset_balance_decimal(quote_asset)
+            available_quote = retry(
+                f"{mode_name}部分成交 查询{quote_asset}余额",
+                lambda: self.c.spot_asset_balance_decimal(quote_asset),
+            )
             reprice_amount = min(remaining_quote, available_quote)
             if reprice_amount <= 0:
                 logger.info(
@@ -970,7 +1054,10 @@ class Strategy:
 
             buy_price = Decimal(str(book_ticker["bidPrice"]))
             self._emit_progress(progress_cb, step, max(step + 1, 1), f"{mode_name}部分成交 重挂买入 {base_asset}")
-            buy_order = self.c.spot_limit_buy_quote_amount(self.spot_symbol, buy_price, reprice_amount)
+            buy_order = retry(
+                f"{mode_name}部分成交 重挂买单",
+                lambda: self.c.spot_limit_buy_quote_amount(self.spot_symbol, buy_price, reprice_amount),
+            )
             if not buy_order:
                 logger.info(
                     "溢价单部分成交循环买单价格偏离超过 %s，旧单#%s 已撤销，剩余金额=%s %s 不满足重挂条件",
@@ -1000,7 +1087,10 @@ class Strategy:
 
         def _place_initial_buy() -> bool:
             nonlocal mode_logged
-            available_quote = self.c.spot_asset_balance_decimal(quote_asset)
+            available_quote = retry(
+                f"{mode_name}部分成交 查询{quote_asset}余额",
+                lambda: self.c.spot_asset_balance_decimal(quote_asset),
+            )
             if available_quote <= 0:
                 logger.info("溢价单部分成交循环现货 %s 可用余额为 0，结束本次运行", quote_asset)
                 return False
@@ -1017,10 +1107,16 @@ class Strategy:
                         "启用溢价单部分成交循环：买单部分成交立即挂卖，卖单部分成交立即挂买；追加挂单已自动关闭，买单重挂未启用，卖单不自动重挂"
                     )
                 mode_logged = True
-            book_ticker = self.c.get_book_ticker(self.spot_symbol)
+            book_ticker = retry(
+                f"{mode_name}部分成交 读取首笔盘口",
+                lambda: self.c.get_book_ticker(self.spot_symbol),
+            )
             buy_price = Decimal(str(book_ticker["bidPrice"]))
             self._emit_progress(progress_cb, step, max(step + 1, 1), f"{mode_name}部分成交 买入 {base_asset}")
-            buy_order = self.c.spot_limit_buy_all_usdt(symbol=self.spot_symbol, price=buy_price)
+            buy_order = retry(
+                f"{mode_name}部分成交 首笔买单",
+                lambda: self.c.spot_limit_buy_all_usdt(symbol=self.spot_symbol, price=buy_price),
+            )
             if not buy_order:
                 return False
             state = _add_active_order(active_buy_orders, buy_order, buy_price, side_text="买")
@@ -1038,17 +1134,26 @@ class Strategy:
             nonlocal pending_base_qty, pending_base_quote
             if pending_base_qty <= 0:
                 return False
-            available_base = self.c.spot_asset_balance_decimal(base_asset)
+            available_base = retry(
+                f"{mode_name}部分成交 查询{base_asset}余额",
+                lambda: self.c.spot_asset_balance_decimal(base_asset),
+            )
             sell_qty = min(pending_base_qty, available_base)
             if sell_qty <= 0:
                 return False
             if pending_base_quote > 0 and pending_base_qty > 0:
                 buy_avg_price = pending_base_quote / pending_base_qty
             else:
-                buy_avg_price = Decimal(str(self.c.get_book_ticker(self.spot_symbol)["bidPrice"]))
+                buy_avg_price = Decimal(str(retry(
+                    f"{mode_name}部分成交 读取卖单兜底盘口",
+                    lambda: self.c.get_book_ticker(self.spot_symbol),
+                )["bidPrice"]))
             sell_price = self._premium_sell_price(buy_avg_price)
             self._emit_progress(progress_cb, step, max(step + 1, 1), f"{mode_name}部分成交 卖出 {base_asset}")
-            sell_order = self.c.spot_limit_sell_quantity(self.spot_symbol, sell_price, sell_qty)
+            sell_order = retry(
+                f"{mode_name}部分成交 挂卖单",
+                lambda: self.c.spot_limit_sell_quantity(self.spot_symbol, sell_price, sell_qty),
+            )
             if not sell_order:
                 return False
 
@@ -1085,14 +1190,23 @@ class Strategy:
             nonlocal pending_quote
             if stop_new_entries or pending_quote <= 0:
                 return False
-            available_quote = self.c.spot_asset_balance_decimal(quote_asset)
+            available_quote = retry(
+                f"{mode_name}部分成交 查询{quote_asset}余额",
+                lambda: self.c.spot_asset_balance_decimal(quote_asset),
+            )
             buy_amount = min(pending_quote, available_quote)
             if buy_amount <= 0:
                 return False
-            book_ticker = self.c.get_book_ticker(self.spot_symbol)
+            book_ticker = retry(
+                f"{mode_name}部分成交 读取回买盘口",
+                lambda: self.c.get_book_ticker(self.spot_symbol),
+            )
             buy_price = Decimal(str(book_ticker["bidPrice"]))
             self._emit_progress(progress_cb, step, max(step + 1, 1), f"{mode_name}部分成交 买入 {base_asset}")
-            buy_order = self.c.spot_limit_buy_quote_amount(self.spot_symbol, buy_price, buy_amount)
+            buy_order = retry(
+                f"{mode_name}部分成交 挂回买单",
+                lambda: self.c.spot_limit_buy_quote_amount(self.spot_symbol, buy_price, buy_amount),
+            )
             if not buy_order:
                 return False
 
@@ -1142,7 +1256,10 @@ class Strategy:
                         return
 
                 for order_key, state in list(active_buy_orders.items()):
-                    order = self.c.get_order(self.spot_symbol, state["order_id"])
+                    order = retry(
+                        f"{mode_name}部分成交 查询买单#{state['order_id']}",
+                        lambda order_id=state["order_id"]: self.c.get_order(self.spot_symbol, order_id),
+                    )
                     status = str(order.get("status") or "").upper()
                     _delta_qty, _delta_quote, order_price = _record_buy_delta(order, state)
                     if self._order_terminal_status(status):
@@ -1153,7 +1270,10 @@ class Strategy:
                 _try_place_pending_sell()
 
                 for order_key, state in list(active_sell_orders.items()):
-                    order = self.c.get_order(self.spot_symbol, state["order_id"])
+                    order = retry(
+                        f"{mode_name}部分成交 查询卖单#{state['order_id']}",
+                        lambda order_id=state["order_id"]: self.c.get_order(self.spot_symbol, order_id),
+                    )
                     status = str(order.get("status") or "").upper()
                     delta_qty, delta_quote, order_price = _order_delta(order, state)
                     if delta_qty > 0:
@@ -1202,14 +1322,11 @@ class Strategy:
                 if not stop_event:
                     time.sleep(1.0)
             except Exception as e:
-                if stop_event and stop_event.is_set():
+                if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
                     logger.info("检测到停止信号，已停止后续执行（%s部分成交循环）", mode_name)
                     return
                 logger.error("%s部分成交循环执行异常: %s", mode_name, e)
-                if self._pause_with_stop(stop_event, 3):
-                    self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
-                    return
 
     def _run_premium_append_mode(self, stop_event, progress_cb=None):
         mode_name = self._mode_name()
@@ -1230,6 +1347,9 @@ class Strategy:
         stop_reason_logged = False
         mode_logged = False
 
+        def retry(context: str, action):
+            return self._run_trade_action_with_retry(stop_event, context, action)
+
         while True:
             if stop_event and stop_event.is_set():
                 self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
@@ -1248,8 +1368,14 @@ class Strategy:
                         logger.info("溢价单模式当前无未完成订单，结束本次运行")
                         return
 
-                    self.c.collect_asset_to_spot(quote_asset, context="交易前")
-                    cycle_quote_amount = self.c.spot_asset_balance_decimal(quote_asset)
+                    retry(
+                        f"{mode_name}分笔 交易前归集{quote_asset}",
+                        lambda: self.c.collect_asset_to_spot(quote_asset, context="交易前"),
+                    )
+                    cycle_quote_amount = retry(
+                        f"{mode_name}分笔 查询{quote_asset}余额",
+                        lambda: self.c.spot_asset_balance_decimal(quote_asset),
+                    )
                     if cycle_quote_amount <= 0:
                         logger.info("溢价单模式现货 %s 可用余额为 0，结束本次运行", quote_asset)
                         return
@@ -1275,7 +1401,10 @@ class Strategy:
                             quote_asset,
                         )
 
-                    book_ticker = self.c.get_book_ticker(self.spot_symbol)
+                    book_ticker = retry(
+                        f"{mode_name}分笔 读取首笔盘口",
+                        lambda: self.c.get_book_ticker(self.spot_symbol),
+                    )
                     current_bid = Decimal(str(book_ticker["bidPrice"]))
                     self._emit_progress(
                         progress_cb,
@@ -1283,7 +1412,10 @@ class Strategy:
                         max(step + 1, 1),
                         f"{mode_name}分笔 挂买 {base_asset} 第1笔",
                     )
-                    initial_order = self._place_premium_split_buy_order(per_order_quote_amount, current_bid, 1)
+                    initial_order = retry(
+                        f"{mode_name}分笔 挂买第1笔",
+                        lambda: self._place_premium_split_buy_order(per_order_quote_amount, current_bid, 1),
+                    )
                     if not initial_order:
                         logger.info("溢价单模式首笔买单未执行（可能余额不足或不满足最小下单额），结束本次运行")
                         return
@@ -1292,7 +1424,10 @@ class Strategy:
                     last_append_price = Decimal(str(initial_order["price"]))
 
                 for order_key, state in list(active_buy_orders.items()):
-                    order = self.c.get_order(self.spot_symbol, state["order_id"])
+                    order = retry(
+                        f"{mode_name}分笔 查询买单#{state['order_id']}",
+                        lambda order_id=state["order_id"]: self.c.get_order(self.spot_symbol, order_id),
+                    )
                     status = str(order.get("status") or "").upper()
                     executed_qty = self._order_executed_qty_decimal(order)
 
@@ -1300,14 +1435,20 @@ class Strategy:
                         active_buy_orders.pop(order_key, None)
 
                     if status == "FILLED" or (status in {"CANCELED", "EXPIRED", "EXPIRED_IN_MATCH"} and executed_qty > 0):
-                        buy_fill_price = self.c.get_order_average_price(order) or Decimal(str(state.get("price", "0") or "0"))
+                        buy_fill_price = retry(
+                            f"{mode_name}分笔 读取买单均价#{state['order_id']}",
+                            lambda order_data=order: self.c.get_order_average_price(order_data),
+                        ) or Decimal(str(state.get("price", "0") or "0"))
                         self._emit_progress(
                             progress_cb,
                             step,
                             max(step + 1, 1),
                             f"{mode_name}分笔 挂卖 {base_asset}",
                         )
-                        sell_state = self._place_premium_split_sell_order(executed_qty, buy_fill_price)
+                        sell_state = retry(
+                            f"{mode_name}分笔 挂卖{base_asset}",
+                            lambda: self._place_premium_split_sell_order(executed_qty, buy_fill_price),
+                        )
                         if sell_state:
                             active_sell_orders[str(sell_state["order_id"])] = sell_state
                         else:
@@ -1318,13 +1459,19 @@ class Strategy:
                             )
 
                 for order_key, state in list(active_sell_orders.items()):
-                    order = self.c.get_order(self.spot_symbol, state["order_id"])
+                    order = retry(
+                        f"{mode_name}分笔 查询卖单#{state['order_id']}",
+                        lambda order_id=state["order_id"]: self.c.get_order(self.spot_symbol, order_id),
+                    )
                     status = str(order.get("status") or "").upper()
                     if status == "FILLED":
                         active_sell_orders.pop(order_key, None)
                         step += 1
                         qty = self._order_executed_qty_decimal(order)
-                        avg_price = self.c.get_order_average_price(order) or Decimal(str(state.get("price", "0") or "0"))
+                        avg_price = retry(
+                            f"{mode_name}分笔 读取卖单均价#{state['order_id']}",
+                            lambda order_data=order: self.c.get_order_average_price(order_data),
+                        ) or Decimal(str(state.get("price", "0") or "0"))
                         logger.info(
                             "--- %s分笔 %d 完成：卖单成交 数量=%s 均价=%s ---",
                             mode_name,
@@ -1343,7 +1490,10 @@ class Strategy:
 
                 if (not stop_new_entries) and per_order_quote_amount > 0:
                     if submitted_buy_count < order_count and last_append_price is not None:
-                        book_ticker = self.c.get_book_ticker(self.spot_symbol)
+                        book_ticker = retry(
+                            f"{mode_name}分笔 读取追加盘口",
+                            lambda: self.c.get_book_ticker(self.spot_symbol),
+                        )
                         current_bid = Decimal(str(book_ticker["bidPrice"]))
                         price_diff = abs(current_bid - last_append_price)
                         if price_diff >= append_threshold:
@@ -1354,10 +1504,13 @@ class Strategy:
                                 max(step + 1, 1),
                                 f"{mode_name}分笔 挂买 {base_asset} 第{next_slot_index}笔",
                             )
-                            appended_order = self._place_premium_split_buy_order(
-                                per_order_quote_amount,
-                                current_bid,
-                                next_slot_index,
+                            appended_order = retry(
+                                f"{mode_name}分笔 追加买单第{next_slot_index}笔",
+                                lambda: self._place_premium_split_buy_order(
+                                    per_order_quote_amount,
+                                    current_bid,
+                                    next_slot_index,
+                                ),
                             )
                             if appended_order:
                                 active_buy_orders[str(appended_order["order_id"])] = appended_order
@@ -1377,21 +1530,30 @@ class Strategy:
                 if not stop_event:
                     time.sleep(1.0)
             except Exception as e:
-                if stop_event and stop_event.is_set():
+                if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
                     logger.info("检测到停止信号，已停止后续执行（%s模式）", mode_name)
                     return
                 logger.error("%s分笔模式执行异常: %s", mode_name, e)
-                if self._pause_with_stop(stop_event, 3):
-                    self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
-                    return
 
     def _run_market_mode(self, stop_event, progress_cb=None):
+        self._reset_market_round_tracking()
         total_steps = self.spot_rounds if self.spot_rounds > 0 else 1
         step = 0
-        base_asset, _quote_asset = self._spot_pair_assets()
+        base_asset, quote_asset = self._spot_pair_assets()
 
         self.ensure_base_sold()
+        try:
+            self._run_trade_action_with_retry(
+                stop_event,
+                "现货轮开始前归集 %s 到现货" % quote_asset,
+                lambda: self.c.collect_asset_to_spot(quote_asset, context="交易前"),
+            )
+        except Exception as e:
+            if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
+                logger.info("检测到停止信号，停止后续执行（现货阶段）")
+                return
+            logger.error("现货轮开始前归集 %s 到现货失败：%s；后续轮次将仅使用现货账户已有余额", quote_asset, e)
 
         for i in range(self.spot_rounds):
             if stop_event and stop_event.is_set():
@@ -1408,7 +1570,11 @@ class Strategy:
                     total_steps,
                     "现货轮 %d/%d 买入 %s" % (i + 1, self.spot_rounds, base_asset),
                 )
-                buy_success = self.c.spot_buy_all_usdt(symbol=self.spot_symbol)
+                buy_success = self._run_trade_action_with_retry(
+                    stop_event,
+                    "现货轮 %d/%d 买入 %s" % (i + 1, self.spot_rounds, base_asset),
+                    lambda: self.c.spot_buy_all_usdt(symbol=self.spot_symbol, assume_spot_funds_ready=True),
+                )
                 if buy_success:
                     self._emit_progress(
                         progress_cb,
@@ -1423,23 +1589,33 @@ class Strategy:
                         total_steps,
                         "现货轮 %d/%d 卖出 %s" % (i + 1, self.spot_rounds, base_asset),
                     )
-                    self.c.spot_sell_all_base(symbol=self.spot_symbol)
+                    self._run_trade_action_with_retry(
+                        stop_event,
+                        "现货轮 %d/%d 卖出 %s" % (i + 1, self.spot_rounds, base_asset),
+                        lambda: self.c.spot_sell_all_base(symbol=self.spot_symbol),
+                    )
                 else:
                     logger.info("买入未执行（可能余额不足），跳过本轮卖出")
 
                 logger.info("--- 现货轮 %d 完成 ---", i + 1)
 
             except Exception as e:
-                logger.error(f"现货轮 %d 执行异常: {e}", i + 1)
-                if self._pause_with_stop(stop_event, 3):
+                if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
+                    logger.info("检测到停止信号，停止后续执行（现货阶段）")
                     return
+                self._record_market_round_failure(i + 1, e)
+                logger.error(f"现货轮 %d 执行异常: {e}", i + 1)
 
             step += 1
+            self.market_round_completed = step
+            failure_suffix = ""
+            if self.market_round_failed_rounds:
+                failure_suffix = "，失败%d轮" % len(self.market_round_failed_rounds)
             self._emit_progress(
                 progress_cb,
                 step,
                 total_steps,
-                "现货轮%s%d/%d完成" % (base_asset.upper(), i + 1, self.spot_rounds),
+                "现货轮%s%d/%d完成%s" % (base_asset.upper(), i + 1, self.spot_rounds, failure_suffix),
             )
             self.sleep_fn()
 
@@ -1467,7 +1643,11 @@ class Strategy:
                     total_steps,
                     "闪兑轮 %d/%d %s->%s" % (i + 1, self.spot_rounds, quote_asset, base_asset),
                 )
-                buy_result = self.c.convert_quote_to_base_all(symbol=self.spot_symbol)
+                buy_result = self._run_trade_action_with_retry(
+                    stop_event,
+                    "闪兑轮 %d/%d %s->%s" % (i + 1, self.spot_rounds, quote_asset, base_asset),
+                    lambda: self.c.convert_quote_to_base_all(symbol=self.spot_symbol),
+                )
                 if buy_result:
                     self._emit_progress(
                         progress_cb,
@@ -1482,7 +1662,11 @@ class Strategy:
                         total_steps,
                         "闪兑轮 %d/%d %s->%s" % (i + 1, self.spot_rounds, base_asset, quote_asset),
                     )
-                    sell_result = self.c.convert_base_to_quote_all(symbol=self.spot_symbol)
+                    sell_result = self._run_trade_action_with_retry(
+                        stop_event,
+                        "闪兑轮 %d/%d %s->%s" % (i + 1, self.spot_rounds, base_asset, quote_asset),
+                        lambda: self.c.convert_base_to_quote_all(symbol=self.spot_symbol),
+                    )
                     if not sell_result:
                         logger.info("闪兑卖出未执行（可能余额不足或不满足最小闪兑金额），结束本次运行")
                         return
@@ -1492,9 +1676,10 @@ class Strategy:
 
                 logger.info("--- 闪兑轮 %d 完成 ---", i + 1)
             except Exception as e:
-                logger.error(f"闪兑轮 %d 执行异常: {e}", i + 1)
-                if self._pause_with_stop(stop_event, 3):
+                if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
+                    logger.info("检测到停止信号，停止后续执行（闪兑阶段）")
                     return
+                logger.error(f"闪兑轮 %d 执行异常: {e}", i + 1)
 
             step += 1
             self._emit_progress(progress_cb, step, total_steps, "闪兑轮 %d/%d 完成" % (i + 1, self.spot_rounds))
@@ -1514,22 +1699,34 @@ class Strategy:
                 return
 
             try:
-                book_ticker = self.c.get_book_ticker(self.spot_symbol)
-                buy_order, sell_order = self._place_limit_orders(
-                    mode_name,
-                    book_ticker,
-                    progress_cb=progress_cb,
-                    step=step,
+                book_ticker = self._run_trade_action_with_retry(
+                    stop_event,
+                    f"{mode_name}轮 {step + 1} 读取盘口",
+                    lambda: self.c.get_book_ticker(self.spot_symbol),
+                )
+                buy_order, sell_order = self._run_trade_action_with_retry(
+                    stop_event,
+                    f"{mode_name}轮 {step + 1} 挂单",
+                    lambda: self._place_limit_orders(
+                        mode_name,
+                        book_ticker,
+                        progress_cb=progress_cb,
+                        step=step,
+                    ),
                 )
                 if not buy_order and not sell_order:
                     logger.info("%s模式当前无可挂出的买卖单（余额不足或不满足最小下单额），结束本次运行", mode_name)
                     return
 
-                action, payload = self._monitor_limit_orders(
+                action, payload = self._run_trade_action_with_retry(
                     stop_event,
-                    mode_name,
-                    buy_order=buy_order,
-                    sell_order=sell_order,
+                    f"{mode_name}轮 {step + 1} 监控订单",
+                    lambda: self._monitor_limit_orders(
+                        stop_event,
+                        mode_name,
+                        buy_order=buy_order,
+                        sell_order=sell_order,
+                    ),
                 )
                 if action == "filled":
                     step += 1
@@ -1544,12 +1741,10 @@ class Strategy:
                 logger.info("%s模式当前无活动挂单，结束本次运行", mode_name)
                 return
             except Exception as e:
-                if stop_event and stop_event.is_set():
+                if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
                     return
                 logger.error("%s轮 %d 执行异常: %s", mode_name, step, e)
-                if self._pause_with_stop(stop_event, 3):
-                    return
 
     def _run_premium_mode(self, stop_event, progress_cb=None):
         if self._premium_partial_fill_mode_enabled():
@@ -1579,7 +1774,11 @@ class Strategy:
                     max(step, 1),
                     f"{mode_name}轮 {step} 买入 {base_asset}",
                 )
-                buy_result, _ask_price = self._place_buy_order_with_reprice(stop_event, mode_name)
+                buy_result, _ask_price = self._run_trade_action_with_retry(
+                    stop_event,
+                    f"{mode_name}轮 {step} 买入 {base_asset}",
+                    lambda: self._place_buy_order_with_reprice(stop_event, mode_name),
+                )
                 buy_order = buy_result
                 if not buy_order:
                     logger.info("%s模式买入未执行（可能余额不足或不满足最小下单额），结束本次运行", mode_name)
@@ -1587,7 +1786,11 @@ class Strategy:
 
                 buy_fill_price = self.c.get_order_average_price(buy_order) or Decimal("0")
                 if buy_fill_price <= 0:
-                    buy_fill_price = Decimal(str(self.c.get_book_ticker(self.spot_symbol)["bidPrice"]))
+                    buy_fill_price = Decimal(str(self._run_trade_action_with_retry(
+                        stop_event,
+                        f"{mode_name}轮 {step} 读取买入均价兜底盘口",
+                        lambda: self.c.get_book_ticker(self.spot_symbol),
+                    )["bidPrice"]))
 
                 self._emit_progress(
                     progress_cb,
@@ -1603,19 +1806,21 @@ class Strategy:
                     max(step, 1),
                     f"{mode_name}轮 {step} 卖出 {base_asset}",
                 )
-                sell_order = self._place_sell_order_with_reprice(stop_event, mode_name, buy_fill_price)
+                sell_order = self._run_trade_action_with_retry(
+                    stop_event,
+                    f"{mode_name}轮 {step} 卖出 {base_asset}",
+                    lambda: self._place_sell_order_with_reprice(stop_event, mode_name, buy_fill_price),
+                )
                 if not sell_order:
                     logger.info("%s模式卖出未执行（可能余额不足或不满足最小下单额），结束本次运行", mode_name)
                     return
 
                 logger.info("--- %s轮 %d 完成 ---", mode_name, step)
             except Exception as e:
-                if stop_event and stop_event.is_set():
+                if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
                     return
                 logger.error("%s轮 %d 执行异常: %s", mode_name, step, e)
-                if self._pause_with_stop(stop_event, 3):
-                    return
 
             self._emit_progress(progress_cb, step, max(step, 1), f"{mode_name}轮 {step} 完成")
             self.sleep_fn()
@@ -1712,16 +1917,24 @@ class Strategy:
 
             try:
                 stage_label = "开仓前预检"
-                qty = self.c.calculate_um_futures_order_quantity(
-                    self.futures_symbol,
-                    self.futures_amount,
-                    open_side,
+                qty = self._run_trade_action_with_retry(
+                    stop_event,
+                    "合约轮 %d/%d 开仓前预检" % (i + 1, self.futures_rounds),
+                    lambda: self.c.calculate_um_futures_order_quantity(
+                        self.futures_symbol,
+                        self.futures_amount,
+                        open_side,
+                    ),
                 )
                 stage_label = "开仓下单"
-                open_order = self.c.place_um_futures_market_order(
-                    self.futures_symbol,
-                    open_side,
-                    qty,
+                open_order = self._run_trade_action_with_retry(
+                    stop_event,
+                    "合约轮 %d/%d 开仓下单" % (i + 1, self.futures_rounds),
+                    lambda: self.c.place_um_futures_market_order(
+                        self.futures_symbol,
+                        open_side,
+                        qty,
+                    ),
                 )
                 try:
                     avg_price = Decimal(str(open_order.get("avgPrice", "0")))
@@ -1737,7 +1950,11 @@ class Strategy:
 
                 self.sleep_fn()
                 stage_label = "平仓下单"
-                close_order = self.c.close_um_futures_position_market(self.futures_symbol)
+                close_order = self._run_trade_action_with_retry(
+                    stop_event,
+                    "合约轮 %d/%d 平仓下单" % (i + 1, self.futures_rounds),
+                    lambda: self.c.close_um_futures_position_market(self.futures_symbol),
+                )
                 if not close_order:
                     raise RuntimeError("合约平仓未执行：未检测到可平持仓")
                 try:
@@ -1751,6 +1968,9 @@ class Strategy:
                     BinanceClient._format_decimal(close_price),
                 )
             except Exception as e:
+                if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
+                    logger.info("检测到停止信号，停止后续执行（合约阶段）")
+                    return
                 self.trade_error = str(e)
                 self.trade_error_stage = stage_label
                 logger.error("【%s失败】合约轮 %d：%s", stage_label, i + 1, e)
@@ -1763,8 +1983,6 @@ class Strategy:
                         progress_cb(i + 1, total_steps, "合约预检失败")
                     else:
                         progress_cb(i + 1, total_steps, "合约失败")
-                if self._pause_with_stop(stop_event, 3):
-                    return
                 return
             finally:
                 self.ensure_futures_position_closed()
@@ -1791,6 +2009,11 @@ class Strategy:
                 "trade_error": self.trade_error,
                 "trade_error_stage": self.trade_error_stage,
                 "trade_failed": bool(self.trade_error),
+                "market_round_total": self.market_round_total,
+                "market_round_completed": self.market_round_completed,
+                "market_round_failed_count": len(self.market_round_failed_rounds),
+                "market_round_failed_rounds": list(self.market_round_failed_rounds),
+                "market_round_failure_details": list(self.market_round_failure_details),
             }
 
         zero_round_spot_conversion = self._is_zero_round_spot_conversion()
@@ -1798,7 +2021,7 @@ class Strategy:
         if zero_round_spot_conversion:
             self._run_zero_round_spot_conversion(stop_event, progress_cb=progress_cb)
         else:
-            self._run_bnb_topup_if_needed()
+            self._run_bnb_topup_if_needed(stop_event)
 
         if not zero_round_spot_conversion:
             if self._is_futures_mode():

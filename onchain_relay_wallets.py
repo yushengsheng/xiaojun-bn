@@ -3,25 +3,21 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import tempfile
 import threading
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 from app_paths import CONFIG_BACKUP_SUFFIX, RELAY_WALLET_FILE
 from core_models import EvmToken, GeneratedWalletEntry
+from secure_config import FORMAT as SECURE_CONFIG_FORMAT
 from secure_config import config_context as secure_config_context, seal_config_payload, unseal_config_payload
 from secret_box import SECRET_BOX
 from stores import _atomic_write_text_with_backup
-
-RELAY_RETENTION_HOURS = 72
-RELAY_TRACKED_BALANCE_SYMBOLS = {"USDT", "USDC"}
-
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -30,21 +26,6 @@ def _utc_now() -> datetime:
 def _utc_text(value: datetime | None = None) -> str:
     current = value or _utc_now()
     return current.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _parse_utc_text(value: str) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except Exception:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 def _decimal_text(value: Decimal | str | None) -> str:
@@ -91,6 +72,7 @@ class RelayWalletRecord:
     private_key: str
     status: str
     batch_id: str
+    reuse_key: str = ""
     token_symbol: str = ""
     token_contract: str = ""
     token_decimals: int = 18
@@ -124,6 +106,7 @@ class RelayWalletRecord:
             private_key=str(raw.get("private_key") or "").strip(),
             status=str(raw.get("status") or "").strip(),
             batch_id=str(raw.get("batch_id") or "").strip(),
+            reuse_key=str(raw.get("reuse_key") or "").strip(),
             token_symbol=str(raw.get("token_symbol") or "").strip().upper(),
             token_contract=str(raw.get("token_contract") or "").strip(),
             token_decimals=max(0, int(raw.get("token_decimals", 18) or 18)),
@@ -151,6 +134,10 @@ class RelayWalletFileStore:
     def __init__(self, file_path: Path | None = None):
         self.file_path = Path(file_path or RELAY_WALLET_FILE)
         self._lock = threading.RLock()
+        self._records_cache: list[RelayWalletRecord] | None = None
+        self._cache_signature: tuple[int, int] | None = None
+        self._dirty = False
+        self._defer_writes = 0
         self.ensure_file()
 
     def ensure_file(self) -> None:
@@ -162,6 +149,12 @@ class RelayWalletFileStore:
             _atomic_write_text(self.file_path, "", encoding="utf-8")
 
     def _load_records_locked(self) -> list[RelayWalletRecord]:
+        if (
+            self._records_cache is not None
+            and self._cache_signature is not None
+            and self._cache_signature == self._file_signature(self.file_path)
+        ):
+            return list(self._records_cache)
         self.ensure_file()
         backup_path = self.file_path.with_name(f"{self.file_path.name}{CONFIG_BACKUP_SUFFIX}")
         errors: list[str] = []
@@ -173,10 +166,36 @@ class RelayWalletFileStore:
                 records = self._parse_records_text(candidate_text)
                 if candidate == backup_path:
                     _atomic_write_text_with_backup(self.file_path, candidate_text, encoding="utf-8")
+                self._records_cache = list(records)
+                self._cache_signature = self._file_signature(self.file_path)
+                self._dirty = False
                 return records
             except Exception as exc:
                 errors.append(f"{candidate.name}: {exc}")
         raise RuntimeError("中转钱包文件读取失败：" + "；".join(errors))
+
+    def _is_authenticated_envelope_file_locked(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            if not text:
+                return False
+            raw = json.loads(text)
+        except Exception:
+            return False
+        return (
+            isinstance(raw, dict)
+            and raw.get("format") == SECURE_CONFIG_FORMAT
+            and str(raw.get("ciphertext") or "").strip()
+        )
+
+    def _file_signature(self, path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (int(stat.st_mtime_ns), int(stat.st_size))
 
     def _parse_records_text(self, text: str) -> list[RelayWalletRecord]:
         whole_text = text.strip()
@@ -234,6 +253,9 @@ class RelayWalletFileStore:
         )
         content = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
         _atomic_write_text_with_backup(self.file_path, content, encoding="utf-8")
+        self._records_cache = list(records)
+        self._cache_signature = self._file_signature(self.file_path)
+        self._dirty = False
 
     def load_records(self) -> list[RelayWalletRecord]:
         with self._lock:
@@ -245,6 +267,23 @@ class RelayWalletFileStore:
             self._save_records_locked(records)
             return len(records)
 
+    def rewrite_encrypted_if_needed(self) -> int:
+        """Migrate legacy relay files once; skip already authenticated files without decrypting all rows."""
+        with self._lock:
+            if self._is_authenticated_envelope_file_locked(self.file_path):
+                return 0
+            records = self._load_records_locked()
+            self._save_records_locked(records)
+            return len(records)
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._dirty and self._records_cache is not None:
+                self._save_records_locked(self._records_cache)
+
+    def defer_writes(self):
+        return _RelayWalletDeferredWrites(self)
+
     def append_records(self, records: list[RelayWalletRecord]) -> None:
         if not records:
             return
@@ -252,6 +291,29 @@ class RelayWalletFileStore:
             current = self._load_records_locked()
             current.extend(records)
             self._save_records_locked(current)
+
+    def remove_records(self, record_keys: set[tuple[str, str]]) -> int:
+        """Remove records by (batch_id, relay_address) after the caller has confirmed they are empty."""
+        normalized_keys = {
+            (str(batch_id or "").strip(), str(relay_address or "").strip())
+            for batch_id, relay_address in (record_keys or set())
+            if str(relay_address or "").strip()
+        }
+        if not normalized_keys:
+            return 0
+        with self._lock:
+            records = self._load_records_locked()
+            remaining: list[RelayWalletRecord] = []
+            removed = 0
+            for record in records:
+                record_key = (str(record.batch_id or "").strip(), str(record.relay_address or "").strip())
+                if record_key in normalized_keys:
+                    removed += 1
+                    continue
+                remaining.append(record)
+            if removed > 0:
+                self._save_records_locked(remaining)
+            return removed
 
     def update_record(self, relay_address: str, *, batch_id: str = "", **changes: object) -> RelayWalletRecord:
         relay_key = str(relay_address or "").strip()
@@ -269,7 +331,11 @@ class RelayWalletFileStore:
                 updated_raw.update(changes)
                 updated = RelayWalletRecord.from_raw(updated_raw)
                 records[idx] = updated
-                self._save_records_locked(records)
+                self._records_cache = list(records)
+                self._cache_signature = self._file_signature(self.file_path)
+                self._dirty = True
+                if self._defer_writes <= 0:
+                    self._save_records_locked(records)
                 return updated
         raise RuntimeError(f"未找到中转钱包记录：{relay_key}")
 
@@ -285,11 +351,12 @@ class RelayWalletFileStore:
         relay_fee_reserve: Decimal | str | None,
         sweep_enabled: bool,
         sweep_target: str,
+        reuse_key: str = "",
     ) -> RelayWalletRecord:
         created_at = _utc_now()
         return RelayWalletRecord(
             created_at=_utc_text(created_at),
-            expires_at=_utc_text(created_at + timedelta(hours=RELAY_RETENTION_HOURS)),
+            expires_at="",
             network=str(network or "").strip().upper(),
             source=str(source_address or "").strip(),
             target=str(target_address or "").strip(),
@@ -297,6 +364,7 @@ class RelayWalletFileStore:
             private_key=str(relay_wallet.private_key or "").strip(),
             status="created",
             batch_id=str(batch_id or "").strip(),
+            reuse_key=str(reuse_key or "").strip(),
             token_symbol=str(token.symbol or "").strip().upper(),
             token_contract=str(token.contract or "").strip(),
             token_decimals=max(0, int(token.decimals)),
@@ -306,119 +374,19 @@ class RelayWalletFileStore:
             sweep_target=str(sweep_target or "").strip(),
         )
 
-    def cleanup_expired_empty_records(self, client, *, log=None, worker_threads: int = 1) -> tuple[int, int, int]:
-        removed = 0
-        kept = 0
-        checked = 0
-        now = _utc_now()
-        with self._lock:
-            records = self._load_records_locked()
-            remain: list[RelayWalletRecord] = []
-            expired_records: list[RelayWalletRecord] = []
-            for record in records:
-                expires_at = _parse_utc_text(record.expires_at)
-                if expires_at is None or expires_at > now:
-                    remain.append(record)
-                    continue
-                expired_records.append(record)
+class _RelayWalletDeferredWrites:
+    def __init__(self, store: RelayWalletFileStore):
+        self.store = store
 
-            checked = len(expired_records)
-            if not expired_records:
-                return checked, removed, kept
+    def __enter__(self):
+        with self.store._lock:
+            self.store._defer_writes += 1
+        return self.store
 
-            tracked_contracts_by_network: dict[str, list[str]] = {}
-            for record in expired_records:
-                network = str(record.network or "").strip().upper()
-                if network in tracked_contracts_by_network:
-                    continue
-                contracts: list[str] = []
-                for token in client.get_default_tokens(network):
-                    if bool(getattr(token, "is_native", False)):
-                        continue
-                    symbol = str(getattr(token, "symbol", "") or "").strip().upper()
-                    if symbol not in RELAY_TRACKED_BALANCE_SYMBOLS:
-                        continue
-                    contract = str(getattr(token, "contract", "") or "").strip()
-                    if contract:
-                        contracts.append(contract)
-                tracked_contracts_by_network[network] = contracts
-
-            def inspect_record(record: RelayWalletRecord) -> tuple[bool, list[int] | Exception]:
-                try:
-                    balances: list[int] = [int(client.get_balance_wei(record.network, record.relay_address))]
-                    for contract in tracked_contracts_by_network.get(str(record.network or "").strip().upper(), []):
-                        balances.append(int(client.get_erc20_balance(record.network, contract, record.relay_address)))
-                    return True, balances
-                except Exception as exc:
-                    return False, exc
-
-            result_by_key: dict[tuple[str, str], tuple[bool, list[int] | Exception]] = {}
-            worker_count = max(1, min(int(worker_threads or 1), len(expired_records)))
-            query_done = 0
-            query_failed = 0
-            progress_interval = max(1, checked // 10)
-
-            def log_query_progress() -> None:
-                if not callable(log):
-                    return
-                if query_done == 1 or query_done >= checked or query_done % progress_interval == 0:
-                    log(
-                        f"中转钱包过期清理进度：余额查询 {query_done}/{checked}，"
-                        f"查询失败 {query_failed}，线程数={worker_count}"
-                    )
-
-            if callable(log):
-                log(
-                    f"中转钱包过期清理开始：发现 {checked} 条超过 {RELAY_RETENTION_HOURS} 小时的记录，"
-                    f"线程数={worker_count}，正在查询余额..."
-                )
-            if worker_count == 1:
-                for record in expired_records:
-                    record_key = (str(record.batch_id or "").strip(), str(record.relay_address or "").strip())
-                    result = inspect_record(record)
-                    result_by_key[record_key] = result
-                    query_done += 1
-                    if not result[0]:
-                        query_failed += 1
-                    log_query_progress()
-            else:
-                with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="relay-retention") as executor:
-                    future_map = {
-                        executor.submit(inspect_record, record): (
-                            str(record.batch_id or "").strip(),
-                            str(record.relay_address or "").strip(),
-                        )
-                        for record in expired_records
-                    }
-                    for future in as_completed(future_map):
-                        result = future.result()
-                        result_by_key[future_map[future]] = result
-                        query_done += 1
-                        if not result[0]:
-                            query_failed += 1
-                        log_query_progress()
-
-            for record in expired_records:
-                record_key = (str(record.batch_id or "").strip(), str(record.relay_address or "").strip())
-                ok, payload = result_by_key.get(record_key, (False, RuntimeError("cleanup result missing")))
-                if not ok:
-                    kept += 1
-                    remain.append(record)
-                    if callable(log):
-                        log(f"中转钱包过期清理跳过：{record.relay_address} 查询失败：{payload}")
-                    continue
-
-                balances = payload
-                if all(int(value) == 0 for value in balances):
-                    removed += 1
-                    if callable(log):
-                        log(f"中转钱包已清空并超过 72 小时，已移除：{record.relay_address}")
-                    continue
-
-                kept += 1
-                remain.append(record)
-                if callable(log):
-                    log(f"中转钱包超过 72 小时但余额未清空，继续保留：{record.relay_address}")
-            if removed > 0:
-                self._save_records_locked(remain)
-        return checked, removed, kept
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        with self.store._lock:
+            self.store._defer_writes = max(0, self.store._defer_writes - 1)
+            should_flush = self.store._defer_writes == 0 and self.store._dirty
+        if should_flush:
+            self.store.flush()
+        return False

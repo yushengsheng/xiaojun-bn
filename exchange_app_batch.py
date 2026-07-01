@@ -868,16 +868,47 @@ class ExchangeAppBatchMixin(object):
             return cls._exchange_success_status_text("自动提现已关闭"), True
         return cls._exchange_failed_status_text("提现失败：可提余额不足/预留过高"), False
     @classmethod
+    def _format_market_round_failure_status(cls, strategy_result: dict | None) -> str:
+        if not isinstance(strategy_result, dict):
+            return ""
+        try:
+            failed_count = max(0, int(strategy_result.get("market_round_failed_count") or 0))
+        except Exception:
+            failed_count = 0
+        if failed_count <= 0:
+            return ""
+        try:
+            completed = max(0, int(strategy_result.get("market_round_completed") or 0))
+        except Exception:
+            completed = 0
+        try:
+            total = max(0, int(strategy_result.get("market_round_total") or 0))
+        except Exception:
+            total = 0
+        finished = total or completed
+        if finished > 0:
+            return f"{finished}轮完成，失败{failed_count}轮"
+        return f"失败{failed_count}轮"
+    @classmethod
     def _format_batch_strategy_completion_status(
         cls,
         amount: float,
         coin: str,
         *,
         enable_withdraw: bool,
+        strategy_result: dict | None = None,
     ) -> tuple[str | None, bool]:
+        round_status = cls._format_market_round_failure_status(strategy_result)
         if not enable_withdraw:
+            if round_status:
+                return cls._exchange_success_status_text(round_status), True
             return None, True
-        return cls._format_withdraw_amount_status(amount, coin, enable_withdraw=enable_withdraw)
+        withdraw_status, success = cls._format_withdraw_amount_status(amount, coin, enable_withdraw=enable_withdraw)
+        if round_status:
+            plain_withdraw = cls._plain_exchange_status_text(withdraw_status)
+            prefix = cls._exchange_success_status_text if success else cls._exchange_failed_status_text
+            return prefix(f"{round_status}；{plain_withdraw}"), success
+        return withdraw_status, success
     @classmethod
     def _format_trade_failure_status(cls, stage: str, err: object) -> str:
         stage_text = str(stage or "").strip()
@@ -1028,7 +1059,31 @@ class ExchangeAppBatchMixin(object):
             )
         withdraw_text = self._format_batch_metric_totals(data.get("withdraw_by_account") or {})
         balance_text = self._format_batch_metric_totals(data.get("balance_by_account") or {})
-        return f"结果汇总：成功{success_count} | 失败{failed_count} | 提现总额={withdraw_text} | 余额总额={balance_text}"
+        text = f"结果汇总：成功{success_count} | 失败{failed_count} | 提现总额={withdraw_text} | 余额总额={balance_text}"
+        market_failed = self._sum_batch_count_metrics(data.get("market_failed_rounds_by_account") or {})
+        if market_failed > 0:
+            affected_accounts = 0
+            for value in dict(data.get("market_failed_rounds_by_account") or {}).values():
+                try:
+                    if int(value or 0) > 0:
+                        affected_accounts += 1
+                except Exception:
+                    continue
+            text += f" | 现货市价失败轮次={market_failed}(账号{affected_accounts})"
+        return text
+    def _build_batch_result_extra_lines(self, summary: dict | None = None) -> list[str]:
+        data = summary if isinstance(summary, dict) else {}
+        market_failed = self._sum_batch_count_metrics(data.get("market_failed_rounds_by_account") or {})
+        if market_failed <= 0:
+            return []
+        affected_accounts = 0
+        for value in dict(data.get("market_failed_rounds_by_account") or {}).values():
+            try:
+                if int(value or 0) > 0:
+                    affected_accounts += 1
+            except Exception:
+                continue
+        return [f"现货市价失败轮次：{market_failed}（涉及账号 {affected_accounts} 个）"]
     def _set_batch_summary_text(self, text: str) -> None:
         var = getattr(self, "exchange_batch_summary_var", None)
         if var is not None:
@@ -2367,6 +2422,12 @@ class ExchangeAppBatchMixin(object):
                             callback_amount = withdraw_state.get("amount")
                             result_amount = float((strategy_result or {}).get("withdraw_amount", 0.0)) if isinstance(strategy_result, dict) else 0.0
                             final_amount = callback_amount if callback_amount is not None else result_amount
+                            if isinstance(strategy_result, dict):
+                                self._record_batch_count_metric(
+                                    acc,
+                                    "market_failed_rounds_by_account",
+                                    strategy_result.get("market_round_failed_count", 0),
+                                )
 
                             trade_error = strategy_result.get("trade_error") if isinstance(strategy_result, dict) else ""
                             if trade_error:
@@ -2380,13 +2441,21 @@ class ExchangeAppBatchMixin(object):
                                 op_success = False
                             elif isinstance(strategy_result, dict) and strategy_result.get("withdraw_error") and (final_amount or 0) <= 0:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
-                                set_status(
-                                    self._exchange_error_status_text(
-                                        "提现失败",
-                                        strategy_result.get("withdraw_error", ""),
-                                        fallback="提现失败",
-                                    )
+                                withdraw_failure_status = self._exchange_error_status_text(
+                                    "提现失败",
+                                    strategy_result.get("withdraw_error", ""),
+                                    fallback="提现失败",
                                 )
+                                round_status = self._format_market_round_failure_status(strategy_result)
+                                if round_status:
+                                    set_status(
+                                        self._exchange_failed_status_text(
+                                            f"{round_status}；{self._plain_exchange_status_text(withdraw_failure_status)}",
+                                            fallback="提现失败",
+                                        )
+                                    )
+                                else:
+                                    set_status(withdraw_failure_status)
                                 op_success = False
                             else:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
@@ -2394,6 +2463,7 @@ class ExchangeAppBatchMixin(object):
                                     float(final_amount or 0.0),
                                     withdraw_coin,
                                     enable_withdraw=enable_withdraw,
+                                    strategy_result=strategy_result if isinstance(strategy_result, dict) else None,
                                 )
                                 if status_text is not None:
                                     set_status(status_text)

@@ -23,6 +23,8 @@ from exchange_constants import TRADE_ACCOUNT_TYPE_FUTURES, TRADE_ACCOUNT_TYPE_SP
 from exchange_logging import logger, runtime_log_path
 from onchain_relay_wallets import RelayWalletFileStore
 from onchain_relay_runner import (
+    RELAY_BNB_DUST_THRESHOLD,
+    RELAY_STABLE_TOKEN_DUST_THRESHOLD,
     _record_matches_job,
     _relay_is_terminal_dust_state,
     _relay_native_dust_below_threshold,
@@ -381,9 +383,11 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                     return f"{self._decimal_to_text(self._units_to_amount(amount_units, 18))} BNB"
 
             dust_owner = _DustThresholdOwner()
+            token_dust_threshold_units = int(RELAY_STABLE_TOKEN_DUST_THRESHOLD * (Decimal(10) ** relay_token.decimals))
+            native_dust_threshold_units = int(RELAY_BNB_DUST_THRESHOLD * (Decimal(10) ** 18))
             dust_low, dust_detail = _relay_token_dust_below_threshold(
                 dust_owner,
-                {"USDT": (relay_token, 1_390_000_000_000)},
+                {"USDT": (relay_token, token_dust_threshold_units - 1)},
             )
             if not dust_low:
                 raise RuntimeError("中转钱包自检失败：低于固定阈值的代币 dust 未被识别")
@@ -391,21 +395,21 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                 raise RuntimeError("中转钱包自检失败：代币 dust 说明文案缺少固定阈值")
             dust_equal, _dust_detail = _relay_token_dust_below_threshold(
                 dust_owner,
-                {"USDT": (relay_token, 100_000_000_000_000)},
+                {"USDT": (relay_token, token_dust_threshold_units)},
             )
             if dust_equal:
                 raise RuntimeError("中转钱包自检失败：等于固定阈值的代币余额被误判为 dust")
             native_low, native_detail = _relay_native_dust_below_threshold(
                 dust_owner,
                 "BSC",
-                9_999_999_999_999,
+                native_dust_threshold_units - 1,
             )
             if not native_low or "dust阈值" not in native_detail:
                 raise RuntimeError("中转钱包自检失败：低于固定阈值的 BNB dust 未被识别")
             native_equal, _native_detail = _relay_native_dust_below_threshold(
                 dust_owner,
                 "BSC",
-                10_000_000_000_000,
+                native_dust_threshold_units,
             )
             if native_equal:
                 raise RuntimeError("中转钱包自检失败：等于固定阈值的 BNB 余额被误判为 dust")
@@ -420,6 +424,9 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                 amount_mode="固定数量",
                 amount="1",
                 confirm_timeout_seconds=240.0,
+                receipt_poll_interval_seconds=4.0,
+                receipt_retry_count=11,
+                nonce_window=6,
                 relay_enabled=True,
                 relay_fee_reserve="0.0012",
                 relay_sweep_enabled=True,
@@ -434,6 +441,12 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                 raise RuntimeError("中转钱包自检失败：配置中的手续费预留未恢复")
             if abs(float(relay_loaded_store.settings.confirm_timeout_seconds) - 240.0) > 0.0001:
                 raise RuntimeError("中转钱包自检失败：配置中的确认超时未恢复")
+            if abs(float(relay_loaded_store.settings.receipt_poll_interval_seconds) - 4.0) > 0.0001:
+                raise RuntimeError("中转钱包自检失败：receipt轮询间隔未恢复")
+            if int(relay_loaded_store.settings.receipt_retry_count) != 11:
+                raise RuntimeError("中转钱包自检失败：receipt重试次数未恢复")
+            if int(relay_loaded_store.settings.nonce_window) != 6:
+                raise RuntimeError("中转钱包自检失败：单钱包nonce并发未恢复")
             relay_onchain_store.settings.mode = "多对1"
             relay_onchain_store.settings.relay_enabled = True
             relay_onchain_store.save_settings_only()
@@ -1027,7 +1040,13 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.calls.append(("bnb-ready", str(min_spot_balance)))
             return Decimal(str(min_spot_balance))
 
-        def spot_buy_all_usdt(self, symbol: str):
+        def collect_asset_to_spot(self, asset: str, *, context: str = "提现前"):
+            self.calls.append(("collect", "%s:%s" % (str(context or "").strip(), str(asset or "").strip().upper())))
+            return 1
+
+        def spot_buy_all_usdt(self, symbol: str, *, assume_spot_funds_ready: bool = False):
+            if not assume_spot_funds_ready:
+                raise RuntimeError("普通市价轮次买入前应已完成一次交易前归集")
             self.calls.append(("buy", str(symbol or "").strip().upper()))
             return True
 
@@ -1065,7 +1084,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     market_buy_count = sum(1 for call in market_round_client.calls if call == ("buy", "BTCUSDT"))
     market_sell_count = sum(1 for call in market_round_client.calls if call == ("sell", "BTCUSDT"))
     market_topup_count = sum(1 for call in market_round_client.calls if call == ("bnb-topup", "USDT"))
-    if market_buy_count != 2 or market_sell_count != 6 or market_topup_count != 1:
+    market_collect_count = sum(1 for call in market_round_client.calls if call == ("collect", "交易前:USDT"))
+    if market_buy_count != 2 or market_sell_count != 6 or market_topup_count != 1 or market_collect_count != 1:
         raise RuntimeError(f"普通市价轮次回归自检失败：执行路径异常（{market_round_client.calls}）")
     expected_market_round_progress = [
         (0, 2, "现货轮 1/2 买入 BTC"),

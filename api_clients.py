@@ -5,8 +5,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-import hashlib
-import hmac
 import importlib
 import json
 import os
@@ -14,12 +12,12 @@ import re
 import sys
 import threading
 import time
-from decimal import Decimal
 from typing import Callable
 
 import requests
 
 from core_models import EvmToken, GeneratedWalletEntry
+from system_proxy import configure_requests_session_for_proxy, resolve_proxy_route
 
 
 @dataclass(frozen=True)
@@ -46,7 +44,7 @@ class EvmClient:
     }
     NATIVE_GAS_LIMIT = 21000
     ERC20_DEFAULT_GAS_LIMIT = 70000
-    RPC_CONNECT_TIMEOUT = 6
+    RPC_CONNECT_TIMEOUT = 5
     RPC_READ_TIMEOUT = 20
     NETWORKS = {
         "ETH": {
@@ -120,18 +118,23 @@ class EvmClient:
         return str(value or "").strip()
 
     @staticmethod
-    def _rpc_session_signature(proxy_url: str, allow_system_proxy: bool) -> tuple[str, bool]:
-        return (str(proxy_url or "").strip(), bool(allow_system_proxy))
+    def _rpc_session_signature(proxy_url: str, allow_system_proxy: bool, target_url: str = "") -> tuple[object, ...]:
+        route, proxies = resolve_proxy_route(
+            explicit_proxy=proxy_url,
+            target_url=target_url,
+            allow_system_proxy=allow_system_proxy,
+        )
+        return (str(proxy_url or "").strip(), bool(allow_system_proxy), route, tuple(sorted(proxies.items())))
 
     @staticmethod
-    def _build_rpc_session(proxy_url: str, allow_system_proxy: bool) -> requests.Session:
+    def _build_rpc_session(proxy_url: str, allow_system_proxy: bool, target_url: str = "") -> requests.Session:
         session = requests.Session()
-        session.trust_env = bool(allow_system_proxy)
-        if proxy_url:
-            session.proxies = {
-                "http": proxy_url,
-                "https": proxy_url,
-            }
+        configure_requests_session_for_proxy(
+            session,
+            explicit_proxy=proxy_url,
+            target_url=target_url,
+            allow_system_proxy=allow_system_proxy,
+        )
         return session
 
     def _close_thread_rpc_session(self, session: requests.Session | None = None) -> None:
@@ -168,22 +171,24 @@ class EvmClient:
             except Exception:
                 pass
 
-    def _rpc_session(self) -> tuple[requests.Session, str]:
+    def _rpc_session(self, target_url: str = "") -> tuple[requests.Session, str]:
         proxy_url = self._current_proxy_url()
         allow_system_proxy = self._allow_system_proxy_now() and not bool(proxy_url)
-        signature = self._rpc_session_signature(proxy_url, allow_system_proxy)
+        signature = self._rpc_session_signature(proxy_url, allow_system_proxy, target_url)
         local = self._rpc_session_local
         session = getattr(local, "session", None)
         cached_signature = getattr(local, "signature", None)
         if session is not None and cached_signature == signature:
-            return session, proxy_url
+            resolved = dict(signature[-1])
+            return session, proxy_url or str(resolved.get("https") or resolved.get("http") or "")
         self._close_thread_rpc_session()
-        session = self._build_rpc_session(proxy_url, allow_system_proxy)
+        session = self._build_rpc_session(proxy_url, allow_system_proxy, target_url)
         local.session = session
         local.signature = signature
         with self._rpc_sessions_lock:
             self._rpc_sessions[threading.get_ident()] = session
-        return session, proxy_url
+        resolved = dict(signature[-1])
+        return session, proxy_url or str(resolved.get("https") or resolved.get("http") or "")
 
     def _network_info(self, network: str) -> dict:
         net = network.strip().upper()
@@ -423,7 +428,7 @@ class EvmClient:
                 session = None
                 proxy_url = ""
                 try:
-                    session, proxy_url = self._rpc_session()
+                    session, proxy_url = self._rpc_session(url)
                     resp = session.post(
                         url,
                         data=body,
@@ -452,7 +457,7 @@ class EvmClient:
                         err_text = f"当前代理为 SOCKS，但运行环境缺少 PySocks：{proxy_url}"
                     last_err = err_text
                     if attempt < max_attempts:
-                        time.sleep(0.4 * attempt)
+                        time.sleep(2.0)
                         continue
                     break
         raise RuntimeError(f"{network} RPC 请求失败：{last_err}")
@@ -699,41 +704,6 @@ class EvmClient:
         tx_hash = self._rpc_call(network, "eth_sendRawTransaction", [raw])
         return self._ensure_hex_prefixed(str(tx_hash or "").strip())
 
-    def _recover_submitted_transaction(
-        self,
-        network: str,
-        tx_hash: str,
-        *,
-        source_address: str = "",
-        nonce: int | None = None,
-        recovery_timeout_seconds: float = 8.0,
-    ) -> tuple[bool, str]:
-        deadline = time.time() + max(0.5, float(recovery_timeout_seconds))
-        source_addr = str(source_address or "").strip()
-        while True:
-            try:
-                receipt = self.get_transaction_receipt(network, tx_hash)
-                if receipt is not None:
-                    return True, "receipt"
-            except Exception:
-                pass
-            try:
-                tx = self.get_transaction_by_hash(network, tx_hash)
-                if tx is not None:
-                    return True, "tx-hash"
-            except Exception:
-                pass
-            if source_addr and nonce is not None:
-                try:
-                    pending_nonce = self.get_nonce(network, source_addr)
-                    if pending_nonce > int(nonce):
-                        return True, "source-nonce"
-                except Exception:
-                    pass
-            if time.time() >= deadline:
-                return False, ""
-            time.sleep(1.0)
-
     def submit_prepared_transaction(
         self,
         network: str,
@@ -754,20 +724,6 @@ class EvmClient:
                 recovery_reason="rpc-ack",
             )
         except Exception as exc:
-            recovered, reason = self._recover_submitted_transaction(
-                network,
-                expected_tx_hash,
-                source_address=source_address,
-                nonce=nonce,
-                recovery_timeout_seconds=recovery_timeout_seconds,
-            )
-            if recovered:
-                return SubmittedTransaction(
-                    tx_hash=expected_tx_hash,
-                    acknowledged=False,
-                    recovered=True,
-                    recovery_reason=reason,
-                )
             raise RuntimeError(str(exc)) from exc
 
     def _build_native_transfer_tx(

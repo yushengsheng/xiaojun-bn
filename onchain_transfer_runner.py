@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import tkinter as tk
+from tkinter import ttk
+
 from onchain_relay_runner import run_relay_batch, run_relay_fee_recovery
-from operation_recovery import build_onchain_recovery_plan
 from page_onchain_base import (
     Decimal,
     InvalidOperation,
@@ -14,105 +16,10 @@ from page_onchain_base import (
     random_decimal_between,
     set_ui_batch_size,
     threading,
-    time,
 )
 
 
 class OnchainTransferRunnerMixin(object):
-    def _prepare_onchain_recovery_batch(
-        self,
-        params: WithdrawRuntimeParams,
-        jobs_data: list[tuple[str, str, str]],
-    ):
-        """Create or resume one immutable direct-transfer batch.
-
-        Only public source addresses and task fingerprints are persisted. Source
-        credentials are used transiently to derive the address and never enter the
-        recovery ledger.
-        """
-        journal = getattr(self, "operation_journal", None)
-        if journal is None:
-            return "", None, {}, False
-        resolved_jobs: list[tuple[str, str, str, str]] = []
-        for row_key, source, target in jobs_data:
-            _private_key, source_address = self._resolve_wallet(source)
-            target_address = self._validate_recipient_address(target, "接收地址")
-            resolved_jobs.append((row_key, source, target_address, source_address))
-        plan = build_onchain_recovery_plan(
-            network=params.network,
-            mode=self._mode(),
-            coin=params.coin,
-            amount=params.amount,
-            random_enabled=params.random_enabled,
-            random_min=self._decimal_to_text(params.random_min) if params.random_min is not None else "",
-            random_max=self._decimal_to_text(params.random_max) if params.random_max is not None else "",
-            token_contract=params.token_contract,
-            token_decimals=params.token_decimals,
-            token_is_native=params.token_is_native,
-            jobs=resolved_jobs,
-        )
-        batch_id, resumed = journal.resume_or_begin_batch(
-            "onchain-transfer-batch",
-            str(params.network or "").upper(),
-            fingerprint=plan.fingerprint,
-            task_keys=[task.task_key for task in plan.tasks],
-        )
-        states = journal.batch_task_states(batch_id, kind="onchain-transfer")
-        completed = {
-            task_key: entry
-            for task_key, entry in states.items()
-            if str(entry.get("state") or "") in {"completed", "reconciled"}
-        }
-        return batch_id, plan, completed, resumed
-
-    def _reconcile_pending_onchain_operations(self, network: str, jobs_data: list[tuple[str, str, str]]) -> bool:
-        journal = getattr(self, "operation_journal", None)
-        if journal is None:
-            return True
-        source_addresses: set[str] = set()
-        for _row_key, source, _target in jobs_data:
-            try:
-                _private_key, source_address = self._resolve_wallet(source)
-                source_addresses.add(source_address.lower())
-            except Exception:
-                continue
-        pending: list[str] = []
-        for entry in journal.active_entries(kind="onchain-transfer"):
-            payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
-            if str(payload.get("network") or "").upper() != str(network or "").upper():
-                continue
-            source_addr = str(payload.get("source_address") or "").lower()
-            if source_addresses and source_addr not in source_addresses:
-                continue
-            entry_id = str(entry.get("id") or "")
-            txid = str(payload.get("txid") or "").strip()
-            try:
-                receipt = self.client.get_transaction_receipt(network, txid) if txid else None
-            except Exception:
-                receipt = None
-            if receipt is not None:
-                status_value = receipt.get("status")
-                if status_value is not None and self.client._int_from_hex(status_value) != 1:
-                    journal.update(entry_id, "failed", reconciliation="receipt-failed")
-                else:
-                    journal.update(entry_id, "completed", reconciliation="receipt-success")
-                continue
-            try:
-                nonce = int(payload.get("nonce"))
-                pending_nonce = self.client.get_nonce(network, source_addr)
-            except Exception:
-                pending.append(entry_id)
-                continue
-            if pending_nonce > nonce:
-                journal.update(entry_id, "submitted_unknown", reconciliation="nonce-advanced")
-            pending.append(entry_id)
-        if pending:
-            message = f"检测到 {len(pending)} 笔未完成链上交易，请先等待确认或核对 txid 后再重试，已阻止重复转账。"
-            self.log(message)
-            self._dispatch_ui(lambda text=message: messagebox.showwarning("待恢复交易", text))
-            return False
-        return True
-
     @classmethod
     def _random_decimal_between(cls, low: Decimal, high: Decimal, token_decimals: int) -> Decimal:
         return random_decimal_between(low, high, cls._random_amount_unit(token_decimals))
@@ -188,6 +95,13 @@ class OnchainTransferRunnerMixin(object):
             messagebox.showerror("参数错误", "执行间隔格式错误")
             return None
         try:
+            one_to_many_source_threads = int(str(self.one_to_many_source_threads_var.get()).strip())
+            if one_to_many_source_threads <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("参数错误", "1对多单钱包线程数必须是大于 0 的整数")
+            return None
+        try:
             threads = max(1, int(str(self.threads_var.get()).strip()))
         except Exception:
             messagebox.showerror("参数错误", "执行线程数格式错误")
@@ -199,6 +113,30 @@ class OnchainTransferRunnerMixin(object):
             return None
         if confirm_timeout_seconds <= 0:
             messagebox.showerror("参数错误", "确认超时必须大于 0")
+            return None
+        try:
+            receipt_poll_interval_seconds = float(str(self.receipt_poll_interval_var.get()).strip())
+        except Exception:
+            messagebox.showerror("参数错误", "receipt轮询间隔格式错误")
+            return None
+        if receipt_poll_interval_seconds <= 0:
+            messagebox.showerror("参数错误", "receipt轮询间隔必须大于 0")
+            return None
+        try:
+            receipt_retry_count = int(str(self.receipt_retry_count_var.get()).strip())
+        except Exception:
+            messagebox.showerror("参数错误", "receipt重试次数格式错误")
+            return None
+        if receipt_retry_count <= 0:
+            messagebox.showerror("参数错误", "receipt重试次数必须大于 0")
+            return None
+        try:
+            nonce_window = int(str(self.nonce_window_var.get()).strip())
+        except Exception:
+            messagebox.showerror("参数错误", "单钱包nonce并发格式错误")
+            return None
+        if nonce_window <= 0:
+            messagebox.showerror("参数错误", "单钱包nonce并发必须大于 0")
             return None
 
         if hasattr(self, "mode_var") and self._is_mode_m1():
@@ -243,7 +181,11 @@ class OnchainTransferRunnerMixin(object):
             network=network,
             delay=delay,
             threads=threads,
+            one_to_many_source_threads=one_to_many_source_threads,
             confirm_timeout_seconds=confirm_timeout_seconds,
+            receipt_poll_interval_seconds=receipt_poll_interval_seconds,
+            receipt_retry_count=receipt_retry_count,
+            nonce_window=nonce_window,
             random_enabled=random_enabled,
             random_min=random_min,
             random_max=random_max,
@@ -280,6 +222,61 @@ class OnchainTransferRunnerMixin(object):
         if hasattr(self, "mode_var") and self._is_mode_m1():
             return "源钱包手续费预留"
         return "中转手续费预留"
+    def _one_to_many_source_threads_confirm_text(self, params: WithdrawRuntimeParams) -> str:
+        if hasattr(self, "mode_var") and self._is_mode_1m():
+            return f"1对多单钱包线程数：{params.one_to_many_source_threads}\n"
+        return ""
+    def _ask_relay_fee_recovery_confirm(self, *, text: str, default_target: str = "") -> str | None:
+        parent = getattr(self, "root", None) or getattr(self, "parent", None)
+        dialog = tk.Toplevel(parent)
+        dialog.title("中转手续费回收确认")
+        dialog.resizable(False, False)
+        if parent is not None:
+            try:
+                dialog.transient(parent)
+            except Exception:
+                pass
+        result: dict[str, str | None] = {"target": None}
+        target_var = tk.StringVar(value=str(default_target or "").strip())
+
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text=text, justify="left", wraplength=560).pack(fill="x", anchor="w")
+        target_row = ttk.Frame(body)
+        target_row.pack(fill="x", pady=(12, 0))
+        ttk.Label(target_row, text="统一收款地址").pack(side="left")
+        target_entry = ttk.Entry(target_row, textvariable=target_var, width=54)
+        target_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        ttk.Label(body, text="留空则按记录默认地址回收", style="Subtle.TLabel").pack(anchor="w", pady=(6, 0))
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x", pady=(14, 0))
+
+        def confirm():
+            result["target"] = str(target_var.get() or "").strip()
+            dialog.destroy()
+
+        def cancel():
+            result["target"] = None
+            dialog.destroy()
+
+        ttk.Button(btn_row, text="取消", command=cancel).pack(side="right")
+        ttk.Button(btn_row, text="确认", command=confirm).pack(side="right", padx=(0, 8))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        target_entry.focus_set()
+        try:
+            dialog.grab_set()
+        except Exception:
+            pass
+        try:
+            dialog.update_idletasks()
+            if parent is not None:
+                x = parent.winfo_rootx() + max(0, (parent.winfo_width() - dialog.winfo_width()) // 2)
+                y = parent.winfo_rooty() + max(0, (parent.winfo_height() - dialog.winfo_height()) // 2)
+                dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        dialog.wait_window()
+        return result["target"]
     def _resolve_source_address(self, source: str) -> str:
         source_key = source.strip()
         if not source_key:
@@ -373,8 +370,12 @@ class OnchainTransferRunnerMixin(object):
                     f"币种：{token_desc}\n"
                     f"数量：{amount_text}\n"
                     f"执行间隔：{params.delay} 秒\n"
+                    f"{self._one_to_many_source_threads_confirm_text(params)}"
                     f"执行线程数：{params.threads}\n"
                     f"确认超时：{params.confirm_timeout_seconds:g} 秒\n"
+                    f"receipt轮询：{params.receipt_poll_interval_seconds:g} 秒\n"
+                    f"receipt重试：{params.receipt_retry_count} 次\n"
+                    f"单钱包nonce并发：{params.nonce_window}\n"
                     f"{relay_text}\n"
                     "确认继续？"
                 )
@@ -513,6 +514,7 @@ class OnchainTransferRunnerMixin(object):
                 f"币种：{token_desc}\n"
                 f"数量：{amount_text}\n"
                 f"执行间隔：{params.delay} 秒\n"
+                f"{self._one_to_many_source_threads_confirm_text(params)}"
                 f"执行线程数：{params.threads}\n\n"
                 f"确认超时：{params.confirm_timeout_seconds:g} 秒\n\n"
                 "确认继续？"
@@ -537,6 +539,7 @@ class OnchainTransferRunnerMixin(object):
         confirm: bool,
         show_dialog: bool = True,
         run_label: str = "manual",
+        sweep_target_override: str = "",
     ) -> bool:
         if self.is_running:
             messagebox.showwarning("提示", "已有任务在运行")
@@ -555,6 +558,7 @@ class OnchainTransferRunnerMixin(object):
                 messagebox.showerror("依赖缺失", str(exc))
                 return False
         worker_threads = max(1, int(self._runtime_worker_threads()))
+        sweep_target_override = str(sweep_target_override or "").strip()
         if confirm:
             scope_text = f"本次批量 {len(batch_filter)} 个批次" if batch_filter else "全部历史记录"
             text = (
@@ -565,10 +569,19 @@ class OnchainTransferRunnerMixin(object):
                 f"回收线程数：{worker_threads}\n\n"
                 "确认继续？"
             )
-            if not messagebox.askyesno("中转手续费回收确认", text):
+            target_input = self._ask_relay_fee_recovery_confirm(text=text, default_target=sweep_target_override)
+            if target_input is None:
                 self.log("用户取消了中转手续费回收")
                 return False
-        self.log(f"开始中转手续费回收：扫描 {len(records)} 条记录，线程数={worker_threads}")
+            sweep_target_override = str(target_input or "").strip()
+            if sweep_target_override:
+                try:
+                    sweep_target_override = self._validate_recipient_address(sweep_target_override, "统一收款地址")
+                except Exception as exc:
+                    messagebox.showerror("参数错误", str(exc))
+                    return False
+        target_log = f"，统一回收地址={sweep_target_override}" if sweep_target_override else ""
+        self.log(f"开始中转手续费回收：扫描 {len(records)} 条记录，线程数={worker_threads}{target_log}")
         self.stop_requested.clear()
         self.is_running = True
         self._start_managed_thread(
@@ -578,6 +591,7 @@ class OnchainTransferRunnerMixin(object):
                 "batch_ids": batch_filter if batch_filter else None,
                 "show_dialog": show_dialog,
                 "run_label": run_label,
+                "sweep_target_override": sweep_target_override,
             },
             name="onchain-relay-fee-recovery",
         )
@@ -643,8 +657,12 @@ class OnchainTransferRunnerMixin(object):
                     f"币种：{token_desc}\n"
                     f"数量：{amount_text}\n"
                     f"执行间隔：{params.delay} 秒\n"
+                    f"{self._one_to_many_source_threads_confirm_text(params)}"
                     f"执行线程数：{params.threads}\n"
                     f"确认超时：{params.confirm_timeout_seconds:g} 秒\n"
+                    f"receipt轮询：{params.receipt_poll_interval_seconds:g} 秒\n"
+                    f"receipt重试：{params.receipt_retry_count} 次\n"
+                    f"单钱包nonce并发：{params.nonce_window}\n"
                     f"{relay_text}\n"
                     "确认继续？"
                 )
@@ -695,40 +713,13 @@ class OnchainTransferRunnerMixin(object):
             self.log(f"中转手续费回收启动异常：{exc}")
             messagebox.showerror("执行异常", str(exc))
     def _run_batch_transfer(self, jobs_data: list[tuple[str, str, str]], params: WithdrawRuntimeParams, dry_run: bool):
-        recovery_batch_id = ""
-        recovery_batch_finalized = False
         success = 0
         failed = 0
         if params.relay_enabled:
             run_relay_batch(self, jobs_data, params, dry_run)
             return
-        if not dry_run and not self._reconcile_pending_onchain_operations(params.network, jobs_data):
-            self._clear_source_private_key_cache()
-            self.is_running = False
-            return
         dispatch_ui = self._dispatch_ui
         try:
-            completed_recoveries: dict[str, dict[str, object]] = {}
-            completed_by_row_key: dict[str, dict[str, object]] = {}
-            task_key_by_row_key: dict[str, str] = {}
-            if not dry_run:
-                recovery_batch_id, recovery_plan, completed_recoveries, resumed = self._prepare_onchain_recovery_batch(params, jobs_data)
-                if recovery_plan is not None:
-                    task_key_by_row_key = {task.row_key: task.task_key for task in recovery_plan.tasks}
-                    completed_by_row_key = {
-                        task.row_key: completed_recoveries[task.task_key]
-                        for task in recovery_plan.tasks
-                        if task.task_key in completed_recoveries
-                    }
-                    jobs_data = [
-                        item
-                        for item in jobs_data
-                        if task_key_by_row_key.get(item[0], "") not in completed_recoveries
-                    ]
-                    if resumed:
-                        self.log(
-                            f"检测到未结束链上批次，已恢复账本：跳过 {len(completed_recoveries)} 笔已确认交易，继续处理 {len(jobs_data)} 笔。"
-                        )
             set_ui_batch_size(self, params.threads)
             row_number_by_key = self._row_number_by_key_snapshot()
 
@@ -755,46 +746,27 @@ class OnchainTransferRunnerMixin(object):
             dispatch_ui(
                 lambda: self.log(
                     f"开始批量链上转账：mode={self._mode()}，任务={len(jobs_data)}，network={params.network}，"
-                    f"coin={token_desc}，amount={amount_view}，delay={params.delay}，threads={params.threads}，dry_run={dry_run}"
+                    f"coin={token_desc}，amount={amount_view}，delay={params.delay}，"
+                    f"1m_source_threads={params.one_to_many_source_threads}，threads={params.threads}，dry_run={dry_run}"
                 ),
             )
             fallback_prefixes: dict[str, str] = {}
-            for row_key, entry in completed_by_row_key.items() if not dry_run else ():
-                payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
-                recovered_amount = str(payload.get("amount") or "")
-                self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
-                dispatch_ui(
-                    lambda k=row_key, amount=recovered_amount: self._set_status(
-                        k,
-                        "success",
-                        self._success_status_text(params.coin, amount),
-                    )
-                )
             for row_key, _source, _target in jobs_data:
                 fallback_prefixes[row_key] = job_prefix(len(fallback_prefixes) + 1, row_key)
                 self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                 dispatch_ui(lambda k=row_key: self._set_status(k, "waiting"))
 
-            success = len(completed_recoveries)
+            success = 0
             failed = 0
             resolved = 0
             total_amount = Decimal("0")
-            if track_amount_total:
-                for entry in completed_recoveries.values():
-                    payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
-                    try:
-                        total_amount += Decimal(str(payload.get("amount") or "0"))
-                    except Exception:
-                        pass
             total_gas_fee_wei = 0
             lock = threading.Lock()
             resolved_event = threading.Event()
             resolved_row_keys: set[str] = set()
-            journal_entry_ids: dict[str, str] = {}
             nonce_lock_map: dict[str, threading.Lock] = {}
             nonce_next_map: dict[str, int] = {}
             nonce_guard = threading.Lock()
-
             jobs_q: queue.Queue[tuple[int, str, str, str]] = queue.Queue()
             for i, item in enumerate(jobs_data, start=1):
                 row_key, source, target = item
@@ -826,7 +798,6 @@ class OnchainTransferRunnerMixin(object):
                 *,
                 amount_text: str = "",
                 gas_fee_wei: int = 0,
-                journal_state: str = "",
             ):
                 nonlocal success, failed, resolved, total_amount, total_gas_fee_wei
                 context_sig = context_by_row_key.get(row_key, "")
@@ -850,14 +821,6 @@ class OnchainTransferRunnerMixin(object):
                     gas_total_text = "-" if dry_run else self._estimated_gas_fee_text(params.network, total_gas_fee_wei)
                     resolved += 1
                     done = resolved >= len(jobs_data)
-                journal_entry_id = journal_entry_ids.get(row_key, "")
-                if journal_entry_id and not dry_run:
-                    if journal_state:
-                        self.operation_journal.update(journal_entry_id, journal_state)
-                    elif result_status == "success":
-                        self.operation_journal.update(journal_entry_id, "completed")
-                    elif result_status == "failed":
-                        self.operation_journal.update(journal_entry_id, "failed")
                 if done:
                     resolved_event.set()
                 dispatch_ui(lambda m=msg: self.log(m))
@@ -865,83 +828,7 @@ class OnchainTransferRunnerMixin(object):
                 dispatch_ui(lambda k=row_key, s=result_status, t=row_status_text: self._set_status(k, s, t))
                 dispatch_ui(lambda a=amount_total_text, g=gas_total_text: self._set_progress_metrics(amount_text=a, gas_text=g))
 
-            def schedule_submitted_timeout(row_key: str, prefix: str, submitted_timeout_seconds: float):
-                timeout_msg = f"{prefix} 确认中超过 {submitted_timeout_seconds:g} 秒，自动判定失败"
-                timeout_deadline = time.monotonic() + max(0.0, float(submitted_timeout_seconds))
-
-                def timeout_worker():
-                    remaining = max(0.0, timeout_deadline - time.monotonic())
-                    if remaining > 0 and self.stop_requested.wait(remaining):
-                        return
-                    if self.stop_requested.is_set() or self._closing or bool(getattr(self.root, "_closing", False)):
-                        return
-                    finalize_job(row_key, "failed", timeout_msg, journal_state="submitted")
-
-                if submitted_timeout_seconds > 0:
-                    timeout_name = f"onchain-submitted-timeout-{str(row_key or '')[-8:] or 'job'}"
-                    self._submit_confirmation_task(timeout_worker, name=timeout_name)
-                else:
-                    timeout_worker()
-
-            def schedule_submitted_confirmation(
-                row_key: str,
-                prefix: str,
-                submitted_timeout_seconds: float,
-                txid: str,
-                amount_text: str,
-                gas_fee_wei: int,
-            ):
-                tx_hash = str(txid or "").strip()
-                if not tx_hash:
-                    schedule_submitted_timeout(row_key, prefix, submitted_timeout_seconds)
-                    return
-                confirm_deadline = time.time() + max(0.1, float(submitted_timeout_seconds))
-
-                def confirm_worker():
-                    last_error = ""
-                    while True:
-                        if self.stop_requested.is_set() or self._closing or bool(getattr(self.root, "_closing", False)):
-                            return
-                        try:
-                            receipt = self.client.get_transaction_receipt(params.network, tx_hash)
-                            if receipt is not None:
-                                status_raw = receipt.get("status")
-                                if status_raw is not None and self.client._int_from_hex(status_raw) != 1:
-                                    finalize_job(
-                                        row_key,
-                                        "failed",
-                                        f"{prefix} 交易确认失败：链上执行状态异常，txid={tx_hash}",
-                                        journal_state="failed",
-                                    )
-                                else:
-                                    finalize_job(
-                                        row_key,
-                                        "success",
-                                        f"{prefix} 转账确认完成：txid={tx_hash}",
-                                        amount_text=amount_text,
-                                        gas_fee_wei=gas_fee_wei,
-                                        journal_state="completed",
-                                    )
-                                return
-                        except Exception as exc:
-                            last_error = str(exc)
-                        if time.time() >= confirm_deadline:
-                            detail = f"，最后错误：{last_error}" if last_error else ""
-                            finalize_job(
-                                row_key,
-                                "failed",
-                                f"{prefix} 确认中超过 {submitted_timeout_seconds:g} 秒，txid={tx_hash}{detail}",
-                                journal_state="submitted",
-                            )
-                            return
-                        if self.stop_requested.wait(2.0):
-                            return
-
-                timeout_name = f"onchain-submitted-confirm-{str(row_key or '')[-8:] or 'job'}"
-                self._submit_confirmation_task(confirm_worker, name=timeout_name)
-
             def worker():
-                total = len(jobs_data)
                 while True:
                     if self.stop_requested.is_set():
                         return
@@ -958,11 +845,8 @@ class OnchainTransferRunnerMixin(object):
                     gas_fee_wei = 0
                     tx_sent = False
                     txid = ""
-                    journal_entry_id = ""
-                    journal_terminal_state = ""
                     self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
                     dispatch_ui(lambda k=row_key: self._set_status(k, "running"))
-                    submitted_timeout_seconds = max(0.0, float(params.confirm_timeout_seconds))
                     prefix = job_prefix(i, row_key)
                     try:
                         if dry_run:
@@ -991,25 +875,6 @@ class OnchainTransferRunnerMixin(object):
                             )
                             nonce = alloc_nonce(source_addr)
                             used_nonce = nonce
-                            journal = getattr(self, "operation_journal", None)
-                            if journal is not None:
-                                journal_entry_id = journal.begin(
-                                    "onchain-transfer",
-                                    f"{params.network}:{source_addr.lower()}",
-                                    {
-                                        "network": params.network,
-                                        "source_address": source_addr,
-                                        "target_address": target,
-                                        "nonce": nonce,
-                                        "coin": params.coin,
-                                        "amount": amount_text,
-                                        "batch_id": recovery_batch_id,
-                                        "task_key": task_key_by_row_key.get(row_key, ""),
-                                    },
-                                )
-                                journal_entry_ids[row_key] = journal_entry_id
-                                journal.update(journal_entry_id, "broadcasting")
-                            recovery_timeout_seconds = min(max(6.0, float(params.confirm_timeout_seconds) / 3.0), 20.0)
                             if params.token_is_native:
                                 submission = self.client.submit_native_transfer_reliably(
                                     network=params.network,
@@ -1020,7 +885,6 @@ class OnchainTransferRunnerMixin(object):
                                     gas_price_wei=gas_price_wei,
                                     gas_limit=gas_limit,
                                     source_address=source_addr,
-                                    recovery_timeout_seconds=recovery_timeout_seconds,
                                 )
                             else:
                                 submission = self.client.submit_erc20_transfer_reliably(
@@ -1033,82 +897,44 @@ class OnchainTransferRunnerMixin(object):
                                     gas_price_wei=gas_price_wei,
                                     gas_limit=gas_limit,
                                     source_address=source_addr,
-                                    recovery_timeout_seconds=recovery_timeout_seconds,
                                 )
                             txid = submission.tx_hash
                             tx_sent = True
-                            if journal_entry_id:
-                                self.operation_journal.update(
-                                    journal_entry_id,
-                                    "submitted",
-                                    txid=txid,
-                                    recovered=bool(submission.recovered),
-                                    recovery_reason=str(submission.recovery_reason or ""),
-                                )
                             if txid:
                                 gas_fee_wei = max(0, int(gas_limit)) * max(0, int(gas_price_wei))
                                 gas_text = self._gas_fee_amount_text(params.network, gas_fee_wei)
-                                if submission.recovered and submission.recovery_reason == "receipt":
-                                    msg = (
-                                        f"{prefix} 金额={params.coin} {amount_text}，预估gas={gas_text}，"
-                                        f"from={source_addr}，to={target}，txid={txid}，广播异常但链上已确认"
-                                    )
-                                    result_status = "success"
-                                    journal_terminal_state = "completed"
-                                elif submission.recovered:
-                                    recover_reason = {
-                                        "tx-hash": "已按 tx hash 找到交易",
-                                        "source-nonce": "已按源地址 nonce 发现交易占用",
-                                    }.get(submission.recovery_reason, "已进入链上确认")
-                                    msg = (
-                                        f"{prefix} 转账广播结果待确认：金额={params.coin} {amount_text}，预估gas={gas_text}，"
-                                        f"from={source_addr}，to={target}，txid={txid}，{recover_reason}"
-                                    )
-                                    result_status = "submitted"
-                                else:
-                                    msg = (
-                                        f"{prefix} 金额={params.coin} {amount_text}，预估gas={gas_text}，"
-                                        f"from={source_addr}，to={target}，txid={txid}"
-                                    )
-                                    result_status = "success"
-                                    # A successful RPC response is only a broadcast result.
-                                    # Keep the ledger active until a receipt is reconciled.
-                                    journal_terminal_state = "submitted"
+                                msg = (
+                                    f"{prefix} 金额={params.coin} {amount_text}，预估gas={gas_text}，"
+                                    f"from={source_addr}，to={target}，txid={txid}"
+                                )
+                                result_status = "success"
                             else:
                                 msg = (
-                                    f"{prefix} 转账确认中：未拿到 txid，"
+                                    f"{prefix} 转账失败：未拿到 txid，"
                                     f"from={source_addr}，to={target}"
                                 )
-                                result_status = "submitted"
+                                result_status = "failed"
                     except Exception as exc:
                         if used_nonce is not None and source_addr and not tx_sent:
                             rollback_nonce(source_addr, used_nonce)
-                        if journal_entry_id and not tx_sent:
-                            self.operation_journal.update(journal_entry_id, "failed", error=str(exc))
                         msg = f"{prefix} 转账失败：{exc}"
                     finally:
                         jobs_q.task_done()
 
-                    if result_status == "submitted":
-                        dispatch_ui(lambda m=msg: self.log(m))
-                        self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
-                        dispatch_ui(lambda k=row_key: self._set_status(k, "submitted"))
-                        schedule_submitted_confirmation(row_key, prefix, submitted_timeout_seconds, txid, amount_text, gas_fee_wei)
-                    else:
-                        finalize_job(
-                            row_key,
-                            result_status,
-                            msg,
-                            amount_text=amount_text,
-                            gas_fee_wei=gas_fee_wei,
-                            journal_state=(journal_terminal_state or ("failed" if result_status == "failed" else "")),
-                        )
+                    finalize_job(
+                        row_key,
+                        result_status,
+                        msg,
+                        amount_text=amount_text,
+                        gas_fee_wei=gas_fee_wei,
+                    )
                     if params.delay > 0:
                         if self.stop_requested.wait(params.delay):
                             return
 
             workers: list[threading.Thread] = []
-            worker_count = max(1, min(params.threads, len(jobs_data)))
+            worker_limit = params.one_to_many_source_threads if self._is_mode_1m() else params.threads
+            worker_count = max(1, min(int(worker_limit or 1), len(jobs_data)))
             for _ in range(worker_count):
                 t = threading.Thread(target=worker, daemon=True)
                 t.start()
@@ -1121,7 +947,7 @@ class OnchainTransferRunnerMixin(object):
                 for row_key in pending_row_keys:
                     prefix = fallback_prefixes.get(row_key, "")
                     stop_msg = f"{prefix} 已停止" if prefix else "任务已停止"
-                    finalize_job(row_key, "failed", stop_msg, journal_state="interrupted")
+                    finalize_job(row_key, "failed", stop_msg)
                 resolved_event.set()
                 dispatch_ui(lambda: self.log("链上转账任务已停止"))
             batch_finalize_timeout_seconds = max(
@@ -1136,7 +962,7 @@ class OnchainTransferRunnerMixin(object):
                 for row_key in pending_row_keys:
                     prefix = fallback_prefixes.get(row_key, "")
                     timeout_msg = f"{prefix} 任务收尾超时，自动判定失败" if prefix else "任务收尾超时，自动判定失败"
-                    finalize_job(row_key, "failed", timeout_msg, journal_state="submitted")
+                    finalize_job(row_key, "failed", timeout_msg)
 
             summary = f"链上转账任务结束：成功 {success}，失败 {failed}"
             if not dry_run:
@@ -1157,19 +983,6 @@ class OnchainTransferRunnerMixin(object):
                 )
             )
             dispatch_ui(lambda s=success, f=failed: self._finish_progress("transfer", s, f))
-            if recovery_batch_id:
-                task_states = self.operation_journal.batch_task_states(recovery_batch_id, kind="onchain-transfer")
-                has_pending_receipt = any(
-                    str(entry.get("state") or "") not in {"completed", "cancelled", "failed", "reconciled"}
-                    for entry in task_states.values()
-                )
-                self.operation_journal.finish_batch(
-                    recovery_batch_id,
-                    success=success,
-                    failed=failed,
-                    interrupted=bool(self.stop_requested.is_set()) or has_pending_receipt,
-                )
-                recovery_batch_finalized = True
         except Exception as exc:
             err_text = str(exc)
             dispatch_ui(lambda m=f"链上转账任务异常终止：{err_text}": self.log(m))
@@ -1178,15 +991,5 @@ class OnchainTransferRunnerMixin(object):
                 lambda s=success if "success" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("transfer", s, f),
             )
         finally:
-            if recovery_batch_id and not recovery_batch_finalized:
-                try:
-                    self.operation_journal.finish_batch(
-                        recovery_batch_id,
-                        success=success,
-                        failed=max(1, failed),
-                        interrupted=True,
-                    )
-                except Exception:
-                    pass
             self._clear_source_private_key_cache()
             self.is_running = False

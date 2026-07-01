@@ -89,7 +89,7 @@ class ExchangeAccountDestructionTests(unittest.TestCase):
                 data / "exchange_strategy_settings.json",
                 data / "exchange_proxy_settings.json",
                 data / "onchain.json",
-                data / "onchain_operations.json",
+                data / "onchain_unrelated_state.json",
                 data / "onchain_ss_proxy_123_token.json",
                 data / "onchain_proxy_runtime_123.log",
                 logs / "relay_sweep.jsonl",

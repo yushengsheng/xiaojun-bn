@@ -23,19 +23,21 @@ from app_defaults import (
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
     ONCHAIN_CONFIRM_WORKER_LIMIT_MAX,
     ONCHAIN_DELAY_SECONDS_DEFAULT,
+    ONCHAIN_NONCE_WINDOW_DEFAULT,
+    ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT,
+    ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT,
+    ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT,
     ONCHAIN_WORKER_THREADS_DEFAULT,
 )
 from app_paths import (
     ONCHAIN_DATA_FILE,
-    ONCHAIN_OPERATION_JOURNAL_FILE,
     RELAY_FAILED_EXPORT_FILE,
     RELAY_MANUAL_EXPORT_FILE,
     RELAY_WALLET_FILE,
 )
 from core_models import EvmToken, GeneratedWalletEntry, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
-from exchange_logging import logger
+from exchange_logging import is_transient_retry_log_message, logger
 from onchain_relay_wallets import RelayWalletFileStore
-from operation_journal import OperationJournal
 from shared_utils import (
     LOG_MAX_ROWS,
     SolidButton,
@@ -68,6 +70,7 @@ from table_import_utils import (
     update_import_target_bar,
 )
 import task_progress
+from system_proxy import refresh_system_proxy_cache, system_proxy_map
 
 SUBMITTED_TIMEOUT_SECONDS = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
 ONCHAIN_PROBLEM_LOG_KEYWORDS = (
@@ -114,19 +117,19 @@ class OnchainTransferPageBase:
     TREE_COL_MIN_WIDTHS = {
         "checked": 42,
         "idx": 42,
-        "source": 330,
-        "target": 420,
-        "status": 110,
-        "recovery": 96,
-        "balance": 80,
+        "source": 190,
+        "target": 430,
+        "status": 150,
+        "recovery": 150,
+        "balance": 150,
     }
     TREE_COL_WEIGHTS = {
-        "checked": 1,
-        "idx": 1,
-        "source": 5,
-        "target": 7,
-        "status": 2,
-        "recovery": 2,
+        "checked": 0,
+        "idx": 0,
+        "source": 0,
+        "target": 0,
+        "status": 1,
+        "recovery": 1,
         "balance": 1,
     }
 
@@ -141,7 +144,7 @@ class OnchainTransferPageBase:
             allow_system_proxy_provider=self._allow_onchain_system_proxy,
         )
         self.relay_wallet_store = RelayWalletFileStore(RELAY_WALLET_FILE)
-        self.operation_journal = OperationJournal(ONCHAIN_OPERATION_JOURNAL_FILE)
+        self.operation_journal = None
         self._closing = False
         self.is_running = False
         self.stop_requested = threading.Event()
@@ -161,6 +164,9 @@ class OnchainTransferPageBase:
         self.row_recovery_context: dict[str, str] = {}
         self.query_row_status: dict[str, str] = {}
         self.query_row_status_context: dict[str, str] = {}
+        self._pending_query_row_update_keys: set[str] = set()
+        self._query_row_update_scheduled = False
+        self._query_row_update_lock = threading.Lock()
         self.source_balance_cache: dict[str, Decimal] = {}
         self.target_balance_cache: dict[str, Decimal] = {}
         self.source_address_cache: dict[str, str] = {}
@@ -188,8 +194,12 @@ class OnchainTransferPageBase:
         self.random_min_var = StringVar(value="")
         self.random_max_var = StringVar(value="")
         self.delay_var = DoubleVar(value=ONCHAIN_DELAY_SECONDS_DEFAULT)
+        self.one_to_many_source_threads_var = StringVar(value=str(ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT))
         self.threads_var = StringVar(value=str(ONCHAIN_WORKER_THREADS_DEFAULT))
         self.confirm_timeout_var = StringVar(value=str(int(ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)))
+        self.receipt_poll_interval_var = StringVar(value=str(int(ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT)))
+        self.receipt_retry_count_var = StringVar(value=str(ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT))
+        self.nonce_window_var = StringVar(value=str(ONCHAIN_NONCE_WINDOW_DEFAULT))
         self.dry_run_var = BooleanVar(value=False)
         self.use_config_proxy_var = BooleanVar(value=False)
         self.onchain_proxy_var = StringVar(value="")
@@ -249,7 +259,7 @@ class OnchainTransferPageBase:
         main = ttk.Frame(self.parent, padding=12)
         main.pack(fill=BOTH, expand=True)
 
-        setting = ttk.LabelFrame(main, text="链上批量转账配置（EVM）", padding=14)
+        setting = ttk.LabelFrame(main, text="链上批量转账配置（EVM）", padding=(10, 8))
         setting.pack(fill="x", pady=(0, 10))
         self.setting_frame = setting
 
@@ -297,10 +307,30 @@ class OnchainTransferPageBase:
         self.btn_save_all = ttk.Button(setting, text="保存配置", command=self.save_all)
         self.lbl_delay = ttk.Label(setting, text="执行间隔(秒)")
         self.ent_delay = ttk.Entry(setting, textvariable=self.delay_var, width=7)
+        self.lbl_one_to_many_source_threads = ttk.Label(setting, text="1对多单钱包线程数")
+        self.spin_one_to_many_source_threads = ttk.Spinbox(
+            setting,
+            from_=1,
+            to=64,
+            textvariable=self.one_to_many_source_threads_var,
+            width=4,
+        )
         self.lbl_threads = ttk.Label(setting, text="执行线程数")
         self.spin_threads = ttk.Spinbox(setting, from_=1, to=64, textvariable=self.threads_var, width=6)
         self.lbl_confirm_timeout = ttk.Label(setting, text="确认超时(秒)")
         self.ent_confirm_timeout = ttk.Entry(setting, textvariable=self.confirm_timeout_var, width=7)
+        self.lbl_receipt_poll_interval = ttk.Label(setting, text="receipt轮询(秒)")
+        self.ent_receipt_poll_interval = ttk.Entry(setting, textvariable=self.receipt_poll_interval_var, width=5)
+        self.lbl_receipt_retry_count = ttk.Label(setting, text="receipt重试")
+        self.spin_receipt_retry_count = ttk.Spinbox(
+            setting,
+            from_=1,
+            to=99,
+            textvariable=self.receipt_retry_count_var,
+            width=4,
+        )
+        self.lbl_nonce_window = ttk.Label(setting, text="单钱包nonce并发")
+        self.spin_nonce_window = ttk.Spinbox(setting, from_=1, to=64, textvariable=self.nonce_window_var, width=4)
 
         self.lbl_source_credential = ttk.Label(setting, text="转出钱包私钥/助记词*")
         self.ent_source_credential = ttk.Entry(setting, textvariable=self.source_credential_var, width=34, show="*")
@@ -318,7 +348,7 @@ class OnchainTransferPageBase:
         self.ent_relay_fee_reserve = ttk.Entry(setting, textvariable=self.relay_fee_reserve_var, width=12)
         self.lbl_relay_wallet_file = ttk.Label(
             setting,
-            text=f"中转钱包受程序密码认证加密保护：{RELAY_WALLET_FILE.name}；仅清理超过 72 小时且余额已清空的钱包。",
+            text=f"中转钱包受程序密码认证加密保护：{RELAY_WALLET_FILE.name}；批量执行不自动清理，手动回收时仅清理已确认无余额的无效记录。",
             style="Subtle.TLabel",
             justify="left",
             wraplength=920,
@@ -368,11 +398,11 @@ class OnchainTransferPageBase:
 
         self.tree.column("checked", width=42, anchor="center")
         self.tree.column("idx", width=42, anchor="center")
-        self.tree.column("source", width=360, anchor="w")
-        self.tree.column("target", width=420, anchor="w")
-        self.tree.column("status", width=110, anchor="center")
-        self.tree.column("recovery", width=96, anchor="center")
-        self.tree.column("balance", width=100, anchor="w")
+        self.tree.column("source", width=190, anchor="w")
+        self.tree.column("target", width=430, anchor="w")
+        self.tree.column("status", width=150, anchor="w")
+        self.tree.column("recovery", width=150, anchor="w")
+        self.tree.column("balance", width=150, anchor="w")
         self.tree.tag_configure("st_waiting", foreground="#8a6d3b", background="#fff7e0")
         self.tree.tag_configure("st_running", foreground="#1d5fbf", background="#eaf2ff")
         self.tree.tag_configure("st_success", foreground="#1b7f3b", background="#eaf8ef")
@@ -878,11 +908,19 @@ class OnchainTransferPageBase:
         timeout: int = 10,
         allow_system_proxy: bool = True,
     ):
+        from system_proxy import configure_requests_session_for_proxy
+
         session = requests.Session()
         try:
-            session.trust_env = bool(allow_system_proxy) and not bool(proxies)
+            explicit_proxy = ""
             if proxies:
-                session.proxies.update(proxies)
+                explicit_proxy = str(proxies.get("https") or proxies.get("http") or "").strip()
+            configure_requests_session_for_proxy(
+                session,
+                explicit_proxy=explicit_proxy,
+                target_url=url,
+                allow_system_proxy=bool(allow_system_proxy) and not bool(explicit_proxy),
+            )
             return session.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
         finally:
             session.close()
@@ -933,17 +971,13 @@ class OnchainTransferPageBase:
             return {}
         return {"http": proxy_url, "https": proxy_url}
     @staticmethod
-    def _onchain_system_proxy_map() -> dict[str, str]:
-        try:
-            proxies = requests.utils.get_environ_proxies("https://gateway.tenderly.co/public/mainnet") or {}
-        except Exception:
-            return {}
-        result = {}
-        for key in ("http", "https"):
-            value = str(proxies.get(key) or "").strip()
-            if value:
-                result[key] = value
-        return result
+    def _onchain_system_proxy_map(*, refresh: bool = False, include_local_probe: bool = False) -> dict[str, str]:
+        if refresh:
+            return refresh_system_proxy_cache(
+                "https://gateway.tenderly.co/public/mainnet",
+                include_local_probe=include_local_probe,
+            )
+        return system_proxy_map("https://gateway.tenderly.co/public/mainnet")
     def _onchain_proxy_route_text(self, state: dict[str, object] | None = None) -> str:
         snapshot = dict(state or self._onchain_proxy_state_snapshot())
         raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
@@ -1667,6 +1701,24 @@ class OnchainTransferPageBase:
     def _update_rows_view(self, row_keys: list[str]):
         for row_key in row_keys:
             self._update_row_view(row_key)
+    def _schedule_query_rows_update(self, row_keys: list[str]):
+        keys = self._unique_row_keys(row_keys)
+        if not keys:
+            return
+        with self._query_row_update_lock:
+            self._pending_query_row_update_keys.update(keys)
+            if self._query_row_update_scheduled:
+                return
+            self._query_row_update_scheduled = True
+
+        def _flush():
+            with self._query_row_update_lock:
+                pending = list(self._pending_query_row_update_keys)
+                self._pending_query_row_update_keys.clear()
+                self._query_row_update_scheduled = False
+            self._update_rows_view(pending)
+
+        schedule_ui_callback(self, "query_rows_update", _flush, root=getattr(self, "root", None))
     @staticmethod
     def _unique_row_keys(row_keys: list[str]) -> list[str]:
         return task_progress.unique_keys(row_keys)
@@ -1788,6 +1840,10 @@ class OnchainTransferPageBase:
         self._shutdown_confirmation_executor()
         self._join_managed_threads(timeout_total=1.0)
         try:
+            self.relay_wallet_store.flush()
+        except Exception:
+            logger.exception("中转钱包运行状态加密落盘失败")
+        try:
             self.client.close()
         except Exception:
             pass
@@ -1872,9 +1928,16 @@ class OnchainTransferPageBase:
         *,
         balance_text: str | None = None,
         amount_text: str | None = None,
+        recovery_text: str | None = None,
         gas_text: str | None = None,
     ):
-        task_progress.set_metrics(self, balance_text=balance_text, amount_text=amount_text, gas_text=gas_text)
+        task_progress.set_metrics(
+            self,
+            balance_text=balance_text,
+            amount_text=amount_text,
+            recovery_text=recovery_text,
+            gas_text=gas_text,
+        )
     def _set_status(self, row_key: str, status: str, status_text: str = ""):
         self._ensure_query_status_store().pop(row_key, None)
         self.row_status[row_key] = status
@@ -1896,11 +1959,16 @@ class OnchainTransferPageBase:
         self._refresh_progress_if_active("recovery", row_key)
     def _set_query_status(self, row_key: str, status: str):
         self._ensure_query_status_store()[row_key] = status
-        queue_ui_render(self, lambda k=row_key: self._update_row_view(k), root=getattr(self, "root", None))
+        self._schedule_query_rows_update([row_key])
         self._refresh_progress_if_active("query", row_key)
     def _set_query_statuses(self, row_keys: list[str], status: str):
-        for row_key in row_keys:
-            self._set_query_status(row_key, status)
+        keys = self._unique_row_keys(row_keys)
+        store = self._ensure_query_status_store()
+        for row_key in keys:
+            store[row_key] = status
+        self._schedule_query_rows_update(keys)
+        if keys:
+            self._refresh_progress_if_active("query", keys[0])
     def _apply_source_balance_summary(self, context_sig: str, text: str) -> None:
         if context_sig == self.source_credential_var.get().strip():
             self.source_balance_var.set(text)
@@ -2239,10 +2307,18 @@ class OnchainTransferPageBase:
             self.btn_save_all,
             self.lbl_delay,
             self.ent_delay,
+            self.lbl_one_to_many_source_threads,
+            self.spin_one_to_many_source_threads,
             self.lbl_threads,
             self.spin_threads,
             self.lbl_confirm_timeout,
             self.ent_confirm_timeout,
+            self.lbl_receipt_poll_interval,
+            self.ent_receipt_poll_interval,
+            self.lbl_receipt_retry_count,
+            self.spin_receipt_retry_count,
+            self.lbl_nonce_window,
+            self.spin_nonce_window,
             self.lbl_source_credential,
             self.ent_source_credential,
             self.btn_toggle_source_credential,
@@ -2269,6 +2345,7 @@ class OnchainTransferPageBase:
         show_source = self._is_mode_1m()
         show_target = self._is_mode_m1()
         show_relay = self._relay_controls_visible()
+        show_nonce_window = not show_target
 
         if layout_mode == "wide":
             self.lbl_mode.grid(row=0, column=0, sticky=W)
@@ -2279,20 +2356,31 @@ class OnchainTransferPageBase:
             self.coin_box.grid(row=0, column=5, sticky=W, padx=(4, 10))
             self.lbl_amount.grid(row=0, column=6, sticky=W)
             self.amount_ctrl.grid(row=0, column=7, sticky=W, padx=(4, 10))
-            self.chk_dry_run.grid(row=0, column=8, sticky=W, padx=(4, 0))
-            self.chk_use_config_proxy.grid(row=0, column=9, sticky=W, padx=(10, 0))
-            self.btn_save_all.grid(row=0, column=10, sticky=W, padx=(8, 0))
 
             self.lbl_contract_search.grid(row=1, column=0, sticky=W, pady=(8, 0))
             self.ent_contract_search.grid(row=1, column=1, columnspan=6, sticky="ew", padx=(4, 10), pady=(8, 0))
             self.btn_contract_search.grid(row=1, column=7, sticky=W, pady=(8, 0))
-            self.lbl_delay.grid(row=1, column=8, sticky=W, pady=(8, 0))
-            self.ent_delay.grid(row=1, column=9, sticky=W, padx=(4, 10), pady=(8, 0))
-            self.lbl_threads.grid(row=1, column=10, sticky=W, pady=(8, 0))
-            self.spin_threads.grid(row=1, column=11, sticky=W, padx=(4, 0), pady=(8, 0))
-            if not show_relay:
-                self.lbl_confirm_timeout.grid(row=1, column=12, sticky=W, pady=(8, 0))
-                self.ent_confirm_timeout.grid(row=1, column=13, sticky=W, padx=(4, 0), pady=(8, 0))
+            self.chk_dry_run.grid(row=1, column=8, sticky=W, padx=(8, 0), pady=(8, 0))
+            self.chk_use_config_proxy.grid(row=1, column=9, sticky=W, padx=(10, 0), pady=(8, 0))
+            self.btn_save_all.grid(row=1, column=10, sticky=W, padx=(8, 0), pady=(8, 0))
+
+            self.lbl_delay.grid(row=2, column=0, sticky=W, pady=(8, 0))
+            self.ent_delay.grid(row=2, column=1, sticky=W, padx=(4, 10), pady=(8, 0))
+            self.lbl_threads.grid(row=2, column=2, sticky=W, pady=(8, 0))
+            self.spin_threads.grid(row=2, column=3, sticky=W, padx=(4, 10), pady=(8, 0))
+            if show_relay:
+                self.chk_relay_enabled.grid(row=2, column=4, sticky=W, padx=(4, 8), pady=(8, 0))
+                self.lbl_relay_fee_reserve.grid(row=2, column=5, sticky=W, pady=(8, 0))
+                self.ent_relay_fee_reserve.grid(row=2, column=6, sticky=W, padx=(4, 10), pady=(8, 0))
+                self.lbl_confirm_timeout.grid(row=2, column=7, sticky=W, pady=(8, 0))
+                self.ent_confirm_timeout.grid(row=2, column=8, sticky=W, padx=(4, 10), pady=(8, 0))
+                self.lbl_receipt_poll_interval.grid(row=2, column=9, sticky=W, pady=(8, 0))
+                self.ent_receipt_poll_interval.grid(row=2, column=10, sticky=W, padx=(4, 8), pady=(8, 0))
+                self.lbl_receipt_retry_count.grid(row=2, column=11, sticky=W, pady=(8, 0))
+                self.spin_receipt_retry_count.grid(row=2, column=12, sticky=W, padx=(4, 8), pady=(8, 0))
+            else:
+                self.lbl_confirm_timeout.grid(row=2, column=4, sticky=W, pady=(8, 0))
+                self.ent_confirm_timeout.grid(row=2, column=5, sticky=W, padx=(4, 0), pady=(8, 0))
             self.setting_frame.columnconfigure(1, weight=1)
             self.setting_frame.columnconfigure(3, weight=1)
             self.setting_frame.columnconfigure(5, weight=1)
@@ -2301,7 +2389,7 @@ class OnchainTransferPageBase:
             if not show_relay:
                 self.setting_frame.columnconfigure(13, weight=1)
 
-            row = 2
+            row = 3
             if show_source:
                 self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
                 self.ent_source_credential.grid(row=row, column=1, columnspan=4, sticky="ew", padx=(4, 8), pady=(8, 0))
@@ -2311,16 +2399,17 @@ class OnchainTransferPageBase:
                 self.lbl_source_balance_title.grid(row=row, column=8, sticky=W, pady=(8, 0))
                 self.lbl_source_balance_val.grid(row=row, column=9, columnspan=3, sticky=W, padx=(4, 0), pady=(8, 0))
                 row += 1
-
-            if show_relay:
-                self.chk_relay_enabled.grid(row=row, column=0, sticky=W, pady=(8, 0))
-                self.lbl_relay_fee_reserve.grid(row=row, column=1, sticky=W, pady=(8, 0))
-                self.ent_relay_fee_reserve.grid(row=row, column=2, sticky=W, padx=(4, 10), pady=(8, 0))
-                self.lbl_confirm_timeout.grid(row=row, column=3, sticky=W, pady=(8, 0))
-                self.ent_confirm_timeout.grid(row=row, column=4, sticky=W, padx=(4, 10), pady=(8, 0))
-                row += 1
-                self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=11, sticky=W, pady=(6, 0))
-                row += 1
+                if not show_relay:
+                    self.lbl_one_to_many_source_threads.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                    self.spin_one_to_many_source_threads.grid(row=row, column=1, sticky=W, padx=(4, 8), pady=(8, 0))
+                    row += 1
+                if show_relay:
+                    self.lbl_one_to_many_source_threads.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                    self.spin_one_to_many_source_threads.grid(row=row, column=1, sticky=W, padx=(4, 10), pady=(8, 0))
+                    if show_nonce_window:
+                        self.lbl_nonce_window.grid(row=row, column=2, sticky=W, pady=(8, 0))
+                        self.spin_nonce_window.grid(row=row, column=3, sticky=W, padx=(4, 8), pady=(8, 0))
+                    row += 1
 
             if show_target:
                 self.lbl_target_address.grid(row=row, column=0, sticky=W, pady=(8, 0))
@@ -2328,6 +2417,9 @@ class OnchainTransferPageBase:
                 self.btn_query_target_balance.grid(row=row, column=5, sticky=W, padx=(0, 8), pady=(8, 0))
                 self.lbl_target_balance_title.grid(row=row, column=6, sticky=W, pady=(8, 0))
                 self.lbl_target_balance_val.grid(row=row, column=7, columnspan=3, sticky=W, padx=(4, 0), pady=(8, 0))
+                row += 1
+            if show_relay:
+                self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=14, sticky=W, pady=(6, 0))
                 row += 1
             return
 
@@ -2340,22 +2432,27 @@ class OnchainTransferPageBase:
             self.coin_box.grid(row=0, column=5, sticky=W, padx=(4, 10))
             self.lbl_amount.grid(row=0, column=6, sticky=W)
             self.amount_ctrl.grid(row=0, column=7, sticky=W, padx=(4, 0))
-            self.chk_dry_run.grid(row=0, column=8, sticky=W, padx=(10, 0))
-            self.chk_use_config_proxy.grid(row=0, column=9, sticky=W, padx=(10, 0))
-            self.btn_save_all.grid(row=0, column=10, sticky=W, padx=(8, 0))
 
             self.lbl_contract_search.grid(row=1, column=0, sticky=W, pady=(8, 0))
             self.ent_contract_search.grid(row=1, column=1, columnspan=5, sticky="ew", padx=(4, 8), pady=(8, 0))
             self.btn_contract_search.grid(row=1, column=6, sticky=W, pady=(8, 0))
-            self.lbl_delay.grid(row=1, column=7, sticky=W, padx=(10, 0), pady=(8, 0))
-            self.ent_delay.grid(row=1, column=8, sticky=W, padx=(4, 10), pady=(8, 0))
-            self.lbl_threads.grid(row=1, column=9, sticky=W, pady=(8, 0))
-            self.spin_threads.grid(row=1, column=10, sticky=W, padx=(4, 0), pady=(8, 0))
-            row = 2
-            if not show_relay:
-                self.lbl_confirm_timeout.grid(row=row, column=7, sticky=W, padx=(10, 0), pady=(8, 0))
-                self.ent_confirm_timeout.grid(row=row, column=8, sticky=W, padx=(4, 10), pady=(8, 0))
-                row += 1
+            self.chk_dry_run.grid(row=1, column=7, sticky=W, padx=(10, 0), pady=(8, 0))
+            self.chk_use_config_proxy.grid(row=1, column=8, sticky=W, padx=(10, 0), pady=(8, 0))
+            self.btn_save_all.grid(row=1, column=9, sticky=W, padx=(8, 0), pady=(8, 0))
+            self.lbl_delay.grid(row=2, column=0, sticky=W, pady=(8, 0))
+            self.ent_delay.grid(row=2, column=1, sticky=W, padx=(4, 10), pady=(8, 0))
+            self.lbl_threads.grid(row=2, column=2, sticky=W, pady=(8, 0))
+            self.spin_threads.grid(row=2, column=3, sticky=W, padx=(4, 0), pady=(8, 0))
+            row = 3
+            if show_relay:
+                self.chk_relay_enabled.grid(row=2, column=4, sticky=W, padx=(10, 8), pady=(8, 0))
+                self.lbl_relay_fee_reserve.grid(row=2, column=5, sticky=W, pady=(8, 0))
+                self.ent_relay_fee_reserve.grid(row=2, column=6, sticky=W, padx=(4, 8), pady=(8, 0))
+                self.lbl_confirm_timeout.grid(row=2, column=7, sticky=W, pady=(8, 0))
+                self.ent_confirm_timeout.grid(row=2, column=8, sticky=W, padx=(4, 8), pady=(8, 0))
+            else:
+                self.lbl_confirm_timeout.grid(row=2, column=4, sticky=W, padx=(10, 0), pady=(8, 0))
+                self.ent_confirm_timeout.grid(row=2, column=5, sticky=W, padx=(4, 10), pady=(8, 0))
 
             if show_source:
                 self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
@@ -2366,15 +2463,24 @@ class OnchainTransferPageBase:
                 self.lbl_source_balance_title.grid(row=row, column=7, sticky=W, pady=(8, 0))
                 self.lbl_source_balance_val.grid(row=row, column=8, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
                 row += 1
+                if not show_relay:
+                    self.lbl_one_to_many_source_threads.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                    self.spin_one_to_many_source_threads.grid(row=row, column=1, sticky=W, padx=(4, 8), pady=(8, 0))
+                    row += 1
 
             if show_relay:
-                self.chk_relay_enabled.grid(row=row, column=0, sticky=W, pady=(8, 0))
-                self.lbl_relay_fee_reserve.grid(row=row, column=1, sticky=W, pady=(8, 0))
-                self.ent_relay_fee_reserve.grid(row=row, column=2, sticky=W, padx=(4, 8), pady=(8, 0))
-                self.lbl_confirm_timeout.grid(row=row, column=3, sticky=W, pady=(8, 0))
-                self.ent_confirm_timeout.grid(row=row, column=4, sticky=W, padx=(4, 8), pady=(8, 0))
-                row += 1
-                self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=10, sticky=W, pady=(6, 0))
+                self.lbl_receipt_poll_interval.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                self.ent_receipt_poll_interval.grid(row=row, column=1, sticky=W, padx=(4, 8), pady=(8, 0))
+                self.lbl_receipt_retry_count.grid(row=row, column=2, sticky=W, pady=(8, 0))
+                self.spin_receipt_retry_count.grid(row=row, column=3, sticky=W, padx=(4, 8), pady=(8, 0))
+                relay_col = 4
+                if show_source:
+                    self.lbl_one_to_many_source_threads.grid(row=row, column=relay_col, sticky=W, pady=(8, 0))
+                    self.spin_one_to_many_source_threads.grid(row=row, column=relay_col + 1, sticky=W, padx=(4, 8), pady=(8, 0))
+                    relay_col += 2
+                if show_nonce_window:
+                    self.lbl_nonce_window.grid(row=row, column=relay_col, sticky=W, pady=(8, 0))
+                    self.spin_nonce_window.grid(row=row, column=relay_col + 1, sticky=W, padx=(4, 8), pady=(8, 0))
                 row += 1
 
             if show_target:
@@ -2383,6 +2489,10 @@ class OnchainTransferPageBase:
                 self.btn_query_target_balance.grid(row=row, column=4, sticky=W, padx=(0, 8), pady=(8, 0))
                 self.lbl_target_balance_title.grid(row=row, column=5, sticky=W, pady=(8, 0))
                 self.lbl_target_balance_val.grid(row=row, column=6, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
+                row += 1
+            if show_relay:
+                self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=10, sticky=W, pady=(6, 0))
+                row += 1
 
             self.setting_frame.columnconfigure(1, weight=1)
             self.setting_frame.columnconfigure(3, weight=1)
@@ -2440,6 +2550,10 @@ class OnchainTransferPageBase:
             self.lbl_source_balance_title.grid(row=row, column=2, sticky=W, pady=(4, 0))
             self.lbl_source_balance_val.grid(row=row, column=3, columnspan=2, sticky=W, padx=(4, 0), pady=(4, 0))
             row += 1
+            if not show_relay:
+                self.lbl_one_to_many_source_threads.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                self.spin_one_to_many_source_threads.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+                row += 1
 
         if show_relay:
             self.chk_relay_enabled.grid(row=row, column=0, columnspan=2, sticky=W, pady=(8, 0))
@@ -2448,7 +2562,25 @@ class OnchainTransferPageBase:
             row += 1
             self.lbl_confirm_timeout.grid(row=row, column=0, sticky=W, pady=(8, 0))
             self.ent_confirm_timeout.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+            self.lbl_receipt_poll_interval.grid(row=row, column=2, sticky=W, padx=(10, 0), pady=(8, 0))
+            self.ent_receipt_poll_interval.grid(row=row, column=3, sticky="ew", padx=(4, 0), pady=(8, 0))
+            if not show_source:
+                self.lbl_receipt_retry_count.grid(row=row, column=4, sticky=W, padx=(10, 0), pady=(8, 0))
+                self.spin_receipt_retry_count.grid(row=row, column=5, sticky=W, padx=(4, 0), pady=(8, 0))
             row += 1
+            if show_source:
+                self.lbl_one_to_many_source_threads.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                self.spin_one_to_many_source_threads.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+                self.lbl_receipt_retry_count.grid(row=row, column=2, sticky=W, padx=(10, 0), pady=(8, 0))
+                self.spin_receipt_retry_count.grid(row=row, column=3, sticky="ew", padx=(4, 0), pady=(8, 0))
+                if show_nonce_window:
+                    self.lbl_nonce_window.grid(row=row, column=4, sticky=W, padx=(10, 0), pady=(8, 0))
+                    self.spin_nonce_window.grid(row=row, column=5, sticky=W, padx=(4, 0), pady=(8, 0))
+                row += 1
+            elif show_nonce_window:
+                self.lbl_nonce_window.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                self.spin_nonce_window.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+                row += 1
             self.lbl_relay_wallet_file.grid(row=row, column=0, columnspan=5, sticky=W, pady=(6, 0))
             row += 1
 
@@ -2488,14 +2620,11 @@ class OnchainTransferPageBase:
         min_widths = dict(self.TREE_COL_MIN_WIDTHS)
         weights = dict(self.TREE_COL_WEIGHTS)
         if width < 820:
-            min_widths.update({"source": 150, "target": 220, "status": 92, "recovery": 84, "balance": 68})
-            weights.update({"source": 3, "target": 6, "status": 2, "recovery": 2, "balance": 1})
+            min_widths.update({"source": 120, "target": 260, "status": 92, "recovery": 92, "balance": 92})
         elif width < 980:
-            min_widths.update({"source": 170, "target": 250, "status": 96, "recovery": 86, "balance": 72})
-            weights.update({"source": 3, "target": 6, "status": 2, "recovery": 2, "balance": 1})
+            min_widths.update({"source": 140, "target": 320, "status": 110, "recovery": 110, "balance": 110})
         elif width < 1220:
-            min_widths.update({"source": 210, "target": 300, "status": 100, "recovery": 90, "balance": 76})
-            weights.update({"source": 4, "target": 6, "status": 2, "recovery": 2, "balance": 1})
+            min_widths.update({"source": 160, "target": 380, "status": 130, "recovery": 130, "balance": 130})
 
         total_min = sum(min_widths[c] for c in cols)
 
@@ -2510,7 +2639,9 @@ class OnchainTransferPageBase:
         for i, c in enumerate(cols):
             add = extra - used if i == len(cols) - 1 else int(extra * weights[c] / total_weight)
             used += add
-            self.tree.column(c, width=min_widths[c] + max(0, add), stretch=True)
+            stretch = bool(weights[c] > 0)
+            anchor = "w" if c in {"source", "target", "status", "recovery", "balance"} else "center"
+            self.tree.column(c, width=min_widths[c] + max(0, add), stretch=stretch, anchor=anchor)
     def _on_log_resize(self, _event=None):
         if not hasattr(self, "log_text"):
             return
@@ -2644,6 +2775,8 @@ class OnchainTransferPageBase:
     @staticmethod
     def _is_problem_log_text(text: str) -> bool:
         message = str(text or "")
+        if is_transient_retry_log_message(message):
+            return False
         if any(keyword in message for keyword in ONCHAIN_PROBLEM_LOG_KEYWORDS if keyword != "失败"):
             return True
         if re.search(r"失败\s*[1-9]\d*", message):
@@ -2664,16 +2797,19 @@ class OnchainTransferPageBase:
             )
     def test_onchain_proxy(self):
         snapshot = self._onchain_proxy_state_snapshot()
-        route_text = self._onchain_proxy_route_text(state=snapshot)
         selected_network = str(self.network_var.get() or "").strip().upper()
 
         def worker():
             test_ok = False
             try:
+                if not bool(snapshot.get("use_config_proxy")):
+                    self._onchain_system_proxy_map(refresh=True, include_local_probe=True)
+                route_text = self._onchain_proxy_route_text(state=snapshot)
                 status, exit_ip, target = self._test_onchain_proxy_once(state=snapshot, selected_network=selected_network)
                 test_ok = True
                 log_text = f"链上代理测试成功：status={status}，exit_ip={exit_ip}，target={target}，route={route_text}"
             except Exception as exc:
+                route_text = self._onchain_proxy_route_text(state=snapshot)
                 use_config_proxy = bool(snapshot.get("use_config_proxy"))
                 raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
                 if use_config_proxy and raw_proxy:

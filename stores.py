@@ -14,6 +14,10 @@ from app_defaults import (
     EXCHANGE_WORKER_THREADS_DEFAULT,
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
     ONCHAIN_DELAY_SECONDS_DEFAULT,
+    ONCHAIN_NONCE_WINDOW_DEFAULT,
+    ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT,
+    ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT,
+    ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT,
     ONCHAIN_WORKER_THREADS_DEFAULT,
 )
 from app_paths import CONFIG_BACKUP_SUFFIX
@@ -442,6 +446,14 @@ class OnchainStore:
         except Exception:
             delay = ONCHAIN_DELAY_SECONDS_DEFAULT
         try:
+            one_to_many_source_threads = int(
+                settings_raw.get("one_to_many_source_threads", ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT)
+            )
+            if one_to_many_source_threads <= 0:
+                one_to_many_source_threads = ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT
+        except Exception:
+            one_to_many_source_threads = ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT
+        try:
             threads = max(1, int(settings_raw.get("worker_threads", ONCHAIN_WORKER_THREADS_DEFAULT)))
         except Exception:
             threads = ONCHAIN_WORKER_THREADS_DEFAULT
@@ -453,6 +465,26 @@ class OnchainStore:
                 confirm_timeout_seconds = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
         except Exception:
             confirm_timeout_seconds = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
+        try:
+            receipt_poll_interval_seconds = float(
+                settings_raw.get("receipt_poll_interval_seconds", ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT)
+            )
+            if receipt_poll_interval_seconds <= 0:
+                receipt_poll_interval_seconds = ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT
+        except Exception:
+            receipt_poll_interval_seconds = ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT
+        try:
+            receipt_retry_count = int(settings_raw.get("receipt_retry_count", ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT))
+            if receipt_retry_count <= 0:
+                receipt_retry_count = ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT
+        except Exception:
+            receipt_retry_count = ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT
+        try:
+            nonce_window = int(settings_raw.get("nonce_window", ONCHAIN_NONCE_WINDOW_DEFAULT))
+            if nonce_window <= 0:
+                nonce_window = ONCHAIN_NONCE_WINDOW_DEFAULT
+        except Exception:
+            nonce_window = ONCHAIN_NONCE_WINDOW_DEFAULT
 
         self.multi_to_multi_pairs = pairs
         self.multi_to_multi_drafts = drafts
@@ -490,8 +522,12 @@ class OnchainStore:
                 if isinstance(value, dict) and str(key or "").strip()
             },
             delay_seconds=delay,
+            one_to_many_source_threads=one_to_many_source_threads,
             worker_threads=threads,
             confirm_timeout_seconds=confirm_timeout_seconds,
+            receipt_poll_interval_seconds=receipt_poll_interval_seconds,
+            receipt_retry_count=receipt_retry_count,
+            nonce_window=nonce_window,
             dry_run=bool(settings_raw.get("dry_run", True)),
             use_config_proxy=bool(settings_raw.get("use_config_proxy", False)),
             proxy_url=SECRET_BOX.decrypt(str(settings_raw.get("proxy_url", "") or "").strip()).strip(),
@@ -537,7 +573,8 @@ class OnchainStore:
             payload["one_to_many"].pop("source", None)
         else:
             payload["one_to_many"]["source"] = SECRET_BOX.encrypt(self.settings.one_to_many_source)
-        payload.setdefault("many_to_one", {})
+        payload["many_to_one"] = dict(payload.get("many_to_one") or {})
+        payload["many_to_one"]["target"] = self.settings.many_to_one_target
         _save_authenticated_config(self.file_path, payload, encoding="utf-8")
 
     def save_transfer_lists_only(self) -> None:

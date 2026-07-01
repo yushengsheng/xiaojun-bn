@@ -3,7 +3,13 @@
 
 from __future__ import annotations
 
-from app_defaults import ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
+from app_defaults import (
+    ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
+    ONCHAIN_NONCE_WINDOW_DEFAULT,
+    ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT,
+    ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT,
+    ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT,
+)
 from page_onchain_base import (
     Decimal,
     InvalidOperation,
@@ -352,6 +358,13 @@ class OnchainImportMixin(object):
             messagebox.showerror("参数错误", "执行间隔格式错误")
             return False
         try:
+            one_to_many_source_threads = int(str(self.one_to_many_source_threads_var.get()).strip())
+            if one_to_many_source_threads <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("参数错误", "1对多单钱包线程数必须是大于 0 的整数")
+            return False
+        try:
             threads = max(1, int(str(self.threads_var.get()).strip()))
         except Exception:
             messagebox.showerror("参数错误", "执行线程数格式错误")
@@ -362,6 +375,27 @@ class OnchainImportMixin(object):
                 raise ValueError
         except Exception:
             messagebox.showerror("参数错误", "确认超时必须是大于 0 的数字")
+            return False
+        try:
+            receipt_poll_interval_seconds = float(str(self.receipt_poll_interval_var.get()).strip())
+            if receipt_poll_interval_seconds <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("参数错误", "receipt轮询间隔必须是大于 0 的数字")
+            return False
+        try:
+            receipt_retry_count = int(str(self.receipt_retry_count_var.get()).strip())
+            if receipt_retry_count <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("参数错误", "receipt重试次数必须是大于 0 的整数")
+            return False
+        try:
+            nonce_window = int(str(self.nonce_window_var.get()).strip())
+            if nonce_window <= 0:
+                raise ValueError
+        except Exception:
+            messagebox.showerror("参数错误", "单钱包nonce并发必须是大于 0 的整数")
             return False
         proxy_text = self.onchain_proxy_var.get().strip()
         if self.use_config_proxy_var.get():
@@ -424,8 +458,12 @@ class OnchainImportMixin(object):
                 current_config=normalized_mode_amount_config,
             ),
             delay_seconds=delay,
+            one_to_many_source_threads=one_to_many_source_threads,
             worker_threads=threads,
             confirm_timeout_seconds=confirm_timeout_seconds,
+            receipt_poll_interval_seconds=receipt_poll_interval_seconds,
+            receipt_retry_count=receipt_retry_count,
+            nonce_window=nonce_window,
             dry_run=bool(self.dry_run_var.get()),
             use_config_proxy=bool(self.use_config_proxy_var.get()),
             proxy_url=proxy_text,
@@ -491,10 +529,32 @@ class OnchainImportMixin(object):
                 self.coin_box.configure(values=[])
                 self.coin_var.set("")
             self.delay_var.set(st.delay_seconds)
+            self.one_to_many_source_threads_var.set(
+                str(
+                    max(
+                        1,
+                        int(
+                            getattr(
+                                st,
+                                "one_to_many_source_threads",
+                                ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT,
+                            )
+                            or ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT
+                        ),
+                    )
+                )
+            )
             self.threads_var.set(str(max(1, int(st.worker_threads or 1))))
             self.confirm_timeout_var.set(
                 self._decimal_to_text(Decimal(str(st.confirm_timeout_seconds or ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)))
             )
+            self.receipt_poll_interval_var.set(
+                self._decimal_to_text(
+                    Decimal(str(getattr(st, "receipt_poll_interval_seconds", ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT)))
+                )
+            )
+            self.receipt_retry_count_var.set(str(max(1, int(getattr(st, "receipt_retry_count", ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT) or ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT))))
+            self.nonce_window_var.set(str(max(1, int(getattr(st, "nonce_window", ONCHAIN_NONCE_WINDOW_DEFAULT) or ONCHAIN_NONCE_WINDOW_DEFAULT))))
             self.dry_run_var.set(st.dry_run)
             self.use_config_proxy_var.set(bool(st.use_config_proxy))
             self.onchain_proxy_var.set(st.proxy_url or "")

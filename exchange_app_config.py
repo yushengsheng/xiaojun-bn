@@ -43,9 +43,9 @@ from exchange_app_base import (
     _restore_text_snapshot,
     logger,
     messagebox,
-    requests,
 )
 from sensitive_data import redact_sensitive_text
+from system_proxy import refresh_system_proxy_cache, system_proxy_map
 
 
 class ExchangeAppConfigMixin(object):
@@ -68,6 +68,7 @@ class ExchangeAppConfigMixin(object):
         return self._normalize_proxy_text(proxy_text)
     def _on_exchange_proxy_config_changed(self, *_args) -> None:
         self._sync_exchange_proxy_state()
+        self._refresh_exchange_proxy_summary()
     def _sync_exchange_proxy_state(self) -> None:
         use_var = getattr(self, "use_exchange_config_proxy_var", None)
         proxy_var = getattr(self, "exchange_proxy_var", None)
@@ -183,17 +184,27 @@ class ExchangeAppConfigMixin(object):
     def _requests_proxy_map(self) -> dict[str, str]:
         return self._requests_proxy_map_from_state()
     @staticmethod
-    def _system_proxy_map() -> dict[str, str]:
-        try:
-            proxies = requests.utils.get_environ_proxies("https://api.binance.com/api/v3/time") or {}
-        except Exception:
-            return {}
-        result = {}
-        for key in ("http", "https"):
-            value = str(proxies.get(key) or "").strip()
-            if value:
-                result[key] = value
-        return result
+    def _system_proxy_map(*, refresh: bool = False, include_local_probe: bool = False) -> dict[str, str]:
+        if refresh:
+            return refresh_system_proxy_cache(
+                "https://api.binance.com/api/v3/time",
+                include_local_probe=include_local_probe,
+            )
+        return system_proxy_map("https://api.binance.com/api/v3/time")
+    def _refresh_exchange_proxy_summary(self) -> None:
+        snapshot = self._exchange_proxy_state_snapshot()
+        raw_proxy = str(snapshot.get("raw_proxy") or "").strip()
+        use_config_proxy = bool(snapshot.get("use_config_proxy"))
+        if use_config_proxy:
+            status = "待测试" if raw_proxy else "未启用"
+        else:
+            status = "跟随系统代理" if self._system_proxy_map() else "未启用"
+        status_var = getattr(self, "exchange_proxy_status_var", None)
+        if status_var is not None:
+            status_var.set(status)
+        exit_ip_var = getattr(self, "exchange_proxy_exit_ip_var", None)
+        if exit_ip_var is not None:
+            exit_ip_var.set("--")
     def _exchange_proxy_route_text_from_state(self, state: dict[str, object] | None = None) -> str:
         snapshot = dict(state or self._exchange_proxy_state_snapshot())
         raw_proxy = str(snapshot.get("raw_proxy") or "").strip()

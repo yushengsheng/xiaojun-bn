@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import ipaddress
 import json
 import os
 import platform
@@ -26,10 +25,10 @@ import requests
 
 from app_paths import APP_DIR, BUNDLE_DIR, DATA_DIR
 from exchange_logging import logger
-from secure_config import config_context as secure_config_context
 from secret_box import SECRET_BOX
 from sensitive_data import redact_sensitive_text
 from stores import _atomic_write_json_with_backup, _atomic_write_text, _load_json_with_backup
+from system_proxy import configure_requests_session_for_proxy
 
 
 def _json_dump_text(payload: object) -> str:
@@ -941,9 +940,15 @@ def http_get_via_proxy(
 ):
     session = requests.Session()
     try:
-        session.trust_env = bool(allow_system_proxy) and not bool(proxies)
+        explicit_proxy = ""
         if proxies:
-            session.proxies.update(proxies)
+            explicit_proxy = str(proxies.get("https") or proxies.get("http") or "").strip()
+        configure_requests_session_for_proxy(
+            session,
+            explicit_proxy=explicit_proxy,
+            target_url=url,
+            allow_system_proxy=bool(allow_system_proxy) and not bool(explicit_proxy),
+        )
         return session.get(url, timeout=timeout, headers=headers or {})
     finally:
         session.close()

@@ -13,6 +13,10 @@ from app_defaults import (
     EXCHANGE_WORKER_THREADS_DEFAULT,
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
     ONCHAIN_DELAY_SECONDS_DEFAULT,
+    ONCHAIN_NONCE_WINDOW_DEFAULT,
+    ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT,
+    ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT,
+    ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT,
     ONCHAIN_WORKER_THREADS_DEFAULT,
 )
 from core_models import OnchainSettings
@@ -67,7 +71,11 @@ class StoreDefaultTests(unittest.TestCase):
             store.load()
             self.assertEqual(store.settings.worker_threads, ONCHAIN_WORKER_THREADS_DEFAULT)
             self.assertEqual(store.settings.delay_seconds, ONCHAIN_DELAY_SECONDS_DEFAULT)
+            self.assertEqual(store.settings.one_to_many_source_threads, ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT)
             self.assertEqual(store.settings.confirm_timeout_seconds, ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)
+            self.assertEqual(store.settings.receipt_poll_interval_seconds, ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT)
+            self.assertEqual(store.settings.receipt_retry_count, ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT)
+            self.assertEqual(store.settings.nonce_window, ONCHAIN_NONCE_WINDOW_DEFAULT)
 
     def test_onchain_store_recovers_when_only_backup_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -89,15 +97,22 @@ class StoreDefaultTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "onchain.json"
             path.write_text(
-                '{"settings":{"worker_threads":"bad","delay_seconds":-5,"confirm_timeout_seconds":0}}',
+                '{"settings":{"worker_threads":"bad","delay_seconds":-5,"confirm_timeout_seconds":0,'
+                '"one_to_many_source_threads":0,'
+                '"receipt_poll_interval_seconds":0,"receipt_retry_count":0,"nonce_window":0}}',
                 encoding="utf-8",
             )
             store = OnchainStore(path)
             store.load()
             self.assertEqual(store.settings.worker_threads, ONCHAIN_WORKER_THREADS_DEFAULT)
             self.assertEqual(store.settings.delay_seconds, 0.0)
+            self.assertEqual(store.settings.one_to_many_source_threads, ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT)
             self.assertEqual(store.settings.confirm_timeout_seconds, ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8")).get("format"), "xiaojun-authenticated-config-v1")
+            self.assertEqual(store.settings.receipt_poll_interval_seconds, ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT)
+            self.assertEqual(store.settings.receipt_retry_count, ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT)
+            self.assertEqual(store.settings.nonce_window, ONCHAIN_NONCE_WINDOW_DEFAULT)
+            saved_payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved_payload.get("format"), "xiaojun-authenticated-config-v1")
 
     def test_onchain_store_does_not_persist_ephemeral_one_to_many_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -174,6 +189,34 @@ class StoreDefaultTests(unittest.TestCase):
             loaded.load()
             self.assertEqual(loaded.settings.one_to_many_source, "new-private-key")
             self.assertFalse(loaded.settings.one_to_many_source_ephemeral)
+
+    def test_onchain_store_save_settings_only_updates_many_to_one_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "onchain.json"
+            old_target = "0x0000000000000000000000000000000000000001"
+            new_target = "0x0000000000000000000000000000000000000002"
+            path.write_text(
+                json.dumps(
+                    {
+                        "settings": {
+                            "many_to_one_target": old_target,
+                        },
+                        "many_to_one": {
+                            "target": old_target,
+                            "sources": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            store = OnchainStore(path)
+            store.settings = OnchainSettings(many_to_one_target=new_target)
+
+            store.save_settings_only()
+
+            loaded = OnchainStore(path)
+            loaded.load()
+            self.assertEqual(loaded.settings.many_to_one_target, new_target)
 
     def test_authenticated_config_rejects_tampering_and_file_replay(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

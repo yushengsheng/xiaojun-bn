@@ -30,6 +30,25 @@ COMPAT_LOG_BACKUP_COUNT = 3
 EXCHANGE_LOG_MAX_ROWS = LOG_MAX_ROWS
 _ACCOUNT_LOG_CONTEXT = threading.local()
 _ACCOUNT_TEXT_RE = re.compile(r"账号\s*[#＃]?\s*\d+")
+_TRANSIENT_RETRY_MARKERS = (
+    "将在",
+    "重试中",
+    "准备重试",
+    "临时RPC错误",
+    "临时 RPC 错误",
+    "网络请求失败",
+)
+
+
+def is_transient_retry_log_message(message: object) -> bool:
+    text = str(message or "")
+    if not text:
+        return False
+    if "重试" not in text and "临时" not in text:
+        return False
+    if "重试" in text and ("仍然失败" in text or "最终失败" in text):
+        return False
+    return any(marker in text for marker in _TRANSIENT_RETRY_MARKERS)
 
 
 def set_exchange_account_log_index(account_index: object) -> None:
@@ -75,6 +94,8 @@ class TkLogEntry:
 
     @property
     def is_problem(self) -> bool:
+        if is_transient_retry_log_message(self.message):
+            return False
         return self.levelno >= logging.WARNING
 
     def __str__(self) -> str:

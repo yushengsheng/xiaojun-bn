@@ -9,24 +9,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from core_models import EvmToken
 import onchain_relay_wallets as relay_wallets_module
 from onchain_relay_wallets import RelayWalletFileStore, RelayWalletRecord
 from secret_box import SecretBox
-
-
-class _FakeCleanupClient:
-    def get_default_tokens(self, network: str) -> list[EvmToken]:
-        return [
-            EvmToken(symbol="BNB", contract="", decimals=18, is_native=True),
-            EvmToken(symbol="USDT", contract="0x55d398326f99059ff775485246999027b3197955", decimals=18, is_native=False),
-        ]
-
-    def get_balance_wei(self, network: str, address: str) -> int:
-        return 1 if address.endswith("3") else 0
-
-    def get_erc20_balance(self, network: str, contract: str, address: str) -> int:
-        return 0
 
 
 def _expired_record(index: int) -> RelayWalletRecord:
@@ -93,6 +78,57 @@ class RelayWalletCleanupTests(unittest.TestCase):
             self.assertIn("enc::", raw_text)
             self.assertEqual(store.load_records()[0].private_key, private_key)
 
+    def test_relay_wallet_file_skips_rewrite_when_already_authenticated(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-relay-wallet-secret-test-") as tmpdir:
+            path = Path(tmpdir) / "relay.txt"
+            store = RelayWalletFileStore(path)
+            record = _expired_record(5)
+            record.private_key = "5" * 64
+            store.append_records([record])
+            before = path.read_text(encoding="utf-8")
+
+            rewritten = store.rewrite_encrypted_if_needed()
+
+            self.assertEqual(rewritten, 0)
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_deferred_updates_flush_once_after_stage(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-relay-wallet-secret-test-") as tmpdir:
+            path = Path(tmpdir) / "relay.txt"
+            store = RelayWalletFileStore(path)
+            record = _expired_record(6)
+            record.private_key = "6" * 64
+            store.append_records([record])
+            before = path.read_text(encoding="utf-8")
+
+            with store.defer_writes():
+                updated = store.update_record(record.relay_address, batch_id=record.batch_id, status="submitted")
+                self.assertEqual(updated.status, "submitted")
+                self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+            self.assertEqual(store.load_records()[0].status, "submitted")
+            self.assertNotEqual(path.read_text(encoding="utf-8"), before)
+
+    def test_remove_records_only_removes_confirmed_keys(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-relay-wallet-secret-test-") as tmpdir:
+            path = Path(tmpdir) / "relay.txt"
+            store = RelayWalletFileStore(path)
+            remove_record = _expired_record(7)
+            keep_same_batch = _expired_record(8)
+            keep_same_address = _expired_record(7)
+            keep_same_address.batch_id = "relay-cleanup-progress-test-other"
+            store.append_records([remove_record, keep_same_batch, keep_same_address])
+
+            removed = store.remove_records({(remove_record.batch_id, remove_record.relay_address)})
+
+            self.assertEqual(removed, 1)
+            remaining = store.load_records()
+            remaining_keys = {(item.batch_id, item.relay_address) for item in remaining}
+            self.assertEqual(len(remaining), 2)
+            self.assertNotIn((remove_record.batch_id, remove_record.relay_address), remaining_keys)
+            self.assertIn((keep_same_batch.batch_id, keep_same_batch.relay_address), remaining_keys)
+            self.assertIn((keep_same_address.batch_id, keep_same_address.relay_address), remaining_keys)
+
     def test_relay_wallet_file_recovers_from_authenticated_backup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="xiaojun-relay-wallet-secret-test-") as tmpdir:
             path = Path(tmpdir) / "relay.txt"
@@ -108,24 +144,6 @@ class RelayWalletCleanupTests(unittest.TestCase):
 
             self.assertEqual(loaded[0].private_key, "4" * 64)
             self.assertEqual(path.read_text(encoding="utf-8"), backup_path.read_text(encoding="utf-8"))
-
-    def test_cleanup_logs_balance_query_progress(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="xiaojun-relay-cleanup-test-") as tmpdir:
-            store = RelayWalletFileStore(Path(tmpdir) / "relay.txt")
-            store.append_records([_expired_record(1), _expired_record(2), _expired_record(3)])
-            logs: list[str] = []
-
-            checked, removed, kept = store.cleanup_expired_empty_records(
-                _FakeCleanupClient(),
-                log=logs.append,
-                worker_threads=2,
-            )
-
-            self.assertEqual((checked, removed, kept), (3, 2, 1))
-            self.assertTrue(any("中转钱包过期清理开始：发现 3 条" in line for line in logs))
-            self.assertTrue(any("中转钱包过期清理进度：余额查询 1/3" in line for line in logs))
-            self.assertTrue(any("中转钱包过期清理进度：余额查询 3/3" in line for line in logs))
-
 
 if __name__ == "__main__":
     unittest.main()

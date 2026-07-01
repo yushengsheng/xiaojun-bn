@@ -674,6 +674,8 @@ class ExchangeAppAccountsMixin(object):
             return "#f2f2f2"
         if "未到账" in s:
             return "#ffe3b8"
+        if "轮完成，失败" in s:
+            return "#ffe3b8"
         if any(k in s for k in ("已停止", "已请求停止")):
             return "#ffe3b8"
         if s.startswith("×") or any(k in s for k in ("失败", "异常")):
@@ -689,7 +691,7 @@ class ExchangeAppAccountsMixin(object):
         s = str(acc.get("status_var").get() if acc.get("status_var") is not None else "").strip()
         if not s or s == "就绪":
             return "acc_ready"
-        if "未到账" in s or any(k in s for k in ("已停止", "已请求停止")):
+        if "未到账" in s or "轮完成，失败" in s or any(k in s for k in ("已停止", "已请求停止")):
             return "acc_warn"
         if s.startswith("×") or any(k in s for k in ("失败", "异常")):
             return "acc_failed"

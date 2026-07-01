@@ -10,6 +10,10 @@ from app_defaults import (
     EXCHANGE_WORKER_THREADS_DEFAULT,
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
     ONCHAIN_DELAY_SECONDS_DEFAULT,
+    ONCHAIN_NONCE_WINDOW_DEFAULT,
+    ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT,
+    ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT,
+    ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT,
     ONCHAIN_WORKER_THREADS_DEFAULT,
 )
 
@@ -43,7 +47,11 @@ class WithdrawRuntimeParams:
     network: str
     delay: float
     threads: int
+    one_to_many_source_threads: int = ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT
     confirm_timeout_seconds: float = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
+    receipt_poll_interval_seconds: float = ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT
+    receipt_retry_count: int = ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT
+    nonce_window: int = ONCHAIN_NONCE_WINDOW_DEFAULT
     random_enabled: bool = False
     random_min: Decimal | None = None
     random_max: Decimal | None = None
@@ -88,8 +96,12 @@ class OnchainSettings:
     random_max: str = ""
     mode_amounts: dict[str, dict[str, str]] = field(default_factory=dict)
     delay_seconds: float = ONCHAIN_DELAY_SECONDS_DEFAULT
+    one_to_many_source_threads: int = ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT
     worker_threads: int = ONCHAIN_WORKER_THREADS_DEFAULT
     confirm_timeout_seconds: float = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
+    receipt_poll_interval_seconds: float = ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT
+    receipt_retry_count: int = ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT
+    nonce_window: int = ONCHAIN_NONCE_WINDOW_DEFAULT
     dry_run: bool = True
     use_config_proxy: bool = False
     proxy_url: str = ""

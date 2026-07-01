@@ -41,6 +41,8 @@ def ensure_state(owner, *, amount_label: str = "总额") -> None:
         owner._summary_balance_text = "-"
     if not hasattr(owner, "_summary_amount_text"):
         owner._summary_amount_text = "-"
+    if not hasattr(owner, "_summary_recovery_text"):
+        owner._summary_recovery_text = ""
     if not hasattr(owner, "_summary_gas_text"):
         owner._summary_gas_text = "-"
     if not hasattr(owner, "_progress_refresh_pending"):
@@ -64,9 +66,12 @@ def idle_text(amount_label: str = "总额") -> str:
 def _summary_suffix(owner, *, include_prefix: bool = False) -> str:
     ensure_state(owner, amount_label=getattr(owner, "_progress_amount_label", "总额"))
     prefix = "进度：空闲 | " if include_prefix else ""
+    recovery_text = str(getattr(owner, "_summary_recovery_text", "") or "").strip()
+    recovery_segment = f"回收总额={recovery_text} | " if recovery_text else ""
     return (
         f"{prefix}余额总额={owner._summary_balance_text} | "
         f"{owner._progress_amount_label}={owner._summary_amount_text} | "
+        f"{recovery_segment}"
         f"gas总额={owner._summary_gas_text}"
     )
 
@@ -101,6 +106,7 @@ def reset_metrics(owner, *, amount_label: str | None = None) -> None:
         owner._progress_amount_label = amount_label
     owner._summary_balance_text = "-"
     owner._summary_amount_text = "-"
+    owner._summary_recovery_text = ""
     owner._summary_gas_text = "-"
     _render_display_now(owner)
 
@@ -110,6 +116,7 @@ def set_metrics(
     *,
     balance_text: str | None = None,
     amount_text: str | None = None,
+    recovery_text: str | None = None,
     gas_text: str | None = None,
     amount_label: str | None = None,
 ) -> None:
@@ -120,6 +127,8 @@ def set_metrics(
         owner._summary_balance_text = str(balance_text or "-")
     if amount_text is not None:
         owner._summary_amount_text = str(amount_text or "-")
+    if recovery_text is not None:
+        owner._summary_recovery_text = str(recovery_text or "")
     if gas_text is not None:
         owner._summary_gas_text = str(gas_text or "-")
     refresh_display(owner)
@@ -132,6 +141,7 @@ def begin(owner, kind: str, row_keys: list[str], *, amount_label: str) -> None:
     owner._progress_amount_label = amount_label
     owner._summary_balance_text = "-"
     owner._summary_amount_text = "-"
+    owner._summary_recovery_text = ""
     owner._summary_gas_text = "-"
     _render_display_now(owner)
 
