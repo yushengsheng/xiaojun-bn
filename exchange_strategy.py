@@ -1851,6 +1851,9 @@ class Strategy:
 
     def _ensure_futures_available_balance(self):
         margin_asset = self._futures_margin_asset()
+        clear_fn = getattr(self.c, "ensure_um_futures_asset_clear_before_trade", None)
+        if callable(clear_fn):
+            clear_fn(margin_asset)
         balance = self.c.um_futures_asset_balance(margin_asset)
         available_balance = Decimal(str(balance.get("availableBalance", "0")))
         required_margin = Decimal("0")
@@ -1897,7 +1900,17 @@ class Strategy:
             self.futures_amount,
             open_side,
         )
-        self._ensure_futures_available_balance()
+        try:
+            self._ensure_futures_available_balance()
+        except Exception as e:
+            if "合约有问题" in str(e):
+                self.trade_error = str(e)
+                self.trade_error_stage = "合约有问题"
+                logger.error("【合约有问题】%s", e)
+                if progress_cb:
+                    progress_cb(1, total_steps, "合约有问题")
+                return
+            raise
         logger.info(
             "【合约预检通过】%s %s，单轮预计下单数量=%s，下单金额=%s",
             self.futures_symbol,

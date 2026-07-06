@@ -211,6 +211,7 @@ class BinanceClient:
         self._price_cache = {}
         self._um_futures_exchange_info_cache = {}
         self._um_futures_price_cache = {}
+        self._um_futures_pretrade_cleared_assets: set[str] = set()
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
@@ -554,6 +555,144 @@ class BinanceClient:
                 break
 
         return positions
+
+    def get_simple_earn_flexible_products(
+        self,
+        *,
+        asset: str | None = None,
+        size: int = 100,
+    ) -> list[dict[str, Any]]:
+        asset_u = str(asset or "").strip().upper()
+        page_size = max(1, min(100, int(size or 100)))
+        current = 1
+        products: list[dict[str, Any]] = []
+
+        while True:
+            params: dict[str, Any] = {
+                "current": current,
+                "size": page_size,
+            }
+            if asset_u:
+                params["asset"] = asset_u
+
+            data = self.request(
+                self.spot,
+                "GET",
+                "/sapi/v1/simple-earn/flexible/list",
+                params,
+            )
+            rows = []
+            total = 0
+            if isinstance(data, dict):
+                rows = data.get("rows") or []
+                try:
+                    total = max(0, int(data.get("total", 0) or 0))
+                except Exception:
+                    total = 0
+            elif isinstance(data, list):
+                rows = data
+
+            normalized_rows: list[dict[str, Any]] = []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                product_id = str(item.get("productId") or "").strip()
+                row_asset = str(item.get("asset") or "").strip().upper()
+                if asset_u and row_asset != asset_u:
+                    continue
+                min_purchase_amount = self._decimal_from_str(item.get("minPurchaseAmount", "0"), "0")
+                normalized_rows.append(
+                    {
+                        "productId": product_id,
+                        "asset": row_asset,
+                        "canPurchase": self._bool_from_value(item.get("canPurchase")),
+                        "isSoldOut": self._bool_from_value(item.get("isSoldOut")),
+                        "status": str(item.get("status") or "").strip(),
+                        "minPurchaseAmount": min_purchase_amount,
+                    }
+                )
+            products.extend(normalized_rows)
+
+            if total > 0 and len(products) >= total:
+                break
+            if len(rows) < page_size and total <= 0:
+                break
+            if not rows:
+                break
+            current += 1
+            if current > 100:
+                logger.warning("活期理财产品分页超过 100 页，提前停止拉取")
+                break
+
+        return products
+
+    def find_simple_earn_flexible_product(self, asset: str, amount: Decimal | str | float | int | None = None) -> dict[str, Any]:
+        asset_u = str(asset or "").strip().upper()
+        if not asset_u:
+            raise RuntimeError("理财币种不能为空")
+        amount_dec = self._decimal_from_str(amount, "0")
+        products = self.get_simple_earn_flexible_products(asset=asset_u)
+        candidates: list[dict[str, Any]] = []
+        unavailable_found = False
+        for item in products:
+            if str(item.get("asset") or "").strip().upper() != asset_u:
+                continue
+            product_id = str(item.get("productId") or "").strip()
+            if not product_id:
+                continue
+            can_purchase = item.get("canPurchase")
+            is_sold_out = item.get("isSoldOut")
+            if can_purchase is False or is_sold_out is True:
+                unavailable_found = True
+                continue
+            candidates.append(item)
+
+        if not candidates:
+            if unavailable_found or products:
+                raise RuntimeError(f"{asset_u} 活期理财当前不可申购")
+            raise RuntimeError(f"未找到 {asset_u} 活期理财产品")
+
+        product = candidates[0]
+        min_purchase_amount = self._decimal_from_str(product.get("minPurchaseAmount", "0"), "0")
+        if amount_dec > 0 and min_purchase_amount > 0 and amount_dec < min_purchase_amount:
+            raise RuntimeError(
+                f"{asset_u} 活期理财最小存入数量为 {self._format_decimal(min_purchase_amount)}"
+            )
+        return product
+
+    def subscribe_simple_earn_flexible_product(
+        self,
+        product_id: str,
+        amount: Decimal | str | float | int,
+        *,
+        source_account: str = "SPOT",
+        auto_subscribe: bool = False,
+    ) -> dict[str, Any]:
+        product_id_text = str(product_id or "").strip()
+        if not product_id_text:
+            raise RuntimeError("活期理财 productId 为空")
+        amount_dec = self._decimal_from_str(amount, "0")
+        if amount_dec <= 0:
+            raise RuntimeError("活期理财存入数量必须大于 0")
+
+        params: dict[str, Any] = {
+            "productId": product_id_text,
+            "amount": self._format_decimal(amount_dec),
+            "autoSubscribe": "true" if bool(auto_subscribe) else "false",
+        }
+        source_account_text = str(source_account or "").strip().upper()
+        if source_account_text:
+            params["sourceAccount"] = source_account_text
+
+        result = self.request(
+            self.spot,
+            "POST",
+            "/sapi/v1/simple-earn/flexible/subscribe",
+            params,
+        )
+        if isinstance(result, dict) and str(result.get("success", "")).strip().lower() == "false":
+            raise RuntimeError("活期理财存入返回失败")
+        return result
 
     def redeem_simple_earn_flexible_product(
         self,
@@ -1338,6 +1477,63 @@ class BinanceClient:
             "crossWalletBalance": Decimal("0"),
             "maxWithdrawAmount": Decimal("0"),
         }
+
+    def ensure_um_futures_asset_clear_before_trade(self, asset: str) -> Decimal:
+        asset_u = str(asset or "").strip().upper()
+        if not asset_u:
+            return Decimal("0")
+        cleared_assets = getattr(self, "_um_futures_pretrade_cleared_assets", set())
+        if asset_u in cleared_assets:
+            return Decimal("0")
+
+        try:
+            balance = self.um_futures_asset_balance(asset_u)
+        except Exception as e:
+            raise RuntimeError(f"合约有问题：查询 U本位 {asset_u} 余额失败: {e}") from e
+
+        wallet_balance = self._decimal_from_str(balance.get("walletBalance", "0"), "0")
+        available_balance = self._decimal_from_str(balance.get("availableBalance", "0"), "0")
+        margin_balance = self._decimal_from_str(balance.get("marginBalance", "0"), "0")
+        cross_wallet_balance = self._decimal_from_str(balance.get("crossWalletBalance", "0"), "0")
+        max_withdraw_amount = self._decimal_from_str(balance.get("maxWithdrawAmount", "0"), "0")
+        has_balance = any(
+            value > 0
+            for value in (wallet_balance, available_balance, margin_balance, cross_wallet_balance, max_withdraw_amount)
+        )
+        if not has_balance:
+            cleared_assets.add(asset_u)
+            self._um_futures_pretrade_cleared_assets = cleared_assets
+            logger.info("合约交易前检查：U本位 %s 无残留资金", asset_u)
+            return Decimal("0")
+
+        if max_withdraw_amount <= 0:
+            raise RuntimeError(
+                "合约有问题："
+                f"U本位 {asset_u} 存在余额但当前不可划出，"
+                f"wallet={self._format_decimal(wallet_balance)}，"
+                f"available={self._format_decimal(available_balance)}"
+            )
+
+        try:
+            self._universal_transfer_with_retry(
+                "UMFUTURE_MAIN",
+                asset_u,
+                max_withdraw_amount,
+                context="合约交易前 U本位清场",
+            )
+            logger.info(
+                "合约交易前检测到 U本位 %s 余额，已先划转回现货：%s",
+                asset_u,
+                self._format_decimal(max_withdraw_amount),
+            )
+            time.sleep(0.5)
+            cleared_assets.add(asset_u)
+            self._um_futures_pretrade_cleared_assets = cleared_assets
+            return max_withdraw_amount
+        except Exception as e:
+            raise RuntimeError(
+                f"合约有问题：U本位 {asset_u} 余额无法划回现货: {e}"
+            ) from e
 
     @staticmethod
     def _normalize_um_futures_position_side(position_side: str | None) -> str:

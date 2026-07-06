@@ -19,7 +19,7 @@ from exchange_app_base import ExchangeAppBase
 from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_app_config import ExchangeAppConfigMixin
 from exchange_binance_client import BinanceAPIError, BinanceClient
-from exchange_constants import TRADE_ACCOUNT_TYPE_FUTURES, TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_LIMIT, TRADE_MODE_MARKET, TRADE_MODE_PREMIUM
+from exchange_constants import TRADE_ACCOUNT_TYPE_EARN, TRADE_ACCOUNT_TYPE_FUTURES, TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_LIMIT, TRADE_MODE_MARKET, TRADE_MODE_PREMIUM
 from exchange_logging import logger, runtime_log_path
 from onchain_relay_wallets import RelayWalletFileStore
 from onchain_relay_runner import (
@@ -1560,6 +1560,159 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError(f"合约开仓失败自检失败：失败后未保持最终归集提现流程（{futures_failure_client.calls}）")
     checks.append("futures-open-failure-status=ok")
 
+    class _SelftestFuturesPretradeClearClient(BinanceClient):
+        def __init__(self, mode: str):
+            super().__init__("selftest-key", "selftest-secret")
+            self.mode = mode
+            self.transfers: list[tuple[str, str, Decimal]] = []
+
+        def um_futures_asset_balance(self, asset: str):
+            if self.mode == "empty":
+                return {
+                    "walletBalance": Decimal("0"),
+                    "availableBalance": Decimal("0"),
+                    "marginBalance": Decimal("0"),
+                    "crossWalletBalance": Decimal("0"),
+                    "maxWithdrawAmount": Decimal("0"),
+                }
+            if self.mode == "blocked":
+                return {
+                    "walletBalance": Decimal("5"),
+                    "availableBalance": Decimal("5"),
+                    "marginBalance": Decimal("5"),
+                    "crossWalletBalance": Decimal("5"),
+                    "maxWithdrawAmount": Decimal("0"),
+                }
+            return {
+                "walletBalance": Decimal("7"),
+                "availableBalance": Decimal("7"),
+                "marginBalance": Decimal("7"),
+                "crossWalletBalance": Decimal("7"),
+                "maxWithdrawAmount": Decimal("7"),
+            }
+
+        def _universal_transfer_with_retry(self, transfer_type: str, asset: str, amount, *, context: str, retries: int = 10, retry_delay: float = 1.0):
+            if self.mode == "transfer-fails":
+                raise RuntimeError("transfer denied")
+            self.transfers.append((transfer_type, asset, Decimal(str(amount))))
+            return {"tranId": 1}
+
+    clear_empty_client = _SelftestFuturesPretradeClearClient("empty")
+    if clear_empty_client.ensure_um_futures_asset_clear_before_trade("USDT") != Decimal("0"):
+        raise RuntimeError("合约清场自检失败：空余额不应返回划转数量")
+    if clear_empty_client.transfers:
+        raise RuntimeError(f"合约清场自检失败：空余额不应划转（{clear_empty_client.transfers}）")
+
+    clear_ok_client = _SelftestFuturesPretradeClearClient("ok")
+    if clear_ok_client.ensure_um_futures_asset_clear_before_trade("USDT") != Decimal("7"):
+        raise RuntimeError("合约清场自检失败：有余额可划出时返回数量异常")
+    clear_ok_client.ensure_um_futures_asset_clear_before_trade("USDT")
+    if clear_ok_client.transfers != [("UMFUTURE_MAIN", "USDT", Decimal("7"))]:
+        raise RuntimeError(f"合约清场自检失败：划转参数或幂等异常（{clear_ok_client.transfers}）")
+
+    for mode in ("blocked", "transfer-fails"):
+        clear_bad_client = _SelftestFuturesPretradeClearClient(mode)
+        try:
+            clear_bad_client.ensure_um_futures_asset_clear_before_trade("USDT")
+        except RuntimeError as exc:
+            if "合约有问题" not in str(exc):
+                raise RuntimeError(f"合约清场自检失败：错误文案未标记合约有问题（{exc}）")
+        else:
+            raise RuntimeError(f"合约清场自检失败：{mode} 未阻止合约交易")
+
+    class _SelftestFuturesWaitPreclearClient:
+        def __init__(self):
+            self.timeline: list[str] = []
+            self.transferred = False
+
+        def get_um_futures_margin_asset(self, symbol: str):
+            return "USDT"
+
+        def ensure_um_futures_asset_clear_before_trade(self, asset: str):
+            self.timeline.append("clear")
+            return Decimal("0")
+
+        def um_futures_asset_balance(self, asset: str):
+            self.timeline.append("balance")
+            return {"availableBalance": Decimal("8") if self.transferred else Decimal("0")}
+
+        def transfer_spot_asset_to_um_futures(self, asset: str, amount):
+            self.timeline.append("transfer")
+            self.transferred = True
+            return Decimal("8")
+
+    class _SelftestFuturesWaitProbe(ExchangeAppBatchMixin):
+        @staticmethod
+        def _normalize_trade_account_type(value):
+            return ExchangeAppBase._normalize_trade_account_type(value)
+
+        @staticmethod
+        def _normalize_trade_mode(value):
+            return ExchangeAppBase._normalize_trade_mode(value)
+
+        def _current_random_delay_seconds(self) -> float:
+            return 0.01
+
+    futures_wait_client = _SelftestFuturesWaitPreclearClient()
+    futures_wait_probe = _SelftestFuturesWaitProbe()
+    if not futures_wait_probe.wait_for_usdt(
+        1,
+        None,
+        client=futures_wait_client,
+        symbol="BTCUSDT",
+        trade_account_type=TRADE_ACCOUNT_TYPE_FUTURES,
+        trade_mode=TRADE_MODE_MARKET,
+        required_quote_amount=Decimal("5"),
+    ):
+        raise RuntimeError("合约清场自检失败：清场后补划未检测到可用保证金")
+    if "clear" not in futures_wait_client.timeline or "transfer" not in futures_wait_client.timeline:
+        raise RuntimeError(f"合约清场自检失败：未执行清场或补划（{futures_wait_client.timeline}）")
+    if futures_wait_client.timeline.index("clear") > futures_wait_client.timeline.index("transfer"):
+        raise RuntimeError(f"合约清场自检失败：补划发生在清场之前（{futures_wait_client.timeline}）")
+
+    class _SelftestFuturesProblemClient(_SelftestFuturesOpenFailureClient):
+        def ensure_um_futures_asset_clear_before_trade(self, asset: str):
+            self.calls.append("clear-problem")
+            raise RuntimeError("合约有问题：U本位 USDT 存在余额但当前不可划出")
+
+        def place_um_futures_market_order(self, symbol: str, side: str, quantity):
+            self.calls.append("open")
+            raise RuntimeError("合约有问题时不应下单")
+
+    futures_problem_client = _SelftestFuturesProblemClient()
+    futures_problem_progress: list[tuple[int, int, str]] = []
+    futures_problem_strategy = Strategy(
+        client=futures_problem_client,
+        spot_rounds=1,
+        withdraw_coin="USDT",
+        withdraw_address="",
+        withdraw_network="BSC",
+        withdraw_fee_buffer=0,
+        spot_symbol="BTCUSDT",
+        sleep_fn=lambda: None,
+        enable_withdraw=False,
+        trade_account_type=TRADE_ACCOUNT_TYPE_FUTURES,
+        trade_mode=TRADE_MODE_MARKET,
+        futures_symbol="BTCUSDT",
+        futures_rounds=1,
+        futures_amount=Decimal("100"),
+        futures_leverage=10,
+        futures_margin_type="CROSSED",
+    )
+    futures_problem_result = futures_problem_strategy.run(
+        stop_event=_SelftestNoSleepStop(),
+        progress_cb=lambda step, total, text: futures_problem_progress.append((step, total, text)),
+    )
+    if futures_problem_result.get("trade_error_stage") != "合约有问题":
+        raise RuntimeError(f"合约清场自检失败：失败阶段异常（{futures_problem_result}）")
+    if "open" in futures_problem_client.calls:
+        raise RuntimeError(f"合约清场自检失败：合约有问题后仍然下单（{futures_problem_client.calls}）")
+    if "合约有问题" not in [item[2] for item in futures_problem_progress]:
+        raise RuntimeError(f"合约清场自检失败：未回调合约有问题状态（{futures_problem_progress}）")
+    if ExchangeAppBatchMixin._format_trade_failure_status("合约有问题", futures_problem_result.get("trade_error"))[:6] != "×合约有问题":
+        raise RuntimeError("合约清场自检失败：批量状态栏未显示合约有问题")
+    checks.append("futures-pretrade-clear=ok")
+
     class _SelftestQuoteWaitClient:
         def __init__(self):
             self.collected_assets: list[str] = []
@@ -1716,8 +1869,16 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self._value = value
 
     class _SelftestTradeSettingsProbe(ExchangeAppBase):
-        def __init__(self, *, mode=TRADE_MODE_MARKET, spot_rounds=0):
-            self.trade_account_type_var = _SimpleVar(TRADE_ACCOUNT_TYPE_SPOT)
+        def __init__(
+            self,
+            *,
+            account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            mode=TRADE_MODE_MARKET,
+            spot_rounds=0,
+            earn_asset="USDT",
+            earn_amount="12.5",
+        ):
+            self.trade_account_type_var = _SimpleVar(account_type)
             self.trade_mode_var = _SimpleVar(mode)
             self.spot_symbol_var = _SimpleVar("BTCUSDT")
             self.spot_rounds_var = _SimpleVar(spot_rounds)
@@ -1734,6 +1895,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.futures_margin_type_var = _SimpleVar("CROSSED")
             self.futures_side_var = _SimpleVar("")
             self.futures_leverage_var = _SimpleVar(10)
+            self.earn_asset_var = _SimpleVar(earn_asset)
+            self.earn_amount_var = _SimpleVar(earn_amount)
 
     market_zero_settings = _SelftestTradeSettingsProbe(
         mode=TRADE_MODE_MARKET,
@@ -1759,7 +1922,20 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         pass
     else:
         raise RuntimeError("现货负轮次参数自检失败：负数轮次未被拒绝")
+    earn_settings = _SelftestTradeSettingsProbe(account_type=TRADE_ACCOUNT_TYPE_EARN)._collect_trade_mode_settings()
+    if earn_settings.get("earn_asset") != "USDT" or earn_settings.get("earn_amount_value") != Decimal("12.5"):
+        raise RuntimeError(f"理财存入参数自检失败：参数解析异常（{earn_settings}）")
+    try:
+        _SelftestTradeSettingsProbe(
+            account_type=TRADE_ACCOUNT_TYPE_EARN,
+            earn_amount="0",
+        )._collect_trade_mode_settings()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("理财存入参数自检失败：0数量未被拒绝")
     checks.append("spot-zero-round-settings=ok")
+    checks.append("earn-subscribe-settings=ok")
 
     class _SelftestCollectClient(BinanceClient):
         def __init__(self):
@@ -2013,6 +2189,33 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                         ],
                     }
                 return {"total": 3, "rows": []}
+            if method == "GET" and path == "/sapi/v1/simple-earn/flexible/list":
+                current = int(params_dict.get("current", 1) or 1)
+                if current > 1:
+                    return {"total": 1, "rows": []}
+                return {
+                    "total": 1 if str(params_dict.get("asset") or "").strip().upper() == "USDT" else 2,
+                    "rows": [
+                        {
+                            "productId": "P-USDT",
+                            "asset": "usdt",
+                            "canPurchase": True,
+                            "isSoldOut": False,
+                            "status": "PURCHASING",
+                            "minPurchaseAmount": "1",
+                        },
+                        {
+                            "productId": "P-BNB",
+                            "asset": "BNB",
+                            "canPurchase": False,
+                            "isSoldOut": False,
+                            "status": "PURCHASING",
+                            "minPurchaseAmount": "0.01",
+                        },
+                    ],
+                }
+            if method == "POST" and path == "/sapi/v1/simple-earn/flexible/subscribe":
+                return {"success": True, "purchaseId": "S-123"}
             if method == "POST" and path == "/sapi/v1/simple-earn/flexible/redeem":
                 return {"success": True, "redeemId": "R-123"}
             if method == "POST" and path == "/sapi/v1/simple-earn/flexible/setAutoSubscribe":
@@ -2034,6 +2237,30 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         filtered_positions = simple_earn_client.get_simple_earn_flexible_positions(asset="USDT")
         if len(filtered_positions) != 1 or filtered_positions[0].get("asset") != "USDT":
             raise RuntimeError(f"活期理财持仓自检失败：按资产过滤异常（{filtered_positions}）")
+
+        products = simple_earn_client.get_simple_earn_flexible_products(asset="USDT")
+        if len(products) != 1 or products[0].get("productId") != "P-USDT":
+            raise RuntimeError(f"活期理财产品自检失败：按资产过滤异常（{products}）")
+        product = simple_earn_client.find_simple_earn_flexible_product("USDT", Decimal("12.5"))
+        if product.get("productId") != "P-USDT":
+            raise RuntimeError(f"活期理财产品自检失败：产品选择异常（{product}）")
+        subscribe_result = simple_earn_client.subscribe_simple_earn_flexible_product("P-USDT", Decimal("12.5"))
+        if str(subscribe_result.get("purchaseId") or "") != "S-123":
+            raise RuntimeError(f"活期理财存入自检失败：返回结果异常（{subscribe_result}）")
+        subscribe_requests = [
+            req for req in simple_earn_client.requests_made
+            if req[1] == "POST" and req[2] == "/sapi/v1/simple-earn/flexible/subscribe"
+        ]
+        if not subscribe_requests:
+            raise RuntimeError("活期理财存入自检失败：未发出存入请求")
+        subscribe_params = subscribe_requests[-1][3]
+        if subscribe_params != {
+            "productId": "P-USDT",
+            "amount": "12.5",
+            "autoSubscribe": "false",
+            "sourceAccount": "SPOT",
+        }:
+            raise RuntimeError(f"活期理财存入自检失败：请求参数异常（{subscribe_params}）")
 
         redeem_result = simple_earn_client.redeem_simple_earn_flexible_product("P-USDT", redeem_all=True, dest_account="SPOT")
         if str(redeem_result.get("redeemId") or "") != "R-123":
@@ -2081,6 +2308,18 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     expected_summary_text = "结果汇总：成功1 | 失败2 | 已赎回资产3 | 跳过资产3 | 关闭自动申购3"
     if redeem_summary_text != expected_summary_text:
         raise RuntimeError(f"理财赎回汇总自检失败：{redeem_summary_text}")
+    subscribe_summary_text = summary_probe._build_batch_summary_text(
+        {
+            "runner": "batch_subscribe_flexible_earn",
+            "results": {"a": True, "b": False},
+            "earn_subscribe_by_account": {
+                "a": (Decimal("12.5"), "USDT"),
+            },
+        },
+    )
+    expected_subscribe_summary_text = "结果汇总：成功1 | 失败1 | 理财存入总额=12.5 USDT"
+    if subscribe_summary_text != expected_subscribe_summary_text:
+        raise RuntimeError(f"理财存入汇总自检失败：{subscribe_summary_text}")
     checks.append("simple-earn-summary=ok")
 
 def _emit_selftest_console(message: str, *, error: bool = False) -> None:

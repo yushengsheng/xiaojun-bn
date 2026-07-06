@@ -39,6 +39,8 @@ from exchange_constants import (
     API_SECRET_DEFAULT,
     BNB_FEE_STOP_DEFAULT,
     BNB_TOPUP_AMOUNT_DEFAULT,
+    EARN_AMOUNT_DEFAULT,
+    EARN_ASSET_DEFAULT,
     EXCHANGE_PROXY_DEFAULT,
     EXCHANGE_USE_CONFIG_PROXY_DEFAULT,
     FUTURES_AMOUNT_DEFAULT,
@@ -62,6 +64,7 @@ from exchange_constants import (
     SPOT_ROUNDS_DEFAULT,
     SPOT_SYMBOL_DEFAULT,
     TRADE_ACCOUNT_TYPE_DEFAULT,
+    TRADE_ACCOUNT_TYPE_EARN,
     TRADE_ACCOUNT_TYPE_FUTURES,
     TRADE_ACCOUNT_TYPE_OPTIONS,
     TRADE_ACCOUNT_TYPE_SPOT,
@@ -369,6 +372,8 @@ class ExchangeAppBase(tk.Tk):
         self.futures_leverage_var = tk.IntVar(value=FUTURES_LEVERAGE_DEFAULT)
         self.futures_margin_type_var = tk.StringVar(value=FUTURES_MARGIN_TYPE_LABEL_CROSSED)
         self.futures_side_var = tk.StringVar(value=FUTURES_SIDE_DEFAULT)
+        self.earn_asset_var = tk.StringVar(value=EARN_ASSET_DEFAULT)
+        self.earn_amount_var = tk.StringVar(value=EARN_AMOUNT_DEFAULT)
 
         self.withdraw_addr_var = tk.StringVar(value=WITHDRAW_ADDRESS_DEFAULT)
         self.withdraw_net_var = tk.StringVar(value=WITHDRAW_NETWORK_DEFAULT)
@@ -1016,6 +1021,11 @@ class ExchangeAppBase(tk.Tk):
         futures_amount_text = str(self.futures_amount_var.get() or "").strip()
         futures_margin_type = self._normalize_futures_margin_type(self.futures_margin_type_var.get())
         futures_side = str(self.futures_side_var.get() or FUTURES_SIDE_DEFAULT).strip()
+        earn_asset_raw = str(self.earn_asset_var.get() or "")
+        earn_asset = earn_asset_raw.strip().upper()
+        if earn_asset_raw.strip() and earn_asset_raw != earn_asset:
+            self.earn_asset_var.set(earn_asset)
+        earn_amount_text = str(self.earn_amount_var.get() or "").strip()
         premium_value: Decimal | None = None
         premium_order_count = PREMIUM_ORDER_COUNT_DEFAULT
         premium_append_threshold_value = Decimal(PREMIUM_APPEND_THRESHOLD_DEFAULT)
@@ -1024,6 +1034,7 @@ class ExchangeAppBase(tk.Tk):
         reprice_threshold_value = Decimal(REPRICE_THRESHOLD_DEFAULT)
         futures_rounds = stored_futures_rounds if stored_futures_rounds > 0 else FUTURES_ROUNDS_DEFAULT
         futures_amount_value: Decimal | None = None
+        earn_amount_value: Decimal | None = None
         try:
             futures_leverage = int(self.futures_leverage_var.get())
         except Exception:
@@ -1065,6 +1076,13 @@ class ExchangeAppBase(tk.Tk):
                             "追加挂单",
                             min_value=0,
                         )
+        elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
+            runtime_rounds = stored_rounds if stored_rounds >= 0 else SPOT_ROUNDS_DEFAULT
+            if not earn_asset:
+                raise RuntimeError("理财币种不能为空")
+            earn_amount_value = self._decimal_field_value(earn_amount_text, "理财存入数量", min_value=0)
+            if earn_amount_value <= 0:
+                raise RuntimeError("理财存入数量必须大于 0")
         else:
             runtime_rounds = stored_rounds if stored_rounds > 0 else SPOT_ROUNDS_DEFAULT
             try:
@@ -1114,6 +1132,9 @@ class ExchangeAppBase(tk.Tk):
             "futures_leverage": futures_leverage,
             "futures_margin_type": futures_margin_type,
             "futures_side": futures_side,
+            "earn_asset": earn_asset,
+            "earn_amount": earn_amount_text,
+            "earn_amount_value": earn_amount_value,
         }
     def _install_entry_placeholder(self, entry, variable, placeholder: str):
         placeholder_color = "#8a8a8a"
@@ -1272,7 +1293,7 @@ class ExchangeAppBase(tk.Tk):
             ttk.Spinbox(row2_left, from_=0, to=100, textvariable=self.spot_rounds_var, width=6).pack(side="left", padx=(4, 12))
             ttk.Label(row2_left, text="预购买BNB金额:").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.bnb_topup_amount_var, width=10).pack(side="left", padx=(4, 12))
-        else:
+        elif current_trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
             ttk.Label(row2_left, text="合约交易对:", style="ExchangeAccent.TLabel").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.futures_symbol_var, width=14).pack(side="left", padx=(4, 12))
             ttk.Label(row2_left, text="合约轮次:").pack(side="left")
@@ -1288,6 +1309,11 @@ class ExchangeAppBase(tk.Tk):
             self.futures_side_combo.pack(side="left", padx=(4, 12))
             ttk.Label(row2_left, text="下单金额:").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.futures_amount_var, width=10).pack(side="left", padx=(4, 12))
+        else:
+            ttk.Label(row2_left, text="理财币种:", style="ExchangeAccent.TLabel").pack(side="left")
+            ttk.Entry(row2_left, textvariable=self.earn_asset_var, width=10).pack(side="left", padx=(4, 12))
+            ttk.Label(row2_left, text="存入数量:").pack(side="left")
+            ttk.Entry(row2_left, textvariable=self.earn_amount_var, width=12).pack(side="left", padx=(4, 12))
 
         row3 = ttk.Frame(frame_top)
         row3.pack(fill="x", padx=5, pady=(3, 2))
@@ -1328,7 +1354,7 @@ class ExchangeAppBase(tk.Tk):
             ttk.Label(row3_right, text="提现预留:").pack(side="left")
             ttk.Entry(row3_right, textvariable=self.withdraw_buffer_var, width=row3_withdraw_width).pack(side="left", padx=row3_withdraw_pad)
             ttk.Checkbutton(row3_right, text="\u81ea\u52a8\u63d0\u73b0", variable=self.enable_withdraw_var, style="AutoWithdraw.TCheckbutton").pack(side="left")
-        else:
+        elif current_trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
             ttk.Label(row3_left, text="保证金模式:").pack(side="left")
             self.futures_margin_type_combo = ttk.Combobox(
                 row3_left,

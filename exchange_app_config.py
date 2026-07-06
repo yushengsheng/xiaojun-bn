@@ -7,6 +7,8 @@ from exchange_app_base import (
     BNB_FEE_STOP_DEFAULT,
     BNB_TOPUP_AMOUNT_DEFAULT,
     BinanceClient,
+    EARN_AMOUNT_DEFAULT,
+    EARN_ASSET_DEFAULT,
     EXCHANGE_PROXY_CONFIG_FILE,
     EXCHANGE_PROXY_DEFAULT,
     EXCHANGE_USE_CONFIG_PROXY_DEFAULT,
@@ -297,6 +299,8 @@ class ExchangeAppConfigMixin(object):
             "futures_leverage": int(trade_settings["futures_leverage"]),
             "futures_margin_type": str(trade_settings["futures_margin_type"] or FUTURES_MARGIN_TYPE_DEFAULT).strip().upper(),
             "futures_side": str(trade_settings["futures_side"] or FUTURES_SIDE_DEFAULT).strip(),
+            "earn_asset": str(trade_settings["earn_asset"] or "").strip().upper(),
+            "earn_amount": str(trade_settings["earn_amount"] or "").strip(),
             "withdraw_address": self.withdraw_addr_var.get().strip(),
             "withdraw_network": self.withdraw_net_var.get().strip(),
             "withdraw_coin": self.withdraw_coin_var.get().strip().upper(),
@@ -439,6 +443,8 @@ class ExchangeAppConfigMixin(object):
             self.futures_side_var.set(str(raw.get("futures_side", FUTURES_SIDE_DEFAULT) or FUTURES_SIDE_DEFAULT).strip())
             if str(self.futures_side_var.get() or "").strip() not in FUTURES_SIDE_OPTIONS:
                 self.futures_side_var.set(FUTURES_SIDE_DEFAULT)
+            self.earn_asset_var.set(str(raw.get("earn_asset", EARN_ASSET_DEFAULT) or EARN_ASSET_DEFAULT).strip().upper())
+            self.earn_amount_var.set(str(raw.get("earn_amount", EARN_AMOUNT_DEFAULT) or EARN_AMOUNT_DEFAULT).strip())
             self.withdraw_addr_var.set(str(raw.get("withdraw_address", WITHDRAW_ADDRESS_DEFAULT) or WITHDRAW_ADDRESS_DEFAULT).strip())
             self.withdraw_net_var.set(str(raw.get("withdraw_network", WITHDRAW_NETWORK_DEFAULT) or WITHDRAW_NETWORK_DEFAULT).strip())
             self.withdraw_coin_var.set(str(raw.get("withdraw_coin", WITHDRAW_COIN_DEFAULT) or WITHDRAW_COIN_DEFAULT).strip().upper())
