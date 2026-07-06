@@ -12,8 +12,10 @@ from core_models import EvmToken, WithdrawRuntimeParams
 from onchain_relay_runner import (
     _RelayBatchItem,
     _receipt_state,
+    _relay_native_main_recovery_status_text,
     _relay_prepare_items,
     _relay_native_dust_below_threshold,
+    _relay_submit_auto_sweep,
     _relay_snapshot_cleanup_allowed,
     _relay_source_stage,
     _relay_token_dust_below_threshold,
@@ -29,6 +31,10 @@ class _FakeClient:
         self.nonce_by_addr: dict[str, int] = {}
         self.receipts: list[dict | None] = [{"status": "0x1"}]
         self.receipt_requests: list[str] = []
+        self.native_balance_wei: int | None = None
+        self.gas_price_wei: int | None = None
+        self.submitted_native_transfers: list[dict[str, object]] = []
+        self.native_transfer_txid = "0x" + "a" * 64
 
     def credential_to_private_key(self, value: str) -> str:
         return str(value or "")
@@ -43,10 +49,14 @@ class _FakeClient:
         return self.receipts[0]
 
     def get_gas_price_wei(self, *_args, **_kwargs) -> int:
-        raise AssertionError("prepare_items must not query gas price")
+        if self.gas_price_wei is None:
+            raise AssertionError("prepare_items must not query gas price")
+        return self.gas_price_wei
 
     def get_balance_wei(self, *_args, **_kwargs) -> int:
-        raise AssertionError("prepare_items must not query balances")
+        if self.native_balance_wei is None:
+            raise AssertionError("prepare_items must not query balances")
+        return self.native_balance_wei
 
     def get_erc20_balance(self, *_args, **_kwargs) -> int:
         raise AssertionError("prepare_items must not query token balances")
@@ -56,6 +66,10 @@ class _FakeClient:
 
     def get_transaction_by_hash(self, *_args, **_kwargs) -> dict | None:
         raise AssertionError("prepare_items must not query transaction history")
+
+    def submit_native_transfer_reliably(self, **kwargs):
+        self.submitted_native_transfers.append(dict(kwargs))
+        return type("Submission", (), {"tx_hash": self.native_transfer_txid})()
 
 
 class _FakeStore:
@@ -77,6 +91,7 @@ class _FakeOwner:
         self.relay_wallet_store = _FakeStore()
         self.logs: list[str] = []
         self.statuses: list[tuple[str, str, str]] = []
+        self.recovery_statuses: list[tuple[str, str, str]] = []
         self.mode_1m = mode_1m
         self.mode_m1 = mode_m1
 
@@ -98,6 +113,9 @@ class _FakeOwner:
 
     def _set_status(self, row_key: str, status: str, status_text: str = ""):
         self.statuses.append((row_key, status, status_text))
+
+    def _set_recovery_status(self, row_key: str, status: str, status_text: str = ""):
+        self.recovery_statuses.append((row_key, status, status_text))
 
     def log(self, message: str):
         self.logs.append(str(message))
@@ -135,9 +153,16 @@ class _FakeOwner:
 _RECORDS: dict[tuple[str, str], RelayWalletRecord] = {}
 
 
-def _params(*, delay: float = 0.0, one_to_many_source_threads: int = 5, nonce_window: int = 5) -> WithdrawRuntimeParams:
+def _params(
+    *,
+    delay: float = 0.0,
+    one_to_many_source_threads: int = 5,
+    nonce_window: int = 5,
+    coin: str = "USDT",
+    token_is_native: bool = False,
+) -> WithdrawRuntimeParams:
     return WithdrawRuntimeParams(
-        coin="USDT",
+        coin=coin,
         amount="1",
         network="BSC",
         delay=delay,
@@ -148,7 +173,7 @@ def _params(*, delay: float = 0.0, one_to_many_source_threads: int = 5, nonce_wi
         nonce_window=nonce_window,
         token_contract="0x55d398326f99059ff775485246999027b3197955",
         token_decimals=18,
-        token_is_native=False,
+        token_is_native=token_is_native,
         relay_enabled=True,
         relay_fee_reserve=Decimal("0.001"),
     )
@@ -262,6 +287,44 @@ class OnchainRelayPipelineTests(unittest.TestCase):
         receipt = _wait_for_receipt_success(owner, _params(), "0x" + "1" * 64, label="测试交易")
 
         self.assertEqual(receipt["status"], "0x1")
+
+    def test_auto_sweep_waits_for_receipt_before_success(self) -> None:
+        owner = _FakeOwner()
+        owner.client.native_balance_wei = 100_000
+        owner.client.gas_price_wei = 1
+        owner.client.receipts = [None, {"status": "0x1"}]
+        item = _item(1)
+
+        _relay_submit_auto_sweep(owner, _params(), item, item.source_addr)
+
+        self.assertEqual(owner.client.receipt_requests, [owner.client.native_transfer_txid] * 2)
+        self.assertEqual(getattr(item, "_auto_sweep_value_wei"), 79_000)
+        self.assertEqual(owner.recovery_statuses[-1], (item.row_key, "success", "回收0.000000000000079 BNB"))
+        self.assertEqual(_RECORDS[(item.relay_addr, "batch")].sweep_resolution, "confirmed")
+
+    def test_auto_sweep_failed_receipt_does_not_count_recovered_amount(self) -> None:
+        owner = _FakeOwner()
+        owner.client.native_balance_wei = 100_000
+        owner.client.gas_price_wei = 1
+        owner.client.receipts = [{"status": "0x0"}]
+        item = _item(1)
+
+        _relay_submit_auto_sweep(owner, _params(), item, item.source_addr)
+
+        self.assertEqual(getattr(item, "_auto_sweep_value_wei"), 0)
+        self.assertEqual(owner.recovery_statuses[-1][1], "incomplete")
+        self.assertIn("receipt status=0", _RECORDS[(item.relay_addr, "batch")].last_error)
+
+    def test_native_relay_recovery_status_shows_amount(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        text = _relay_native_main_recovery_status_text(
+            owner,
+            _params(coin="BNB", token_is_native=True),
+            "0.000123",
+        )
+
+        self.assertEqual(text, "回收0.000123 BNB")
+        self.assertNotEqual(text, "随主流程完成")
 
     def test_source_stage_respects_nonce_window_and_delay(self) -> None:
         owner = _FakeOwner(mode_1m=False)

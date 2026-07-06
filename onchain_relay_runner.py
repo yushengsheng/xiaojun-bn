@@ -82,6 +82,17 @@ def _relay_success_status_text(owner, params: WithdrawRuntimeParams, amount_text
     return "✅"
 
 
+def _relay_native_main_recovery_status_text(owner, params: WithdrawRuntimeParams, amount_text: str) -> str:
+    amount = str(amount_text or "").strip()
+    if not amount:
+        return "回收-"
+    try:
+        return f"回收{owner._token_amount_text(params.coin, Decimal(amount))}"
+    except Exception:
+        symbol = str(getattr(params, "coin", "") or _relay_native_symbol(owner, params.network)).strip().upper()
+        return f"回收{amount} {symbol}".strip()
+
+
 def _relay_record_transfer_status_text(record: RelayWalletRecord) -> str:
     amount = str(getattr(record, "transfer_amount", "") or "").strip()
     symbol = str(getattr(record, "token_symbol", "") or "").strip().lower()
@@ -2990,9 +3001,28 @@ def _relay_submit_auto_sweep(owner, params: WithdrawRuntimeParams, item: _RelayB
             sweep_resolution="submitted",
             last_error="",
         )
-        setattr(item, "_auto_sweep_value_wei", sweep_value)
         _relay_dispatch_recovery_status(owner, item, "submitted", "回收已提交")
-        owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币回收已提交：to={owner._mask(target, head=8, tail=6)}，txid={txid}": owner.log(m))
+        owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币回收已提交，等待receipt确认：to={owner._mask(target, head=8, tail=6)}，txid={txid}": owner.log(m))
+        _wait_for_receipt_success(
+            owner,
+            params,
+            txid,
+            label=f"{item.prefix} 中转原生币回收",
+        )
+        _relay_update_item_record(
+            owner,
+            item,
+            "completed",
+            gas_sweep_txid=txid,
+            gas_sweep_nonce=_tx_nonce_text(nonce),
+            sweep_target=target,
+            sweep_resolution="confirmed",
+            last_error="",
+        )
+        setattr(item, "_auto_sweep_value_wei", sweep_value)
+        recovered_text = owner._gas_fee_amount_text(params.network, sweep_value)
+        _relay_dispatch_recovery_status(owner, item, "success", f"回收{recovered_text}")
+        owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币回收成功：to={owner._mask(target, head=8, tail=6)}，金额={recovered_text}，txid={txid}": owner.log(m))
     except Exception as exc:
         _relay_dispatch_recovery_status(owner, item, "incomplete", f"回收待处理：{exc}")
         try:
@@ -3495,7 +3525,12 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                 total_gas_fee_wei += item.gas_fee_wei
                 _relay_dispatch_row_status(owner, item, "success", item.success_text)
                 if params.token_is_native:
-                    _relay_dispatch_recovery_status(owner, item, "success", "随主流程完成")
+                    _relay_dispatch_recovery_status(
+                        owner,
+                        item,
+                        "success",
+                        _relay_native_main_recovery_status_text(owner, params, final_amount_text),
+                    )
                 owner._dispatch_ui(
                     lambda m=(
                         f"{item.prefix} 中转主流程完成：A({item.source_label}) -> "
