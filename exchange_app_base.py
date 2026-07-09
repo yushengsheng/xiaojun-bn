@@ -40,6 +40,7 @@ from exchange_constants import (
     BNB_FEE_STOP_DEFAULT,
     BNB_TOPUP_AMOUNT_DEFAULT,
     EARN_AMOUNT_DEFAULT,
+    EARN_AMOUNT_ALL_DEFAULT,
     EARN_ASSET_DEFAULT,
     EXCHANGE_PROXY_DEFAULT,
     EXCHANGE_USE_CONFIG_PROXY_DEFAULT,
@@ -374,6 +375,8 @@ class ExchangeAppBase(tk.Tk):
         self.futures_side_var = tk.StringVar(value=FUTURES_SIDE_DEFAULT)
         self.earn_asset_var = tk.StringVar(value=EARN_ASSET_DEFAULT)
         self.earn_amount_var = tk.StringVar(value=EARN_AMOUNT_DEFAULT)
+        self.earn_amount_all_var = tk.BooleanVar(value=EARN_AMOUNT_ALL_DEFAULT)
+        self.earn_amount_all_var.trace_add("write", lambda *_args: self._sync_earn_amount_entry_state())
 
         self.withdraw_addr_var = tk.StringVar(value=WITHDRAW_ADDRESS_DEFAULT)
         self.withdraw_net_var = tk.StringVar(value=WITHDRAW_NETWORK_DEFAULT)
@@ -976,6 +979,15 @@ class ExchangeAppBase(tk.Tk):
         tree.column("status", width=status_width, minwidth=status_min, stretch=True, anchor="w")
     def _on_trade_mode_changed(self, _event=None):
         self._refresh_strategy_panel_layout()
+    def _sync_earn_amount_entry_state(self):
+        entry = getattr(self, "earn_amount_entry", None)
+        if entry is None:
+            return
+        state = "disabled" if bool(self.earn_amount_all_var.get()) else "normal"
+        try:
+            entry.configure(state=state)
+        except Exception:
+            pass
     @staticmethod
     def _reprice_threshold_label_text() -> str:
         return "重挂阈值:"
@@ -1026,6 +1038,7 @@ class ExchangeAppBase(tk.Tk):
         if earn_asset_raw.strip() and earn_asset_raw != earn_asset:
             self.earn_asset_var.set(earn_asset)
         earn_amount_text = str(self.earn_amount_var.get() or "").strip()
+        earn_amount_all = bool(self.earn_amount_all_var.get())
         premium_value: Decimal | None = None
         premium_order_count = PREMIUM_ORDER_COUNT_DEFAULT
         premium_append_threshold_value = Decimal(PREMIUM_APPEND_THRESHOLD_DEFAULT)
@@ -1080,9 +1093,12 @@ class ExchangeAppBase(tk.Tk):
             runtime_rounds = stored_rounds if stored_rounds >= 0 else SPOT_ROUNDS_DEFAULT
             if not earn_asset:
                 raise RuntimeError("理财币种不能为空")
-            earn_amount_value = self._decimal_field_value(earn_amount_text, "理财存入数量", min_value=0)
-            if earn_amount_value <= 0:
-                raise RuntimeError("理财存入数量必须大于 0")
+            if earn_amount_all:
+                earn_amount_value = None
+            else:
+                earn_amount_value = self._decimal_field_value(earn_amount_text, "理财存入数量", min_value=0)
+                if earn_amount_value <= 0:
+                    raise RuntimeError("理财存入数量必须大于 0")
         else:
             runtime_rounds = stored_rounds if stored_rounds > 0 else SPOT_ROUNDS_DEFAULT
             try:
@@ -1135,6 +1151,7 @@ class ExchangeAppBase(tk.Tk):
             "earn_asset": earn_asset,
             "earn_amount": earn_amount_text,
             "earn_amount_value": earn_amount_value,
+            "earn_amount_all": earn_amount_all,
         }
     def _install_entry_placeholder(self, entry, variable, placeholder: str):
         placeholder_color = "#8a8a8a"
@@ -1263,6 +1280,7 @@ class ExchangeAppBase(tk.Tk):
         self.trade_account_type_combo = None
         self.futures_margin_type_combo = None
         self.futures_side_combo = None
+        self.earn_amount_entry = None
 
         ttk.Label(row2_left, text="交易类型:").pack(side="left")
         self.trade_account_type_combo = ttk.Combobox(
@@ -1313,7 +1331,15 @@ class ExchangeAppBase(tk.Tk):
             ttk.Label(row2_left, text="理财币种:", style="ExchangeAccent.TLabel").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.earn_asset_var, width=10).pack(side="left", padx=(4, 12))
             ttk.Label(row2_left, text="存入数量:").pack(side="left")
-            ttk.Entry(row2_left, textvariable=self.earn_amount_var, width=12).pack(side="left", padx=(4, 12))
+            self.earn_amount_entry = ttk.Entry(row2_left, textvariable=self.earn_amount_var, width=12)
+            self.earn_amount_entry.pack(side="left", padx=(4, 8))
+            ttk.Checkbutton(
+                row2_left,
+                text="全部",
+                variable=self.earn_amount_all_var,
+                command=self._sync_earn_amount_entry_state,
+            ).pack(side="left", padx=(0, 12))
+            self._sync_earn_amount_entry_state()
 
         row3 = ttk.Frame(frame_top)
         row3.pack(fill="x", padx=5, pady=(3, 2))

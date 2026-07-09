@@ -50,6 +50,25 @@ class ExchangeAppBatchMixin(object):
     def _reconcile_exchange_orders(self, client, api_key: str) -> None:
         reconcile_exchange_orders(getattr(self, "exchange_operation_journal", None), client, api_key)
 
+    def _resolve_earn_subscribe_amount(self, client, asset: str, configured_amount, earn_amount_all: bool) -> Decimal:
+        asset_u = str(asset or "").strip().upper()
+        if not asset_u:
+            raise RuntimeError("理财币种不能为空")
+        if earn_amount_all:
+            amount_dec = client.spot_asset_balance_decimal(asset_u)
+            if amount_dec <= 0:
+                raise RuntimeError(f"现货 {asset_u} 可用余额为 0，无法全部存入理财")
+            logger.info(
+                "理财全部存入：现货 %s 可用余额=%s",
+                asset_u,
+                BinanceClient._format_decimal(amount_dec),
+            )
+            return amount_dec
+        amount_dec = Decimal(str(configured_amount or "0"))
+        if amount_dec <= 0:
+            raise RuntimeError("理财存入数量必须大于 0")
+        return amount_dec
+
     def _set_account_manage_buttons_state(self, state):
         for name in (
             "btn_add_account",
@@ -322,6 +341,7 @@ class ExchangeAppBatchMixin(object):
             futures_side = str(trade_settings["futures_side"])
             earn_asset = str(trade_settings["earn_asset"])
             earn_amount_value = trade_settings["earn_amount_value"]
+            earn_amount_all = bool(trade_settings.get("earn_amount_all"))
             withdraw_buffer = float(self.withdraw_buffer_var.get())
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "\u6700\u5c0f")
             max_delay = self._delay_var_value(self.max_delay_var, 3000, "\u6700\u5927")
@@ -348,7 +368,10 @@ class ExchangeAppBatchMixin(object):
         try:
             client = self._create_binance_client(key, secret)
             if trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
-                earn_product = client.find_simple_earn_flexible_product(earn_asset, earn_amount_value)
+                earn_product = client.find_simple_earn_flexible_product(
+                    earn_asset,
+                    None if earn_amount_all else earn_amount_value,
+                )
                 validated_earn_product_id = str(earn_product.get("productId") or "").strip()
             else:
                 quote_asset = self._ensure_trade_symbol_supported(
@@ -423,7 +446,6 @@ class ExchangeAppBatchMixin(object):
                 failure_text = ""
                 try:
                     asset_u = str(earn_asset or "").strip().upper()
-                    amount_dec = Decimal(str(earn_amount_value or "0"))
                     if not self._wait_batch_random_delay(
                         self.stop_event,
                         min_delay,
@@ -432,8 +454,18 @@ class ExchangeAppBatchMixin(object):
                     ):
                         return
                     self._dispatch_ui(lambda: self.status_var.set(f"状态：存入理财 {asset_u}..."))
+                    amount_dec = self._resolve_earn_subscribe_amount(
+                        client,
+                        asset_u,
+                        earn_amount_value,
+                        earn_amount_all,
+                    )
+                    product_id = validated_earn_product_id
+                    if earn_amount_all or not product_id:
+                        earn_product = client.find_simple_earn_flexible_product(asset_u, amount_dec)
+                        product_id = str(earn_product.get("productId") or "").strip()
                     result = client.subscribe_simple_earn_flexible_product(
-                        validated_earn_product_id,
+                        product_id,
                         amount_dec,
                         source_account="SPOT",
                         auto_subscribe=False,
@@ -444,7 +476,7 @@ class ExchangeAppBatchMixin(object):
                         "单账号活期理财存入已提交：资产=%s，数量=%s，productId=%s，purchaseId=%s",
                         asset_u,
                         amount_text,
-                        validated_earn_product_id,
+                        product_id,
                         purchase_id or "--",
                     )
 
@@ -1370,12 +1402,13 @@ class ExchangeAppBatchMixin(object):
         bnb_topup_amount: Decimal | None = None,
         earn_asset: str = "",
         earn_amount: Decimal | str | None = None,
+        earn_amount_all: bool = False,
     ) -> list[str]:
         lines = [f"批量账号数：{int(account_count)}"]
         lines.append(f"交易类型：{trade_account_type}")
         if trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
             lines.append(f"理财币种：{str(earn_asset or '').strip().upper() or '-'}")
-            amount_text = BinanceClient._format_decimal(Decimal(str(earn_amount or "0")))
+            amount_text = "全部" if earn_amount_all else BinanceClient._format_decimal(Decimal(str(earn_amount or "0")))
             lines.append(f"存入数量：{amount_text}")
         elif trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
             lines.append(f"交易对：{str(futures_symbol or '').strip().upper() or '-'}")
@@ -1414,6 +1447,7 @@ class ExchangeAppBatchMixin(object):
         show_bnb_topup_option: bool = False,
         earn_asset: str = "",
         earn_amount: Decimal | str | None = None,
+        earn_amount_all: bool = False,
     ) -> tuple[bool, bool, bool]:
         dialog = tk.Toplevel(self)
         dialog.title("确认批量执行")
@@ -1452,6 +1486,7 @@ class ExchangeAppBatchMixin(object):
             bnb_topup_amount=bnb_topup_amount,
             earn_asset=earn_asset,
             earn_amount=earn_amount,
+            earn_amount_all=earn_amount_all,
         ):
             ttk.Label(summary, text=line, foreground="#444444").pack(anchor="w", pady=(0, 2))
 
@@ -1939,6 +1974,7 @@ class ExchangeAppBatchMixin(object):
             futures_side = str(trade_settings["futures_side"])
             earn_asset = str(trade_settings["earn_asset"])
             earn_amount_value = trade_settings["earn_amount_value"]
+            earn_amount_all = bool(trade_settings.get("earn_amount_all"))
         else:
             trade_account_type = TRADE_ACCOUNT_TYPE_SPOT
             spot_rounds = max(1, int(self.spot_rounds_var.get() or SPOT_ROUNDS_DEFAULT))
@@ -1967,6 +2003,7 @@ class ExchangeAppBatchMixin(object):
             futures_side = str(self.futures_side_var.get() or FUTURES_SIDE_DEFAULT).strip()
             earn_asset = ""
             earn_amount_value = None
+            earn_amount_all = False
 
         configured_bnb_topup_amount_value = Decimal(str(bnb_topup_amount_value or "0"))
         show_bnb_topup_option = (
@@ -1999,6 +2036,7 @@ class ExchangeAppBatchMixin(object):
                 show_bnb_topup_option=show_bnb_topup_option,
                 earn_asset=earn_asset,
                 earn_amount=earn_amount_value,
+                earn_amount_all=earn_amount_all,
             )
             if not confirmed:
                 return
@@ -2346,10 +2384,15 @@ class ExchangeAppBatchMixin(object):
                     # 3) 活期理财存入
                     elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
                         asset_u = str(earn_asset or "").strip().upper()
-                        amount_dec = Decimal(str(earn_amount_value or "0"))
                         product_id = str(validated_earn_product_id or "").strip()
-                        if not product_id:
+                        if (not earn_amount_all) and (not product_id):
                             set_status(f"查询{asset_u}理财...")
+                            amount_dec = self._resolve_earn_subscribe_amount(
+                                client,
+                                asset_u,
+                                earn_amount_value,
+                                earn_amount_all,
+                            )
                             product = client.find_simple_earn_flexible_product(asset_u, amount_dec)
                             product_id = str(product.get("productId") or "").strip()
                         if combined_stop.is_set():
@@ -2367,6 +2410,17 @@ class ExchangeAppBatchMixin(object):
                             continue
 
                         set_status(f"存入理财 {asset_u}...")
+                        amount_dec = self._resolve_earn_subscribe_amount(
+                            client,
+                            asset_u,
+                            earn_amount_value,
+                            earn_amount_all,
+                        )
+                        if earn_amount_all or not product_id:
+                            set_status(f"查询{asset_u}理财...")
+                            product = client.find_simple_earn_flexible_product(asset_u, amount_dec)
+                            product_id = str(product.get("productId") or "").strip()
+                            set_status(f"存入理财 {asset_u}...")
                         result = client.subscribe_simple_earn_flexible_product(
                             product_id,
                             amount_dec,
@@ -2677,7 +2731,10 @@ class ExchangeAppBatchMixin(object):
                     sample_acc = selected[0]
                     validate_client = self._create_binance_client(sample_acc["api_key"], sample_acc["api_secret"])
                     if trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
-                        earn_product = validate_client.find_simple_earn_flexible_product(earn_asset, earn_amount_value)
+                        earn_product = validate_client.find_simple_earn_flexible_product(
+                            earn_asset,
+                            None if earn_amount_all else earn_amount_value,
+                        )
                         validated_earn_product_id = str(earn_product.get("productId") or "").strip()
                     else:
                         validated_quote_asset = self._ensure_trade_symbol_supported(

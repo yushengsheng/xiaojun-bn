@@ -1486,54 +1486,120 @@ class BinanceClient:
         if asset_u in cleared_assets:
             return Decimal("0")
 
-        try:
-            balance = self.um_futures_asset_balance(asset_u)
-        except Exception as e:
-            raise RuntimeError(f"合约有问题：查询 U本位 {asset_u} 余额失败: {e}") from e
+        def load_asset_balances() -> list[dict[str, object]]:
+            info = self.um_futures_account_info()
+            balances: list[dict[str, object]] = []
+            for item in info.get("assets", []):
+                balance_asset = str(item.get("asset") or "").strip().upper()
+                if not balance_asset:
+                    continue
+                balances.append({
+                    "asset": balance_asset,
+                    "walletBalance": self._decimal_from_str(item.get("walletBalance", "0"), "0"),
+                    "availableBalance": self._decimal_from_str(item.get("availableBalance", "0"), "0"),
+                    "marginBalance": self._decimal_from_str(item.get("marginBalance", "0"), "0"),
+                    "crossWalletBalance": self._decimal_from_str(item.get("crossWalletBalance", "0"), "0"),
+                    "maxWithdrawAmount": self._decimal_from_str(item.get("maxWithdrawAmount", "0"), "0"),
+                })
+            return balances
 
-        wallet_balance = self._decimal_from_str(balance.get("walletBalance", "0"), "0")
-        available_balance = self._decimal_from_str(balance.get("availableBalance", "0"), "0")
-        margin_balance = self._decimal_from_str(balance.get("marginBalance", "0"), "0")
-        cross_wallet_balance = self._decimal_from_str(balance.get("crossWalletBalance", "0"), "0")
-        max_withdraw_amount = self._decimal_from_str(balance.get("maxWithdrawAmount", "0"), "0")
-        has_balance = any(
-            value > 0
-            for value in (wallet_balance, available_balance, margin_balance, cross_wallet_balance, max_withdraw_amount)
-        )
-        if not has_balance:
+        def has_actual_balance(balance: dict[str, object]) -> bool:
+            # 多资产模式下 availableBalance 可能是其他抵押资产折算后的账户总可用余额。
+            return any(
+                Decimal(str(balance.get(name, "0"))) > 0
+                for name in ("walletBalance", "marginBalance", "crossWalletBalance", "maxWithdrawAmount")
+            )
+
+        try:
+            balances = load_asset_balances()
+        except Exception as e:
+            raise RuntimeError(f"合约有问题：查询 U本位全部资产余额失败: {e}") from e
+
+        actual_balances = [balance for balance in balances if has_actual_balance(balance)]
+        transferable: list[tuple[str, Decimal]] = []
+        for balance in actual_balances:
+            balance_asset = str(balance["asset"])
+            max_withdraw_amount = Decimal(str(balance["maxWithdrawAmount"]))
+            if max_withdraw_amount > 0:
+                transferable.append((balance_asset, max_withdraw_amount))
+
+        if not actual_balances:
             cleared_assets.add(asset_u)
             self._um_futures_pretrade_cleared_assets = cleared_assets
-            logger.info("合约交易前检查：U本位 %s 无残留资金", asset_u)
+            logger.info("合约交易前检查：U本位无残留资金")
             return Decimal("0")
 
-        if max_withdraw_amount <= 0:
-            raise RuntimeError(
-                "合约有问题："
-                f"U本位 {asset_u} 存在余额但当前不可划出，"
-                f"wallet={self._format_decimal(wallet_balance)}，"
-                f"available={self._format_decimal(available_balance)}"
-            )
+        transferred_total = Decimal("0")
+        transfer_failures: list[str] = []
+        for balance_asset, max_withdraw_amount in transferable:
+            try:
+                self._universal_transfer_with_retry(
+                    "UMFUTURE_MAIN",
+                    balance_asset,
+                    max_withdraw_amount,
+                    context="合约交易前 U本位清场",
+                )
+                transferred_total += max_withdraw_amount
+                logger.info(
+                    "合约交易前检测到 U本位 %s 余额，已先划转回现货：%s",
+                    balance_asset,
+                    self._format_decimal(max_withdraw_amount),
+                )
+            except Exception as e:
+                transfer_failures.append(f"{balance_asset}: {e}")
+                logger.error("合约交易前 U本位 %s 余额划回现货失败: %s", balance_asset, e)
+        if transferable:
+            time.sleep(0.5)
 
         try:
-            self._universal_transfer_with_retry(
-                "UMFUTURE_MAIN",
-                asset_u,
-                max_withdraw_amount,
-                context="合约交易前 U本位清场",
-            )
-            logger.info(
-                "合约交易前检测到 U本位 %s 余额，已先划转回现货：%s",
-                asset_u,
-                self._format_decimal(max_withdraw_amount),
-            )
-            time.sleep(0.5)
-            cleared_assets.add(asset_u)
-            self._um_futures_pretrade_cleared_assets = cleared_assets
-            return max_withdraw_amount
+            remaining = [balance for balance in load_asset_balances() if has_actual_balance(balance)]
         except Exception as e:
-            raise RuntimeError(
-                f"合约有问题：U本位 {asset_u} 余额无法划回现货: {e}"
-            ) from e
+            raise RuntimeError(f"合约有问题：划转后复查 U本位余额失败: {e}") from e
+        if remaining:
+            details = "，".join(
+                f"{balance['asset']} wallet={self._format_decimal(Decimal(str(balance['walletBalance'])))}"
+                for balance in remaining
+            )
+            if transfer_failures:
+                details = f"{details}；划转失败={'；'.join(transfer_failures)}"
+                raise RuntimeError(f"合约有问题：U本位资产划转后仍有余额：{details}")
+            if any(Decimal(str(balance["maxWithdrawAmount"])) > 0 for balance in remaining):
+                raise RuntimeError(f"合约有问题：U本位资产划转后仍有可划余额：{details}")
+
+            probe_amount = Decimal("0.01")
+            try:
+                spot_balance = self.spot_asset_balance_decimal(asset_u)
+                if spot_balance < probe_amount:
+                    raise RuntimeError(
+                        f"现货 {asset_u} 余额不足 {self._format_decimal(probe_amount)}，无法验证合约划转"
+                    )
+                self._universal_transfer_with_retry(
+                    "MAIN_UMFUTURE",
+                    asset_u,
+                    probe_amount,
+                    context="合约交易前划转探测转入",
+                )
+                time.sleep(0.5)
+                self._universal_transfer_with_retry(
+                    "UMFUTURE_MAIN",
+                    asset_u,
+                    probe_amount,
+                    context="合约交易前划转探测转出",
+                )
+                time.sleep(0.5)
+            except Exception as e:
+                raise RuntimeError(
+                    f"合约有问题：U本位存在不可划余额，且 {asset_u} 0.01 往返划转验证失败: {e}"
+                ) from e
+            logger.warning(
+                "U本位存在不可划转余额（可能为合约赠金），%s 0.01 往返划转验证通过，继续交易：%s",
+                asset_u,
+                details,
+            )
+
+        cleared_assets.add(asset_u)
+        self._um_futures_pretrade_cleared_assets = cleared_assets
+        return transferred_total
 
     @staticmethod
     def _normalize_um_futures_position_side(position_side: str | None) -> str:

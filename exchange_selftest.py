@@ -1565,36 +1565,66 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             super().__init__("selftest-key", "selftest-secret")
             self.mode = mode
             self.transfers: list[tuple[str, str, Decimal]] = []
+            self.transferred_assets: set[str] = set()
 
-        def um_futures_asset_balance(self, asset: str):
-            if self.mode == "empty":
-                return {
-                    "walletBalance": Decimal("0"),
-                    "availableBalance": Decimal("0"),
-                    "marginBalance": Decimal("0"),
-                    "crossWalletBalance": Decimal("0"),
-                    "maxWithdrawAmount": Decimal("0"),
-                }
-            if self.mode == "blocked":
-                return {
-                    "walletBalance": Decimal("5"),
-                    "availableBalance": Decimal("5"),
-                    "marginBalance": Decimal("5"),
-                    "crossWalletBalance": Decimal("5"),
-                    "maxWithdrawAmount": Decimal("0"),
-                }
+        @staticmethod
+        def _asset_balance(asset: str, amount: Decimal, *, available: Decimal | None = None, withdrawable: Decimal | None = None):
+            available_amount = amount if available is None else available
+            max_withdraw_amount = amount if withdrawable is None else withdrawable
             return {
-                "walletBalance": Decimal("7"),
-                "availableBalance": Decimal("7"),
-                "marginBalance": Decimal("7"),
-                "crossWalletBalance": Decimal("7"),
-                "maxWithdrawAmount": Decimal("7"),
+                "asset": asset,
+                "walletBalance": str(amount),
+                "availableBalance": str(available_amount),
+                "marginBalance": str(amount),
+                "crossWalletBalance": str(amount),
+                "maxWithdrawAmount": str(max_withdraw_amount),
             }
+
+        def um_futures_account_info(self):
+            zero_usdt = self._asset_balance("USDT", Decimal("0"))
+            if self.mode == "empty":
+                return {"assets": [zero_usdt]}
+            if self.mode == "multi-asset":
+                usdc_amount = Decimal("0") if "USDC" in self.transferred_assets else Decimal("7")
+                return {
+                    "multiAssetsMargin": True,
+                    "assets": [
+                        self._asset_balance("USDT", Decimal("0"), available=usdc_amount),
+                        self._asset_balance("USDC", usdc_amount),
+                    ],
+                }
+            if self.mode in {"blocked", "probe-fails", "probe-no-spot"}:
+                usdt_amount = Decimal("0") if "USDT" in self.transferred_assets else Decimal("7")
+                return {
+                    "multiAssetsMargin": True,
+                    "assets": [
+                        self._asset_balance("USDT", usdt_amount, available=usdt_amount + Decimal("5")),
+                        self._asset_balance("USDC", Decimal("5"), withdrawable=Decimal("0")),
+                    ],
+                }
+
+            balances = (("USDT", Decimal("7")), ("USDC", Decimal("3")), ("BNB", Decimal("1")))
+            assets = []
+            for balance_asset, initial_amount in balances:
+                transferred = balance_asset in self.transferred_assets and self.mode != "residual"
+                amount = Decimal("0") if transferred else initial_amount
+                assets.append(self._asset_balance(balance_asset, amount))
+            return {"assets": assets}
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            if self.mode == "probe-no-spot":
+                return Decimal("0")
+            return Decimal("55") if str(asset or "").strip().upper() == "USDT" else Decimal("0")
 
         def _universal_transfer_with_retry(self, transfer_type: str, asset: str, amount, *, context: str, retries: int = 10, retry_delay: float = 1.0):
             if self.mode == "transfer-fails":
                 raise RuntimeError("transfer denied")
-            self.transfers.append((transfer_type, asset, Decimal(str(amount))))
+            asset_u = str(asset or "").strip().upper()
+            amount_dec = Decimal(str(amount))
+            if self.mode == "probe-fails" and transfer_type == "UMFUTURE_MAIN" and amount_dec == Decimal("0.01"):
+                raise RuntimeError("probe transfer denied")
+            self.transfers.append((transfer_type, asset_u, amount_dec))
+            self.transferred_assets.add(asset_u)
             return {"tranId": 1}
 
     clear_empty_client = _SelftestFuturesPretradeClearClient("empty")
@@ -1603,20 +1633,49 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     if clear_empty_client.transfers:
         raise RuntimeError(f"合约清场自检失败：空余额不应划转（{clear_empty_client.transfers}）")
 
-    clear_ok_client = _SelftestFuturesPretradeClearClient("ok")
-    if clear_ok_client.ensure_um_futures_asset_clear_before_trade("USDT") != Decimal("7"):
-        raise RuntimeError("合约清场自检失败：有余额可划出时返回数量异常")
-    clear_ok_client.ensure_um_futures_asset_clear_before_trade("USDT")
-    if clear_ok_client.transfers != [("UMFUTURE_MAIN", "USDT", Decimal("7"))]:
-        raise RuntimeError(f"合约清场自检失败：划转参数或幂等异常（{clear_ok_client.transfers}）")
+    clear_multi_asset_client = _SelftestFuturesPretradeClearClient("multi-asset")
+    if clear_multi_asset_client.ensure_um_futures_asset_clear_before_trade("USDT") != Decimal("7"):
+        raise RuntimeError("合约清场自检失败：多资产模式划转数量异常")
+    if clear_multi_asset_client.transfers != [("UMFUTURE_MAIN", "USDC", Decimal("7"))]:
+        raise RuntimeError(f"合约清场自检失败：多资产模式错误划转了虚拟USDT余额（{clear_multi_asset_client.transfers}）")
 
-    for mode in ("blocked", "transfer-fails"):
+    clear_ok_client = _SelftestFuturesPretradeClearClient("ok")
+    if clear_ok_client.ensure_um_futures_asset_clear_before_trade("USDT") != Decimal("11"):
+        raise RuntimeError("合约清场自检失败：全资产划转数量异常")
+    clear_ok_client.ensure_um_futures_asset_clear_before_trade("USDT")
+    if clear_ok_client.transfers != [
+        ("UMFUTURE_MAIN", "USDT", Decimal("7")),
+        ("UMFUTURE_MAIN", "USDC", Decimal("3")),
+        ("UMFUTURE_MAIN", "BNB", Decimal("1")),
+    ]:
+        raise RuntimeError(f"合约清场自检失败：全资产划转参数或幂等异常（{clear_ok_client.transfers}）")
+
+    clear_blocked_client = _SelftestFuturesPretradeClearClient("blocked")
+    if clear_blocked_client.ensure_um_futures_asset_clear_before_trade("USDT") != Decimal("7"):
+        raise RuntimeError("合约清场自检失败：不可划余额探测后的划转数量异常")
+    if clear_blocked_client.transfers != [
+        ("UMFUTURE_MAIN", "USDT", Decimal("7")),
+        ("MAIN_UMFUTURE", "USDT", Decimal("0.01")),
+        ("UMFUTURE_MAIN", "USDT", Decimal("0.01")),
+    ]:
+        raise RuntimeError(f"合约清场自检失败：0.01 往返划转探测异常（{clear_blocked_client.transfers}）")
+
+    for mode in ("transfer-fails", "residual", "probe-fails", "probe-no-spot"):
         clear_bad_client = _SelftestFuturesPretradeClearClient(mode)
         try:
             clear_bad_client.ensure_um_futures_asset_clear_before_trade("USDT")
         except RuntimeError as exc:
             if "合约有问题" not in str(exc):
                 raise RuntimeError(f"合约清场自检失败：错误文案未标记合约有问题（{exc}）")
+            if mode == "probe-fails" and clear_bad_client.transfers != [
+                ("UMFUTURE_MAIN", "USDT", Decimal("7")),
+                ("MAIN_UMFUTURE", "USDT", Decimal("0.01")),
+            ]:
+                raise RuntimeError(f"合约清场自检失败：探测失败时发生了额外划转（{clear_bad_client.transfers}）")
+            if mode == "probe-no-spot" and clear_bad_client.transfers != [
+                ("UMFUTURE_MAIN", "USDT", Decimal("7")),
+            ]:
+                raise RuntimeError(f"合约清场自检失败：现货不足时仍发起了探测划转（{clear_bad_client.transfers}）")
         else:
             raise RuntimeError(f"合约清场自检失败：{mode} 未阻止合约交易")
 
@@ -1877,6 +1936,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             spot_rounds=0,
             earn_asset="USDT",
             earn_amount="12.5",
+            earn_amount_all=False,
         ):
             self.trade_account_type_var = _SimpleVar(account_type)
             self.trade_mode_var = _SimpleVar(mode)
@@ -1897,6 +1957,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.futures_leverage_var = _SimpleVar(10)
             self.earn_asset_var = _SimpleVar(earn_asset)
             self.earn_amount_var = _SimpleVar(earn_amount)
+            self.earn_amount_all_var = _SimpleVar(earn_amount_all)
 
     market_zero_settings = _SelftestTradeSettingsProbe(
         mode=TRADE_MODE_MARKET,
@@ -1923,8 +1984,24 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     else:
         raise RuntimeError("现货负轮次参数自检失败：负数轮次未被拒绝")
     earn_settings = _SelftestTradeSettingsProbe(account_type=TRADE_ACCOUNT_TYPE_EARN)._collect_trade_mode_settings()
-    if earn_settings.get("earn_asset") != "USDT" or earn_settings.get("earn_amount_value") != Decimal("12.5"):
+    if (
+        earn_settings.get("earn_asset") != "USDT"
+        or earn_settings.get("earn_amount_value") != Decimal("12.5")
+        or earn_settings.get("earn_amount_all") is not False
+    ):
         raise RuntimeError(f"理财存入参数自检失败：参数解析异常（{earn_settings}）")
+    earn_all_settings = _SelftestTradeSettingsProbe(
+        account_type=TRADE_ACCOUNT_TYPE_EARN,
+        earn_asset="USDC",
+        earn_amount="",
+        earn_amount_all=True,
+    )._collect_trade_mode_settings()
+    if (
+        earn_all_settings.get("earn_asset") != "USDC"
+        or earn_all_settings.get("earn_amount_value") is not None
+        or earn_all_settings.get("earn_amount_all") is not True
+    ):
+        raise RuntimeError(f"理财全部存入参数自检失败：参数解析异常（{earn_all_settings}）")
     try:
         _SelftestTradeSettingsProbe(
             account_type=TRADE_ACCOUNT_TYPE_EARN,
@@ -1936,6 +2013,40 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError("理财存入参数自检失败：0数量未被拒绝")
     checks.append("spot-zero-round-settings=ok")
     checks.append("earn-subscribe-settings=ok")
+
+    class _SelftestEarnAmountClient:
+        def __init__(self):
+            self.balance_calls: list[str] = []
+
+        def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+            asset_u = str(asset or "").strip().upper()
+            self.balance_calls.append(asset_u)
+            return {
+                "USDT": Decimal("12.5"),
+                "USDC": Decimal("8.88"),
+                "ETH": Decimal("0.25"),
+            }.get(asset_u, Decimal("0"))
+
+    class _SelftestEarnAmountProbe(ExchangeAppBatchMixin):
+        pass
+
+    earn_amount_probe = _SelftestEarnAmountProbe()
+    earn_amount_client = _SelftestEarnAmountClient()
+    if earn_amount_probe._resolve_earn_subscribe_amount(earn_amount_client, "usdc", None, True) != Decimal("8.88"):
+        raise RuntimeError("理财全部存入数量自检失败：未使用现货 USDC 可用余额")
+    if earn_amount_probe._resolve_earn_subscribe_amount(earn_amount_client, "ETH", "999", True) != Decimal("0.25"):
+        raise RuntimeError("理财全部存入数量自检失败：未按币种查询现货 ETH 可用余额")
+    if earn_amount_probe._resolve_earn_subscribe_amount(earn_amount_client, "USDT", "3.3", False) != Decimal("3.3"):
+        raise RuntimeError("理财自定义存入数量自检失败：未保留手填数量")
+    try:
+        earn_amount_probe._resolve_earn_subscribe_amount(earn_amount_client, "BNB", None, True)
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("理财全部存入数量自检失败：0 余额未被拒绝")
+    if earn_amount_client.balance_calls[:2] != ["USDC", "ETH"]:
+        raise RuntimeError(f"理财全部存入数量自检失败：余额查询币种异常（{earn_amount_client.balance_calls}）")
+    checks.append("earn-subscribe-all=ok")
 
     class _SelftestCollectClient(BinanceClient):
         def __init__(self):
