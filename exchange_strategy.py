@@ -2050,6 +2050,10 @@ class Strategy:
             logger.info("检测到停止信号，跳过最终提现")
             return result_payload()
 
+        if not str(self.withdraw_address or "").strip():
+            logger.info("未填写提现地址，跳过最终提现")
+            return result_payload()
+
         if self.enable_withdraw:
             logger.info("最终提现前执行随机延迟")
             self.sleep_fn()

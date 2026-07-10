@@ -15,6 +15,7 @@ import requests
 from api_clients import EvmClient
 from app_paths import LOG_FILE_PATH
 from core_models import EvmToken, OnchainPairEntry, OnchainSettings, WithdrawRuntimeParams
+from exchange_app_accounts import ExchangeAppAccountsMixin
 from exchange_app_base import ExchangeAppBase
 from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_app_config import ExchangeAppConfigMixin
@@ -50,6 +51,40 @@ def _load_onchain_page_class():
 
 def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     run_basic_selftest_checks(checks)
+
+    import_key = "A" * 32
+    import_secret = "b" * 32
+    parsed_no_address, parse_error = ExchangeAppAccountsMixin._parse_accounts_from_text(
+        object(),
+        f"{import_key}\t{import_secret}",
+    )
+    if parse_error or parsed_no_address != [(import_key, import_secret, "", "")]:
+        raise RuntimeError(f"交易所两字段账号导入自检失败：{parse_error or parsed_no_address}")
+    import_address = "0x" + ("1" * 40)
+    parsed_with_address, parse_error = ExchangeAppAccountsMixin._parse_accounts_from_text(
+        object(),
+        "\n".join((import_key, import_secret, import_address)),
+    )
+    if parse_error or parsed_with_address != [(import_key, import_secret, import_address, "")]:
+        raise RuntimeError(f"交易所三字段账号导入回归自检失败：{parse_error or parsed_with_address}")
+    parsed_export_row, parse_error = ExchangeAppAccountsMixin._parse_accounts_from_text(
+        object(),
+        f"{import_key}|{import_secret}||BSC",
+    )
+    if parse_error or parsed_export_row != [(import_key, import_secret, "", "BSC")]:
+        raise RuntimeError(f"交易所无地址账号导出回读自检失败：{parse_error or parsed_export_row}")
+
+    class _SelftestAccountStoreEntriesProbe:
+        accounts = [{"api_key": import_key, "api_secret": import_secret, "address": ""}]
+
+        @staticmethod
+        def _account_network_value(_acc):
+            return "BSC"
+
+    account_entries = ExchangeAppAccountsMixin._account_store_entries(_SelftestAccountStoreEntriesProbe())
+    if len(account_entries) != 1 or account_entries[0].address != "":
+        raise RuntimeError("交易所无提现地址账号持久化自检失败")
+    checks.append("exchange-account-import-without-address=ok")
 
     with tempfile.TemporaryDirectory(prefix="xiaojun-selftest-") as tmpdir:
         store_path = Path(tmpdir) / "onchain.json"
@@ -899,6 +934,36 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError(f"最终提现停止自检失败：随机延迟和停止顺序异常（{stop_withdraw_events}）")
     checks.append("final-withdraw-delay-stop=ok")
 
+    missing_address_events: list[str] = []
+    missing_address_client = _SelftestZeroRoundClient(missing_address_events)
+    missing_address_sleep_calls = {"count": 0}
+
+    def missing_address_sleep_fn():
+        missing_address_sleep_calls["count"] += 1
+        missing_address_events.append("sleep")
+
+    missing_address_strategy = Strategy(
+        client=missing_address_client,
+        spot_rounds=0,
+        withdraw_coin="USDT",
+        withdraw_address="",
+        withdraw_network="BSC",
+        withdraw_fee_buffer=0,
+        spot_symbol="BTCUSDT",
+        sleep_fn=missing_address_sleep_fn,
+        enable_withdraw=True,
+        trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+        trade_mode=TRADE_MODE_MARKET,
+    )
+    missing_address_result = missing_address_strategy.run(stop_event=None)
+    if ("withdraw", "USDT") in missing_address_client.calls:
+        raise RuntimeError(f"无提现地址自检失败：仍调用了提现（{missing_address_client.calls}）")
+    if missing_address_result.get("withdraw_attempted") is not False:
+        raise RuntimeError(f"无提现地址自检失败：提现状态异常（{missing_address_result}）")
+    if missing_address_events != ["sleep", "convert"] or missing_address_sleep_calls["count"] != 1:
+        raise RuntimeError(f"无提现地址自检失败：仍执行提现前步骤（{missing_address_events}）")
+    checks.append("withdraw-skip-without-address=ok")
+
     class _SelftestStableUZeroRoundClient:
         def __init__(self):
             self.calls: list[tuple[str, str]] = []
@@ -1099,8 +1164,10 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     ]
     if market_round_progress != expected_market_round_progress:
         raise RuntimeError(f"普通市价轮次状态栏自检失败：进度回调异常（{market_round_progress}）")
-    if not market_round_result or market_round_result.get("withdraw_attempted") is not True:
-        raise RuntimeError("普通市价轮次回归自检失败：未保持既有最终提现流程")
+    if not market_round_result or market_round_result.get("withdraw_attempted") is not False:
+        raise RuntimeError("普通市价轮次回归自检失败：无提现地址时未跳过提现")
+    if ("withdraw", "USDT") in market_round_client.calls:
+        raise RuntimeError(f"普通市价轮次回归自检失败：无地址仍调用提现（{market_round_client.calls}）")
     no_withdraw_status, no_withdraw_success = ExchangeAppBatchMixin._format_batch_strategy_completion_status(
         0.0,
         "USDT",
@@ -1530,7 +1597,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         client=futures_failure_client,
         spot_rounds=1,
         withdraw_coin="USDT",
-        withdraw_address="",
+        withdraw_address="0x0000000000000000000000000000000000000001",
         withdraw_network="BSC",
         withdraw_fee_buffer=0,
         spot_symbol="BTCUSDT",
@@ -2244,14 +2311,78 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         bnb_ready_skip_client.close()
     checks.append("bnb-fee-ready-skip=ok")
 
-    collect_coin, collect_enable = ExchangeAppBatchMixin._collect_bnb_withdraw_runtime(
-        force_bnb_withdraw=True,
-        enable_withdraw=False,
-        withdraw_coin="USDT",
-    )
+    collect_coin, collect_enable = ExchangeAppBatchMixin._collect_bnb_withdraw_runtime()
     if collect_coin != "BNB" or collect_enable is not True:
         raise RuntimeError("归集BNB并提现自检失败：强制提现参数未固定为 BNB/开启")
     checks.append("collect-bnb-withdraw=ok")
+
+    class _SelftestCollectBnbEarnClient:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def get_simple_earn_flexible_positions(self, *, asset=None, size=100):
+            self.calls.append(str(asset or "").strip().upper())
+            return [
+                {"asset": "BNB", "totalAmount": Decimal("0.25"), "redeemingAmount": Decimal("0")},
+                {"asset": "bnb", "totalAmount": "0", "redeemingAmount": "0.05"},
+                {"asset": "USDT", "totalAmount": "99", "redeemingAmount": "0"},
+            ]
+
+    collect_bnb_earn_client = _SelftestCollectBnbEarnClient()
+    earn_assets = ExchangeAppBatchMixin._collect_bnb_simple_earn_assets(collect_bnb_earn_client)
+    if earn_assets != ["BNB", "USDT"]:
+        raise RuntimeError(f"归集BNB跳过理财自检失败：理财资产识别异常（{earn_assets}）")
+    if collect_bnb_earn_client.calls != [""]:
+        raise RuntimeError(f"归集BNB跳过理财自检失败：查询币种异常（{collect_bnb_earn_client.calls}）")
+    insufficient_status, insufficient_complete = ExchangeAppBatchMixin._format_collect_bnb_earn_status(
+        0.0,
+        "BNB",
+        earn_assets,
+    )
+    if insufficient_status != "×跳过理财；提现失败：提现额度不足" or insufficient_complete is not True:
+        raise RuntimeError("归集BNB跳过理财自检失败：余额不足状态异常")
+    success_status, success_complete = ExchangeAppBatchMixin._format_collect_bnb_earn_status(
+        0.25,
+        "BNB",
+        earn_assets,
+    )
+    if success_status != "✔提现0.25 BNB；跳过理财" or success_complete is not True:
+        raise RuntimeError("归集BNB跳过理财自检失败：提现成功状态异常")
+    regular_failure_status, regular_failure_complete = ExchangeAppBatchMixin._format_collect_bnb_earn_status(
+        0.0,
+        "BNB",
+        [],
+    )
+    if regular_failure_status != "×提现失败：可提余额不足/预留过高" or regular_failure_complete is not False:
+        raise RuntimeError("归集BNB跳过理财自检失败：无理财时提现失败状态异常")
+    if ExchangeAppBatchMixin._format_missing_withdraw_address_status() != "✔未填写提现地址，已跳过提现":
+        raise RuntimeError("无提现地址跳过状态自检失败")
+    long_error = BinanceAPIError(-4003, "Quantity less than zero. Please verify the withdrawal amount before retrying.")
+    long_error_status = ExchangeAppBatchMixin._exchange_error_status_text("BNB提现失败", long_error)
+    if "Binance API error -4003" not in long_error_status or len(long_error_status) <= 60:
+        raise RuntimeError("账号状态栏自检失败：较长错误原因仍被过早截断")
+
+    class _SelftestAccountTree:
+        def __init__(self):
+            self.columns: dict[str, dict[str, object]] = {}
+
+        @staticmethod
+        def winfo_width():
+            return 2025
+
+        def column(self, name, **kwargs):
+            self.columns[str(name)] = dict(kwargs)
+
+    class _SelftestAccountTreeProbe:
+        account_tree = _SelftestAccountTree()
+
+    account_tree_probe = _SelftestAccountTreeProbe()
+    ExchangeAppBase._resize_account_tree_columns(account_tree_probe)
+    address_width = int(account_tree_probe.account_tree.columns.get("address", {}).get("width") or 0)
+    status_width = int(account_tree_probe.account_tree.columns.get("status", {}).get("width") or 0)
+    if address_width != 190 or status_width != 1505:
+        raise RuntimeError(f"账号列表列宽自检失败：address={address_width}, status={status_width}")
+    checks.append("collect-bnb-earn-skip=ok")
 
     class _SelftestSimpleEarnClient(BinanceClient):
         def __init__(self):

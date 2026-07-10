@@ -247,7 +247,7 @@ class AccountStore:
             api_secret = SECRET_BOX.decrypt(str(item.get("api_secret") or "").strip()).strip()
             address = (item.get("address") or "").strip()
             network = str(item.get("network") or settings_raw.get("network") or "").strip().upper()
-            if api_key and api_secret and address:
+            if api_key and api_secret:
                 loaded.append(AccountEntry(api_key=api_key, api_secret=api_secret, address=address, network=network))
 
         self.accounts = loaded

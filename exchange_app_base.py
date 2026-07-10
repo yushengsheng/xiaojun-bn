@@ -536,9 +536,9 @@ class ExchangeAppBase(tk.Tk):
         self.account_tree.column("checked", width=52, minwidth=52, stretch=False, anchor="center")
         self.account_tree.column("idx", width=52, minwidth=52, stretch=False, anchor="center")
         self.account_tree.column("api_key", width=150, minwidth=130, stretch=False, anchor="w")
-        self.account_tree.column("address", width=310, minwidth=240, stretch=False, anchor="w")
+        self.account_tree.column("address", width=190, minwidth=160, stretch=False, anchor="w")
         self.account_tree.column("network", width=76, minwidth=68, stretch=False, anchor="center")
-        self.account_tree.column("status", width=620, minwidth=260, stretch=True, anchor="w")
+        self.account_tree.column("status", width=740, minwidth=260, stretch=True, anchor="w")
         self.account_tree.tag_configure("acc_ready", foreground="#111111", background="#F2F2F2")
         self.account_tree.tag_configure("acc_running", foreground="#111111", background="#CFE3FF")
         self.account_tree.tag_configure("acc_warn", foreground="#111111", background="#FFE3B8")
@@ -556,7 +556,7 @@ class ExchangeAppBase(tk.Tk):
         self.after_idle(self._resize_account_tree_columns)
         self.account_list_hint = ttk.Label(
             self.frame_list_canvas,
-            text="账号列表为空。点击此区域后可直接 Ctrl+V / Cmd+V 粘贴导入账号。\n导入格式：每 3 段一组，依次为 API KEY / SECRET / 提现地址。",
+            text="账号列表为空。点击此区域后可直接 Ctrl+V / Cmd+V 粘贴导入账号。\n导入格式：API KEY / SECRET / 可选提现地址。",
             foreground="#666",
             justify="center",
             anchor="center",
@@ -963,18 +963,18 @@ class ExchangeAppBase(tk.Tk):
             return
 
         if width < 950:
-            api_width, address_width, status_min = 130, 240, 220
+            api_width, address_width, status_min = 130, 160, 220
         elif width < 1150:
-            api_width, address_width, status_min = 140, 280, 260
+            api_width, address_width, status_min = 140, 175, 260
         else:
-            api_width, address_width, status_min = 150, 310, 320
+            api_width, address_width, status_min = 150, 190, 320
 
         fixed = 52 + 52 + api_width + address_width + 76
         status_width = max(status_min, width - fixed)
         tree.column("checked", width=52, minwidth=52, stretch=False, anchor="center")
         tree.column("idx", width=52, minwidth=52, stretch=False, anchor="center")
         tree.column("api_key", width=api_width, minwidth=130, stretch=False, anchor="w")
-        tree.column("address", width=address_width, minwidth=240, stretch=False, anchor="w")
+        tree.column("address", width=address_width, minwidth=160, stretch=False, anchor="w")
         tree.column("network", width=76, minwidth=68, stretch=False, anchor="center")
         tree.column("status", width=status_width, minwidth=status_min, stretch=True, anchor="w")
     def _on_trade_mode_changed(self, _event=None):

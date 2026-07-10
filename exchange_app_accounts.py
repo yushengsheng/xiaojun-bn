@@ -414,26 +414,37 @@ class ExchangeAppAccountsMixin(object):
                 continue
 
             if "|" in line:
-                parts = [p.strip() for p in line.split("|") if p.strip()]
-                if len(parts) >= 3:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    address = parts[2] if len(parts) >= 3 else ""
                     network = parts[3] if len(parts) >= 4 else ""
-                    accounts.append((parts[0], parts[1], parts[2], network))
+                    accounts.append((parts[0], parts[1], address, network))
                     continue
 
             # 支持“行尾备注/中文说明”，只提取长 token（API KEY/SECRET/地址）
             found = re.findall(r"0x[a-fA-F0-9]{40}|[A-Za-z0-9]{24,}", line)
-            if found:
+            if len(found) in {2, 3}:
+                address = found[2] if len(found) == 3 else ""
+                accounts.append((found[0], found[1], address, ""))
+            elif found:
                 tokens.extend(found)
 
         if not accounts and not tokens:
             return [], "没有识别到账号数据"
 
-        if tokens and len(tokens) % 3 != 0:
-            return [], f"识别到 {len(tokens)} 条有效字段，必须按 3 条一组：APIKEY / APISECRET / 提现地址"
-
-        for i in range(0, len(tokens), 3):
-            key, secret, addr = tokens[i], tokens[i + 1], tokens[i + 2]
-            accounts.append((key, secret, addr, ""))
+        if tokens:
+            if len(tokens) % 3 == 0:
+                group_size = 3
+            elif len(tokens) % 2 == 0:
+                group_size = 2
+            else:
+                return [], (
+                    f"识别到 {len(tokens)} 条有效字段，必须按 2 条或 3 条一组："
+                    "APIKEY / APISECRET / 可选提现地址"
+                )
+            for i in range(0, len(tokens), group_size):
+                address = tokens[i + 2] if group_size == 3 else ""
+                accounts.append((tokens[i], tokens[i + 1], address, ""))
         return accounts, ""
     def _import_accounts_from_text(self, raw_text, source_name):
         parsed, err_msg = self._parse_accounts_from_text(raw_text)
@@ -580,7 +591,7 @@ class ExchangeAppAccountsMixin(object):
             api_key = str(acc.get("api_key") or "").strip()
             api_secret = str(acc.get("api_secret") or "").strip()
             address = str(acc.get("address") or "").strip()
-            if not api_key or not api_secret or not address:
+            if not api_key or not api_secret:
                 continue
             entries.append(
                 AccountEntry(

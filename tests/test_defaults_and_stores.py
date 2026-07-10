@@ -65,6 +65,27 @@ class StoreDefaultTests(unittest.TestCase):
             self.assertEqual(len(recovered.accounts), 1)
             self.assertEqual(recovered.accounts[0].api_key, "account-key")
 
+    def test_account_store_preserves_account_without_withdraw_address(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "accounts.json"
+            source = AccountStore(path)
+            source.accounts = [
+                stores_module.AccountEntry(
+                    api_key="account-key",
+                    api_secret="account-secret",
+                    address="",
+                    network="BSC",
+                )
+            ]
+            source.save()
+
+            loaded = AccountStore(path)
+            loaded.load()
+
+            self.assertEqual(len(loaded.accounts), 1)
+            self.assertEqual(loaded.accounts[0].api_key, "account-key")
+            self.assertEqual(loaded.accounts[0].address, "")
+
     def test_onchain_store_uses_central_defaults_when_file_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = OnchainStore(Path(tmpdir) / "onchain.json")

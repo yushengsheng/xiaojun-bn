@@ -1003,6 +1003,13 @@ class ExchangeAppBatchMixin(object):
             return prefix(f"{round_status}；{plain_withdraw}"), success
         return withdraw_status, success
     @classmethod
+    def _format_missing_withdraw_address_status(cls, strategy_result: dict | None = None) -> str:
+        skip_text = "未填写提现地址，已跳过提现"
+        round_status = cls._format_market_round_failure_status(strategy_result)
+        if round_status:
+            skip_text = f"{round_status}；{skip_text}"
+        return cls._exchange_success_status_text(skip_text)
+    @classmethod
     def _format_trade_failure_status(cls, stage: str, err: object) -> str:
         stage_text = str(stage or "").strip()
         if stage_text == "开仓下单":
@@ -1017,10 +1024,8 @@ class ExchangeAppBatchMixin(object):
             prefix = "交易失败"
         return cls._exchange_error_status_text(prefix, err, fallback=prefix)
     @staticmethod
-    def _collect_bnb_withdraw_runtime(*, force_bnb_withdraw: bool, enable_withdraw: bool, withdraw_coin: str) -> tuple[str, bool]:
-        if force_bnb_withdraw:
-            return "BNB", True
-        return "BNB", bool(enable_withdraw)
+    def _collect_bnb_withdraw_runtime() -> tuple[str, bool]:
+        return "BNB", True
     @staticmethod
     def _collect_bnb_remaining_spot_assets(client) -> list[str]:
         remaining_assets: list[str] = []
@@ -1031,6 +1036,27 @@ class ExchangeAppBatchMixin(object):
             if asset not in remaining_assets:
                 remaining_assets.append(asset)
         return remaining_assets
+    @staticmethod
+    def _collect_bnb_simple_earn_assets(client) -> list[str]:
+        if not hasattr(client, "get_simple_earn_flexible_positions"):
+            return []
+        assets: list[str] = []
+        for item in client.get_simple_earn_flexible_positions():
+            item_asset = str((item or {}).get("asset") or "").strip().upper()
+            if not item_asset:
+                continue
+            has_amount = False
+            for field_name in ("totalAmount", "redeemingAmount"):
+                try:
+                    amount = Decimal(str((item or {}).get(field_name) or "0"))
+                except Exception:
+                    amount = Decimal("0")
+                if amount > 0:
+                    has_amount = True
+                    break
+            if has_amount and item_asset not in assets:
+                assets.append(item_asset)
+        return assets
     @staticmethod
     def _asset_list_preview(assets: list[str], *, limit: int = 3) -> str:
         unique_assets: list[str] = []
@@ -1044,6 +1070,26 @@ class ExchangeAppBatchMixin(object):
         if len(unique_assets) > limit:
             preview += f"等{len(unique_assets)}个"
         return preview
+    @classmethod
+    def _format_collect_bnb_earn_status(
+        cls,
+        amount: float,
+        coin: str,
+        earn_assets: list[str] | None = None,
+    ) -> tuple[str, bool]:
+        status_text, withdraw_success = cls._format_withdraw_amount_status(
+            amount,
+            coin,
+            enable_withdraw=True,
+        )
+        if not earn_assets:
+            return status_text, withdraw_success
+        if withdraw_success:
+            return cls._exchange_success_status_text(
+                f"{cls._plain_exchange_status_text(status_text)}；跳过理财"
+            ), True
+        # 理财已明确排除时，显示提现失败，但不把账号放回失败重试队列。
+        return cls._exchange_failed_status_text("跳过理财；提现失败：提现额度不足"), True
     @staticmethod
     def _detail_list_preview(items: list[str], *, limit: int = 3) -> str:
         unique_items: list[str] = []
@@ -1082,15 +1128,9 @@ class ExchangeAppBatchMixin(object):
             return True
         return not stop_event.wait(delay_seconds)
     @staticmethod
-    def _compact_error_text(err_text: str, max_len: int = 28) -> str:
-        s = str(err_text or "").strip().replace("\n", " ")
-        if not s:
-            return "未知错误"
-        return s if len(s) <= max_len else (s[: max_len - 1] + "…")
-    @staticmethod
     def _exchange_error_status_text(prefix: str, err: object, *, fallback: str = "异常") -> str:
         prefix_text = str(prefix or "").strip() or str(fallback or "异常").strip() or "异常"
-        reason_text = summarize_exchange_exception(err, fallback=fallback, max_len=22)
+        reason_text = summarize_exchange_exception(err, fallback=fallback, max_len=72)
         if not reason_text:
             return ExchangeAppBatchMixin._exchange_failed_status_text(prefix_text, fallback=fallback)
         return ExchangeAppBatchMixin._exchange_failed_status_text(f"{prefix_text}: {reason_text}", fallback=fallback)
@@ -1909,7 +1949,6 @@ class ExchangeAppBatchMixin(object):
         self.run_selected_accounts(
             accounts_to_run=selected,
             batch_collect_bnb_mode=True,
-            batch_sell_large_spot_to_bnb=True,
             require_confirm=False,
         )
     def run_selected_accounts(
@@ -1918,7 +1957,6 @@ class ExchangeAppBatchMixin(object):
         *,
         batch_total_asset_only: bool = False,
         batch_collect_bnb_mode: bool = False,
-        batch_sell_large_spot_to_bnb: bool = False,
         batch_enable_withdraw_override: bool | None = None,
         batch_enable_bnb_topup_override: bool | None = None,
         require_confirm: bool = True,
@@ -2055,10 +2093,8 @@ class ExchangeAppBatchMixin(object):
 
         if batch_total_asset_only:
             batch_action_label = "查询全部总资产"
-        elif batch_collect_bnb_mode and batch_sell_large_spot_to_bnb:
-            batch_action_label = "归集BNB并提现"
         elif batch_collect_bnb_mode:
-            batch_action_label = "归集BNB"
+            batch_action_label = "归集BNB并提现"
         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
             batch_action_label = "理财存入"
         else:
@@ -2082,7 +2118,6 @@ class ExchangeAppBatchMixin(object):
                 retry_kwargs={
                     "batch_total_asset_only": bool(batch_total_asset_only),
                     "batch_collect_bnb_mode": bool(batch_collect_bnb_mode),
-                    "batch_sell_large_spot_to_bnb": bool(batch_sell_large_spot_to_bnb),
                     "batch_enable_withdraw_override": (
                         enable_withdraw
                         if (
@@ -2126,10 +2161,8 @@ class ExchangeAppBatchMixin(object):
                 self.status_var.set("状态：初始化连接/校验交易对中...")
         elif batch_total_asset_only:
             self.status_var.set(f"状态：查询全部总资产中 (并发 {max_threads} 线程)...")
-        elif batch_collect_bnb_mode and batch_sell_large_spot_to_bnb:
-            self.status_var.set(f"状态：归集BNB并提现中 (并发 {max_threads} 线程)...")
         elif batch_collect_bnb_mode:
-            self.status_var.set(f"状态：批量归集BNB模式运行中 (并发 {max_threads} 线程)...")
+            self.status_var.set(f"状态：归集BNB并提现中 (并发 {max_threads} 线程)...")
         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
             self.status_var.set(f"状态：理财存入中 (并发 {max_threads} 线程)...")
         else:
@@ -2246,24 +2279,56 @@ class ExchangeAppBatchMixin(object):
                         )
                         op_success = True
 
-                    # 2) 批量归集BNB模式
+                    # 2) 归集BNB并提现
                     elif batch_collect_bnb_mode:
-                        collect_bnb_force_withdraw = bool(batch_sell_large_spot_to_bnb)
-                        collect_withdraw_coin, collect_withdraw_enabled = self._collect_bnb_withdraw_runtime(
-                            force_bnb_withdraw=collect_bnb_force_withdraw,
-                            enable_withdraw=enable_withdraw,
-                            withdraw_coin=withdraw_coin,
-                        )
-                        if batch_sell_large_spot_to_bnb:
-                            logger.info(f"账号 #{idx} 开始执行【归集BNB并提现模式】")
-                        else:
-                            logger.info(f"账号 #{idx} 开始执行【批量归集BNB模式】")
+                        collect_withdraw_coin, collect_withdraw_enabled = self._collect_bnb_withdraw_runtime()
+                        logger.info(f"账号 #{idx} 开始执行【归集BNB并提现模式】")
                         set_status("归集合约/资金...")
                         client.collect_all_to_spot()
 
                         if combined_stop.is_set():
                             finish_current_now("已停止")
                             continue
+
+                        time.sleep(1)
+
+                        set_status("大额资产兑BNB...")
+                        convert_summary = {"direct_bnb": [], "fallback_usdt": [], "residual_assets": []}
+                        try:
+                            convert_summary = client.convert_large_spot_assets_to_bnb()
+                            logger.info(
+                                "账号 #%d 大额资产处理完成：直兑BNB=%s，回退USDT=%s",
+                                idx,
+                                convert_summary.get("direct_bnb", []),
+                                convert_summary.get("fallback_usdt", []),
+                            )
+                        except Exception as e:
+                            logger.warning(f"账号 #{idx} 大额资产兑BNB失败: {e}")
+
+                        if combined_stop.is_set():
+                            finish_current_now("已停止")
+                            continue
+
+                        time.sleep(1)
+
+                        set_status("USDT补换BNB...")
+                        try:
+                            usdt_balance = client.spot_asset_balance_decimal("USDT")
+                            if usdt_balance > 0:
+                                buy_ok = client.buy_bnb_with_quote_amount(
+                                    "USDT",
+                                    usdt_balance,
+                                    assume_spot_funds_ready=True,
+                                    spot_balance_snapshot=usdt_balance,
+                                )
+                            else:
+                                buy_ok = False
+                            if buy_ok:
+                                logger.info("账号 #%d 已将回退得到的现货 USDT 闪兑为 BNB", idx)
+                            else:
+                                logger.info("账号 #%d 无需再用 USDT 补换 BNB", idx)
+                        except Exception as e:
+                            logger.warning(f"账号 #{idx} 用 USDT 补换 BNB 失败: {e}")
 
                         time.sleep(1)
 
@@ -2280,72 +2345,29 @@ class ExchangeAppBatchMixin(object):
 
                         time.sleep(1)
 
-                        if batch_sell_large_spot_to_bnb:
-                            set_status("大额资产兑BNB...")
-                            convert_summary = {"direct_bnb": [], "fallback_usdt": [], "residual_assets": []}
-                            try:
-                                convert_summary = client.convert_large_spot_assets_to_bnb()
-                                logger.info(
-                                    "账号 #%d 大额资产处理完成：直兑BNB=%s，回退USDT=%s",
-                                    idx,
-                                    convert_summary.get("direct_bnb", []),
-                                    convert_summary.get("fallback_usdt", []),
-                                )
-                            except Exception as e:
-                                logger.warning(f"账号 #{idx} 大额资产兑BNB失败: {e}")
-
-                            if combined_stop.is_set():
-                                finish_current_now("已停止")
-                                continue
-
-                            time.sleep(1)
-
-                            set_status("USDT补换BNB...")
-                            try:
-                                usdt_balance = client.spot_asset_balance_decimal("USDT")
-                                if usdt_balance > 0:
-                                    buy_ok = client.buy_bnb_with_quote_amount(
-                                        "USDT",
-                                        usdt_balance,
-                                        assume_spot_funds_ready=True,
-                                        spot_balance_snapshot=usdt_balance,
-                                    )
-                                else:
-                                    buy_ok = False
-                                if buy_ok:
-                                    logger.info("账号 #%d 已将回退得到的现货 USDT 闪兑为 BNB", idx)
-                                else:
-                                    logger.info("账号 #%d 无需再用 USDT 补换 BNB", idx)
-                            except Exception as e:
-                                logger.warning(f"账号 #{idx} 用 USDT 补换 BNB 失败: {e}")
-
-                            time.sleep(1)
-
-                        if batch_sell_large_spot_to_bnb:
-                            set_status("确认BNB在现货...")
-                            client.ensure_bnb_fee_ready_in_spot()
+                        set_status("确认BNB在现货...")
+                        client.ensure_bnb_fee_ready_in_spot()
 
                         residual_assets: list[str] = []
-                        if batch_sell_large_spot_to_bnb:
-                            for asset in convert_summary.get("residual_assets", []):
-                                asset_u = str(asset or "").strip().upper()
-                                if asset_u and asset_u not in residual_assets:
-                                    residual_assets.append(asset_u)
-                            try:
-                                for asset in self._collect_bnb_remaining_spot_assets(client):
-                                    if asset not in residual_assets:
-                                        residual_assets.append(asset)
-                            except Exception as e:
-                                logger.error(f"账号 #{idx} 归集完成后校验残留资产失败: {e}")
-                                set_status(self._exchange_error_status_text("归集校验失败", e, fallback="归集校验失败"))
-                                op_success = False
-                                continue
-                            if residual_assets:
-                                asset_preview = self._asset_list_preview(residual_assets)
-                                logger.warning("账号 #%d 仍有残留现货资产，已停止 BNB 提现: %s", idx, residual_assets)
-                                set_status(self._exchange_failed_status_text(f"残留资产：{asset_preview}", fallback="残留资产"))
-                                op_success = False
-                                continue
+                        for asset in convert_summary.get("residual_assets", []):
+                            asset_u = str(asset or "").strip().upper()
+                            if asset_u and asset_u not in residual_assets:
+                                residual_assets.append(asset_u)
+                        try:
+                            for asset in self._collect_bnb_remaining_spot_assets(client):
+                                if asset not in residual_assets:
+                                    residual_assets.append(asset)
+                        except Exception as e:
+                            logger.error(f"账号 #{idx} 归集完成后校验残留资产失败: {e}")
+                            set_status(self._exchange_error_status_text("归集校验失败", e, fallback="归集校验失败"))
+                            op_success = False
+                            continue
+                        if residual_assets:
+                            asset_preview = self._asset_list_preview(residual_assets)
+                            logger.warning("账号 #%d 仍有残留现货资产，已停止 BNB 提现: %s", idx, residual_assets)
+                            set_status(self._exchange_failed_status_text(f"残留资产：{asset_preview}", fallback="残留资产"))
+                            op_success = False
+                            continue
 
                         set_status("查询BNB余额...")
                         bnb_balance = client.spot_asset_balance_decimal(collect_withdraw_coin)
@@ -2356,6 +2378,34 @@ class ExchangeAppBatchMixin(object):
                             collect_withdraw_coin,
                             BinanceClient._format_decimal(bnb_balance),
                         )
+                        if not str(acc.get("address") or "").strip():
+                            logger.info("账号 #%d 未填写提现地址，跳过 %s 提现", idx, collect_withdraw_coin)
+                            set_status(self._format_missing_withdraw_address_status())
+                            op_success = True
+                            continue
+                        earn_assets: list[str] = []
+                        if collect_withdraw_enabled:
+                            try:
+                                earn_assets = self._collect_bnb_simple_earn_assets(client)
+                            except Exception as e:
+                                logger.warning("账号 #%d 查询理财持仓失败，继续按现货提现判断: %s", idx, e)
+                        if earn_assets and bnb_balance - Decimal(str(withdraw_buffer or "0")) <= 0:
+                            logger.info(
+                                "账号 #%d 检测到活期理财资产并跳过，现货提现额度不足：理财资产=%s，现货%s=%s，预留=%s",
+                                idx,
+                                earn_assets,
+                                collect_withdraw_coin,
+                                BinanceClient._format_decimal(bnb_balance),
+                                BinanceClient._format_decimal(Decimal(str(withdraw_buffer or "0"))),
+                            )
+                            status_text, batch_complete = self._format_collect_bnb_earn_status(
+                                0.0,
+                                collect_withdraw_coin,
+                                earn_assets,
+                            )
+                            set_status(status_text)
+                            op_success = batch_complete
+                            continue
 
                         set_status(f"提现{collect_withdraw_coin}...")
                         try:
@@ -2369,13 +2419,13 @@ class ExchangeAppBatchMixin(object):
                             self._record_batch_withdraw_metric(acc, amount, collect_withdraw_coin)
                             if amount > 0:
                                 self.record_withdraw(idx, acc["api_key"], acc["address"], amount)
-                            status_text, withdraw_success = self._format_withdraw_amount_status(
+                            status_text, batch_complete = self._format_collect_bnb_earn_status(
                                 amount,
                                 collect_withdraw_coin,
-                                enable_withdraw=collect_withdraw_enabled,
+                                earn_assets,
                             )
                             set_status(status_text)
-                            op_success = withdraw_success
+                            op_success = batch_complete
                         except Exception as e:
                             logger.error(f"账号 #{idx} {collect_withdraw_coin}提现失败: {e}")
                             set_status(self._exchange_error_status_text(f"{collect_withdraw_coin}提现失败", e, fallback=f"{collect_withdraw_coin}提现失败"))
@@ -2676,6 +2726,13 @@ class ExchangeAppBatchMixin(object):
                                     )
                                 )
                                 op_success = False
+                            elif not str(acc.get("address") or "").strip():
+                                set_status(
+                                    self._format_missing_withdraw_address_status(
+                                        strategy_result if isinstance(strategy_result, dict) else None
+                                    )
+                                )
+                                op_success = True
                             elif isinstance(strategy_result, dict) and strategy_result.get("withdraw_error") and (final_amount or 0) <= 0:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
                                 withdraw_failure_status = self._exchange_error_status_text(
@@ -2751,7 +2808,6 @@ class ExchangeAppBatchMixin(object):
                         retry_kwargs={
                             "batch_total_asset_only": bool(batch_total_asset_only),
                             "batch_collect_bnb_mode": bool(batch_collect_bnb_mode),
-                            "batch_sell_large_spot_to_bnb": bool(batch_sell_large_spot_to_bnb),
                             "batch_enable_withdraw_override": (
                                 enable_withdraw
                                 if (
@@ -2780,10 +2836,8 @@ class ExchangeAppBatchMixin(object):
                         self._set_retry_failed_button_state()
                         if batch_total_asset_only:
                             self.status_var.set(f"状态：查询全部总资产中 (并发 {max_threads} 线程)...")
-                        elif batch_collect_bnb_mode and batch_sell_large_spot_to_bnb:
-                            self.status_var.set(f"状态：归集BNB并提现中 (并发 {max_threads} 线程)...")
                         elif batch_collect_bnb_mode:
-                            self.status_var.set(f"状态：批量归集BNB模式运行中 (并发 {max_threads} 线程)...")
+                            self.status_var.set(f"状态：归集BNB并提现中 (并发 {max_threads} 线程)...")
                         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
                             self.status_var.set(f"状态：理财存入中 (并发 {max_threads} 线程)...")
                         else:
@@ -2896,6 +2950,10 @@ class ExchangeAppBatchMixin(object):
                     if combined_stop.is_set():
                         set_status("已停止")
                         op_success = False
+                    elif not str(acc.get("address") or "").strip():
+                        logger.info("账号 #%d 未填写提现地址，跳过批量提现", idx)
+                        set_status(self._format_missing_withdraw_address_status())
+                        op_success = True
                     else:
                         set_status(f"提现 {coin}...")
                         client = self._create_binance_client(acc["api_key"], acc["api_secret"])

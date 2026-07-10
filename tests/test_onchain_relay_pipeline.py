@@ -12,6 +12,7 @@ from core_models import EvmToken, WithdrawRuntimeParams
 from onchain_relay_runner import (
     _RelayBatchItem,
     _receipt_state,
+    _relay_confirm_auto_sweep,
     _relay_native_main_recovery_status_text,
     _relay_prepare_items,
     _relay_native_dust_below_threshold,
@@ -301,6 +302,26 @@ class OnchainRelayPipelineTests(unittest.TestCase):
         self.assertEqual(getattr(item, "_auto_sweep_value_wei"), 79_000)
         self.assertEqual(owner.recovery_statuses[-1], (item.row_key, "success", "回收0.000000000000079 BNB"))
         self.assertEqual(_RECORDS[(item.relay_addr, "batch")].sweep_resolution, "confirmed")
+
+    def test_auto_sweep_can_submit_all_before_receipt_confirmation(self) -> None:
+        owner = _FakeOwner()
+        owner.client.native_balance_wei = 100_000
+        owner.client.gas_price_wei = 1
+        items = [_item(1), _item(2)]
+
+        for item in items:
+            _relay_submit_auto_sweep(owner, _params(), item, item.source_addr, confirm_receipt=False)
+
+        self.assertEqual(len(owner.client.submitted_native_transfers), 2)
+        self.assertEqual(owner.client.receipt_requests, [])
+        self.assertTrue(all(getattr(item, "_auto_sweep_pending", False) for item in items))
+
+        for item in items:
+            _relay_confirm_auto_sweep(owner, _params(), item)
+
+        self.assertEqual(len(owner.client.receipt_requests), 2)
+        self.assertTrue(all(not getattr(item, "_auto_sweep_pending", False) for item in items))
+        self.assertTrue(all(_RECORDS[(item.relay_addr, "batch")].sweep_resolution == "confirmed" for item in items))
 
     def test_auto_sweep_failed_receipt_does_not_count_recovered_amount(self) -> None:
         owner = _FakeOwner()

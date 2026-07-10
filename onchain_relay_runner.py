@@ -72,7 +72,7 @@ def _append_relay_sweep_log(event: str, **fields: object) -> None:
         pass
 
 
-def _relay_success_status_text(owner, params: WithdrawRuntimeParams, amount_text: str, *, sweep_pending: bool = False) -> str:
+def _relay_success_status_text(owner, params: WithdrawRuntimeParams, amount_text: str) -> str:
     amount = str(amount_text or "").strip()
     coin_text = str(getattr(params, "coin", "") or "").strip().lower()
     if amount and coin_text:
@@ -2961,8 +2961,59 @@ def _relay_prepare_items(
     return items
 
 
-def _relay_submit_auto_sweep(owner, params: WithdrawRuntimeParams, item: _RelayBatchItem, target: str) -> None:
+def _relay_auto_sweep_incomplete(owner, item: _RelayBatchItem, target: str, exc: object) -> None:
+    setattr(item, "_auto_sweep_pending", False)
+    _relay_dispatch_recovery_status(owner, item, "incomplete", f"回收待处理：{exc}")
+    try:
+        _relay_update_item_record(owner, item, "completed", sweep_target=target, sweep_resolution="manual", last_error=str(exc))
+    except Exception:
+        pass
+    owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币自动回收待处理：{exc}": owner.log(m))
+
+
+def _relay_confirm_auto_sweep(owner, params: WithdrawRuntimeParams, item: _RelayBatchItem) -> None:
+    if not bool(getattr(item, "_auto_sweep_pending", False)):
+        return
+    target = str(getattr(item, "_auto_sweep_target", "") or "").strip()
+    txid = str(getattr(item, "_auto_sweep_txid", "") or "").strip()
+    nonce = getattr(item, "_auto_sweep_nonce", None)
+    sweep_value = max(0, int(getattr(item, "_auto_sweep_submitted_value_wei", 0) or 0))
+    try:
+        _wait_for_receipt_success(
+            owner,
+            params,
+            txid,
+            label=f"{item.prefix} 中转原生币回收",
+        )
+        _relay_update_item_record(
+            owner,
+            item,
+            "completed",
+            gas_sweep_txid=txid,
+            gas_sweep_nonce=_tx_nonce_text(nonce),
+            sweep_target=target,
+            sweep_resolution="confirmed",
+            last_error="",
+        )
+        setattr(item, "_auto_sweep_pending", False)
+        setattr(item, "_auto_sweep_value_wei", sweep_value)
+        recovered_text = owner._gas_fee_amount_text(params.network, sweep_value)
+        _relay_dispatch_recovery_status(owner, item, "success", f"回收{recovered_text}")
+        owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币回收成功：to={owner._mask(target, head=8, tail=6)}，金额={recovered_text}，txid={txid}": owner.log(m))
+    except Exception as exc:
+        _relay_auto_sweep_incomplete(owner, item, target, exc)
+
+
+def _relay_submit_auto_sweep(
+    owner,
+    params: WithdrawRuntimeParams,
+    item: _RelayBatchItem,
+    target: str,
+    *,
+    confirm_receipt: bool = True,
+) -> None:
     setattr(item, "_auto_sweep_value_wei", 0)
+    setattr(item, "_auto_sweep_pending", False)
     try:
         native_balance = owner.client.get_balance_wei(params.network, item.relay_addr)
         gas_price = owner.client.get_gas_price_wei(params.network)
@@ -3001,35 +3052,17 @@ def _relay_submit_auto_sweep(owner, params: WithdrawRuntimeParams, item: _RelayB
             sweep_resolution="submitted",
             last_error="",
         )
+        setattr(item, "_auto_sweep_target", target)
+        setattr(item, "_auto_sweep_txid", txid)
+        setattr(item, "_auto_sweep_nonce", nonce)
+        setattr(item, "_auto_sweep_submitted_value_wei", sweep_value)
+        setattr(item, "_auto_sweep_pending", True)
         _relay_dispatch_recovery_status(owner, item, "submitted", "回收已提交")
         owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币回收已提交，等待receipt确认：to={owner._mask(target, head=8, tail=6)}，txid={txid}": owner.log(m))
-        _wait_for_receipt_success(
-            owner,
-            params,
-            txid,
-            label=f"{item.prefix} 中转原生币回收",
-        )
-        _relay_update_item_record(
-            owner,
-            item,
-            "completed",
-            gas_sweep_txid=txid,
-            gas_sweep_nonce=_tx_nonce_text(nonce),
-            sweep_target=target,
-            sweep_resolution="confirmed",
-            last_error="",
-        )
-        setattr(item, "_auto_sweep_value_wei", sweep_value)
-        recovered_text = owner._gas_fee_amount_text(params.network, sweep_value)
-        _relay_dispatch_recovery_status(owner, item, "success", f"回收{recovered_text}")
-        owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币回收成功：to={owner._mask(target, head=8, tail=6)}，金额={recovered_text}，txid={txid}": owner.log(m))
+        if confirm_receipt:
+            _relay_confirm_auto_sweep(owner, params, item)
     except Exception as exc:
-        _relay_dispatch_recovery_status(owner, item, "incomplete", f"回收待处理：{exc}")
-        try:
-            _relay_update_item_record(owner, item, "completed", sweep_target=target, sweep_resolution="manual", last_error=str(exc))
-        except Exception:
-            pass
-        owner._dispatch_ui(lambda m=f"{item.prefix} 中转原生币自动回收待处理：{exc}": owner.log(m))
+        _relay_auto_sweep_incomplete(owner, item, target, exc)
 
 
 def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: WithdrawRuntimeParams, dry_run: bool):
@@ -3543,11 +3576,17 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
 
         if not params.token_is_native:
             sweep_items = [item for item in items if not item.failed and final_result_by_row_key.get(item.row_key) == "success"]
-            def sweep_item(item: _RelayBatchItem) -> None:
+            def submit_sweep_item(item: _RelayBatchItem) -> None:
                 target = item.target if is_many_to_one_mode else item.source_addr
-                _relay_submit_auto_sweep(owner, params, item, target)
+                _relay_submit_auto_sweep(owner, params, item, target, confirm_receipt=False)
             with _relay_defer_record_writes(owner):
-                _relay_run_parallel(owner, sweep_items, params.threads, sweep_item)
+                _relay_run_parallel(owner, sweep_items, params.threads, submit_sweep_item)
+                _relay_flush_record_writes(owner)
+                sweep_confirm_items = [
+                    item for item in sweep_items
+                    if bool(getattr(item, "_auto_sweep_pending", False))
+                ]
+                _relay_run_parallel(owner, sweep_confirm_items, params.threads, lambda item: _relay_confirm_auto_sweep(owner, params, item))
                 _relay_flush_record_writes(owner)
             total_gas_fee_wei = sum(item.gas_fee_wei for item in items if not item.failed)
 
