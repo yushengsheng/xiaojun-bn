@@ -457,6 +457,31 @@ def _relay_is_terminal_dust_state(
     )
 
 
+def _relay_terminal_snapshot_can_be_ignored(
+    owner,
+    network: str,
+    record: RelayWalletRecord,
+    snapshot: dict[str, tuple[EvmToken, int]],
+) -> bool:
+    return (
+        _relay_is_terminal_dust_state(record, _relay_positive_tracked_tokens(snapshot))
+        and _relay_snapshot_cleanup_allowed(owner, network, snapshot)
+    )
+
+
+def _relay_token_dust_requires_native_recovery(
+    owner,
+    network: str,
+    snapshot: dict[str, tuple[EvmToken, int]],
+) -> bool:
+    positive_tracked_tokens = _relay_positive_tracked_tokens(snapshot)
+    return (
+        bool(positive_tracked_tokens)
+        and _relay_token_dust_below_threshold(owner, positive_tracked_tokens)[0]
+        and not _relay_snapshot_cleanup_allowed(owner, network, snapshot)
+    )
+
+
 def _relay_native_balance_entry(snapshot: dict[str, tuple[EvmToken, int]]) -> tuple[EvmToken | None, int]:
     for token, units in snapshot.values():
         if token.is_native:
@@ -1674,15 +1699,14 @@ def run_relay_fee_recovery(
                     sweep_resolution = str(record.sweep_resolution or "").strip().lower()
                     auto_forward_gas_fee = 0
 
-                    if _relay_is_terminal_dust_state(record, positive_tracked_tokens):
-                        cleanup_record = record if _relay_snapshot_cleanup_allowed(owner, network, snapshot) else None
+                    if _relay_terminal_snapshot_can_be_ignored(owner, network, record, snapshot):
                         finish_job(
                             progress_key,
                             display_row_key,
                             outcome="ignored",
                             msg=f"{prefix} 已核对：中转钱包已是终态，仅剩已标记的原生币边际",
                             status_text="已核对",
-                            cleanup_record=cleanup_record,
+                            cleanup_record=record,
                         )
                         continue
 
@@ -1739,6 +1763,13 @@ def run_relay_fee_recovery(
                         "pending": "第二跳交易仍在确认中",
                         "failed": "第二跳交易失败",
                     }.get(forward_state, f"状态 {forward_state}")
+
+                    if (
+                        _relay_token_dust_requires_native_recovery(owner, network, snapshot)
+                        and forward_state != "pending"
+                        and not dry_run
+                    ):
+                        positive_tracked_tokens = {}
 
                     if positive_tracked_tokens:
                         if forward_state == "pending":

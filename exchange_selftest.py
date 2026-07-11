@@ -2190,6 +2190,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                 {"asset": "AAA", "free": "5", "locked": "0", "total": "5"},
                 {"asset": "BBB", "free": "7", "locked": "0", "total": "7"},
                 {"asset": "CCC", "free": "9", "locked": "0", "total": "9"},
+                {"asset": "LDUSDC", "free": "18", "locked": "0", "total": "18"},
                 {"asset": "USDT", "free": "11", "locked": "0", "total": "11"},
                 {"asset": "BNB", "free": "1", "locked": "0", "total": "1"},
             ]
@@ -2232,7 +2233,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
 
     large_asset_client = _SelftestLargeAssetBnbClient()
     try:
-        summary = large_asset_client.convert_large_spot_assets_to_bnb()
+        summary = large_asset_client.convert_large_spot_assets_to_bnb(skip_assets=["LDUSDC"])
         if summary.get("direct_bnb") != ["AAA"]:
             raise RuntimeError(f"大额资产直兑BNB自检失败：直兑结果异常（{summary}）")
         if summary.get("fallback_usdt") != ["BBB"]:
@@ -2326,14 +2327,18 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                 {"asset": "BNB", "totalAmount": Decimal("0.25"), "redeemingAmount": Decimal("0")},
                 {"asset": "bnb", "totalAmount": "0", "redeemingAmount": "0.05"},
                 {"asset": "USDT", "totalAmount": "99", "redeemingAmount": "0"},
+                {"asset": "USDC", "totalAmount": "18", "redeemingAmount": "0"},
             ]
 
     collect_bnb_earn_client = _SelftestCollectBnbEarnClient()
     earn_assets = ExchangeAppBatchMixin._collect_bnb_simple_earn_assets(collect_bnb_earn_client)
-    if earn_assets != ["BNB", "USDT"]:
+    if earn_assets != ["BNB", "USDT", "USDC"]:
         raise RuntimeError(f"归集BNB跳过理财自检失败：理财资产识别异常（{earn_assets}）")
     if collect_bnb_earn_client.calls != [""]:
         raise RuntimeError(f"归集BNB跳过理财自检失败：查询币种异常（{collect_bnb_earn_client.calls}）")
+    earn_balance_assets = ExchangeAppBatchMixin._collect_bnb_simple_earn_balance_assets(earn_assets)
+    if earn_balance_assets != ["LDBNB", "LDUSDT", "LDUSDC"]:
+        raise RuntimeError(f"归集BNB跳过理财自检失败：理财余额映射异常（{earn_balance_assets}）")
     insufficient_status, insufficient_complete = ExchangeAppBatchMixin._format_collect_bnb_earn_status(
         0.0,
         "BNB",

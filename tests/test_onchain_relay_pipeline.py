@@ -19,7 +19,9 @@ from onchain_relay_runner import (
     _relay_submit_auto_sweep,
     _relay_snapshot_cleanup_allowed,
     _relay_source_stage,
+    _relay_terminal_snapshot_can_be_ignored,
     _relay_token_dust_below_threshold,
+    _relay_token_dust_requires_native_recovery,
     _wait_for_receipt_success,
 )
 from onchain_relay_wallets import RelayWalletRecord
@@ -277,6 +279,81 @@ class OnchainRelayPipelineTests(unittest.TestCase):
                 {
                     "BNB": (bnb, bnb_threshold_units - 1),
                     "USDT": (usdt, usdt_threshold_units),
+                },
+            )
+        )
+
+    def test_terminal_dust_record_does_not_ignore_bnb_at_threshold(self) -> None:
+        owner = _FakeOwner()
+        bnb = EvmToken(symbol="BNB", contract="", decimals=18, is_native=True)
+        bnb_threshold_units = 5_000_000_000_000
+        record = RelayWalletRecord(
+            created_at="",
+            expires_at="",
+            network="BSC",
+            source="0x00000000000000000000000000000000000000aa",
+            target="0x00000000000000000000000000000000000000bb",
+            relay_address="0x00000000000000000000000000000000000000cc",
+            private_key="relay-private-key",
+            status="completed",
+            batch_id="batch",
+            sweep_resolution="dust_left",
+        )
+
+        self.assertTrue(
+            _relay_terminal_snapshot_can_be_ignored(
+                owner,
+                "BSC",
+                record,
+                {"BNB": (bnb, bnb_threshold_units - 1)},
+            )
+        )
+        self.assertFalse(
+            _relay_terminal_snapshot_can_be_ignored(
+                owner,
+                "BSC",
+                record,
+                {"BNB": (bnb, bnb_threshold_units)},
+            )
+        )
+        self.assertFalse(
+            _relay_terminal_snapshot_can_be_ignored(
+                owner,
+                "BSC",
+                record,
+                {"BNB": (bnb, bnb_threshold_units + 1)},
+            )
+        )
+
+    def test_token_dust_does_not_block_native_recovery(self) -> None:
+        owner = _FakeOwner()
+        bnb = EvmToken(symbol="BNB", contract="", decimals=18, is_native=True)
+        usdt = EvmToken(
+            symbol="USDT",
+            contract="0x55d398326f99059ff775485246999027b3197955",
+            decimals=18,
+            is_native=False,
+        )
+        bnb_threshold_units = 5_000_000_000_000
+        usdt_dust_units = 50_000_000_000_000
+
+        self.assertFalse(
+            _relay_token_dust_requires_native_recovery(
+                owner,
+                "BSC",
+                {
+                    "BNB": (bnb, bnb_threshold_units - 1),
+                    "USDT": (usdt, usdt_dust_units),
+                },
+            )
+        )
+        self.assertTrue(
+            _relay_token_dust_requires_native_recovery(
+                owner,
+                "BSC",
+                {
+                    "BNB": (bnb, bnb_threshold_units + 1),
+                    "USDT": (usdt, usdt_dust_units),
                 },
             )
         )

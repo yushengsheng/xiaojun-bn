@@ -1058,6 +1058,15 @@ class ExchangeAppBatchMixin(object):
                 assets.append(item_asset)
         return assets
     @staticmethod
+    def _collect_bnb_simple_earn_balance_assets(earn_assets: list[str]) -> list[str]:
+        balance_assets: list[str] = []
+        for asset in earn_assets:
+            asset_u = str(asset or "").strip().upper()
+            balance_asset = f"LD{asset_u}" if asset_u else ""
+            if balance_asset and balance_asset not in balance_assets:
+                balance_assets.append(balance_asset)
+        return balance_assets
+    @staticmethod
     def _asset_list_preview(assets: list[str], *, limit: int = 3) -> str:
         unique_assets: list[str] = []
         for asset in assets:
@@ -2290,12 +2299,28 @@ class ExchangeAppBatchMixin(object):
                             finish_current_now("已停止")
                             continue
 
+                        earn_assets: list[str] = []
+                        earn_balance_assets: list[str] = []
+                        try:
+                            earn_assets = self._collect_bnb_simple_earn_assets(client)
+                            earn_balance_assets = self._collect_bnb_simple_earn_balance_assets(earn_assets)
+                            if earn_balance_assets:
+                                logger.info(
+                                    "账号 #%d 跳过理财余额映射资产：%s",
+                                    idx,
+                                    earn_balance_assets,
+                                )
+                        except Exception as e:
+                            logger.warning("账号 #%d 查询理财持仓失败，继续按现货资产归集: %s", idx, e)
+
                         time.sleep(1)
 
                         set_status("大额资产兑BNB...")
                         convert_summary = {"direct_bnb": [], "fallback_usdt": [], "residual_assets": []}
                         try:
-                            convert_summary = client.convert_large_spot_assets_to_bnb()
+                            convert_summary = client.convert_large_spot_assets_to_bnb(
+                                skip_assets=earn_balance_assets,
+                            )
                             logger.info(
                                 "账号 #%d 大额资产处理完成：直兑BNB=%s，回退USDT=%s",
                                 idx,
@@ -2383,12 +2408,6 @@ class ExchangeAppBatchMixin(object):
                             set_status(self._format_missing_withdraw_address_status())
                             op_success = True
                             continue
-                        earn_assets: list[str] = []
-                        if collect_withdraw_enabled:
-                            try:
-                                earn_assets = self._collect_bnb_simple_earn_assets(client)
-                            except Exception as e:
-                                logger.warning("账号 #%d 查询理财持仓失败，继续按现货提现判断: %s", idx, e)
                         if earn_assets and bnb_balance - Decimal(str(withdraw_buffer or "0")) <= 0:
                             logger.info(
                                 "账号 #%d 检测到活期理财资产并跳过，现货提现额度不足：理财资产=%s，现货%s=%s，预留=%s",
