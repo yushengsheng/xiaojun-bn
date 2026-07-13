@@ -562,6 +562,33 @@ def _relay_build_manual_export_row(
     return row
 
 
+def _relay_manual_account_copy_lines(rows: list[dict[str, object]]) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        address = str(row.get("relay_address", "") or "").strip()
+        private_key = str(row.get("private_key", "") or "").strip()
+        address_key = address.lower()
+        if not address or not private_key or address_key in seen:
+            continue
+        seen.add(address_key)
+        lines.append(f"{address} {private_key}")
+    return lines
+
+
+def _relay_copy_manual_accounts(owner, lines: list[str]) -> None:
+    values = [str(line or "").strip() for line in lines if str(line or "").strip()]
+    if not values:
+        return
+    root = getattr(owner, "root", None)
+    if root is None:
+        return
+    root.clipboard_clear()
+    root.clipboard_append("\n".join(values))
+    root.update_idletasks()
+    owner.log(f"已复制待人工账号 {len(values)} 条到剪贴板")
+
+
 def _relay_export_line_address(line: str) -> str:
     text = str(line or "").strip()
     if not text or " - " not in text:
@@ -1603,6 +1630,12 @@ def run_relay_fee_recovery(
         manual_export_rows: list[dict[str, object]] = []
         cleanup_enabled = (not dry_run) and str(run_label or "").strip() == "manual" and not batch_id_filter
         cleanup_empty_record_keys: set[tuple[str, str]] = set()
+        retry_collect_enabled = cleanup_enabled
+        retry_candidates: dict[tuple[str, str], tuple[int, str, str, RelayWalletRecord]] = {}
+        job_index_by_progress_key = {
+            progress_key: index
+            for index, (progress_key, _display_row_key, _record) in enumerate(jobs, start=1)
+        }
         lock = threading.Lock()
         jobs_q: queue.Queue[tuple[int, str, str, RelayWalletRecord]] = queue.Queue()
         for index, (progress_key, display_row_key, record) in enumerate(jobs, start=1):
@@ -1621,40 +1654,53 @@ def run_relay_fee_recovery(
             manual_tokens: dict[str, tuple[EvmToken, int]] | None = None,
             export_row: dict[str, object] | None = None,
             cleanup_record: RelayWalletRecord | None = None,
+            retry_record: RelayWalletRecord | None = None,
         ) -> None:
             nonlocal handled, failed, recovered, skipped, already_empty, kept_margin, pending, warnings
             with lock:
-                if outcome == "failed":
-                    failed += 1
-                elif outcome != "ignored":
-                    handled += 1
-                    if outcome == "recovered":
-                        recovered += 1
-                        if network and recovered_value > 0:
-                            recovered_totals[network] = recovered_totals.get(network, 0) + recovered_value
-                        if network and gas_fee > 0:
-                            gas_totals[network] = gas_totals.get(network, 0) + gas_fee
-                    elif outcome == "skipped":
-                        skipped += 1
-                    elif outcome == "already_empty":
-                        already_empty += 1
-                    elif outcome == "kept_margin":
-                        kept_margin += 1
-                    elif outcome == "pending":
-                        pending += 1
-                    elif outcome == "warning":
-                        warnings += 1
-                if manual_tokens:
-                    for _symbol, (token, units) in manual_tokens.items():
-                        token_key = _relay_manual_token_key(network, token)
-                        manual_token_totals[token_key] = manual_token_totals.get(token_key, 0) + max(0, int(units))
-                        manual_token_wallet_counts[token_key] = manual_token_wallet_counts.get(token_key, 0) + 1
-                if export_row:
-                    manual_export_rows.append(dict(export_row))
-                if cleanup_enabled and cleanup_record is not None:
-                    relay_address = str(getattr(cleanup_record, "relay_address", "") or "").strip()
+                defer_for_retry = retry_collect_enabled and outcome in {"failed", "warning"} and retry_record is not None
+                if defer_for_retry:
+                    relay_address = str(getattr(retry_record, "relay_address", "") or "").strip()
+                    retry_key = (str(getattr(retry_record, "batch_id", "") or "").strip(), relay_address.lower())
                     if relay_address:
-                        cleanup_empty_record_keys.add((str(getattr(cleanup_record, "batch_id", "") or "").strip(), relay_address))
+                        retry_candidates[retry_key] = (
+                            job_index_by_progress_key.get(progress_key, 0),
+                            progress_key,
+                            display_row_key,
+                            retry_record,
+                        )
+                else:
+                    if outcome == "failed":
+                        failed += 1
+                    elif outcome != "ignored":
+                        handled += 1
+                        if outcome == "recovered":
+                            recovered += 1
+                            if network and recovered_value > 0:
+                                recovered_totals[network] = recovered_totals.get(network, 0) + recovered_value
+                            if network and gas_fee > 0:
+                                gas_totals[network] = gas_totals.get(network, 0) + gas_fee
+                        elif outcome == "skipped":
+                            skipped += 1
+                        elif outcome == "already_empty":
+                            already_empty += 1
+                        elif outcome == "kept_margin":
+                            kept_margin += 1
+                        elif outcome == "pending":
+                            pending += 1
+                        elif outcome == "warning":
+                            warnings += 1
+                    if manual_tokens:
+                        for _symbol, (token, units) in manual_tokens.items():
+                            token_key = _relay_manual_token_key(network, token)
+                            manual_token_totals[token_key] = manual_token_totals.get(token_key, 0) + max(0, int(units))
+                            manual_token_wallet_counts[token_key] = manual_token_wallet_counts.get(token_key, 0) + 1
+                    if export_row:
+                        manual_export_rows.append(dict(export_row))
+                    if cleanup_enabled and cleanup_record is not None:
+                        relay_address = str(getattr(cleanup_record, "relay_address", "") or "").strip()
+                        if relay_address:
+                            cleanup_empty_record_keys.add((str(getattr(cleanup_record, "batch_id", "") or "").strip(), relay_address))
                 amount_total_text = _relay_totals_text(owner, recovered_totals)
                 gas_total_text = _relay_totals_text(owner, gas_totals, prefix="预估 ")
             dispatch_ui(lambda m=msg: owner.log(m))
@@ -1876,6 +1922,7 @@ def run_relay_fee_recovery(
                                     sweep_target=sweep_target,
                                     reason=manual_reason,
                                 ),
+                                retry_record=record,
                             )
                             continue
                         if positive_tracked_tokens:
@@ -1902,6 +1949,7 @@ def run_relay_fee_recovery(
                                     sweep_target=sweep_target,
                                     reason=manual_reason,
                                 ),
+                                retry_record=record,
                             )
                             continue
                         if not has_positive_balance:
@@ -2088,6 +2136,7 @@ def run_relay_fee_recovery(
                                         sweep_target=sweep_target,
                                         reason=manual_reason,
                                     ),
+                                    retry_record=record,
                                 )
                                 continue
 
@@ -2400,6 +2449,7 @@ def run_relay_fee_recovery(
                                 sweep_target=sweep_target,
                                 reason=manual_reason,
                             ),
+                            retry_record=record,
                         )
                         continue
                     cleanup_record = record if _relay_snapshot_cleanup_allowed(owner, network, snapshot) else None
@@ -2446,18 +2496,48 @@ def run_relay_fee_recovery(
                         outcome="failed",
                         msg=f"{prefix} 中转手续费回收失败：{exc}",
                         status_text="失败",
+                        retry_record=record,
                     )
                 finally:
                     jobs_q.task_done()
 
-        with _relay_defer_record_writes(owner):
+        def run_workers(count: int) -> None:
             workers: list[threading.Thread] = []
-            for _ in range(worker_count):
+            for _ in range(max(1, int(count))):
                 t = threading.Thread(target=worker, daemon=True)
                 t.start()
                 workers.append(t)
             for t in workers:
                 t.join()
+
+        with _relay_defer_record_writes(owner):
+            run_workers(worker_count)
+            retry_collect_enabled = False
+            if retry_candidates and not owner.stop_requested.is_set():
+                latest_records = {
+                    (
+                        str(getattr(record, "batch_id", "") or "").strip(),
+                        str(getattr(record, "relay_address", "") or "").strip().lower(),
+                    ): record
+                    for record in owner.relay_wallet_store.load_records()
+                    if str(getattr(record, "relay_address", "") or "").strip()
+                }
+                retry_jobs = sorted(retry_candidates.items(), key=lambda item: item[1][0])
+                for retry_key, (index, progress_key, display_row_key, original_record) in retry_jobs:
+                    jobs_q.put((index, progress_key, display_row_key, latest_records.get(retry_key, original_record)))
+                retry_worker_count = min(worker_count, len(retry_jobs))
+                dispatch_ui(
+                    lambda n=len(retry_jobs), w=retry_worker_count: owner.log(
+                        f"首轮回收已完成，对 {n} 个失败/待人工账号进行一次二次验证，threads={w}"
+                    )
+                )
+                _append_relay_sweep_log(
+                    "recovery_retry_start",
+                    run_label=run_label,
+                    record_count=len(retry_jobs),
+                    worker_threads=retry_worker_count,
+                )
+                run_workers(retry_worker_count)
             _relay_flush_record_writes(owner)
 
         if owner.stop_requested.is_set():
@@ -2533,13 +2613,22 @@ def run_relay_fee_recovery(
             export_path=export_path,
         )
         if show_dialog:
+            manual_copy_lines = _relay_manual_account_copy_lines(manual_export_rows) if cleanup_enabled else []
+            action_buttons = [
+                (
+                    "复制待人工账号",
+                    lambda values=list(manual_copy_lines): _relay_copy_manual_accounts(owner, values),
+                    bool(manual_copy_lines),
+                )
+            ] if cleanup_enabled else None
             dispatch_ui(
-                lambda s=handled, f=failed, detail=summary: owner._show_result_summary_dialog(
+                lambda s=handled, f=failed, detail=summary, actions=action_buttons: owner._show_result_summary_dialog(
                     title="执行完成",
                     summary_title="中转手续费回收完成",
                     success=s,
                     failed=f,
                     detail_text=detail,
+                    action_buttons=actions,
                     success_label="已处理",
                 )
             )

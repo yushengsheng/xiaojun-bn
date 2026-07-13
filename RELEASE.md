@@ -2,6 +2,52 @@
 
 This project must be released from GitHub Actions on a clean `windows-latest` runner.
 
+## Mandatory release runbook
+
+Before every GitHub update or version release, read this file and
+`RELEASE_GUARDRAILS.md` in full. Use the following sequence exactly; do not
+switch environments, create a release manually, or try alternate publishing
+methods after a failure.
+
+1. Confirm the intended changes and repository state:
+   - `git status --short`
+   - `git branch --show-current` must be `main`.
+   - `git fetch origin --tags`
+   - `git rev-parse origin/main`
+2. Select the next sequential `v*` tag and prove it is unused both locally and
+   remotely:
+   - `git tag --list <tag>` must print nothing.
+   - `git ls-remote --exit-code --refs origin refs/tags/<tag>` must report no
+     matching ref (exit code 2).
+3. Use one already validated, isolated Python 3.11 release environment. Verify
+   it first with `<release-python> -m pip check`; do not use the system Python
+   or change environments halfway through the release.
+4. Run the complete local gate once on the final worktree:
+   - `SING_BOX_PATH=<verified-sing-box> <release-python> tools/run_regression.py --gui --strict-pip-check`
+   - In Codex, run the Tk/GUI gate outside the sandbox as required by
+     `RELEASE_GUARDRAILS.md`.
+   - Continue only after the command ends with `REGRESSION OK`.
+5. Commit all intended code, tests, and release-document changes together,
+   then push the commit:
+   - `git add <intended-files>`
+   - `git commit -m "<message>"`
+   - `git push origin main`
+6. Tag that exact pushed commit and trigger the release workflow:
+   - `git tag -a <tag> -m "<tag>"`
+   - `git push origin <tag>`
+7. Locate the single run of `release-windows-exe.yml` for that tag and wait for
+   it instead of triggering another run or creating another tag:
+   - `gh run list --workflow release-windows-exe.yml --limit 10`
+   - `gh run watch <run-id> --exit-status`
+8. Verify the published release and all three expected assets:
+   - `gh release view <tag>`
+   - `xiaojun-bn-<tag>-windows-x64.exe`
+   - `xiaojun-bn-<tag>-windows-x64.zip`
+   - `xiaojun-bn-<tag>-windows-x64-portable.zip`
+9. Report success only after the workflow and release asset checks both pass.
+   On a genuine failure, stop at that step and diagnose it; never hide the
+   failure by changing the tag or publishing path.
+
 `RELEASE_GUARDRAILS.md` is mandatory. Any crash such as `Python 意外退出`, exit code `134`, failed GUI selftest, proxy runtime authentication failure, or failed GitHub Actions release is a blocking release issue, not a warning.
 
 Rules:

@@ -7,12 +7,16 @@ import threading
 import time
 import unittest
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from core_models import EvmToken, WithdrawRuntimeParams
 from onchain_relay_runner import (
     _RelayBatchItem,
     _receipt_state,
     _relay_confirm_auto_sweep,
+    _relay_manual_account_copy_lines,
     _relay_native_main_recovery_status_text,
     _relay_prepare_items,
     _relay_native_dust_below_threshold,
@@ -23,6 +27,7 @@ from onchain_relay_runner import (
     _relay_token_dust_below_threshold,
     _relay_token_dust_requires_native_recovery,
     _wait_for_receipt_success,
+    run_relay_fee_recovery,
 )
 from onchain_relay_wallets import RelayWalletRecord
 
@@ -35,6 +40,8 @@ class _FakeClient:
         self.receipts: list[dict | None] = [{"status": "0x1"}]
         self.receipt_requests: list[str] = []
         self.native_balance_wei: int | None = None
+        self.native_balance_responses: list[int | Exception] = []
+        self.erc20_balance_units: int | None = None
         self.gas_price_wei: int | None = None
         self.submitted_native_transfers: list[dict[str, object]] = []
         self.native_transfer_txid = "0x" + "a" * 64
@@ -57,12 +64,36 @@ class _FakeClient:
         return self.gas_price_wei
 
     def get_balance_wei(self, *_args, **_kwargs) -> int:
+        if self.native_balance_responses:
+            result = self.native_balance_responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return int(result)
         if self.native_balance_wei is None:
             raise AssertionError("prepare_items must not query balances")
         return self.native_balance_wei
 
     def get_erc20_balance(self, *_args, **_kwargs) -> int:
+        if self.erc20_balance_units is not None:
+            return self.erc20_balance_units
         raise AssertionError("prepare_items must not query token balances")
+
+    def get_default_tokens(self, _network: str) -> list[EvmToken]:
+        return [
+            EvmToken(symbol="BNB", contract="", decimals=18, is_native=True),
+            EvmToken(
+                symbol="USDT",
+                contract="0x55d398326f99059ff775485246999027b3197955",
+                decimals=18,
+                is_native=False,
+            ),
+            EvmToken(
+                symbol="USDC",
+                contract="0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+                decimals=18,
+                is_native=False,
+            ),
+        ]
 
     def estimate_erc20_transfer_gas(self, *_args, **_kwargs) -> int:
         raise AssertionError("prepare_items must not estimate token gas")
@@ -76,6 +107,9 @@ class _FakeClient:
 
 
 class _FakeStore:
+    def load_records(self) -> list[RelayWalletRecord]:
+        return list(_RECORDS.values())
+
     def update_record(self, relay_address: str, *, batch_id: str = "", **changes: object) -> RelayWalletRecord:
         record = _RECORDS[(relay_address, batch_id)]
         raw = dict(record.__dict__)
@@ -83,6 +117,30 @@ class _FakeStore:
         updated = RelayWalletRecord.from_raw(raw)
         _RECORDS[(relay_address, batch_id)] = updated
         return updated
+
+    def remove_records(self, record_keys: set[tuple[str, str]]) -> int:
+        removed = 0
+        for batch_id, relay_address in record_keys:
+            if _RECORDS.pop((relay_address, batch_id), None) is not None:
+                removed += 1
+        return removed
+
+    def flush(self) -> None:
+        return None
+
+
+class _FakeRoot:
+    def __init__(self):
+        self.clipboard_text = ""
+
+    def clipboard_clear(self) -> None:
+        self.clipboard_text = ""
+
+    def clipboard_append(self, text: str) -> None:
+        self.clipboard_text += str(text or "")
+
+    def update_idletasks(self) -> None:
+        return None
 
 
 class _FakeOwner:
@@ -97,6 +155,9 @@ class _FakeOwner:
         self.recovery_statuses: list[tuple[str, str, str]] = []
         self.mode_1m = mode_1m
         self.mode_m1 = mode_m1
+        self.result_dialogs: list[dict[str, object]] = []
+        self.is_running = False
+        self.root = _FakeRoot()
 
     def _is_mode_1m(self) -> bool:
         return self.mode_1m
@@ -113,6 +174,23 @@ class _FakeOwner:
 
     def _dispatch_ui(self, callback):
         callback()
+
+    def _runtime_worker_threads(self) -> int:
+        return 4
+
+    @staticmethod
+    def _unique_row_keys(row_keys: list[str]) -> list[str]:
+        return list(dict.fromkeys(row_keys))
+
+    @staticmethod
+    def _validate_recipient_address(value: str, _field_label: str = "收款地址") -> str:
+        return str(value or "").strip()
+
+    def _show_result_summary_dialog(self, **kwargs: object) -> None:
+        self.result_dialogs.append(dict(kwargs))
+
+    def _clear_source_private_key_cache(self) -> None:
+        return None
 
     def _set_status(self, row_key: str, status: str, status_text: str = ""):
         self.statuses.append((row_key, status, status_text))
@@ -282,6 +360,181 @@ class OnchainRelayPipelineTests(unittest.TestCase):
                 },
             )
         )
+
+    def test_manual_account_copy_lines_match_wallet_generator_format(self) -> None:
+        rows = [
+            {"relay_address": "0xAbC", "private_key": "key-1"},
+            {"relay_address": "0xabc", "private_key": "duplicate-key"},
+            {"relay_address": "0xDef", "private_key": "key-2"},
+            {"relay_address": "0xMissing"},
+        ]
+
+        self.assertEqual(
+            _relay_manual_account_copy_lines(rows),
+            ["0xAbC key-1", "0xDef key-2"],
+        )
+
+    def test_manual_recovery_retries_rpc_failure_after_first_pass(self) -> None:
+        owner = _FakeOwner()
+        relay_addr = "0x00000000000000000000000000000000000000cc"
+        record = RelayWalletRecord(
+            created_at="",
+            expires_at="",
+            network="BSC",
+            source="0x00000000000000000000000000000000000000aa",
+            target="0x00000000000000000000000000000000000000bb",
+            relay_address=relay_addr,
+            private_key="relay-private-key",
+            status="forwarded",
+            batch_id="batch-retry",
+        )
+        _RECORDS[(relay_addr, record.batch_id)] = record
+        owner.client.native_balance_responses = [RuntimeError("temporary RPC failure"), 0]
+        owner.client.erc20_balance_units = 0
+
+        with TemporaryDirectory() as tmp_dir:
+            with (
+                patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
+                patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+            ):
+                run_relay_fee_recovery(
+                    owner,
+                    False,
+                    show_dialog=True,
+                    use_progress=False,
+                    manage_running_state=False,
+                    run_label="manual",
+                )
+
+        self.assertEqual(_RECORDS, {})
+        self.assertTrue(any("进行一次二次验证" in message for message in owner.logs))
+        self.assertEqual(len(owner.result_dialogs), 1)
+        result = owner.result_dialogs[0]
+        self.assertEqual(result["success"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertIn("已清空 1", str(result["detail_text"]))
+        self.assertEqual(result["action_buttons"][0][0], "复制待人工账号")
+        self.assertFalse(result["action_buttons"][0][2])
+
+    def test_manual_recovery_counts_persistent_rpc_failure_once(self) -> None:
+        owner = _FakeOwner()
+        relay_addr = "0x00000000000000000000000000000000000000cd"
+        record = RelayWalletRecord(
+            created_at="",
+            expires_at="",
+            network="BSC",
+            source="0x00000000000000000000000000000000000000aa",
+            target="0x00000000000000000000000000000000000000bb",
+            relay_address=relay_addr,
+            private_key="relay-private-key",
+            status="forwarded",
+            batch_id="batch-failed",
+        )
+        _RECORDS[(relay_addr, record.batch_id)] = record
+        owner.client.native_balance_responses = [
+            RuntimeError("temporary RPC failure"),
+            RuntimeError("persistent RPC failure"),
+        ]
+
+        with TemporaryDirectory() as tmp_dir:
+            with (
+                patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
+                patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+            ):
+                run_relay_fee_recovery(
+                    owner,
+                    False,
+                    show_dialog=True,
+                    use_progress=False,
+                    manage_running_state=False,
+                    run_label="manual",
+                )
+
+        self.assertEqual(len(_RECORDS), 1)
+        self.assertEqual(_RECORDS[(relay_addr, record.batch_id)].status, "failed")
+        result = owner.result_dialogs[0]
+        self.assertEqual(result["success"], 0)
+        self.assertEqual(result["failed"], 1)
+
+    def test_batch_recovery_does_not_enable_manual_second_pass(self) -> None:
+        owner = _FakeOwner()
+        relay_addr = "0x00000000000000000000000000000000000000cf"
+        record = RelayWalletRecord(
+            created_at="",
+            expires_at="",
+            network="BSC",
+            source="0x00000000000000000000000000000000000000aa",
+            target="0x00000000000000000000000000000000000000bb",
+            relay_address=relay_addr,
+            private_key="relay-private-key",
+            status="forwarded",
+            batch_id="batch-dialog",
+        )
+        _RECORDS[(relay_addr, record.batch_id)] = record
+        owner.client.native_balance_responses = [RuntimeError("temporary RPC failure"), 0]
+
+        with TemporaryDirectory() as tmp_dir:
+            with (
+                patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
+                patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+            ):
+                run_relay_fee_recovery(
+                    owner,
+                    False,
+                    batch_ids={record.batch_id},
+                    show_dialog=True,
+                    use_progress=False,
+                    manage_running_state=False,
+                    run_label="batch-dialog",
+                )
+
+        self.assertEqual(owner.client.native_balance_responses, [0])
+        self.assertFalse(any("进行一次二次验证" in message for message in owner.logs))
+        result = owner.result_dialogs[0]
+        self.assertEqual(result["failed"], 1)
+        self.assertIsNone(result["action_buttons"])
+
+    def test_manual_recovery_copy_button_contains_final_manual_accounts(self) -> None:
+        owner = _FakeOwner()
+        relay_addr = "0x00000000000000000000000000000000000000ce"
+        private_key = "manual-private-key"
+        record = RelayWalletRecord(
+            created_at="",
+            expires_at="",
+            network="BSC",
+            source="0x00000000000000000000000000000000000000aa",
+            target="0x00000000000000000000000000000000000000bb",
+            relay_address=relay_addr,
+            private_key=private_key,
+            status="created",
+            batch_id="batch-manual",
+        )
+        _RECORDS[(relay_addr, record.batch_id)] = record
+        owner.client.native_balance_responses = [5_000_000_000_000, 5_000_000_000_000]
+        owner.client.erc20_balance_units = 0
+        owner.client.gas_price_wei = 1_000_000_000
+
+        with TemporaryDirectory() as tmp_dir:
+            with (
+                patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
+                patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+            ):
+                run_relay_fee_recovery(
+                    owner,
+                    False,
+                    show_dialog=True,
+                    use_progress=False,
+                    manage_running_state=False,
+                    run_label="manual",
+                )
+
+        result = owner.result_dialogs[0]
+        action_label, action_callback, action_enabled = result["action_buttons"][0]
+        self.assertEqual(action_label, "复制待人工账号")
+        self.assertTrue(action_enabled)
+        action_callback()
+        self.assertEqual(owner.root.clipboard_text, f"{relay_addr} {private_key}")
+        self.assertNotIn(" - ", owner.root.clipboard_text)
 
     def test_terminal_dust_record_does_not_ignore_bnb_at_threshold(self) -> None:
         owner = _FakeOwner()
