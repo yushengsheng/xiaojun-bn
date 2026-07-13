@@ -681,10 +681,17 @@ class OnchainRelayPipelineTests(unittest.TestCase):
         owner = _FakeOwner(mode_1m=False)
         params = _params(delay=0.01, nonce_window=2)
         items = [_item(1), _item(2), _item(3)]
-        submissions: list[tuple[int, int, float]] = []
+        submissions: list[tuple[int, int]] = []
+        wait_intervals: list[float | None] = []
+
+        def record_wait(timeout: float | None = None) -> bool:
+            wait_intervals.append(timeout)
+            return False
+
+        owner.stop_requested.wait = record_wait
 
         def submit_one(item: _RelayBatchItem, nonce: int) -> str:
-            submissions.append((item.index, nonce, time.monotonic()))
+            submissions.append((item.index, nonce))
             return "0x" + f"{item.index:064x}"
 
         _relay_source_stage(
@@ -703,7 +710,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
 
         self.assertEqual([item[0] for item in submissions], [1, 2, 3])
         self.assertEqual([item[1] for item in submissions], [0, 1, 2])
-        self.assertGreaterEqual(submissions[1][2] - submissions[0][2], 0.008)
+        self.assertEqual(wait_intervals, [0.01, 0.01])
         self.assertEqual([_RECORDS[(item.relay_addr, "batch")].status for item in items], ["token_funded"] * 3)
 
     def test_source_stage_1m_uses_dedicated_source_threads(self) -> None:

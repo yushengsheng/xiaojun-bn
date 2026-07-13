@@ -48,6 +48,13 @@ methods after a failure.
    On a genuine failure, stop at that step and diagnose it; never hide the
    failure by changing the tag or publishing path.
 
+If a tag-triggered workflow fails before publishing a GitHub Release, use this
+single recovery path: confirm that the release does not exist, fix the root
+cause on `main`, rerun the complete local gate, push the fix, delete only the
+failed local/remote tag, recreate the same version tag on the verified commit,
+and wait for its new workflow run. Do not skip to another version number and do
+not publish assets manually.
+
 `RELEASE_GUARDRAILS.md` is mandatory. Any crash such as `Python 意外退出`, exit code `134`, failed GUI selftest, proxy runtime authentication failure, or failed GitHub Actions release is a blocking release issue, not a warning.
 
 Rules:
