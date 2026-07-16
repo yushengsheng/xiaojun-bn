@@ -66,7 +66,16 @@ py -3 -m venv .venv
 
 ## 回归检查
 
-源码改动后建议先跑统一回归：
+macOS 源码改动后使用固定入口运行完整回归：
+
+```bash
+python3 tools/run_full_regression.py
+```
+
+该入口使用项目内 `.venv-regression`。首次运行或依赖锁变化时会按
+`requirements-build.lock` 自动重建，后续直接复用，不依赖会被系统清理的临时目录。
+
+Windows 可在已安装构建锁依赖的项目虚拟环境中运行：
 
 ```powershell
 .\.venv\Scripts\python tools\run_regression.py --gui

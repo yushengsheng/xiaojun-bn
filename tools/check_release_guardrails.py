@@ -28,6 +28,7 @@ def check_release_guardrails() -> None:
     release_workflow = _read(".github/workflows/release-windows-exe.yml")
     ci_workflow = _read(".github/workflows/ci.yml")
     regression = _read("tools/run_regression.py")
+    full_regression = _read("tools/run_full_regression.py")
     local_gui_check = _read("tools/run_local_gui_check.py")
 
     for needle in (
@@ -75,9 +76,17 @@ def check_release_guardrails() -> None:
 
     _require(regression, "tools/check_release_guardrails.py", source="tools/run_regression.py")
     for needle in (
+        ".venv-regression",
+        "requirements-build.lock",
+        "--require-hashes",
+        "tools/run_local_gui_check.py",
+        "--regression",
+    ):
+        _require(full_regression, needle, source="tools/run_full_regression.py")
+    for needle in (
         "XIAOJUN_GUI_PYTHON",
-        "/private/tmp/xiaojun-bn-regression-verify/bin/python",
-        "/private/tmp/xiaojun-bn-sing-box-verify",
+        ".venv-regression",
+        "proxy_runtimes",
         "SING_BOX_EXECUTABLE_SHA256",
         "--full-selftest",
         "--regression",

@@ -20,7 +20,7 @@
 
 正式发版必须满足：
 
-- 目标 commit 已在本地完成回归：`python tools/run_regression.py --gui --strict-pip-check`。
+- 目标 commit 已通过固定入口完成回归：`python3 tools/run_full_regression.py`。
 - 若本地 GUI/Tk 环境异常，必须明确标记为阻断项，并在 GitHub Actions 上完成等价 GUI 自检后才能发版。
 - CI 使用 `pip install --require-hashes -r requirements-build.lock` 安装构建依赖。
 - release workflow 下载 `xray` 和 `sing-box` 时必须校验 `XRAY_SHA256` 和 `SING_BOX_SHA256`。
@@ -35,8 +35,9 @@
 
 - 本地 GUI 检查必须使用 `tools/run_local_gui_check.py`，不得临时手写 `python3 -c ...` 或直接使用已知会 abort 的普通 macOS Python。
 - 在 Codex/沙箱环境里启动 Tk GUI 时，必须脱离沙箱申请 GUI 运行权限；普通沙箱里的 `exit 134` 不能被当作应用本身失败。
-- `tools/run_local_gui_check.py` 会优先使用 `XIAOJUN_GUI_PYTHON`，其次使用 `/private/tmp/xiaojun-bn-regression-verify/bin/python`；如本地路径变化，先设置 `XIAOJUN_GUI_PYTHON`，再运行 GUI 检查。
-- `tools/run_local_gui_check.py` 会在未显式指定 `SING_BOX_PATH` 时使用本机已验证的 `/private/tmp/xiaojun-bn-sing-box-verify` 和 `SING_BOX_EXECUTABLE_SHA256`；不要让完整 GUI 自检临时联网下载代理运行时。
+- `tools/run_full_regression.py` 是唯一的本地完整回归入口；它固定使用项目内 `.venv-regression`，按 `requirements-build.lock` 指纹校验，缺失、损坏或锁文件变化时自动重建。
+- `tools/run_local_gui_check.py` 会优先使用 `XIAOJUN_GUI_PYTHON`，其次使用项目内 `.venv-regression`；禁止重新加入 `/private/tmp` 回归环境候选。
+- `tools/run_local_gui_check.py` 会在未显式指定 `SING_BOX_PATH` 时使用项目内已验证运行时和 `SING_BOX_EXECUTABLE_SHA256`；不要让完整 GUI 自检临时联网下载代理运行时。
 - 确认崩溃发生在源码 GUI、打包 GUI、代理运行时启动、还是网络下载阶段。
 - 查最近的 runtime log 和 `bot_log.txt`，记录最后一个通过的自检步骤。
 - 如果是 GUI/Tk 层 abort，必须用同一目标平台的 packaged app 自检作为最终依据。
@@ -57,6 +58,7 @@
 
 - 不得删除 `tools/check_release_guardrails.py` 或从 `tools/run_regression.py` 移除该检查。
 - 不得删除 `tools/run_local_gui_check.py`，本地 GUI 验证必须通过该脚本或 GitHub Actions 的 packaged GUI selftest 完成。
+- 不得删除 `tools/run_full_regression.py`，也不得把固定回归环境改回 `/private/tmp`。
 - 不得降低 release workflow 中 packaged `--selftest --selftest-gui` 的要求。
 - 不得移除 proxy runtime 哈希校验。
 - 不得把本地运行状态、日志、账号、私钥、中转钱包文件打进 release 包。

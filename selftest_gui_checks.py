@@ -127,6 +127,47 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：交易所账号销毁按钮未紧随清空按钮")
                 checks.append("exchange-destroy-control-gui=ok")
 
+                def _strategy_row3_labels() -> list[str]:
+                    labels: list[str] = []
+                    for widget in app._strategy_row3_right.pack_slaves():
+                        try:
+                            text = str(widget.cget("text") or "")
+                        except Exception:
+                            text = ""
+                        if text:
+                            labels.append(text)
+                    return labels
+
+                if str(app.rate_limit_wait_var.get()) != "10":
+                    raise RuntimeError("GUI 自检失败：限流等待默认值不是10秒")
+                expected_gate_modes = [
+                    ("现货", "市价", True),
+                    ("现货", "闪兑", True),
+                    ("现货", "挂单", False),
+                    ("现货", "溢价单", False),
+                    ("合约", "市价", True),
+                    ("理财", "市价", False),
+                ]
+                for account_type, trade_mode, expected_visible in expected_gate_modes:
+                    app.trade_account_type_var.set(account_type)
+                    app.trade_mode_var.set(trade_mode)
+                    app._refresh_strategy_panel_layout()
+                    pump_tk_events(app, timeout=2.0)
+                    labels = _strategy_row3_labels()
+                    visible = "限流等待(秒):" in labels
+                    if visible != expected_visible:
+                        raise RuntimeError(
+                            f"GUI 自检失败：{account_type}/{trade_mode} 限流等待显示状态异常（{labels}）"
+                        )
+                    if visible and labels.index("限流等待(秒):") > labels.index("提现预留:"):
+                        raise RuntimeError("GUI 自检失败：限流等待未放在提现预留前")
+                app.trade_account_type_var.set("现货")
+                app.trade_mode_var.set("市价")
+                app.rate_limit_wait_var.set("17")
+                app._refresh_strategy_panel_layout()
+                pump_tk_events(app, timeout=2.0)
+                checks.append("exchange-rate-limit-control-gui=ok")
+
                 drain_exchange_log_queue()
                 logger.info("GUI日志拆分普通日志自检")
                 logger.error("GUI日志拆分报错日志自检")
@@ -184,6 +225,8 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：共享策略仍保留交易所账号凭据")
                 if strategy_payload.get("spot_symbol") != "BNBUSDT" or not proxy_path.exists():
                     raise RuntimeError("GUI 自检失败：销毁误删共享策略参数或代理配置")
+                if strategy_payload.get("rate_limit_wait_sec") != 17:
+                    raise RuntimeError("GUI 自检失败：限流等待配置未保存")
                 checks.append("exchange-destroy-execution-gui=ok")
 
                 app._show_main_page("onchain")

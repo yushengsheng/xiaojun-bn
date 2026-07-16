@@ -33,7 +33,7 @@ from app_paths import (
     WITHDRAW_SUCCESS_FILE,
 )
 from core_models import AccountEntry
-from exchange_binance_client import BinanceClient, summarize_exchange_exception
+from exchange_binance_client import BinanceClient, SharedRateLimitGate, summarize_exchange_exception
 from exchange_constants import (
     API_KEY_DEFAULT,
     API_SECRET_DEFAULT,
@@ -42,6 +42,7 @@ from exchange_constants import (
     EARN_AMOUNT_DEFAULT,
     EARN_AMOUNT_ALL_DEFAULT,
     EARN_ASSET_DEFAULT,
+    EXCHANGE_RATE_LIMIT_WAIT_SECONDS_DEFAULT,
     EXCHANGE_PROXY_DEFAULT,
     EXCHANGE_USE_CONFIG_PROXY_DEFAULT,
     FUTURES_AMOUNT_DEFAULT,
@@ -382,6 +383,7 @@ class ExchangeAppBase(tk.Tk):
         self.withdraw_net_var = tk.StringVar(value=WITHDRAW_NETWORK_DEFAULT)
         self.withdraw_coin_var = tk.StringVar(value=WITHDRAW_COIN_DEFAULT)
         self.withdraw_buffer_var = tk.DoubleVar(value=WITHDRAW_FEE_BUFFER_DEFAULT)
+        self.rate_limit_wait_var = tk.StringVar(value=str(EXCHANGE_RATE_LIMIT_WAIT_SECONDS_DEFAULT))
         self.enable_withdraw_var = tk.BooleanVar(value=True)
 
         self.min_delay_var = tk.StringVar(value="")
@@ -1153,6 +1155,14 @@ class ExchangeAppBase(tk.Tk):
             "earn_amount_value": earn_amount_value,
             "earn_amount_all": earn_amount_all,
         }
+    def _rate_limit_wait_seconds_value(self) -> int:
+        try:
+            value = int(str(self.rate_limit_wait_var.get() or "").strip())
+        except Exception as exc:
+            raise RuntimeError("限流等待秒数格式不正确") from exc
+        if value < 1 or value > 3600:
+            raise RuntimeError("限流等待秒数必须在 1-3600 之间")
+        return value
     def _install_entry_placeholder(self, entry, variable, placeholder: str):
         placeholder_color = "#8a8a8a"
         normal_color = entry.cget("fg")
@@ -1355,6 +1365,7 @@ class ExchangeAppBase(tk.Tk):
         row3_compact_entry_width = 7
         row3_spin_width = 4
         row3_withdraw_width = 6
+        row3_rate_limit_width = 5
         row3_item_pad = (4, 8)
         row3_withdraw_pad = (4, 4)
 
@@ -1377,6 +1388,9 @@ class ExchangeAppBase(tk.Tk):
                 ttk.Entry(row3_left, textvariable=self.reprice_threshold_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
                 ttk.Checkbutton(row3_left, text="部分成交循环", variable=self.premium_partial_fill_var).pack(side="left", padx=(0, 8))
 
+            if current_trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_CONVERT}:
+                ttk.Label(row3_right, text="限流等待(秒):").pack(side="left")
+                ttk.Entry(row3_right, textvariable=self.rate_limit_wait_var, width=row3_rate_limit_width).pack(side="left", padx=row3_item_pad)
             ttk.Label(row3_right, text="提现预留:").pack(side="left")
             ttk.Entry(row3_right, textvariable=self.withdraw_buffer_var, width=row3_withdraw_width).pack(side="left", padx=row3_withdraw_pad)
             ttk.Checkbutton(row3_right, text="\u81ea\u52a8\u63d0\u73b0", variable=self.enable_withdraw_var, style="AutoWithdraw.TCheckbutton").pack(side="left")
@@ -1392,6 +1406,8 @@ class ExchangeAppBase(tk.Tk):
             self.futures_margin_type_combo.pack(side="left", padx=row3_item_pad)
             ttk.Label(row3_left, text="杠杆:").pack(side="left")
             ttk.Spinbox(row3_left, from_=1, to=125, textvariable=self.futures_leverage_var, width=5).pack(side="left", padx=row3_item_pad)
+            ttk.Label(row3_right, text="限流等待(秒):").pack(side="left")
+            ttk.Entry(row3_right, textvariable=self.rate_limit_wait_var, width=row3_rate_limit_width).pack(side="left", padx=row3_item_pad)
             ttk.Label(row3_right, text="提现预留:").pack(side="left")
             ttk.Entry(row3_right, textvariable=self.withdraw_buffer_var, width=row3_withdraw_width).pack(side="left", padx=row3_withdraw_pad)
             ttk.Checkbutton(row3_right, text="\u81ea\u52a8\u63d0\u73b0", variable=self.enable_withdraw_var, style="AutoWithdraw.TCheckbutton").pack(side="left")

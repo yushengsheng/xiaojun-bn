@@ -15,6 +15,7 @@ from exchange_app_base import (
     PREMIUM_ORDER_COUNT_DEFAULT,
     REPRICE_THRESHOLD_DEFAULT,
     SPOT_ROUNDS_DEFAULT,
+    SharedRateLimitGate,
     Strategy,
     TRADE_ACCOUNT_TYPE_EARN,
     TRADE_ACCOUNT_TYPE_FUTURES,
@@ -43,6 +44,13 @@ from exchange_order_recovery import exchange_operation_scope, reconcile_exchange
 
 
 class ExchangeAppBatchMixin(object):
+    @staticmethod
+    def _uses_shared_rate_limit_gate(trade_account_type: str, trade_mode: str) -> bool:
+        return trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES or (
+            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
+            and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_CONVERT}
+        )
+
     @staticmethod
     def _exchange_operation_scope(api_key: str) -> str:
         return exchange_operation_scope(api_key)
@@ -2052,6 +2060,18 @@ class ExchangeAppBatchMixin(object):
             earn_amount_value = None
             earn_amount_all = False
 
+        use_shared_rate_limit_gate = bool(
+            trade_settings
+            and self._uses_shared_rate_limit_gate(trade_account_type, trade_mode)
+        )
+        try:
+            rate_limit_wait_seconds = (
+                self._rate_limit_wait_seconds_value() if use_shared_rate_limit_gate else 0
+            )
+        except RuntimeError as e:
+            messagebox.showerror("错误", str(e))
+            return
+
         configured_bnb_topup_amount_value = Decimal(str(bnb_topup_amount_value or "0"))
         show_bnb_topup_option = (
             trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
@@ -2119,6 +2139,13 @@ class ExchangeAppBatchMixin(object):
 
         logger.info("交易所批量链路：%s", self._exchange_proxy_route_text())
         self.stop_event = threading.Event()
+        batch_request_gate = (
+            SharedRateLimitGate(rate_limit_wait_seconds, stop_event=self.stop_event)
+            if use_shared_rate_limit_gate
+            else None
+        )
+        if batch_request_gate is not None:
+            logger.info("批次 API 限流共享等待已启用：%d 秒", rate_limit_wait_seconds)
         self._batch_task_active = True
         if not preflight_required:
             self._begin_batch_summary_tracking(
@@ -2238,7 +2265,12 @@ class ExchangeAppBatchMixin(object):
 
                 try:
                     client = None
-                    client = self._create_binance_client(acc["api_key"], acc["api_secret"])
+                    client = self._create_binance_client(
+                        acc["api_key"],
+                        acc["api_secret"],
+                        request_gate=batch_request_gate,
+                        request_stop_event=combined_stop,
+                    )
                     trade_symbol = futures_symbol if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES else spot_symbol
                     quote_asset = str(validated_quote_asset or "").strip().upper()
                     if (not batch_total_asset_only) and trade_account_type != TRADE_ACCOUNT_TYPE_EARN and (not quote_asset):
@@ -2786,8 +2818,12 @@ class ExchangeAppBatchMixin(object):
                             op_success = False
 
                 except Exception as e:
-                    logger.error(f"账号 #{idx} 执行异常: {e}")
-                    set_status(self._exchange_error_status_text("异常", e))
+                    if combined_stop.is_set():
+                        logger.info("账号 #%d 已停止", idx)
+                        set_status("已停止")
+                    else:
+                        logger.error(f"账号 #{idx} 执行异常: {e}")
+                        set_status(self._exchange_error_status_text("异常", e))
                     op_success = False
                 finally:
                     self._close_binance_client_instance(client)
@@ -2805,7 +2841,11 @@ class ExchangeAppBatchMixin(object):
                 validate_client = None
                 try:
                     sample_acc = selected[0]
-                    validate_client = self._create_binance_client(sample_acc["api_key"], sample_acc["api_secret"])
+                    validate_client = self._create_binance_client(
+                        sample_acc["api_key"],
+                        sample_acc["api_secret"],
+                        request_gate=batch_request_gate,
+                    )
                     if trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
                         earn_product = validate_client.find_simple_earn_flexible_product(
                             earn_asset,

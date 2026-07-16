@@ -14,7 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHILD_ENV_KEY = "XIAOJUN_GUI_CHECK_CHILD"
-VERIFIED_SING_BOX_PATH = Path("/private/tmp/xiaojun-bn-sing-box-verify")
+PERSISTENT_REGRESSION_PYTHON = ROOT / ".venv-regression" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+VERIFIED_SING_BOX_PATH = ROOT / "data" / "proxy_runtimes" / "sing-box" / "v1.13.5" / "sing-box"
 VERIFIED_SING_BOX_SHA256 = "44c9311a332c66a9785ffecc318fc2bddda9dbd61be23b462b526cbc4ad4f207"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -27,7 +28,7 @@ def _candidate_pythons() -> list[Path]:
         candidates.append(Path(env_python))
     candidates.extend(
         [
-            Path("/private/tmp/xiaojun-bn-regression-verify/bin/python"),
+            PERSISTENT_REGRESSION_PYTHON,
             ROOT / ".venv" / "bin" / "python",
             ROOT / ".venv" / "Scripts" / "python.exe",
             Path(sys.executable),

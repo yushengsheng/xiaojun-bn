@@ -137,9 +137,18 @@ def summarize_exchange_exception(exc: object, *, fallback: str = "异常", max_l
     return text if len(text) <= max_len else (text[: max_len - 1] + "…")
 
 class BinanceAPIError(Exception):
-    def __init__(self, code: int, msg: str):
+    def __init__(
+        self,
+        code: int,
+        msg: str,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+    ):
         self.code = code
         self.msg = msg
+        self.status_code = status_code
+        self.retry_after = retry_after
         super().__init__(f"Binance API error {code}: {msg}")
 
     def __str__(self) -> str:
@@ -148,6 +157,52 @@ class BinanceAPIError(Exception):
         if not explanation:
             return base_text
         return f"{base_text} | 中文说明: {explanation}"
+
+
+class SharedRateLimitGate:
+    def __init__(self, wait_seconds: float, *, stop_event=None):
+        self.wait_seconds = max(0.0, float(wait_seconds or 0.0))
+        self.stop_event = stop_event
+        self._lock = threading.Lock()
+        self._pause_until = 0.0
+
+    def pause(self, retry_after: float | None = None) -> float:
+        try:
+            required_wait = max(0.0, float(retry_after or 0.0))
+        except (TypeError, ValueError):
+            required_wait = 0.0
+        pause_seconds = max(self.wait_seconds, required_wait)
+        now = time.monotonic()
+        with self._lock:
+            self._pause_until = max(self._pause_until, now + pause_seconds)
+            return max(0.0, self._pause_until - now)
+
+    def wait(self, stop_event=None) -> bool:
+        effective_stop_event = stop_event or self.stop_event
+
+        def is_stopped() -> bool:
+            if effective_stop_event is None:
+                return False
+            try:
+                return bool(effective_stop_event.is_set())
+            except Exception:
+                return False
+
+        while True:
+            if is_stopped():
+                return False
+            with self._lock:
+                remaining = self._pause_until - time.monotonic()
+            if remaining <= 0:
+                return not is_stopped()
+            if effective_stop_event is not None:
+                try:
+                    if effective_stop_event.wait(remaining):
+                        return False
+                    continue
+                except Exception:
+                    pass
+            time.sleep(remaining)
 
 
 def retry_request(max_retries=3, delay=2):
@@ -184,6 +239,8 @@ class BinanceClient:
     DEFAULT_REQUEST_RETRY_COUNT = 10
     DEFAULT_REQUEST_RETRY_DELAY_SECONDS = 1.0
     RETRYABLE_BINANCE_ERROR_CODES = {-1001, -1003, -2015}
+    SHARED_RATE_LIMIT_ERROR_CODES = {-1003, -1008, -1015}
+    SHARED_RATE_LIMIT_HTTP_STATUS_CODES = {418, 429}
     _shared_convert_exchange_info_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     _shared_convert_asset_info_cache: dict[str, int] | None = None
     _shared_convert_cache_lock = threading.Lock()
@@ -191,13 +248,23 @@ class BinanceClient:
     _shared_server_time_synced_at: dict[str, float] = {}
     _shared_server_time_lock = threading.Lock()
 
-    def __init__(self, key: str, secret: str, proxy_url: str = ""):
+    def __init__(
+        self,
+        key: str,
+        secret: str,
+        proxy_url: str = "",
+        *,
+        request_gate: SharedRateLimitGate | None = None,
+        request_stop_event=None,
+    ):
         if not key or not secret:
             raise ValueError("API KEY / SECRET 不能为空")
 
         self.key = key
         self.secret = secret.encode()
         self._proxy_url = str(proxy_url or "").strip()
+        self._request_gate = request_gate
+        self._request_stop_event = request_stop_event
         self.spot = "https://api.binance.com"
         self.um_futures = "https://fapi.binance.com"
         self.cm_futures = "https://dapi.binance.com"
@@ -324,7 +391,63 @@ class BinanceClient:
             self.secret, urlencode(params, True).encode(), hashlib.sha256
         ).hexdigest()
 
-    def _run_request_with_retry(self, request_fn, *, max_retries: int, delay: float):
+    @staticmethod
+    def _retry_after_from_response(response) -> float | None:
+        if response is None:
+            return None
+        try:
+            value = response.headers.get("Retry-After")
+            if value is None:
+                return None
+            return max(0.0, float(value))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _shared_rate_limit_details(self, exc: Exception, *, base: str, path: str) -> tuple[bool, float | None]:
+        status_code = None
+        retry_after = None
+        if isinstance(exc, BinanceAPIError):
+            status_code = exc.status_code
+            retry_after = exc.retry_after
+            if exc.code in self.SHARED_RATE_LIMIT_ERROR_CODES:
+                return True, retry_after
+            is_convert_request = (
+                self._normalize_base_url(base) == self._normalize_base_url(self.spot)
+                and str(path or "").startswith("/sapi/v1/convert/")
+            )
+            if exc.code == -1004 and is_convert_request:
+                return True, retry_after
+        elif isinstance(exc, requests.exceptions.HTTPError):
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            retry_after = self._retry_after_from_response(response)
+        return status_code in self.SHARED_RATE_LIMIT_HTTP_STATUS_CODES, retry_after
+
+    def _wait_for_request_gate(self) -> None:
+        gate = self._request_gate
+        if gate is not None and not gate.wait(self._request_stop_event):
+            raise RuntimeError("检测到停止信号，已停止限流等待")
+
+    def _pause_for_shared_rate_limit(self, exc: Exception, retry_after: float | None) -> None:
+        gate = self._request_gate
+        if gate is None:
+            return
+        remaining = gate.pause(retry_after)
+        logger.warning(
+            "检测到 Binance API 限流/繁忙保护，整个批次暂停 %.3g 秒后重试当前请求: %s",
+            remaining,
+            exc,
+        )
+
+    def _run_request_with_retry(
+        self,
+        request_fn,
+        *,
+        max_retries: int,
+        delay: float,
+        base: str = "",
+        path: str = "",
+    ):
         last_exception = None
         retry_count = max(1, int(max_retries or self.DEFAULT_REQUEST_RETRY_COUNT))
         retry_delay = max(0.0, float(delay if delay is not None else self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS))
@@ -339,22 +462,42 @@ class BinanceClient:
                 return "Binance API 权限校验失败"
             return "Binance 系统繁忙"
 
-        for i in range(retry_count):
+        attempt = 0
+        while attempt < retry_count:
+            self._wait_for_request_gate()
             try:
                 return request_fn()
-            except (requests.exceptions.RequestException, ConnectionError, TimeoutError) as e:
+            except requests.exceptions.HTTPError as e:
+                is_rate_limited, retry_after = self._shared_rate_limit_details(e, base=base, path=path)
+                if self._request_gate is not None and is_rate_limited:
+                    self._pause_for_shared_rate_limit(e, retry_after)
+                    continue
+                attempt += 1
                 last_exception = e
                 self._reset_session_after_transport_error()
-                if i + 1 >= retry_count:
+                if attempt >= retry_count:
                     break
-                logger.warning(f"网络请求失败 ({i + 1}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
+                logger.warning(f"网络请求失败 ({attempt}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
+                sleep_before_retry()
+            except (requests.exceptions.RequestException, ConnectionError, TimeoutError) as e:
+                attempt += 1
+                last_exception = e
+                self._reset_session_after_transport_error()
+                if attempt >= retry_count:
+                    break
+                logger.warning(f"网络请求失败 ({attempt}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
                 sleep_before_retry()
             except BinanceAPIError as e:
                 last_exception = e
+                is_rate_limited, retry_after = self._shared_rate_limit_details(e, base=base, path=path)
+                if self._request_gate is not None and is_rate_limited:
+                    self._pause_for_shared_rate_limit(e, retry_after)
+                    continue
+                attempt += 1
                 if e.code in self.RETRYABLE_BINANCE_ERROR_CODES:
-                    if i + 1 >= retry_count:
+                    if attempt >= retry_count:
                         break
-                    logger.warning(f"{retryable_binance_error_label(e.code)} ({i + 1}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
+                    logger.warning(f"{retryable_binance_error_label(e.code)} ({attempt}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
                     sleep_before_retry()
                     continue
                 raise e
@@ -383,7 +526,12 @@ class BinanceClient:
             if r.status_code == 200:
                 return data
 
-            err = BinanceAPIError(data.get("code", -1), data.get("msg", "Unknown"))
+            err = BinanceAPIError(
+                data.get("code", -1),
+                data.get("msg", "Unknown"),
+                status_code=r.status_code,
+                retry_after=self._retry_after_from_response(r),
+            )
             last_error = err
             if err.code == -1021 and attempt == 0:
                 try:
@@ -403,6 +551,8 @@ class BinanceClient:
             lambda: self._request_impl(base, method, path, params, timeout=15),
             max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
             delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+            base=base,
+            path=path,
         )
 
     def request_query(self, base, method, path, params=None, *, timeout: float = 6, max_retries: int | None = None):
@@ -410,6 +560,8 @@ class BinanceClient:
             lambda: self._request_impl(base, method, path, params, timeout=timeout),
             max_retries=self.DEFAULT_REQUEST_RETRY_COUNT if max_retries is None else max_retries,
             delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+            base=base,
+            path=path,
         )
 
     def public_get(self, base, path, params=None):
@@ -434,6 +586,8 @@ class BinanceClient:
             lambda: self._public_get_impl(base, path, params, timeout=timeout),
             max_retries=self.DEFAULT_REQUEST_RETRY_COUNT if max_retries is None else max_retries,
             delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS if delay is None else delay,
+            base=base,
+            path=path,
         )
 
     # -------- 余额 --------
@@ -2848,6 +3002,7 @@ class BinanceClient:
 
 __all__ = [
     "BinanceAPIError",
+    "SharedRateLimitGate",
     "retry_request",
     "BinanceClient",
     "explain_binance_api_error",

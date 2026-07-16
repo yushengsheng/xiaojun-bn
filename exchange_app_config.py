@@ -12,6 +12,7 @@ from exchange_app_base import (
     EARN_ASSET_DEFAULT,
     EXCHANGE_PROXY_CONFIG_FILE,
     EXCHANGE_PROXY_DEFAULT,
+    EXCHANGE_RATE_LIMIT_WAIT_SECONDS_DEFAULT,
     EXCHANGE_USE_CONFIG_PROXY_DEFAULT,
     ExchangeProxyRuntime,
     FUTURES_AMOUNT_DEFAULT,
@@ -244,8 +245,21 @@ class ExchangeAppConfigMixin(object):
         previous = self.client
         self.client = None
         self._close_binance_client_instance(previous)
-    def _create_binance_client(self, key: str, secret: str) -> BinanceClient:
-        return BinanceClient(key, secret, proxy_url=self._get_exchange_proxy_url())
+    def _create_binance_client(
+        self,
+        key: str,
+        secret: str,
+        *,
+        request_gate=None,
+        request_stop_event=None,
+    ) -> BinanceClient:
+        return BinanceClient(
+            key,
+            secret,
+            proxy_url=self._get_exchange_proxy_url(),
+            request_gate=request_gate,
+            request_stop_event=request_stop_event,
+        )
     @staticmethod
     def _ensure_trade_symbol_supported(
         client: BinanceClient,
@@ -307,6 +321,7 @@ class ExchangeAppConfigMixin(object):
             "withdraw_network": self.withdraw_net_var.get().strip(),
             "withdraw_coin": self.withdraw_coin_var.get().strip().upper(),
             "withdraw_buffer": float(self.withdraw_buffer_var.get()),
+            "rate_limit_wait_sec": self._rate_limit_wait_seconds_value(),
             "enable_withdraw": bool(self.enable_withdraw_var.get()),
             "min_delay_ms": self._delay_var_value(self.min_delay_var, 1000, "\u6700\u5c0f"),
             "max_delay_ms": self._delay_var_value(self.max_delay_var, 3000, "\u6700\u5927"),
@@ -452,6 +467,9 @@ class ExchangeAppConfigMixin(object):
             self.withdraw_net_var.set(str(raw.get("withdraw_network", WITHDRAW_NETWORK_DEFAULT) or WITHDRAW_NETWORK_DEFAULT).strip())
             self.withdraw_coin_var.set(str(raw.get("withdraw_coin", WITHDRAW_COIN_DEFAULT) or WITHDRAW_COIN_DEFAULT).strip().upper())
             self.withdraw_buffer_var.set(float(raw.get("withdraw_buffer", WITHDRAW_FEE_BUFFER_DEFAULT)))
+            self.rate_limit_wait_var.set(
+                int(raw.get("rate_limit_wait_sec", EXCHANGE_RATE_LIMIT_WAIT_SECONDS_DEFAULT))
+            )
             self.enable_withdraw_var.set(bool(raw.get("enable_withdraw", True)))
             self.min_delay_var.set(int(raw.get("min_delay_ms", 1000)))
             self.max_delay_var.set(int(raw.get("max_delay_ms", 3000)))

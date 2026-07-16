@@ -19,11 +19,12 @@ methods after a failure.
    - `git tag --list <tag>` must print nothing.
    - `git ls-remote --exit-code --refs origin refs/tags/<tag>` must report no
      matching ref (exit code 2).
-3. Use one already validated, isolated Python 3.11 release environment. Verify
-   it first with `<release-python> -m pip check`; do not use the system Python
-   or change environments halfway through the release.
+3. Use the repository's fixed regression entrypoint. It validates and reuses
+   `.venv-regression`, or rebuilds it from `requirements-build.lock` when the
+   environment is missing, damaged, or stale. Do not use `/private/tmp` or
+   switch Python environments manually.
 4. Run the complete local gate once on the final worktree:
-   - `SING_BOX_PATH=<verified-sing-box> <release-python> tools/run_regression.py --gui --strict-pip-check`
+   - `python3 tools/run_full_regression.py`
    - In Codex, run the Tk/GUI gate outside the sandbox as required by
      `RELEASE_GUARDRAILS.md`.
    - Continue only after the command ends with `REGRESSION OK`.

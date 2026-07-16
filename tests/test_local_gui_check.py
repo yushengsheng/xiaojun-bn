@@ -25,6 +25,19 @@ class LocalGuiCheckTests(unittest.TestCase):
     def test_guarded_child_env_name_is_stable(self) -> None:
         self.assertEqual(run_local_gui_check.CHILD_ENV_KEY, "XIAOJUN_GUI_CHECK_CHILD")
 
+    def test_prefers_persistent_regression_environment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-gui-python-test-") as tmpdir:
+            regression_python = Path(tmpdir) / "python"
+            regression_python.write_text("", encoding="utf-8")
+            regression_python.chmod(0o755)
+            with (
+                patch.dict(run_local_gui_check.os.environ, {}, clear=True),
+                patch.object(run_local_gui_check, "PERSISTENT_REGRESSION_PYTHON", regression_python),
+            ):
+                candidates = run_local_gui_check._candidate_pythons()
+
+        self.assertEqual(candidates[0], regression_python)
+
     def test_applies_verified_sing_box_defaults_when_available(self) -> None:
         with tempfile.TemporaryDirectory(prefix="xiaojun-sing-box-test-") as tmpdir:
             sing_box = Path(tmpdir) / "sing-box"
