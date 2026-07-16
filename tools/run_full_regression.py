@@ -95,35 +95,35 @@ def _environment_status(
 ) -> tuple[bool, str]:
     python = _environment_python(env_dir)
     if not (env_dir / "pyvenv.cfg").is_file() or not python.is_file():
-        return False, "虚拟环境文件不完整"
+        return False, "virtual environment files are incomplete"
 
     probe = _probe_python([str(python)])
     if probe is None:
-        return False, "虚拟环境 Python 无法启动"
+        return False, "virtual environment Python cannot start"
     if tuple(probe.get("version", ())) != REQUIRED_PYTHON:
-        return False, "虚拟环境不是 Python 3.11"
+        return False, "virtual environment is not Python 3.11"
     if probe.get("prefix") == probe.get("base_prefix"):
-        return False, "Python 实际指向系统环境"
+        return False, "Python resolves to the system environment"
     try:
         if Path(str(probe.get("prefix", ""))).resolve() != env_dir.resolve():
-            return False, "Python 指向了其他虚拟环境"
+            return False, "Python resolves to another virtual environment"
     except OSError:
-        return False, "虚拟环境路径无效"
+        return False, "virtual environment path is invalid"
 
     try:
         expected_digest = _lock_digest(lock_file)
         installed_digest = marker_file.read_text(encoding="ascii").strip()
     except OSError:
-        return False, "缺少依赖锁指纹"
+        return False, "dependency lock fingerprint is missing"
     if installed_digest != expected_digest:
-        return False, "依赖锁已变化"
+        return False, "dependency lock has changed"
 
     installed_versions = _installed_versions(python)
     if installed_versions is None:
-        return False, "无法读取已安装依赖版本"
+        return False, "installed dependency versions cannot be read"
     locked_versions = _locked_versions(lock_file)
     if any(installed_versions.get(name) != version for name, version in locked_versions.items()):
-        return False, "已安装依赖与锁文件不一致"
+        return False, "installed dependencies do not match the lock file"
 
     dependency_probe = _run_capture(
         [
@@ -133,11 +133,11 @@ def _environment_status(
         ]
     )
     if dependency_probe.returncode != 0:
-        return False, "回归依赖不完整"
+        return False, "regression dependencies are incomplete"
     pip_check = _run_capture([str(python), "-m", "pip", "check"])
     if pip_check.returncode != 0:
-        return False, "回归依赖存在冲突"
-    return True, "环境有效"
+        return False, "regression dependencies have conflicts"
+    return True, "environment is valid"
 
 
 def _base_python_candidates() -> list[list[str]]:
@@ -186,14 +186,14 @@ def _select_base_python() -> list[str]:
         if probe is not None and tuple(probe.get("version", ())) == REQUIRED_PYTHON:
             return candidate
     raise RuntimeError(
-        "未找到 Python 3.11；请安装 Python 3.11，或设置 "
-        f"{BASE_PYTHON_ENV} 指向 Python 3.11"
+        "Python 3.11 was not found; install Python 3.11 or set "
+        f"{BASE_PYTHON_ENV} to a Python 3.11 executable"
     )
 
 
 def _remove_managed_environment(env_dir: Path = ENV_DIR) -> None:
     if env_dir.resolve().parent != ROOT.resolve() or env_dir.name != ".venv-regression":
-        raise RuntimeError(f"拒绝清理非托管目录: {env_dir}")
+        raise RuntimeError(f"refusing to remove unmanaged directory: {env_dir}")
     if env_dir.is_symlink() or env_dir.is_file():
         env_dir.unlink()
     elif env_dir.exists():
@@ -203,7 +203,7 @@ def _remove_managed_environment(env_dir: Path = ENV_DIR) -> None:
 def _rebuild_environment() -> Path:
     base_python = _select_base_python()
     _remove_managed_environment()
-    print(f"重建固定回归环境: {ENV_DIR}", flush=True)
+    print(f"Rebuilding the fixed regression environment: {ENV_DIR}", flush=True)
     subprocess.run([*base_python, "-m", "venv", str(ENV_DIR)], cwd=ROOT, check=True)
 
     python = _environment_python()
@@ -229,13 +229,13 @@ def _rebuild_environment() -> Path:
 def ensure_regression_environment() -> Path:
     valid, reason = _environment_status()
     if valid:
-        print(f"复用固定回归环境: {ENV_DIR}", flush=True)
+        print(f"Reusing the fixed regression environment: {ENV_DIR}", flush=True)
         return _environment_python()
-    print(f"固定回归环境需要重建: {reason}", flush=True)
+    print(f"The fixed regression environment must be rebuilt: {reason}", flush=True)
     python = _rebuild_environment()
     valid, reason = _environment_status()
     if not valid:
-        raise RuntimeError(f"固定回归环境重建后校验失败: {reason}")
+        raise RuntimeError(f"rebuilt regression environment is invalid: {reason}")
     return python
 
 
@@ -243,7 +243,7 @@ def main() -> int:
     try:
         python = ensure_regression_environment()
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
-        print(f"回归环境准备失败: {exc}", file=sys.stderr)
+        print(f"Regression environment setup failed: {exc}", file=sys.stderr)
         return 1
 
     env = os.environ.copy()

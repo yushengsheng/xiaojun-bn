@@ -27,7 +27,7 @@ class FullRegressionEnvironmentTests(unittest.TestCase):
             )
 
         self.assertFalse(valid)
-        self.assertIn("不完整", reason)
+        self.assertIn("incomplete", reason)
 
     def test_accepts_matching_healthy_environment(self) -> None:
         with tempfile.TemporaryDirectory(prefix="xiaojun-regression-env-") as tmpdir:
@@ -61,7 +61,7 @@ class FullRegressionEnvironmentTests(unittest.TestCase):
                 )
 
         self.assertTrue(valid)
-        self.assertEqual(reason, "环境有效")
+        self.assertEqual(reason, "environment is valid")
 
     def test_rejects_environment_when_lock_changes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="xiaojun-regression-env-") as tmpdir:
@@ -89,7 +89,7 @@ class FullRegressionEnvironmentTests(unittest.TestCase):
                 )
 
         self.assertFalse(valid)
-        self.assertIn("依赖锁已变化", reason)
+        self.assertIn("lock has changed", reason)
 
     def test_rejects_installed_version_drift(self) -> None:
         with tempfile.TemporaryDirectory(prefix="xiaojun-regression-env-") as tmpdir:
@@ -120,7 +120,7 @@ class FullRegressionEnvironmentTests(unittest.TestCase):
                 )
 
         self.assertFalse(valid)
-        self.assertIn("不一致", reason)
+        self.assertIn("do not match", reason)
 
     def test_invalid_environment_is_rebuilt_and_rechecked(self) -> None:
         rebuilt_python = Path("/managed/.venv-regression/bin/python")
@@ -128,7 +128,10 @@ class FullRegressionEnvironmentTests(unittest.TestCase):
             patch.object(
                 run_full_regression,
                 "_environment_status",
-                side_effect=[(False, "虚拟环境文件不完整"), (True, "环境有效")],
+                side_effect=[
+                    (False, "virtual environment files are incomplete"),
+                    (True, "environment is valid"),
+                ],
             ) as status,
             patch.object(
                 run_full_regression,
