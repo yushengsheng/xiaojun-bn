@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from time import perf_counter
+
 from page_onchain_base import (
     BOTH,
     END,
@@ -19,6 +21,8 @@ from page_onchain_base import (
 
 
 class OnchainWalletMixin(object):
+    WALLET_RENDER_BATCH_SIZE = 250
+
     def _wallet_export_lines(self, format_name: str) -> list[str]:
         wallets = list(self.generated_wallets)
         if format_name == "仅地址":
@@ -42,6 +46,7 @@ class OnchainWalletMixin(object):
         except Exception:
             pass
     def _close_wallet_generator(self) -> None:
+        self._cancel_wallet_tree_render()
         window = getattr(self, "wallet_generator_window", None)
         if window is not None:
             try:
@@ -142,13 +147,54 @@ class OnchainWalletMixin(object):
             btn.configure(state="disabled" if busy else "normal")
         except Exception:
             pass
+    def _cancel_wallet_tree_render(self) -> int:
+        generation = int(getattr(self, "_wallet_tree_render_generation", 0)) + 1
+        self._wallet_tree_render_generation = generation
+        token = getattr(self, "_wallet_tree_render_token", None)
+        scheduler = getattr(self, "_wallet_tree_render_scheduler", None)
+        self._wallet_tree_render_token = None
+        self._wallet_tree_render_scheduler = None
+        after_cancel = getattr(scheduler, "after_cancel", None)
+        if token is not None and callable(after_cancel):
+            try:
+                after_cancel(token)
+            except Exception:
+                pass
+        return generation
     def _refresh_generated_wallet_tree(self) -> None:
+        generation = self._cancel_wallet_tree_render()
         tree = getattr(self, "wallet_generator_tree", None)
         if tree is None:
             return
         tree.delete(*tree.get_children())
-        for i, item in enumerate(self.generated_wallets, start=1):
-            tree.insert("", END, iid=f"wallet_{i}", values=(i, item.address, item.private_key))
+        wallets = tuple(self.generated_wallets)
+        total = len(wallets)
+        if not total:
+            return
+        started_at = perf_counter()
+
+        def render_batch(start_index: int = 0) -> None:
+            if generation != getattr(self, "_wallet_tree_render_generation", 0):
+                return
+            if tree is not getattr(self, "wallet_generator_tree", None):
+                return
+            self._wallet_tree_render_token = None
+            stop_index = min(start_index + self.WALLET_RENDER_BATCH_SIZE, total)
+            for index in range(start_index, stop_index):
+                item = wallets[index]
+                number = index + 1
+                tree.insert("", END, iid=f"wallet_{number}", values=(number, item.address, item.private_key))
+            if stop_index >= total:
+                self._wallet_tree_render_scheduler = None
+                elapsed = perf_counter() - started_at
+                self.log(f"钱包生成器列表渲染完成：数量={total}，耗时={elapsed:.3f}s")
+                return
+            self._wallet_tree_render_scheduler = tree
+            self._wallet_tree_render_token = tree.after_idle(
+                lambda next_index=stop_index: render_batch(next_index)
+            )
+
+        render_batch()
     def generate_wallets(self):
         try:
             count = int(str(self.wallet_generate_count_var.get()).strip())
@@ -164,22 +210,31 @@ class OnchainWalletMixin(object):
             name="onchain-generate-wallets",
         )
     def _run_generate_wallets(self, count: int, workers: int) -> None:
+        started_at = perf_counter()
         try:
             wallets = self.client.create_wallets(count, worker_threads=workers)
         except Exception as exc:
+            elapsed = perf_counter() - started_at
+
+            def show_error(err: str = str(exc)) -> None:
+                self._set_wallet_generator_busy(False)
+                self.log(f"钱包生成器创建失败：数量={count}，执行线程数={workers}，耗时={elapsed:.3f}s")
+                messagebox.showerror("创建失败", err, parent=getattr(self, "wallet_generator_window", None) or self.root)
+
             self._dispatch_ui(
-                lambda err=str(exc): (
-                    self._set_wallet_generator_busy(False),
-                    messagebox.showerror("创建失败", err, parent=getattr(self, "wallet_generator_window", None) or self.root),
-                )
+                show_error
             )
             return
+        elapsed = perf_counter() - started_at
 
         def apply_result() -> None:
             self.generated_wallets = wallets
             self._refresh_generated_wallet_tree()
             self._set_wallet_generator_busy(False)
-            self.log(f"钱包生成器创建完成：新增 {len(wallets)} 个 EVM 钱包，执行线程数={workers}")
+            self.log(
+                f"钱包生成器创建完成：新增 {len(wallets)} 个 EVM 钱包，"
+                f"执行线程数={workers}，生成耗时={elapsed:.3f}s"
+            )
 
         self._dispatch_ui(apply_result)
     def copy_generated_wallets(self):

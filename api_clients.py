@@ -36,6 +36,7 @@ class SubmittedTransaction:
 
 
 class EvmClient:
+    MAX_WALLET_CREATE_COUNT = 9999
     _DEPENDENCY_LOCK = threading.Lock()
     _DEPENDENCY_MODULE_CACHE: dict[str, object] = {}
     _ONCHAIN_DEPENDENCY_MODULES = {
@@ -399,8 +400,8 @@ class EvmClient:
             raise RuntimeError("创建数量格式错误") from exc
         if total <= 0:
             raise RuntimeError("创建数量必须大于 0")
-        if total > 2000:
-            raise RuntimeError("单次最多创建 2000 个钱包")
+        if total > self.MAX_WALLET_CREATE_COUNT:
+            raise RuntimeError(f"单次最多创建 {self.MAX_WALLET_CREATE_COUNT} 个钱包")
         try:
             workers = max(1, int(worker_threads))
         except Exception as exc:
@@ -472,12 +473,6 @@ class EvmClient:
         if text.startswith("0x") or text.startswith("0X"):
             return int(text, 16)
         return int(text)
-
-    @staticmethod
-    def _hex_quantity(value: int) -> str:
-        if value < 0:
-            raise RuntimeError("数值不能为负数")
-        return hex(int(value))
 
     @staticmethod
     def _strip_0x(value: str) -> str:
@@ -681,10 +676,6 @@ class EvmClient:
             )
         except Exception as exc:
             raise RuntimeError(f"{error_prefix}结果解析失败：{exc}") from exc
-
-    def _sign_transaction_hex(self, tx: dict, private_key: str, error_prefix: str) -> str:
-        prepared = self._sign_transaction(tx, private_key, error_prefix)
-        return prepared.raw_transaction
 
     def get_transaction_by_hash(self, network: str, tx_hash: str) -> dict | None:
         txid = self._ensure_hex_prefixed(str(tx_hash or "").strip())

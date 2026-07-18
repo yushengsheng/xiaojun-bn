@@ -90,9 +90,6 @@ class ExchangeAppConfigMixin(object):
             return dict(getattr(self, "_exchange_proxy_state", {}) or {})
         with lock:
             return dict(getattr(self, "_exchange_proxy_state", {}) or {})
-    def _get_exchange_proxy(self) -> str:
-        state = self._exchange_proxy_state_snapshot()
-        return self._normalize_exchange_proxy(state.get("raw_proxy") or "")
     def _exchange_proxy_config_payload(self, state: dict[str, object] | None = None) -> dict[str, object]:
         snapshot = dict(state or self._exchange_proxy_state_snapshot())
         use_proxy = bool(snapshot.get("use_config_proxy"))
@@ -108,9 +105,6 @@ class ExchangeAppConfigMixin(object):
             "exchange_proxy_enc": self._encrypt_optional_text(proxy_text),
             "use_exchange_config_proxy": use_proxy,
         }
-    def _use_exchange_config_proxy(self) -> bool:
-        state = self._exchange_proxy_state_snapshot()
-        return bool(state.get("use_config_proxy"))
     def _get_exchange_proxy_url(self, *, proxy_text: str | None = None, use_config_proxy: bool | None = None) -> str:
         if proxy_text is None or use_config_proxy is None:
             state = self._exchange_proxy_state_snapshot()
@@ -133,9 +127,6 @@ class ExchangeAppConfigMixin(object):
         if page is None:
             return None
         return page
-    def _get_onchain_proxy(self) -> str:
-        state = self._get_onchain_proxy_state()
-        return self._normalize_proxy_text(state.get("raw_proxy") or "")
     def _get_onchain_proxy_state(self) -> dict[str, object]:
         page = self._get_onchain_proxy_page()
         if page is None:
@@ -156,9 +147,6 @@ class ExchangeAppConfigMixin(object):
             "use_config_proxy": bool(use_var.get()) if use_var is not None else False,
             "raw_proxy": str(raw.get() or "") if raw is not None else "",
         }
-    def _use_onchain_config_proxy(self) -> bool:
-        state = self._get_onchain_proxy_state()
-        return bool(state.get("use_config_proxy"))
     def _get_onchain_proxy_url(self, *, proxy_text: str | None = None, use_config_proxy: bool | None = None) -> str:
         if proxy_text is None or use_config_proxy is None:
             state = self._get_onchain_proxy_state()

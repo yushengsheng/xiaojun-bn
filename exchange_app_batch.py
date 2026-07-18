@@ -917,18 +917,6 @@ class ExchangeAppBatchMixin(object):
             text = text.rstrip("0").rstrip(".")
         return text if text else "0"
     @classmethod
-    def _format_spot_balances_text(cls, balances: list[dict]) -> str:
-        if not balances:
-            return "--"
-        parts = []
-        for item in balances:
-            asset = str(item.get("asset") or "").strip().upper()
-            total = float(item.get("total", 0) or 0)
-            if not asset or total <= 0:
-                continue
-            parts.append(f"{asset} {cls._format_amount(total)}")
-        return " | ".join(parts) if parts else "--"
-    @classmethod
     def _query_account_asset_balances_text(cls, client, *, fast: bool = True) -> str:
         asset_breakdown = client.query_asset_balances_breakdown(fast=fast)
         return cls._format_asset_breakdown_text(asset_breakdown)
@@ -1246,10 +1234,6 @@ class ExchangeAppBatchMixin(object):
         var = getattr(self, "exchange_batch_summary_var", None)
         if var is not None:
             var.set(str(text or ""))
-    def _refresh_batch_summary_text(self) -> None:
-        with self._batch_summary_lock:
-            text = self._build_batch_summary_text(self._current_batch_summary)
-        self._dispatch_ui(lambda t=text: self._set_batch_summary_text(t))
     def _record_batch_withdraw_metric(self, acc: dict, amount, asset: str) -> None:
         summary_text = ""
         with self._batch_summary_lock:
@@ -2331,6 +2315,19 @@ class ExchangeAppBatchMixin(object):
                             finish_current_now("已停止")
                             continue
 
+                        set_status("小额兑换为BNB...")
+                        try:
+                            convert_result = client.convert_spot_dust_to_bnb()
+                            logger.info(f"账号 #{idx} 小额兑换完成，数量: {len(convert_result)}")
+                        except Exception as e:
+                            logger.warning(f"账号 #{idx} 小额兑换失败: {e}")
+
+                        if combined_stop.is_set():
+                            finish_current_now("已停止")
+                            continue
+
+                        time.sleep(1)
+
                         earn_assets: list[str] = []
                         earn_balance_assets: list[str] = []
                         try:
@@ -2386,19 +2383,6 @@ class ExchangeAppBatchMixin(object):
                                 logger.info("账号 #%d 无需再用 USDT 补换 BNB", idx)
                         except Exception as e:
                             logger.warning(f"账号 #{idx} 用 USDT 补换 BNB 失败: {e}")
-
-                        time.sleep(1)
-
-                        set_status("小额兑换为BNB...")
-                        try:
-                            convert_result = client.convert_spot_dust_to_bnb()
-                            logger.info(f"账号 #{idx} 小额兑换完成，数量: {len(convert_result)}")
-                        except Exception as e:
-                            logger.warning(f"账号 #{idx} 小额兑换失败: {e}")
-
-                        if combined_stop.is_set():
-                            finish_current_now("已停止")
-                            continue
 
                         time.sleep(1)
 

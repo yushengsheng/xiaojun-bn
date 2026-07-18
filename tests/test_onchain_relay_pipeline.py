@@ -9,15 +9,16 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from core_models import EvmToken, WithdrawRuntimeParams
+from core_models import EvmToken, GeneratedWalletEntry, WithdrawRuntimeParams
 from onchain_relay_runner import (
     _RelayBatchItem,
     _receipt_state,
     _relay_confirm_auto_sweep,
     _relay_manual_account_copy_lines,
     _relay_native_main_recovery_status_text,
+    _pick_or_create_relay_records,
     _relay_prepare_items,
     _relay_native_dust_below_threshold,
     _relay_submit_auto_sweep,
@@ -293,6 +294,49 @@ def _item(index: int) -> _RelayBatchItem:
 
 
 class OnchainRelayPipelineTests(unittest.TestCase):
+    def test_relay_wallet_preparation_uses_shared_wallet_generator(self) -> None:
+        owner = Mock()
+        owner._is_mode_m1.return_value = False
+        owner._mode.return_value = "1M"
+        owner._decimal_to_text.side_effect = lambda value: str(value)
+        wallets = [
+            GeneratedWalletEntry(address="0x" + "1" * 40, private_key="a" * 64),
+            GeneratedWalletEntry(address="0x" + "2" * 40, private_key="b" * 64),
+        ]
+        owner.client.create_wallets.return_value = wallets
+        owner.relay_wallet_store.build_record.side_effect = lambda **kwargs: kwargs["relay_wallet"]
+        jobs = [
+            ("row-1", "source-1", "0x" + "3" * 40),
+            ("row-2", "source-2", "0x" + "4" * 40),
+        ]
+        source_wallets = {
+            "row-1": ("private-1", "0x" + "5" * 40),
+            "row-2": ("private-2", "0x" + "6" * 40),
+        }
+        params = WithdrawRuntimeParams(
+            coin="BNB",
+            amount="0.01",
+            network="BSC",
+            delay=0,
+            threads=64,
+            relay_enabled=True,
+            relay_fee_reserve=Decimal("0.001"),
+        )
+
+        records, resumed_count, batch_id = _pick_or_create_relay_records(
+            owner,
+            jobs,
+            params,
+            source_wallets,
+            {},
+        )
+
+        owner.client.create_wallets.assert_called_once_with(2, worker_threads=2)
+        owner.relay_wallet_store.append_records.assert_called_once_with(wallets)
+        self.assertEqual(records, {"row-1": wallets[0], "row-2": wallets[1]})
+        self.assertEqual(resumed_count, 0)
+        self.assertTrue(batch_id.startswith("relay-"))
+
     def setUp(self) -> None:
         _RECORDS.clear()
 

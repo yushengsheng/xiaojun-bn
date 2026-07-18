@@ -93,16 +93,6 @@ def _relay_native_main_recovery_status_text(owner, params: WithdrawRuntimeParams
         return f"回收{amount} {symbol}".strip()
 
 
-def _relay_record_transfer_status_text(record: RelayWalletRecord) -> str:
-    amount = str(getattr(record, "transfer_amount", "") or "").strip()
-    symbol = str(getattr(record, "token_symbol", "") or "").strip().lower()
-    if amount and symbol:
-        return f"✅{amount}{symbol}"
-    if amount:
-        return f"✅{amount}"
-    return "✅"
-
-
 def _relay_recovery_row_key(owner, record: RelayWalletRecord, *, fallback_index: int = 0) -> str:
     batch_id = str(getattr(record, "batch_id", "") or "").strip()
     network = str(getattr(record, "network", "") or "").strip().upper()
@@ -742,22 +732,6 @@ def _wait_for_native_balance_at_most(
             raise RuntimeError(f"{label}超时：等待原生币余额降至目标值以下超过 {timeout_value:g} 秒")
         if owner.stop_requested.wait(RELAY_POLL_INTERVAL_SECONDS):
             raise RuntimeError("任务已停止")
-
-
-def _infer_native_transfer_value_from_chain(owner, network: str, txid: str) -> int:
-    tx_hash = str(txid or "").strip()
-    if not tx_hash:
-        return 0
-    try:
-        tx = owner.client.get_transaction_by_hash(network, tx_hash)
-    except Exception:
-        tx = None
-    if not tx:
-        return 0
-    try:
-        return int(owner.client._int_from_hex(tx.get("value")))
-    except Exception:
-        return 0
 
 
 def _relay_many_to_one_source_keep_units(owner, params: WithdrawRuntimeParams, record: RelayWalletRecord) -> int:

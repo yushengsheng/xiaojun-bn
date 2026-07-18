@@ -1159,9 +1159,6 @@ class OnchainTransferPageBase:
     @staticmethod
     def _many_to_one_key(source: str) -> str:
         return f"m1:{source}"
-    @staticmethod
-    def _token_identity(token: EvmToken) -> tuple[str, str]:
-        return token.symbol.strip().upper(), token.contract.strip().lower()
     def _token_display(self, token: EvmToken) -> str:
         if token.is_native:
             return f"{token.symbol}(原生)"
@@ -1178,9 +1175,6 @@ class OnchainTransferPageBase:
             return "-"
         symbol = self.symbol_var.get().strip() or "-"
         return f"{symbol}:{self._decimal_to_text(v)}"
-    def _source_addr_text(self, source: str) -> str:
-        addr = self.source_address_cache.get(source, "")
-        return addr if addr else "-"
     def _onchain_source_address_for_search(self, source: str) -> str:
         source_key = str(source or "").strip()
         if not source_key:
@@ -1730,10 +1724,6 @@ class OnchainTransferPageBase:
         return self.row_status
     def _begin_progress(self, kind: str, row_keys: list[str]):
         task_progress.begin(self, kind, row_keys, amount_label="转账总额")
-    def _progress_counts(self, kind: str, row_keys: list[str]) -> tuple[int, int, int, int, int]:
-        return task_progress.progress_counts(self, kind, row_keys)
-    def _refresh_progress_display(self):
-        task_progress.refresh_display(self)
     def _refresh_progress_if_active(self, kind: str, row_key: str):
         task_progress.refresh_if_active(self, kind, row_key)
     def _dispatch_ui(self, callback) -> None:
