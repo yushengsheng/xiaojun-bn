@@ -411,7 +411,14 @@ class EvmClient:
         with ThreadPoolExecutor(max_workers=min(workers, total)) as executor:
             return list(executor.map(lambda _idx: self.create_wallet(), range(total)))
 
-    def _rpc_call(self, network: str, method: str, params: list) -> object:
+    def _rpc_call(
+        self,
+        network: str,
+        method: str,
+        params: list,
+        *,
+        require_positive_hex_result: bool = False,
+    ) -> object:
         info = self._network_info(network)
         max_attempts = 2
         payload = {
@@ -448,8 +455,11 @@ class EvmClient:
                         code = err.get("code")
                         msg = err.get("message")
                         raise RuntimeError(f"RPC({url}) code={code} msg={msg}")
+                    result = j.get("result")
+                    if require_positive_hex_result and self._int_from_hex(result) <= 0:
+                        raise RuntimeError(f"RPC({url}) {method} 返回无效结果：{result}")
                     self._remember_preferred_rpc_url(network, url)
-                    return j.get("result")
+                    return result
                 except Exception as exc:
                     err_text = str(exc)
                     if session is not None and isinstance(exc, requests.exceptions.RequestException):
@@ -589,6 +599,12 @@ class EvmClient:
         result = self._rpc_call(network, "eth_getTransactionCount", [address, "pending"])
         return self._int_from_hex(result)
 
+    def get_confirmed_nonce(self, network: str, address: str) -> int:
+        if not self.is_address(address):
+            raise RuntimeError(f"地址格式错误：{address}")
+        result = self._rpc_call(network, "eth_getTransactionCount", [address, "latest"])
+        return self._int_from_hex(result)
+
     def get_transaction_receipt(self, network: str, tx_hash: str) -> dict | None:
         txid = self._ensure_hex_prefixed(str(tx_hash or "").strip())
         if not re.fullmatch(r"0x[a-fA-F0-9]{64}", txid):
@@ -601,7 +617,12 @@ class EvmClient:
         return dict(result)
 
     def get_gas_price_wei(self, network: str) -> int:
-        result = self._rpc_call(network, "eth_gasPrice", [])
+        result = self._rpc_call(
+            network,
+            "eth_gasPrice",
+            [],
+            require_positive_hex_result=True,
+        )
         val = self._int_from_hex(result)
         if val <= 0:
             raise RuntimeError("读取 gasPrice 失败")

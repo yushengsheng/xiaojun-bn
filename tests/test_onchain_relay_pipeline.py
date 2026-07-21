@@ -16,8 +16,10 @@ from onchain_relay_runner import (
     _RelayBatchItem,
     _receipt_state,
     _relay_confirm_auto_sweep,
+    _relay_clear_missing_source_txids,
     _relay_manual_account_copy_lines,
     _relay_native_main_recovery_status_text,
+    _relay_preflight_1m_native_source,
     _pick_or_create_relay_records,
     _relay_prepare_items,
     _relay_native_dust_below_threshold,
@@ -51,6 +53,9 @@ class _FakeClient:
         return str(value or "")
 
     def get_nonce(self, _network: str, address: str) -> int:
+        return self.nonce_by_addr.setdefault(address, 0)
+
+    def get_confirmed_nonce(self, _network: str, address: str) -> int:
         return self.nonce_by_addr.setdefault(address, 0)
 
     def get_transaction_receipt(self, _network: str, _txid: str) -> dict | None:
@@ -720,6 +725,145 @@ class OnchainRelayPipelineTests(unittest.TestCase):
 
         self.assertEqual(text, "回收0.000123 BNB")
         self.assertNotEqual(text, "随主流程完成")
+
+    def test_1m_native_preflight_rejects_insufficient_batch_balance(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        owner.client.gas_price_wei = 2
+        items = [_item(1), _item(2)]
+        for item in items:
+            item.value_units = 100
+            item.reserve_units = 10
+        required = 2 * (100 + 10 + 2 * owner.client.NATIVE_GAS_LIMIT)
+        owner.client.native_balance_wei = required - 1
+
+        with self.assertRaisesRegex(RuntimeError, "一对多中转整批余额不足"):
+            _relay_preflight_1m_native_source(
+                owner,
+                _params(coin="BNB", token_is_native=True),
+                items,
+                tx_attr="token_funded_txid",
+                done_statuses={"token_funded"},
+            )
+
+        self.assertEqual(owner.client.submitted_native_transfers, [])
+
+    def test_1m_native_retry_clears_missing_txid_and_keeps_nonce(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        item = _item(1)
+        missing_txid = "0x" + "b" * 64
+        item.relay_record = owner.relay_wallet_store.update_record(
+            item.relay_addr,
+            batch_id="batch",
+            status="failed",
+            token_funded_txid=missing_txid,
+            token_funded_nonce="7",
+        )
+        owner.client.receipts = [None]
+        owner.client.get_transaction_by_hash = lambda *_args, **_kwargs: None
+        owner.client.native_balance_wei = 0
+        owner.client.nonce_by_addr[item.source_addr] = 7
+
+        _relay_clear_missing_source_txids(
+            owner,
+            _params(coin="BNB", token_is_native=True),
+            [item],
+            tx_attr="token_funded_txid",
+            nonce_attr="token_funded_nonce",
+            done_status="token_funded",
+            done_statuses={"token_funded"},
+        )
+
+        self.assertEqual(item.relay_record.token_funded_txid, "")
+        self.assertEqual(item.relay_record.token_funded_nonce, "7")
+        self.assertTrue(any("保留 nonce=7 重新广播" in message for message in owner.logs))
+
+    def test_1m_native_retry_uses_new_nonce_when_old_nonce_is_confirmed(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        item = _item(1)
+        missing_txid = "0x" + "d" * 64
+        item.relay_record = owner.relay_wallet_store.update_record(
+            item.relay_addr,
+            batch_id="batch",
+            status="failed",
+            token_funded_txid=missing_txid,
+            token_funded_nonce="7",
+        )
+        owner.client.receipts = [None]
+        owner.client.get_transaction_by_hash = lambda *_args, **_kwargs: None
+        owner.client.native_balance_wei = 0
+        owner.client.nonce_by_addr[item.source_addr] = 8
+
+        _relay_clear_missing_source_txids(
+            owner,
+            _params(coin="BNB", token_is_native=True),
+            [item],
+            tx_attr="token_funded_txid",
+            nonce_attr="token_funded_nonce",
+            done_status="token_funded",
+            done_statuses={"token_funded"},
+        )
+
+        self.assertEqual(item.relay_record.token_funded_txid, "")
+        self.assertEqual(item.relay_record.token_funded_nonce, "")
+        self.assertTrue(any("改用当前 nonce 重新广播" in message for message in owner.logs))
+
+    def test_1m_native_retry_recovers_when_relay_is_already_funded(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        item = _item(1)
+        item.value_units = 100
+        item.reserve_units = 10
+        missing_txid = "0x" + "e" * 64
+        item.relay_record = owner.relay_wallet_store.update_record(
+            item.relay_addr,
+            batch_id="batch",
+            status="failed",
+            token_funded_txid=missing_txid,
+            token_funded_nonce="7",
+        )
+        owner.client.receipts = [None]
+        owner.client.get_transaction_by_hash = lambda *_args, **_kwargs: None
+        owner.client.native_balance_wei = 110
+
+        _relay_clear_missing_source_txids(
+            owner,
+            _params(coin="BNB", token_is_native=True),
+            [item],
+            tx_attr="token_funded_txid",
+            nonce_attr="token_funded_nonce",
+            done_status="token_funded",
+            done_statuses={"token_funded"},
+        )
+
+        self.assertEqual(item.relay_record.status, "token_funded")
+        self.assertEqual(item.relay_record.token_funded_txid, missing_txid)
+        self.assertTrue(any("中转钱包已足额到账" in message for message in owner.logs))
+
+    def test_1m_native_retry_keeps_txid_when_transaction_still_exists(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        item = _item(1)
+        pending_txid = "0x" + "c" * 64
+        item.relay_record = owner.relay_wallet_store.update_record(
+            item.relay_addr,
+            batch_id="batch",
+            status="failed",
+            token_funded_txid=pending_txid,
+            token_funded_nonce="7",
+        )
+        owner.client.receipts = [None]
+        owner.client.get_transaction_by_hash = lambda *_args, **_kwargs: {"hash": pending_txid}
+
+        _relay_clear_missing_source_txids(
+            owner,
+            _params(coin="BNB", token_is_native=True),
+            [item],
+            tx_attr="token_funded_txid",
+            nonce_attr="token_funded_nonce",
+            done_status="token_funded",
+            done_statuses={"token_funded"},
+        )
+
+        self.assertEqual(item.relay_record.token_funded_txid, pending_txid)
+        self.assertFalse(any("重新广播" in message for message in owner.logs))
 
     def test_source_stage_respects_nonce_window_and_delay(self) -> None:
         owner = _FakeOwner(mode_1m=False)

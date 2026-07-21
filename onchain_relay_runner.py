@@ -1267,8 +1267,8 @@ def _relay_resolve_source_token_transfer(owner, params: WithdrawRuntimeParams, i
 def _relay_resolve_1m_native_transfer(owner, params: WithdrawRuntimeParams, item: "_RelayBatchItem") -> None:
     if item.value_units <= 0:
         raise RuntimeError(f"{item.prefix} 转账数量必须大于 0")
-    gas_price = owner.client.get_gas_price_wei(params.network)
-    gas_limit = owner.client.NATIVE_GAS_LIMIT
+    gas_price = int(item.source_token_gas_price or owner.client.get_gas_price_wei(params.network))
+    gas_limit = int(item.source_token_gas_limit or owner.client.NATIVE_GAS_LIMIT)
     balance_units = owner.client.get_balance_wei(params.network, item.source_addr)
     total_send_units = item.value_units + item.reserve_units
     if balance_units < total_send_units + gas_price * gas_limit:
@@ -2701,6 +2701,97 @@ def _relay_dispatch_recovery_status(owner, item: _RelayBatchItem, status: str, s
     owner._dispatch_ui(lambda k=item.row_key, s=status, t=status_text: owner._set_recovery_status(k, s, t))
 
 
+def _relay_clear_missing_source_txids(
+    owner,
+    params: WithdrawRuntimeParams,
+    items: list[_RelayBatchItem],
+    *,
+    tx_attr: str,
+    nonce_attr: str,
+    done_status: str,
+    done_statuses: set[str],
+) -> None:
+    for item in items:
+        if item.failed or _relay_record_status(item) in done_statuses:
+            continue
+        txid = _relay_record_txid(item, tx_attr)
+        stored_nonce = _tx_nonce_value(_relay_record_txid(item, nonce_attr))
+        if not txid or stored_nonce is None:
+            continue
+        try:
+            if owner.client.get_transaction_receipt(params.network, txid) is not None:
+                continue
+            if owner.client.get_transaction_by_hash(params.network, txid) is not None:
+                continue
+            relay_balance = owner.client.get_balance_wei(params.network, item.relay_addr)
+            expected_units = item.value_units + item.reserve_units
+            if relay_balance >= expected_units:
+                _relay_update_item_record(owner, item, done_status, last_error="")
+                owner._dispatch_ui(
+                    lambda m=f"{item.prefix} 旧交易哈希不可查，但中转钱包已足额到账，按已确认继续": owner.log(m)
+                )
+                continue
+            confirmed_nonce = owner.client.get_confirmed_nonce(params.network, item.source_addr)
+        except Exception:
+            continue
+        nonce_changes = {nonce_attr: ""} if confirmed_nonce > stored_nonce else {}
+        _relay_update_item_record(
+            owner,
+            item,
+            _relay_record_status(item) or "created",
+            **{tx_attr: "", "last_error": "", **nonce_changes},
+        )
+        retry_text = (
+            "原 nonce 已被确认交易占用，改用当前 nonce 重新广播"
+            if nonce_changes
+            else f"保留 nonce={stored_nonce} 重新广播"
+        )
+        owner._dispatch_ui(
+            lambda m=f"{item.prefix} 旧交易未上链，{retry_text}：txid={txid}": owner.log(m)
+        )
+
+
+def _relay_preflight_1m_native_source(
+    owner,
+    params: WithdrawRuntimeParams,
+    items: list[_RelayBatchItem],
+    *,
+    tx_attr: str,
+    done_statuses: set[str],
+) -> None:
+    active_items = [
+        item
+        for item in items
+        if not item.failed
+        and _relay_record_status(item) not in done_statuses
+        and not _relay_record_txid(item, tx_attr)
+    ]
+    if not active_items:
+        return
+    gas_price = owner.client.get_gas_price_wei(params.network)
+    gas_limit = owner.client.NATIVE_GAS_LIMIT
+    grouped: dict[str, list[_RelayBatchItem]] = {}
+    for item in active_items:
+        if item.value_units <= 0:
+            raise RuntimeError(f"{item.prefix} 转账数量必须大于 0")
+        grouped.setdefault(item.source_addr.lower(), []).append(item)
+        item.source_token_gas_price = gas_price
+        item.source_token_gas_limit = gas_limit
+    for source_items in grouped.values():
+        source_addr = source_items[0].source_addr
+        required_units = sum(
+            item.value_units + item.reserve_units + gas_price * gas_limit
+            for item in source_items
+        )
+        balance_units = owner.client.get_balance_wei(params.network, source_addr)
+        if balance_units < required_units:
+            current_text = owner._gas_fee_amount_text(params.network, balance_units)
+            required_text = owner._gas_fee_amount_text(params.network, required_units)
+            raise RuntimeError(
+                f"一对多中转整批余额不足：当前 {current_text}，本批 {len(source_items)} 笔至少需要 {required_text}"
+            )
+
+
 def _relay_fail_item(owner, item: _RelayBatchItem, reason: object, *, log_prefix: str = "中转失败") -> None:
     if item.failed:
         return
@@ -3339,6 +3430,25 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                 status_text="原生币转入",
             )
         elif params.token_is_native:
+            native_done_statuses = {"token_funded", "forwarded", "completed", "completed_pending_sweep"}
+            if hasattr(owner, "_is_mode_1m") and owner._is_mode_1m():
+                _relay_clear_missing_source_txids(
+                    owner,
+                    params,
+                    items,
+                    tx_attr="token_funded_txid",
+                    nonce_attr="token_funded_nonce",
+                    done_status="token_funded",
+                    done_statuses=native_done_statuses,
+                )
+                _relay_preflight_1m_native_source(
+                    owner,
+                    params,
+                    items,
+                    tx_attr="token_funded_txid",
+                    done_statuses=native_done_statuses,
+                )
+
             def submit_1m_native_to_relay(item: _RelayBatchItem, nonce: int) -> str:
                 _relay_resolve_1m_native_transfer(owner, params, item)
                 total_units = item.value_units + item.reserve_units
@@ -3370,7 +3480,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
                 nonce_attr="token_funded_nonce",
                 submitted_status="token_funding_submitted",
                 done_status="token_funded",
-                done_statuses={"token_funded", "forwarded", "completed", "completed_pending_sweep"},
+                done_statuses=native_done_statuses,
                 submit_one=submit_1m_native_to_relay,
                 status_text="原生币转入",
             )
