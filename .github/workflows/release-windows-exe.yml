@@ -16,6 +16,9 @@ env:
   SING_BOX_TAG: v1.13.5
   SING_BOX_ASSET: sing-box-1.13.5-windows-amd64.zip
   SING_BOX_SHA256: 841a46ab1fef823fefd4248229db5220f09535c883b4cfc6d4fbe5903bc3f1d1
+  HYSTERIA_TAG: app/v2.9.2
+  HYSTERIA_ASSET: hysteria-windows-amd64.exe
+  HYSTERIA_SHA256: 103c7258384d0ebbf0d19ca4bec50d6cb9b0b7be33f5b76f004fed0a8805ff9f
 
 jobs:
   build-windows:
@@ -47,8 +50,10 @@ jobs:
           $proxyRoot = Join-Path $PWD "build-proxy"
           $xrayDir = Join-Path $proxyRoot "xray"
           $singBoxDir = Join-Path $proxyRoot "sing-box"
+          $hysteriaDir = Join-Path $proxyRoot "hysteria"
           New-Item -ItemType Directory -Path $xrayDir -Force | Out-Null
           New-Item -ItemType Directory -Path $singBoxDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $hysteriaDir -Force | Out-Null
 
           $xrayTag = "${{ env.XRAY_TAG }}"
           $xrayAsset = "${{ env.XRAY_ASSET }}"
@@ -66,6 +71,13 @@ jobs:
           Expand-Archive -Path (Join-Path $proxyRoot $singBoxAsset) -DestinationPath $singBoxDir -Force
           Remove-Item (Join-Path $proxyRoot $singBoxAsset) -Force
 
+          $hysteriaTag = "${{ env.HYSTERIA_TAG }}"
+          $hysteriaAsset = "${{ env.HYSTERIA_ASSET }}"
+          Write-Host "Using pinned Hysteria runtime: $hysteriaTag ($hysteriaAsset)"
+          gh release download $hysteriaTag --repo apernet/hysteria --pattern $hysteriaAsset --dir $proxyRoot
+          if ((Get-FileHash (Join-Path $proxyRoot $hysteriaAsset) -Algorithm SHA256).Hash.ToLower() -ne "${{ env.HYSTERIA_SHA256 }}".ToLower()) { throw "hysteria asset digest mismatch." }
+          Move-Item (Join-Path $proxyRoot $hysteriaAsset) (Join-Path $hysteriaDir "hysteria.exe") -Force
+
           $xrayExe = Get-ChildItem $xrayDir -Filter "xray.exe" -File -Recurse | Select-Object -First 1
           if (-not $xrayExe) {
             throw "xray.exe was not found after extraction."
@@ -73,6 +85,10 @@ jobs:
           $singBoxExe = Get-ChildItem $singBoxDir -Filter "sing-box.exe" -File -Recurse | Select-Object -First 1
           if (-not $singBoxExe) {
             throw "sing-box.exe was not found after extraction."
+          }
+          $hysteriaExe = Get-ChildItem $hysteriaDir -Filter "hysteria.exe" -File -Recurse | Select-Object -First 1
+          if (-not $hysteriaExe) {
+            throw "hysteria.exe was not found after download."
           }
 
       - name: Run source regression checks and locked dependency audit
@@ -86,8 +102,13 @@ jobs:
           if (-not $singBoxExe) {
             throw "sing-box.exe was not found before source regression."
           }
+          $hysteriaExe = Get-ChildItem "build-proxy/hysteria" -Filter "hysteria.exe" -File -Recurse | Select-Object -First 1
+          if (-not $hysteriaExe) {
+            throw "hysteria.exe was not found before source regression."
+          }
           $env:XRAY_PATH = $xrayExe.FullName
           $env:SING_BOX_PATH = $singBoxExe.FullName
+          $env:HYSTERIA_PATH = $hysteriaExe.FullName
           python tools/run_regression.py --skip-pip-check --skip-app-selftest
 
       - name: Prepare entry script
@@ -122,6 +143,10 @@ jobs:
               $dest = "$dest/$($relativeDir -replace '\\', '/')"
             }
             $commonArgs += @('--add-binary', "$($_.FullName);$dest")
+          }
+
+          Get-ChildItem "build-proxy/hysteria" -File -Recurse | ForEach-Object {
+            $commonArgs += @('--add-binary', "$($_.FullName);bin/hysteria")
           }
 
           pyinstaller --onefile --name $appName @commonArgs app_entry.py
@@ -176,7 +201,9 @@ jobs:
             "exchange_*_proxy_runtime_*.log",
             "onchain_*_proxy_runtime_*.log",
             "exchange_ss_proxy_*.json",
-            "onchain_ss_proxy_*.json"
+            "onchain_ss_proxy_*.json",
+            "exchange_hysteria2_proxy_*.json",
+            "onchain_hysteria2_proxy_*.json"
           )
           & robocopy "dist/$portableName" $portableStage /E /XD $excludeDirs /XF $excludeFiles /NFL /NDL /NJH /NJS /NC /NS /NP
           if ($LASTEXITCODE -ge 8) {

@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import time
+
 from exchange_app_base import (
     EXCHANGE_LOG_MAX_ROWS,
     http_get_via_proxy,
     ipaddress,
     log_queue,
-    messagebox,
     queue,
 )
 from sensitive_data import redact_sensitive_text
@@ -30,14 +31,22 @@ PROBLEM_LOG_KEYWORDS = (
 
 
 class ExchangeAppLogViewMixin(object):
-    def _fetch_public_ip(self, *, use_exchange_proxy: bool, allow_system_proxy: bool = True) -> str:
+    def _fetch_public_ip(
+        self,
+        *,
+        use_exchange_proxy: bool,
+        allow_system_proxy: bool = True,
+        state: dict[str, object] | None = None,
+    ) -> str:
         urls = [
             "https://api.ipify.org",
             "https://ifconfig.me/ip",
             "https://ipinfo.io/ip",
         ]
         headers = {"User-Agent": "Mozilla/5.0"}
-        proxies = self._requests_proxy_map() if use_exchange_proxy else None
+        proxies = self._requests_proxy_map_from_state(state) if use_exchange_proxy and state is not None else None
+        if use_exchange_proxy and state is None:
+            proxies = self._requests_proxy_map()
         for url in urls:
             try:
                 r = http_get_via_proxy(
@@ -55,7 +64,13 @@ class ExchangeAppLogViewMixin(object):
                 continue
         raise RuntimeError("网络不可达或 IP 服务异常")
     @staticmethod
-    def _test_exchange_target_connectivity(*, proxies: dict[str, str] | None, allow_system_proxy: bool) -> str:
+    def _test_exchange_target_connectivity(
+        *,
+        proxies: dict[str, str] | None,
+        allow_system_proxy: bool,
+        latency_out: list[int] | None = None,
+    ) -> str:
+        started = time.perf_counter()
         test_resp = http_get_via_proxy(
             "https://api.binance.com/api/v3/time",
             proxies=proxies or None,
@@ -68,12 +83,15 @@ class ExchangeAppLogViewMixin(object):
             server_time = int(data.get("serverTime"))
         except Exception as exc:
             raise RuntimeError(f"Binance 时间接口返回异常：{data}") from exc
+        if latency_out is not None:
+            latency_out.append(max(0, round((time.perf_counter() - started) * 1000)))
         return f"Binance /api/v3/time OK (serverTime={server_time})"
     def _test_exchange_proxy_once(
         self,
         *,
         include_exit_ip: bool = True,
         state: dict[str, object] | None = None,
+        latency_out: list[int] | None = None,
     ) -> tuple[str, str, str]:
         snapshot = dict(state or self._exchange_proxy_state_snapshot())
         proxies = self._requests_proxy_map_from_state(snapshot)
@@ -88,19 +106,33 @@ class ExchangeAppLogViewMixin(object):
         target = self._test_exchange_target_connectivity(
             proxies=proxies or None,
             allow_system_proxy=allow_system_proxy,
+            latency_out=latency_out,
         )
         if use_config_proxy and proxy_text:
             proxy_status = "SS代理已连接" if proxy_text.lower().startswith("ss://") else "代理已连接"
             if include_exit_ip:
-                proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=True, allow_system_proxy=False)
+                try:
+                    proxy_exit_ip = self._fetch_public_ip(
+                        use_exchange_proxy=True,
+                        allow_system_proxy=False,
+                        state=snapshot,
+                    )
+                except Exception:
+                    proxy_exit_ip = "获取失败"
         elif system_proxy:
             proxy_status = "系统代理已连接"
             if include_exit_ip:
-                proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=True)
+                try:
+                    proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=True)
+                except Exception:
+                    proxy_exit_ip = "获取失败"
         else:
             proxy_status = "直连可用"
             if include_exit_ip:
-                proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=False)
+                try:
+                    proxy_exit_ip = self._fetch_public_ip(use_exchange_proxy=False, allow_system_proxy=False)
+                except Exception:
+                    proxy_exit_ip = "获取失败"
         return proxy_status, proxy_exit_ip, target
     def _resolve_exchange_ip_refresh_state(self, snapshot: dict[str, object] | None = None) -> tuple[str, str, str]:
         current = dict(snapshot or self._exchange_proxy_state_snapshot())
@@ -136,20 +168,33 @@ class ExchangeAppLogViewMixin(object):
         proxy_exit_ip = ip_text
         return ip_text, proxy_status, proxy_exit_ip
     def test_exchange_proxy(self):
+        if self._exchange_proxy_test_inflight:
+            return
+        self._exchange_proxy_test_inflight = True
+        self.exchange_proxy_latency_var.set("测试中…")
         snapshot = self._exchange_proxy_state_snapshot()
 
         def worker():
             test_ok = False
             save_err = ""
+            latency_ms = None
             try:
                 if not bool(snapshot.get("use_config_proxy")):
                     self._system_proxy_map(refresh=True, include_local_probe=True)
                 route_text = self._exchange_proxy_route_text_from_state(snapshot)
-                status, exit_ip, target = self._test_exchange_proxy_once(state=snapshot)
-                try:
-                    self._save_exchange_proxy_config_only(state=snapshot)
-                except Exception as e:
-                    save_err = str(e)
+                latency_values: list[int] = []
+                status, exit_ip, target = self._test_exchange_proxy_once(
+                    state=snapshot,
+                    latency_out=latency_values,
+                )
+                latency_ms = latency_values[0]
+                if self._exchange_proxy_state_snapshot() == snapshot:
+                    try:
+                        self._save_exchange_proxy_config_only(state=snapshot)
+                    except Exception as e:
+                        save_err = str(e)
+                else:
+                    save_err = "测试期间代理配置已变化，未保存旧配置"
                 test_ok = True
                 log_text = f"交易所代理测试成功：status={status}，exit_ip={exit_ip}，target={target}，route={route_text}"
                 if save_err:
@@ -169,15 +214,13 @@ class ExchangeAppLogViewMixin(object):
                 log_text = f"交易所代理测试失败：{e}，route={route_text}"
 
             def _update():
-                self.exchange_proxy_status_var.set(status)
-                self.exchange_proxy_exit_ip_var.set(exit_ip)
+                self._exchange_proxy_test_inflight = False
+                is_current = self._exchange_proxy_state_snapshot() == snapshot
+                if is_current:
+                    self.exchange_proxy_status_var.set(status)
+                    self.exchange_proxy_exit_ip_var.set(exit_ip)
+                    self.exchange_proxy_latency_var.set(f"延迟 {latency_ms} ms" if test_ok else "失败")
                 self._append_log(log_text, problem=(not test_ok) or bool(save_err))
-                if not test_ok:
-                    messagebox.showerror("代理测试失败", log_text)
-                elif save_err:
-                    messagebox.showwarning("代理测试成功", log_text)
-                else:
-                    messagebox.showinfo("代理测试成功", log_text)
 
             self._dispatch_ui(_update)
 

@@ -40,6 +40,8 @@ RUNTIME_FILE_PATTERNS = (
     "onchain_*_proxy_runtime_*.log",
     "exchange_ss_proxy_*.json",
     "onchain_ss_proxy_*.json",
+    "exchange_hysteria2_proxy_*.json",
+    "onchain_hysteria2_proxy_*.json",
 )
 
 

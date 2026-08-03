@@ -192,6 +192,7 @@ class ExchangeAppBase(tk.Tk):
         self._update_ip_after_token = None
         self._ip_refresh_inflight = False
         self._ip_refresh_lock = threading.Lock()
+        self._exchange_proxy_test_inflight = False
         self._result_file_lock = threading.Lock()
         self._managed_threads_lock = threading.Lock()
         self._managed_threads: set[threading.Thread] = set()
@@ -355,6 +356,7 @@ class ExchangeAppBase(tk.Tk):
         self.api_secret_var = tk.StringVar(value=API_SECRET_DEFAULT)
         self.exchange_proxy_var = tk.StringVar(value=EXCHANGE_PROXY_DEFAULT)
         self.use_exchange_config_proxy_var = tk.BooleanVar(value=EXCHANGE_USE_CONFIG_PROXY_DEFAULT)
+        self.exchange_proxy_latency_var = tk.StringVar(value="延迟 --")
         self.exchange_proxy_var.trace_add("write", self._on_exchange_proxy_config_changed)
         self.use_exchange_config_proxy_var.trace_add("write", self._on_exchange_proxy_config_changed)
         self.trade_account_type_var = tk.StringVar(value=TRADE_ACCOUNT_TYPE_DEFAULT)
@@ -393,7 +395,6 @@ class ExchangeAppBase(tk.Tk):
         self.exchange_proxy_status_var = tk.StringVar(value="未启用")
         self.exchange_proxy_exit_ip_var = tk.StringVar(value="--")
         self.top_proxy_name_var = tk.StringVar(value="交易所代理:")
-        self.top_proxy_test_btn_text_var = tk.StringVar(value="测试交易所代理")
         self._current_main_page = "exchange"
 
         self.main_tabs = None
@@ -437,7 +438,7 @@ class ExchangeAppBase(tk.Tk):
         self.lbl_top_proxy_name.grid(row=0, column=2, sticky="e")
         self.ent_top_proxy = ttk.Entry(proxy_bar, textvariable=self.exchange_proxy_var, width=24)
         self.ent_top_proxy.grid(row=0, column=3, sticky="w", padx=(4, 6))
-        self.btn_top_proxy_test = ttk.Button(proxy_bar, textvariable=self.top_proxy_test_btn_text_var, command=self.test_exchange_proxy)
+        self.btn_top_proxy_test = ttk.Button(proxy_bar, textvariable=self.exchange_proxy_latency_var, command=self.test_exchange_proxy)
         self.btn_top_proxy_test.grid(row=0, column=4, sticky="w", padx=(0, 12))
         ttk.Label(proxy_bar, text="状态:").grid(row=0, column=5, sticky="e")
         self.lbl_top_proxy_status = ttk.Label(proxy_bar, textvariable=self.exchange_proxy_status_var)
@@ -741,16 +742,22 @@ class ExchangeAppBase(tk.Tk):
         page = self._current_main_page
         if page == "onchain" and getattr(self, "onchain_page", None) is not None:
             self.top_proxy_name_var.set("链上RPC代理:")
-            self.top_proxy_test_btn_text_var.set("测试链上代理")
             self.ent_top_proxy.configure(textvariable=self.onchain_page.onchain_proxy_var)
-            self.btn_top_proxy_test.configure(command=self.onchain_page.test_onchain_proxy, state="normal")
+            self.btn_top_proxy_test.configure(
+                textvariable=self.onchain_page.onchain_proxy_latency_var,
+                command=self.onchain_page.test_onchain_proxy,
+                state="normal",
+            )
             self.lbl_top_proxy_status.configure(textvariable=self.onchain_page.onchain_proxy_status_var)
             self.lbl_top_proxy_exit_ip.configure(textvariable=self.onchain_page.onchain_proxy_exit_ip_var)
             return
         self.top_proxy_name_var.set("交易所代理:")
-        self.top_proxy_test_btn_text_var.set("测试交易所代理")
         self.ent_top_proxy.configure(textvariable=self.exchange_proxy_var)
-        self.btn_top_proxy_test.configure(command=self.test_exchange_proxy, state="normal")
+        self.btn_top_proxy_test.configure(
+            textvariable=self.exchange_proxy_latency_var,
+            command=self.test_exchange_proxy,
+            state="normal",
+        )
         self.lbl_top_proxy_status.configure(textvariable=self.exchange_proxy_status_var)
         self.lbl_top_proxy_exit_ip.configure(textvariable=self.exchange_proxy_exit_ip_var)
     def _show_onchain_loading_hint(self) -> None:

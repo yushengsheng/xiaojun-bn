@@ -21,6 +21,9 @@ jobs:
       SING_BOX_TAG: v1.13.5
       SING_BOX_ASSET: sing-box-1.13.5-windows-amd64.zip
       SING_BOX_SHA256: 841a46ab1fef823fefd4248229db5220f09535c883b4cfc6d4fbe5903bc3f1d1
+      HYSTERIA_TAG: app/v2.9.2
+      HYSTERIA_ASSET: hysteria-windows-amd64.exe
+      HYSTERIA_SHA256: 103c7258384d0ebbf0d19ca4bec50d6cb9b0b7be33f5b76f004fed0a8805ff9f
 
     steps:
       - name: Checkout
@@ -48,8 +51,10 @@ jobs:
           $proxyRoot = Join-Path $PWD "build-proxy"
           $xrayDir = Join-Path $proxyRoot "xray"
           $singBoxDir = Join-Path $proxyRoot "sing-box"
+          $hysteriaDir = Join-Path $proxyRoot "hysteria"
           New-Item -ItemType Directory -Path $xrayDir -Force | Out-Null
           New-Item -ItemType Directory -Path $singBoxDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $hysteriaDir -Force | Out-Null
 
           gh release download "${{ env.XRAY_TAG }}" --repo XTLS/Xray-core --pattern "${{ env.XRAY_ASSET }}" --dir $proxyRoot
           if ((Get-FileHash (Join-Path $proxyRoot "${{ env.XRAY_ASSET }}") -Algorithm SHA256).Hash.ToLower() -ne "${{ env.XRAY_SHA256 }}".ToLower()) { throw "xray asset digest mismatch." }
@@ -61,11 +66,18 @@ jobs:
           Expand-Archive -Path (Join-Path $proxyRoot "${{ env.SING_BOX_ASSET }}") -DestinationPath $singBoxDir -Force
           Remove-Item (Join-Path $proxyRoot "${{ env.SING_BOX_ASSET }}") -Force
 
+          gh release download "${{ env.HYSTERIA_TAG }}" --repo apernet/hysteria --pattern "${{ env.HYSTERIA_ASSET }}" --dir $proxyRoot
+          if ((Get-FileHash (Join-Path $proxyRoot "${{ env.HYSTERIA_ASSET }}") -Algorithm SHA256).Hash.ToLower() -ne "${{ env.HYSTERIA_SHA256 }}".ToLower()) { throw "hysteria asset digest mismatch." }
+          Move-Item (Join-Path $proxyRoot "${{ env.HYSTERIA_ASSET }}") (Join-Path $hysteriaDir "hysteria.exe") -Force
+
           if (-not (Get-ChildItem $xrayDir -Filter "xray.exe" -File -Recurse | Select-Object -First 1)) {
             throw "xray.exe was not found after extraction."
           }
           if (-not (Get-ChildItem $singBoxDir -Filter "sing-box.exe" -File -Recurse | Select-Object -First 1)) {
             throw "sing-box.exe was not found after extraction."
+          }
+          if (-not (Get-ChildItem $hysteriaDir -Filter "hysteria.exe" -File -Recurse | Select-Object -First 1)) {
+            throw "hysteria.exe was not found after download."
           }
 
       - name: Run regression checks and locked dependency audit
@@ -79,8 +91,13 @@ jobs:
           if (-not $singBoxExe) {
             throw "sing-box.exe was not found before regression."
           }
+          $hysteriaExe = Get-ChildItem "build-proxy/hysteria" -Filter "hysteria.exe" -File -Recurse | Select-Object -First 1
+          if (-not $hysteriaExe) {
+            throw "hysteria.exe was not found before regression."
+          }
           $env:XRAY_PATH = $xrayExe.FullName
           $env:SING_BOX_PATH = $singBoxExe.FullName
+          $env:HYSTERIA_PATH = $hysteriaExe.FullName
           $env:PYTHONUTF8 = "1"
           python tools\run_regression.py --gui --strict-pip-check
 

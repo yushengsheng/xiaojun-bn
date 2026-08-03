@@ -80,6 +80,7 @@ def exchange_account_artifact_paths(
     for pattern in (
         "exchange_ss_proxy_*.json",
         "exchange_ss_proxy_xray_*.json",
+        "exchange_hysteria2_proxy_*.json",
         "exchange_proxy_runtime_*.log",
     ):
         paths.update(runtime_root.glob(pattern))

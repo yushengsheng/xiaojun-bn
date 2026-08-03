@@ -19,7 +19,7 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
 
@@ -63,6 +63,17 @@ class ExchangeProxyRuntime:
         "sing-box-1.13.5-windows-386.zip": "c1644083fc9439b442a063534cd0fc7a1243cce6e9aff2f83b4585342ade01b9",
         "sing-box-1.13.5-windows-amd64.zip": "841a46ab1fef823fefd4248229db5220f09535c883b4cfc6d4fbe5903bc3f1d1",
         "sing-box-1.13.5-windows-arm64.zip": "b9c7eda0ce0f511cf8433181319f983a864f2316c4c1c3a949f5abe447316d71",
+    }
+    _HYSTERIA_TAG = "app/v2.9.2"
+    _HYSTERIA_ASSET_SHA256 = {
+        "hysteria-darwin-amd64": "226363d1ad1f44c978f4ee052e45196589fc6eefa21c9646b3c27ef89122d172",
+        "hysteria-darwin-arm64": "a08b087f4a7544d07e6dd94280bc1baa23f6ab67d314e4578aa717209917b3eb",
+        "hysteria-linux-386": "cc6f15d81185bd009625d98bcee16bb3be058f23b050e467056c26b3a053194c",
+        "hysteria-linux-amd64": "86fef8e2f1b2bf41318ac96724eee6c3b449e4e510022cc89658b63a6713922a",
+        "hysteria-linux-arm64": "9ec8f49f4ea554b1cac04e6f3690cea76ff835082e943e54196d7f323fcfba71",
+        "hysteria-windows-386.exe": "586bb34ef13aeef36bde97229c9e3d0d5a2a09c96fb9cd25cf4d4ea186d77581",
+        "hysteria-windows-amd64.exe": "103c7258384d0ebbf0d19ca4bec50d6cb9b0b7be33f5b76f004fed0a8805ff9f",
+        "hysteria-windows-arm64.exe": "668d8d36650df0bd0c26b606ed6cf45e9dfb22e63b276e72e3d33fc345c9635d",
     }
     _RUNTIME_MANIFEST_VERSION = 1
 
@@ -127,6 +138,29 @@ class ExchangeProxyRuntime:
             "password": password,
             "network": network,
         }
+
+    @staticmethod
+    def is_hysteria2_uri(value: object) -> bool:
+        return urlsplit(str(value or "").strip()).scheme.lower() in {"hy2", "hysteria2"}
+
+    @classmethod
+    def validate_hysteria2_uri(cls, value: object) -> str:
+        text = str(value or "").strip()
+        parsed = urlsplit(text)
+        if parsed.scheme.lower() not in {"hy2", "hysteria2"}:
+            raise RuntimeError("不是有效的 Hysteria2 链接")
+        if not parsed.hostname:
+            raise RuntimeError("Hysteria2 链接解析失败：缺少服务器地址")
+        userinfo = parsed.netloc.rsplit("@", 1)[0] if "@" in parsed.netloc else ""
+        if not unquote(userinfo).strip():
+            raise RuntimeError("Hysteria2 链接解析失败：缺少认证信息")
+        query = {str(key or "").lower(): values for key, values in parse_qs(parsed.query).items()}
+        pin_values = query.get("pinsha256") or []
+        if pin_values:
+            fingerprint = str(pin_values[0] or "").replace(":", "").strip()
+            if len(fingerprint) != 64 or any(char not in "0123456789abcdefABCDEF" for char in fingerprint):
+                raise RuntimeError("Hysteria2 链接解析失败：pinSHA256 证书指纹无效")
+        return text
 
     @staticmethod
     def _allocate_local_port() -> int:
@@ -221,7 +255,7 @@ class ExchangeProxyRuntime:
         )
 
     @staticmethod
-    def _prepare_darwin_runtime(executable: Path) -> None:
+    def _prepare_darwin_runtime(executable: Path, backend: str = "sing-box") -> None:
         """Apply a local ad-hoc signature after the downloaded archive hash is verified.
 
         macOS can leave a downloaded command-line Mach-O blocked before it reaches
@@ -233,7 +267,7 @@ class ExchangeProxyRuntime:
             return
         codesign = Path("/usr/bin/codesign")
         if not codesign.is_file():
-            raise RuntimeError("macOS 缺少 codesign，无法准备已验证的 sing-box 运行时")
+            raise RuntimeError(f"macOS 缺少 codesign，无法准备已验证的 {backend} 运行时")
         try:
             result = subprocess.run(
                 [str(codesign), "--force", "--sign", "-", str(executable)],
@@ -243,10 +277,93 @@ class ExchangeProxyRuntime:
                 check=False,
             )
         except Exception as exc:
-            raise RuntimeError(f"macOS sing-box 本机签名失败：{exc}") from exc
+            raise RuntimeError(f"macOS {backend} 本机签名失败：{exc}") from exc
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "未知错误").strip()
-            raise RuntimeError(f"macOS sing-box 本机签名失败：{detail}")
+            raise RuntimeError(f"macOS {backend} 本机签名失败：{detail}")
+
+    @classmethod
+    def _hysteria_manifest_path(cls, executable: Path) -> Path:
+        candidate = Path(executable)
+        return candidate.with_name(f".{candidate.name}.manifest.json")
+
+    @classmethod
+    def _hysteria_manifest_context(cls, executable: Path) -> str:
+        candidate = Path(executable)
+        return f"proxy-runtime:hysteria:{cls._HYSTERIA_TAG}:{candidate.parent.name}:{candidate.name}"
+
+    @classmethod
+    def _is_cached_hysteria_path(cls, executable: Path) -> bool:
+        return cls._path_is_within(Path(executable), cls._runtime_cache_dir("hysteria"))
+
+    @classmethod
+    def _validate_hysteria_manifest(cls, payload: object, executable: Path) -> None:
+        if not isinstance(payload, dict):
+            raise RuntimeError("Hysteria 运行时清单格式无效")
+        if int(payload.get("version", 0) or 0) != cls._RUNTIME_MANIFEST_VERSION:
+            raise RuntimeError("Hysteria 运行时清单版本不支持")
+        if str(payload.get("backend") or "") != "hysteria":
+            raise RuntimeError("Hysteria 运行时清单后端不匹配")
+        if str(payload.get("runtime_tag") or "") != cls._HYSTERIA_TAG:
+            raise RuntimeError("Hysteria 运行时版本不匹配")
+        if str(payload.get("executable") or "") != Path(executable).name:
+            raise RuntimeError("Hysteria 运行时文件名不匹配")
+        digest = str(payload.get("sha256") or "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise RuntimeError("Hysteria 运行时清单哈希无效")
+
+    @classmethod
+    def _write_hysteria_manifest(cls, executable: Path) -> None:
+        candidate = Path(executable)
+        payload = {
+            "version": cls._RUNTIME_MANIFEST_VERSION,
+            "backend": "hysteria",
+            "runtime_tag": cls._HYSTERIA_TAG,
+            "executable": candidate.name,
+            "sha256": cls._file_sha256(candidate),
+        }
+        _atomic_write_json_with_backup(
+            cls._hysteria_manifest_path(candidate),
+            payload,
+            secret_box=SECRET_BOX,
+            config_context=cls._hysteria_manifest_context(candidate),
+        )
+
+    @classmethod
+    def _verify_cached_hysteria(cls, executable: Path) -> bool:
+        candidate = Path(executable)
+        if not candidate.is_file():
+            return False
+        try:
+            payload, _recovered = _load_json_with_backup(
+                cls._hysteria_manifest_path(candidate),
+                validator=lambda value: cls._validate_hysteria_manifest(value, candidate),
+                secret_box=SECRET_BOX,
+                config_context=cls._hysteria_manifest_context(candidate),
+            )
+            return cls._file_sha256(candidate).lower() == str(payload["sha256"]).strip().lower()
+        except Exception as exc:
+            logger.warning("已忽略未通过认证的 Hysteria 缓存运行时 %s：%s", candidate, exc)
+            return False
+
+    @classmethod
+    def _trusted_hysteria_candidate(cls, executable: Path) -> Path | None:
+        candidate = Path(executable)
+        if cls._is_cached_hysteria_path(candidate) and not cls._verify_cached_hysteria(candidate):
+            return None
+        return candidate
+
+    @classmethod
+    def _verify_external_hysteria_override(cls, executable: Path) -> None:
+        expected = str(os.environ.get("HYSTERIA_EXECUTABLE_SHA256", "") or "").strip().lower()
+        if expected.startswith("sha256:"):
+            expected = expected.split(":", 1)[1].strip()
+        if not expected:
+            return
+        if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+            raise RuntimeError("HYSTERIA_EXECUTABLE_SHA256 格式无效，应为 64 位 SHA-256")
+        if cls._file_sha256(Path(executable)).lower() != expected:
+            raise RuntimeError("显式 Hysteria 运行时哈希校验失败")
 
     @classmethod
     def _verify_cached_sing_box(cls, executable: Path) -> bool:
@@ -351,6 +468,16 @@ class ExchangeProxyRuntime:
         return unique
 
     @staticmethod
+    def _candidate_hysteria_paths() -> list[Path]:
+        return ExchangeProxyRuntime._collect_executable_candidates([
+            BUNDLE_DIR / "bin",
+            BUNDLE_DIR / "bin" / "hysteria",
+            APP_DIR / "bin",
+            APP_DIR / "bin" / "hysteria",
+            ExchangeProxyRuntime._runtime_cache_dir("hysteria"),
+        ], ExchangeProxyRuntime._candidate_executable_names("hysteria"))
+
+    @staticmethod
     def _path_is_within(path: Path, root: Path) -> bool:
         try:
             Path(path).resolve().relative_to(Path(root).resolve())
@@ -435,8 +562,22 @@ class ExchangeProxyRuntime:
         url = f"https://github.com/SagerNet/sing-box/releases/download/{cls._SING_BOX_TAG}/{asset_name}"
         return asset_name, url, f"sha256:{digest}"
 
+    @classmethod
+    def _pinned_hysteria_asset(cls) -> tuple[str, str, str]:
+        platform_tag = cls._runtime_platform_tag()
+        arch_tag = cls._runtime_arch_tag()
+        suffix = ".exe" if platform_tag == "windows" else ""
+        asset_name = f"hysteria-{platform_tag}-{arch_tag}{suffix}"
+        digest = cls._HYSTERIA_ASSET_SHA256.get(asset_name)
+        if not digest:
+            raise RuntimeError(
+                f"当前系统没有受支持的固定 Hysteria 运行时（platform={platform_tag}, arch={arch_tag}）。"
+            )
+        url = f"https://github.com/apernet/hysteria/releases/download/{cls._HYSTERIA_TAG}/{asset_name}"
+        return asset_name, url, f"sha256:{digest}"
+
     @staticmethod
-    def _download_asset(url: str, destination: Path, *, digest: str = "") -> None:
+    def _download_asset(url: str, destination: Path, *, digest: str = "", runtime_name: str = "sing-box") -> None:
         expected_sha256 = ""
         digest_text = str(digest or "").strip()
         if digest_text.startswith("sha256:"):
@@ -457,7 +598,7 @@ class ExchangeProxyRuntime:
                     if hasher is not None:
                         hasher.update(chunk)
         if hasher is not None and hasher.hexdigest().lower() != expected_sha256:
-            raise RuntimeError("下载的 sing-box 运行时校验失败")
+            raise RuntimeError(f"下载的 {runtime_name} 运行时校验失败")
 
     @staticmethod
     def _extract_archive(archive_path: Path, destination: Path) -> None:
@@ -530,6 +671,34 @@ class ExchangeProxyRuntime:
             return install_path
 
     @classmethod
+    def _ensure_hysteria_runtime(cls) -> Path:
+        with cls._RUNTIME_PREPARE_LOCK:
+            for path in cls._candidate_hysteria_paths():
+                if path.exists():
+                    trusted = cls._trusted_hysteria_candidate(path)
+                    if trusted is not None:
+                        return trusted
+
+            asset_name, download_url, digest = cls._pinned_hysteria_asset()
+            install_dir = cls._runtime_cache_dir("hysteria") / cls._HYSTERIA_TAG.replace("/", "_")
+            install_path = install_dir / cls._executable_name("hysteria")
+            if install_path.exists() and cls._verify_cached_hysteria(install_path):
+                return install_path
+
+            logger.info("未找到 Hysteria，开始下载项目内运行时：%s", asset_name)
+            install_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="hysteria_", dir=str(cls._runtime_cache_dir("hysteria"))) as tmp_dir:
+                downloaded = Path(tmp_dir) / asset_name
+                cls._download_asset(download_url, downloaded, digest=digest, runtime_name="Hysteria")
+                shutil.copy2(downloaded, install_path)
+            if os.name != "nt":
+                install_path.chmod(install_path.stat().st_mode | 0o755)
+            cls._prepare_darwin_runtime(install_path, "Hysteria")
+            cls._write_hysteria_manifest(install_path)
+            logger.info("Hysteria 已缓存到项目目录：%s", install_path)
+            return install_path
+
+    @classmethod
     def find_sing_box_executable(cls) -> Path:
         env_path = os.environ.get("SING_BOX_PATH", "").strip()
         if env_path:
@@ -556,6 +725,34 @@ class ExchangeProxyRuntime:
             return cls._stage_bundled_runtime_if_needed(cls._ensure_sing_box_runtime(), "sing-box")
         except Exception as exc:
             raise RuntimeError(f"未找到 sing-box 可执行文件，且项目内自动准备失败：{exc}") from exc
+
+    @classmethod
+    def find_hysteria_executable(cls) -> Path:
+        env_path = os.environ.get("HYSTERIA_PATH", "").strip()
+        if env_path:
+            candidate = Path(env_path)
+            if candidate.exists():
+                cls._verify_external_hysteria_override(candidate)
+                trusted = cls._trusted_hysteria_candidate(candidate)
+                if trusted is not None:
+                    return cls._stage_bundled_runtime_if_needed(trusted, "hysteria")
+        for candidate in cls._candidate_hysteria_paths():
+            if candidate.exists():
+                trusted = cls._trusted_hysteria_candidate(candidate)
+                if trusted is not None:
+                    return cls._stage_bundled_runtime_if_needed(trusted, "hysteria")
+        for exe_name in cls._candidate_executable_names("hysteria"):
+            which_path = shutil.which(exe_name)
+            if which_path:
+                candidate = Path(which_path)
+                cls._verify_external_hysteria_override(candidate)
+                trusted = cls._trusted_hysteria_candidate(candidate)
+                if trusted is not None:
+                    return cls._stage_bundled_runtime_if_needed(trusted, "hysteria")
+        try:
+            return cls._stage_bundled_runtime_if_needed(cls._ensure_hysteria_runtime(), "hysteria")
+        except Exception as exc:
+            raise RuntimeError(f"未找到 Hysteria 可执行文件，且项目内自动准备失败：{exc}") from exc
 
     @classmethod
     def find_xray_executable(cls) -> Path:
@@ -752,7 +949,19 @@ class ExchangeProxyRuntime:
         _atomic_write_json(config_path, cfg)
         return config_path
 
-    def _wait_ready(self, local_proxy_url: str, timeout_sec: float = 12.0) -> None:
+    def _write_hysteria_config(self, hysteria2_uri: str, listen_port: int, *, lazy: bool = False) -> Path:
+        config_path = self._runtime_file_path("hysteria2_proxy", ".json")
+        cfg = {
+            "server": self.validate_hysteria2_uri(hysteria2_uri),
+            "http": {"listen": f"127.0.0.1:{listen_port}"},
+            "fastOpen": True,
+        }
+        if lazy:
+            cfg["lazy"] = True
+        _atomic_write_json(config_path, cfg)
+        return config_path
+
+    def _wait_ready(self, local_proxy_url: str, timeout_sec: float = 12.0, *, proxy_name: str = "SS") -> None:
         deadline = time.time() + timeout_sec
         proxies = {"http": local_proxy_url, "https": local_proxy_url}
         last_err = ""
@@ -770,7 +979,7 @@ class ExchangeProxyRuntime:
                 except Exception as exc:
                     last_err = f"{url}: {exc}"
             time.sleep(0.4)
-        raise RuntimeError(f"SS 代理启动失败：{last_err or '本地代理未就绪'}")
+        raise RuntimeError(f"{proxy_name} 代理启动失败：{last_err or '本地代理未就绪'}")
 
     @staticmethod
     def _wait_local_port_ready(port: int, timeout_sec: float = 6.0) -> None:
@@ -787,7 +996,7 @@ class ExchangeProxyRuntime:
 
     def probe_backend_launch(self, backend: str) -> str:
         backend_name = str(backend or "").strip().lower()
-        if backend_name not in {"xray", "sing-box"}:
+        if backend_name not in {"xray", "sing-box", "hysteria"}:
             raise RuntimeError(f"不支持的代理后端: {backend}")
 
         ss_info = {
@@ -804,7 +1013,15 @@ class ExchangeProxyRuntime:
         try:
             listen_port = self._allocate_local_port()
             log_handle = self._open_runtime_log()
-            if backend_name == "xray":
+            if backend_name == "hysteria":
+                exe = self.find_hysteria_executable()
+                probe_uri = (
+                    "hysteria2://xiaojun-proxy-selftest@127.0.0.1:9/"
+                    "?insecure=1&pinSHA256=" + ("00:" * 31) + "00"
+                )
+                config_path = self._write_hysteria_config(probe_uri, listen_port, lazy=True)
+                cmd = [str(exe), "-c", str(config_path)]
+            elif backend_name == "xray":
                 exe = self.find_xray_executable()
                 config_path = self._write_xray_config(ss_info, listen_port)
                 cmd = [str(exe), "run", "-c", str(config_path)]
@@ -844,14 +1061,64 @@ class ExchangeProxyRuntime:
                     pass
             self._log_path = None
 
-    def ensure_proxy(self, ss_uri: str) -> str:
-        raw = str(ss_uri or "").strip()
+    def _ensure_hysteria2_proxy_locked(self, raw: str) -> str:
+        hysteria2_uri = self.validate_hysteria2_uri(raw)
+        listen_port = self._allocate_local_port()
+        proc = None
+        config_path = None
+        runtime_log_handle = None
+        try:
+            runtime_log_handle = self._open_runtime_log()
+            executable = self.find_hysteria_executable()
+            config_path = self._write_hysteria_config(hysteria2_uri, listen_port)
+            proc = subprocess.Popen(
+                [str(executable), "-c", str(config_path)],
+                stdout=runtime_log_handle,
+                stderr=runtime_log_handle,
+                **self._hidden_process_kwargs(),
+            )
+            local_proxy_url = f"http://127.0.0.1:{listen_port}"
+            self._wait_ready(local_proxy_url, proxy_name="Hysteria2")
+        except Exception as exc:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            if runtime_log_handle is not None:
+                try:
+                    runtime_log_handle.close()
+                except Exception:
+                    pass
+            if config_path is not None:
+                try:
+                    Path(config_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise self._format_backend_error("Hysteria2", exc) from exc
+
+        self._proc = proc
+        self._raw_source = raw
+        self._local_proxy_url = local_proxy_url
+        self._config_path = config_path
+        self._log_handle = runtime_log_handle
+        self._backend = "hysteria"
+        return local_proxy_url
+
+    def ensure_proxy(self, proxy_uri: str) -> str:
+        raw = str(proxy_uri or "").strip()
         if not raw:
             return ""
         with self._lock:
             if raw == self._raw_source and self._is_process_alive(self._proc) and self._local_proxy_url:
                 return self._local_proxy_url
             self._stop_locked()
+            if self.is_hysteria2_uri(raw):
+                return self._ensure_hysteria2_proxy_locked(raw)
             ss_info = self.parse_ss_uri(raw)
             listen_port = self._allocate_local_port()
             last_exc = None

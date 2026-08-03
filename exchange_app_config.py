@@ -62,17 +62,22 @@ class ExchangeAppConfigMixin(object):
         if lower.startswith("ss://"):
             ExchangeProxyRuntime.parse_ss_uri(proxy)
             return proxy
+        if ExchangeProxyRuntime.is_hysteria2_uri(proxy):
+            return ExchangeProxyRuntime.validate_hysteria2_uri(proxy)
         if "://" not in proxy:
             proxy = f"http://{proxy}"
             lower = proxy.lower()
         if not lower.startswith(("http://", "https://", "socks5://", "socks5h://")):
-            raise RuntimeError("代理地址格式不支持，请使用 http://、https://、socks5://、socks5h:// 或 ss://")
+            raise RuntimeError("代理地址格式不支持，请使用 http(s)://、socks5(h)://、ss:// 或 hysteria2://")
         return proxy
     def _normalize_exchange_proxy(self, proxy_text: str) -> str:
         return self._normalize_proxy_text(proxy_text)
     def _on_exchange_proxy_config_changed(self, *_args) -> None:
         self._sync_exchange_proxy_state()
         self._refresh_exchange_proxy_summary()
+        latency_var = getattr(self, "exchange_proxy_latency_var", None)
+        if latency_var is not None:
+            latency_var.set("延迟 --")
     def _sync_exchange_proxy_state(self) -> None:
         use_var = getattr(self, "use_exchange_config_proxy_var", None)
         proxy_var = getattr(self, "exchange_proxy_var", None)
@@ -119,7 +124,7 @@ class ExchangeAppConfigMixin(object):
         if not proxy:
             self.exchange_proxy_runtime.stop()
             return ""
-        if proxy.lower().startswith("ss://"):
+        if proxy.lower().startswith("ss://") or ExchangeProxyRuntime.is_hysteria2_uri(proxy):
             return self.exchange_proxy_runtime.ensure_proxy(proxy)
         return proxy
     def _get_onchain_proxy_page(self):
@@ -161,7 +166,7 @@ class ExchangeAppConfigMixin(object):
         if not proxy:
             self.onchain_proxy_runtime.stop()
             return ""
-        if proxy.lower().startswith("ss://"):
+        if proxy.lower().startswith("ss://") or ExchangeProxyRuntime.is_hysteria2_uri(proxy):
             return self.onchain_proxy_runtime.ensure_proxy(proxy)
         return proxy
     def _requests_proxy_map_from_state(self, state: dict[str, object] | None = None) -> dict[str, str]:
@@ -213,6 +218,10 @@ class ExchangeAppConfigMixin(object):
             backend = snap.get("backend") or "unknown"
             local_proxy = snap.get("local_proxy_url") or "pending"
             return f"builtin-ss/{backend} -> {local_proxy}"
+        if ExchangeProxyRuntime.is_hysteria2_uri(raw_proxy):
+            snap = self.exchange_proxy_runtime.snapshot()
+            local_proxy = snap.get("local_proxy_url") or "pending"
+            return f"builtin-hysteria2/hysteria -> {local_proxy}"
         return redact_sensitive_text(f"manual-proxy -> {self._normalize_exchange_proxy(raw_proxy)}")
     def _exchange_proxy_route_text(self) -> str:
         return self._exchange_proxy_route_text_from_state()

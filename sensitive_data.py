@@ -9,6 +9,7 @@ import re
 REDACTED = "***"
 
 _SS_URI_RE = re.compile(r"\bss://[^\s,，;；]+", re.IGNORECASE)
+_HYSTERIA2_URI_RE = re.compile(r"\b(?:hy2|hysteria2)://[^\s,，;；]+", re.IGNORECASE)
 _URL_USERINFO_RE = re.compile(r"\b((?:https?|socks5h?|socks4)://)([^/\s:@]+):([^/\s@]+)@", re.IGNORECASE)
 _QUERY_SECRET_RE = re.compile(
     r"((?:^|[?&])(?:signature|api[_-]?key|apikey|api[_-]?secret|private[_-]?key|privatekey|"
@@ -56,6 +57,7 @@ def redact_sensitive_text(text: object) -> str:
         return raw
 
     redacted = _SS_URI_RE.sub("ss://***", raw)
+    redacted = _HYSTERIA2_URI_RE.sub("hysteria2://***", redacted)
     redacted = _URL_USERINFO_RE.sub(lambda m: f"{m.group(1)}***:***@", redacted)
     redacted = _QUERY_SECRET_RE.sub(lambda m: f"{m.group(1)}{mask_secret_value(m.group(2))}", redacted)
     redacted = _JSON_SECRET_RE.sub(lambda m: f"{m.group(1)}{mask_secret_value(m.group(2))}{m.group(3)}", redacted)

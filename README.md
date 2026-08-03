@@ -15,7 +15,7 @@ Binance 自动化工具（Tkinter GUI）。
 2. 双击运行，无需本机安装 Python、交易所模块依赖、代理模块依赖、链上模块依赖、UI 运行依赖
 3. 首次运行会在程序同目录自动创建 `data/`，用于保存本地配置与链上页面数据
 
-> Windows Release 已内置主程序运行环境，以及交易所、代理、链上、UI 所需运行依赖；同时内置 `xray` 与 `sing-box`，页面内置 SS 代理在其他电脑上也可直接使用。
+> Windows Release 已内置主程序运行环境，以及交易所、代理、链上、UI 所需运行依赖；同时内置 `xray`、`sing-box` 与官方 `Hysteria` 客户端，SS 和 Hysteria2 代理在其他电脑上也可直接使用。
 
 ## 源码运行
 
@@ -55,13 +55,15 @@ py -3 -m venv .venv
 - 建议源码运行使用项目内 `.venv`，避免全局 Python 依赖冲突影响交易所、链上或打包自检
 - 发布回归会审计运行锁和构建锁中的已知漏洞；本地完整回归请按 `requirements-build.lock` 安装依赖
 - 若通过 `SING_BOX_PATH` 指定外部 `sing-box`，可同时设置 `SING_BOX_EXECUTABLE_SHA256` 为该可执行文件的 SHA-256；项目内已认证缓存和随包运行时会优先于普通 `PATH` 程序
+- 交易所与链上代理框支持完整 `hy2://` / `hysteria2://` 分享链接；`pinSHA256` 证书指纹会原样交给官方客户端校验，并启用 Hysteria2 Fast Open 降低新连接延迟
+- 代理框旁的按钮每次点击都会重新请求对应业务接口，并显示 `延迟 N ms`；连接失败时显示 `失败`
 
 ## 发布包说明
 
 - `windows-x64.exe`：单文件版，适合直接下载即用
 - `windows-x64-portable.zip`：便携目录版，适合长期放在固定目录运行
 - GitHub Release 构建会一并打包交易所、代理、链上、UI 所需运行依赖
-- Release 会附带页面内置 SS 代理所需的 `xray` 与 `sing-box` 运行文件，无需目标电脑额外安装 v2rayN 或单独拷贝代理内核
+- Release 会附带 SS 所需的 `xray` / `sing-box` 和 Hysteria2 所需的官方 `Hysteria` 客户端，无需目标电脑额外安装代理内核
 - Release 冒烟默认使用离线 `--selftest`；联机链上连通性需要时再额外执行 `--selftest-online`
 
 ## 回归检查

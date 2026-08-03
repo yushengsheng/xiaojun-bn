@@ -2642,6 +2642,8 @@ def run_selftest(*, include_online_checks: bool = False, include_gui_checks: boo
             checks.append(f"xray={xray_path.name}")
         sing_box_path = ExchangeProxyRuntime.find_sing_box_executable()
         checks.append(f"sing-box={sing_box_path.name}")
+        hysteria_path = ExchangeProxyRuntime.find_hysteria_executable()
+        checks.append(f"hysteria={hysteria_path.name}")
         with tempfile.TemporaryDirectory(prefix="xiaojun-proxy-runtime-") as tmpdir:
             proxy_runtime = ExchangeProxyRuntime(Path(tmpdir), runtime_name="selftest")
             def _probe_or_skip(backend_name: str) -> None:
@@ -2661,6 +2663,7 @@ def run_selftest(*, include_online_checks: bool = False, include_gui_checks: boo
             if "xray_path" in locals():
                 _probe_or_skip("xray")
             _probe_or_skip("sing-box")
+            _probe_or_skip("hysteria")
 
         summary = ", ".join(checks)
         logger.info("SELFTEST OK: %s", summary)

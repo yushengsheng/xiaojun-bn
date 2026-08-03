@@ -150,6 +150,7 @@ class OnchainTransferPageBase:
         self.stop_requested = threading.Event()
         self._managed_threads_lock = threading.Lock()
         self._managed_threads: set[threading.Thread] = set()
+        self._proxy_test_inflight = False
         self._layout_mode: str | None = None
 
         self.row_index_map: dict[str, int] = {}
@@ -205,6 +206,7 @@ class OnchainTransferPageBase:
         self.onchain_proxy_var = StringVar(value="")
         self.onchain_proxy_status_var = StringVar(value="未启用")
         self.onchain_proxy_exit_ip_var = StringVar(value="--")
+        self.onchain_proxy_latency_var = StringVar(value="延迟 --")
         self.source_credential_var = StringVar(value="")
         self.one_to_many_source_ephemeral_var = BooleanVar(value=False)
         self._source_credential_visible = False
@@ -948,8 +950,8 @@ class OnchainTransferPageBase:
         if "://" not in text:
             text = f"http://{text}"
             lower = text.lower()
-        if not lower.startswith(("http://", "https://", "socks5://", "socks5h://", "ss://")):
-            raise RuntimeError("代理地址格式不支持，请使用 http://、https://、socks5://、socks5h:// 或 ss://")
+        if not lower.startswith(("http://", "https://", "socks5://", "socks5h://", "ss://", "hy2://", "hysteria2://")):
+            raise RuntimeError("代理地址格式不支持，请使用 http(s)://、socks5(h)://、ss:// 或 hysteria2://")
         return text
     def _onchain_proxy_map(self, state: dict[str, object] | None = None) -> dict[str, str]:
         snapshot = dict(state or self._onchain_proxy_state_snapshot())
@@ -991,6 +993,8 @@ class OnchainTransferPageBase:
             return "direct"
         if raw_proxy.lower().startswith("ss://"):
             return "builtin-ss"
+        if raw_proxy.lower().startswith(("hy2://", "hysteria2://")):
+            return "builtin-hysteria2/hysteria"
         return redact_sensitive_text(f"manual-proxy -> {self._normalize_onchain_proxy(raw_proxy)}")
     def _fetch_onchain_public_ip(
         self,
@@ -1025,31 +1029,32 @@ class OnchainTransferPageBase:
         if selected_network in EvmClient.NETWORKS:
             return [selected_network]
         return list(EvmClient.NETWORKS.keys())
-    def _test_onchain_target_connectivity(self, selected_network: str = "") -> str:
+    def _test_onchain_target_connectivity(
+        self,
+        selected_network: str = "",
+        latency_out: list[int] | None = None,
+    ) -> str:
         networks = self._proxy_test_networks(selected_network)
-        details: list[str] = []
         errors: list[str] = []
-        success_count = 0
         for network in networks:
             try:
+                started = time.perf_counter()
                 chain_id = self.client.get_rpc_chain_id(network)
-                details.append(f"{network} RPC chainId={chain_id}")
-                success_count += 1
+                if latency_out is not None:
+                    latency_out.append(max(0, round((time.perf_counter() - started) * 1000)))
+                return f"{network} RPC chainId={chain_id}"
             except Exception as exc:
                 errors.append(f"{network}: {exc}")
                 if len(networks) == 1:
                     raise
-        if success_count <= 0:
-            raise RuntimeError("；".join(errors) if errors else "RPC 连通性测试失败")
-        if errors:
-            details.append("部分失败=" + " | ".join(errors))
-        return "；".join(details)
+        raise RuntimeError("；".join(errors) if errors else "RPC 连通性测试失败")
     def _test_onchain_proxy_once(
         self,
         *,
         include_exit_ip: bool = True,
         state: dict[str, object] | None = None,
         selected_network: str = "",
+        latency_out: list[int] | None = None,
     ) -> tuple[str, str, str]:
         snapshot = dict(state or self._onchain_proxy_state_snapshot())
         use_config_proxy = bool(snapshot.get("use_config_proxy"))
@@ -1062,7 +1067,7 @@ class OnchainTransferPageBase:
         if use_config_proxy:
             # 触发代理规范化/内置 SS runtime 初始化
             self._onchain_proxy_map(state=snapshot)
-        target = self._test_onchain_target_connectivity(selected_network)
+        target = self._test_onchain_target_connectivity(selected_network, latency_out=latency_out)
         if use_config_proxy and raw_proxy:
             status = "SS代理已连接" if raw_proxy.lower().startswith("ss://") else "代理已连接"
         elif system_proxy:
@@ -1071,13 +1076,26 @@ class OnchainTransferPageBase:
             status = "直连可用"
         if use_config_proxy:
             if include_exit_ip:
-                exit_ip = self._fetch_onchain_public_ip(use_config_proxy=True, allow_system_proxy=False, state=snapshot)
+                try:
+                    exit_ip = self._fetch_onchain_public_ip(
+                        use_config_proxy=True,
+                        allow_system_proxy=False,
+                        state=snapshot,
+                    )
+                except Exception:
+                    exit_ip = "获取失败"
         elif system_proxy:
             if include_exit_ip:
-                exit_ip = self._fetch_onchain_public_ip(use_config_proxy=False, allow_system_proxy=True)
+                try:
+                    exit_ip = self._fetch_onchain_public_ip(use_config_proxy=False, allow_system_proxy=True)
+                except Exception:
+                    exit_ip = "获取失败"
         else:
             if include_exit_ip:
-                exit_ip = self._fetch_onchain_public_ip(use_config_proxy=False, allow_system_proxy=False)
+                try:
+                    exit_ip = self._fetch_onchain_public_ip(use_config_proxy=False, allow_system_proxy=False)
+                except Exception:
+                    exit_ip = "获取失败"
         return status, exit_ip, target
     def _refresh_onchain_proxy_summary(self) -> None:
         if self.use_config_proxy_var.get():
@@ -2719,6 +2737,7 @@ class OnchainTransferPageBase:
     def _on_proxy_config_changed(self, *_args):
         self._sync_onchain_proxy_state()
         self._refresh_onchain_proxy_summary()
+        self.onchain_proxy_latency_var.set("延迟 --")
     def _on_source_or_target_changed(self, *_args):
         if self._is_mode_1m():
             self._clear_source_private_key_cache()
@@ -2786,16 +2805,27 @@ class OnchainTransferPageBase:
                 root=getattr(self, "root", None),
             )
     def test_onchain_proxy(self):
+        if self._proxy_test_inflight:
+            return
+        self._proxy_test_inflight = True
+        self.onchain_proxy_latency_var.set("测试中…")
         snapshot = self._onchain_proxy_state_snapshot()
         selected_network = str(self.network_var.get() or "").strip().upper()
 
         def worker():
             test_ok = False
+            latency_ms = None
             try:
                 if not bool(snapshot.get("use_config_proxy")):
                     self._onchain_system_proxy_map(refresh=True, include_local_probe=True)
                 route_text = self._onchain_proxy_route_text(state=snapshot)
-                status, exit_ip, target = self._test_onchain_proxy_once(state=snapshot, selected_network=selected_network)
+                latency_values: list[int] = []
+                status, exit_ip, target = self._test_onchain_proxy_once(
+                    state=snapshot,
+                    selected_network=selected_network,
+                    latency_out=latency_values,
+                )
+                latency_ms = latency_values[0]
                 test_ok = True
                 log_text = f"链上代理测试成功：status={status}，exit_ip={exit_ip}，target={target}，route={route_text}"
             except Exception as exc:
@@ -2812,13 +2842,12 @@ class OnchainTransferPageBase:
                 log_text = f"链上代理测试失败：{exc}，route={route_text}"
 
             def _update():
-                self.onchain_proxy_status_var.set(status)
-                self.onchain_proxy_exit_ip_var.set(exit_ip)
+                self._proxy_test_inflight = False
+                if self._onchain_proxy_state_snapshot() == snapshot:
+                    self.onchain_proxy_status_var.set(status)
+                    self.onchain_proxy_exit_ip_var.set(exit_ip)
+                    self.onchain_proxy_latency_var.set(f"延迟 {latency_ms} ms" if test_ok else "失败")
                 self.log(log_text)
-                if test_ok:
-                    messagebox.showinfo("链上代理测试成功", log_text)
-                else:
-                    messagebox.showerror("链上代理测试失败", log_text)
 
             self._dispatch_ui(_update)
 

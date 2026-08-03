@@ -17,6 +17,7 @@ CHILD_ENV_KEY = "XIAOJUN_GUI_CHECK_CHILD"
 PERSISTENT_REGRESSION_PYTHON = ROOT / ".venv-regression" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 VERIFIED_SING_BOX_PATH = ROOT / "data" / "proxy_runtimes" / "sing-box" / "v1.13.5" / "sing-box"
 VERIFIED_SING_BOX_SHA256 = "44c9311a332c66a9785ffecc318fc2bddda9dbd61be23b462b526cbc4ad4f207"
+VERIFIED_HYSTERIA_PATH = ROOT / "data" / "proxy_runtimes" / "hysteria" / "app_v2.9.2" / "hysteria"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -62,6 +63,9 @@ def _apply_verified_runtime_defaults(env: MutableMapping[str, str]) -> None:
     existing_sha = str(env.get("SING_BOX_EXECUTABLE_SHA256", "") or "").strip()
     if not existing_sha and existing_path == str(VERIFIED_SING_BOX_PATH):
         env["SING_BOX_EXECUTABLE_SHA256"] = VERIFIED_SING_BOX_SHA256
+
+    if not str(env.get("HYSTERIA_PATH", "") or "").strip() and VERIFIED_HYSTERIA_PATH.exists():
+        env["HYSTERIA_PATH"] = str(VERIFIED_HYSTERIA_PATH)
 
 
 def _run_gui_smoke() -> int:

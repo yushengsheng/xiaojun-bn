@@ -9,7 +9,7 @@
 - macOS 或 Windows 弹出 `Python 意外退出`、进程退出码 `134`、GUI smoke 直接 abort。
 - `--selftest` 或 `--selftest --selftest-gui` 失败。
 - 打包后的 onefile 或 portable 任一包未通过 `--selftest --selftest-gui`。
-- 代理运行时缺失、manifest 认证失败、`sing-box` 或 `xray` 无法启动、端口未监听。
+- 代理运行时缺失、manifest 认证失败、`sing-box`、`xray` 或 `hysteria` 无法启动、端口未监听。
 - 发版验证过程中需要临时联网下载运行时，且下载失败或哈希未验证。
 - GitHub Actions 发版 workflow 失败、卡住、或 release asset 不完整。
 - 工作区存在未解释的脏改动、测试失败、敏感文件检查失败、依赖漏洞审计失败。
@@ -23,7 +23,7 @@
 - 目标 commit 已通过固定入口完成回归：`python3 tools/run_full_regression.py`。
 - 若本地 GUI/Tk 环境异常，必须明确标记为阻断项，并在 GitHub Actions 上完成等价 GUI 自检后才能发版。
 - CI 使用 `pip install --require-hashes -r requirements-build.lock` 安装构建依赖。
-- release workflow 下载 `xray` 和 `sing-box` 时必须校验 `XRAY_SHA256` 和 `SING_BOX_SHA256`。
+- release workflow 下载 `xray`、`sing-box` 和 `hysteria` 时必须校验 `XRAY_SHA256`、`SING_BOX_SHA256` 和 `HYSTERIA_SHA256`。
 - 打包前必须运行源码回归。
 - 打包后必须分别对 onefile 和 portable 执行 `--selftest --selftest-gui`。
 - portable 打包必须从干净 staging 目录生成，不能把测试产生的 `data/`、日志、查询结果、钱包文件带入 release zip。
@@ -37,11 +37,11 @@
 - 在 Codex/沙箱环境里启动 Tk GUI 时，必须脱离沙箱申请 GUI 运行权限；普通沙箱里的 `exit 134` 不能被当作应用本身失败。
 - `tools/run_full_regression.py` 是唯一的本地完整回归入口；它固定使用项目内 `.venv-regression`，按 `requirements-build.lock` 指纹校验，缺失、损坏或锁文件变化时自动重建。
 - `tools/run_local_gui_check.py` 会优先使用 `XIAOJUN_GUI_PYTHON`，其次使用项目内 `.venv-regression`；禁止重新加入 `/private/tmp` 回归环境候选。
-- `tools/run_local_gui_check.py` 会在未显式指定 `SING_BOX_PATH` 时使用项目内已验证运行时和 `SING_BOX_EXECUTABLE_SHA256`；不要让完整 GUI 自检临时联网下载代理运行时。
+- `tools/run_local_gui_check.py` 会在未显式指定运行时路径时使用项目内已验证的 `sing-box` 和 `Hysteria` 运行时；不要让完整 GUI 自检临时联网下载代理运行时。
 - 确认崩溃发生在源码 GUI、打包 GUI、代理运行时启动、还是网络下载阶段。
 - 查最近的 runtime log 和 `bot_log.txt`，记录最后一个通过的自检步骤。
 - 如果是 GUI/Tk 层 abort，必须用同一目标平台的 packaged app 自检作为最终依据。
-- 如果是 `sing-box` 或 `xray` 问题，必须先固定运行时来源、哈希和 manifest；不能在发版过程中依赖临时下载补救。
+- 如果是 `sing-box`、`xray` 或 `hysteria` 问题，必须先固定运行时来源、哈希和 manifest；不能在发版过程中依赖临时下载补救。
 - 如果是网络下载中断，只能判定为环境阻断，不允许发布。
 
 ## GitHub 更新规则

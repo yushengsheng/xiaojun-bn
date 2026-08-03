@@ -39,6 +39,7 @@ def check_release_guardrails() -> None:
         "--selftest --selftest-gui",
         "GitHub Actions",
         "SING_BOX_SHA256",
+        "HYSTERIA_SHA256",
         "不允许发布",
         "tools/check_release_guardrails.py",
     ):
@@ -50,6 +51,7 @@ def check_release_guardrails() -> None:
         "--selftest --selftest-gui",
         "requirements-build.lock",
         "SING_BOX_SHA256",
+        "HYSTERIA_SHA256",
         "check_sensitive_artifacts.py",
     ):
         _require(release_doc, needle, source="RELEASE.md")
@@ -59,6 +61,7 @@ def check_release_guardrails() -> None:
         "pip install --require-hashes -r requirements-build.lock",
         "XRAY_SHA256",
         "SING_BOX_SHA256",
+        "HYSTERIA_SHA256",
         "python tools/run_regression.py --skip-pip-check --skip-app-selftest",
         "Invoke-Selftest",
         "'--selftest', '--selftest-gui'",
@@ -71,6 +74,7 @@ def check_release_guardrails() -> None:
         "python tools\\run_regression.py --gui --strict-pip-check",
         "XRAY_SHA256",
         "SING_BOX_SHA256",
+        "HYSTERIA_SHA256",
     ):
         _require(ci_workflow, needle, source=".github/workflows/ci.yml")
 
@@ -88,6 +92,7 @@ def check_release_guardrails() -> None:
         ".venv-regression",
         "proxy_runtimes",
         "SING_BOX_EXECUTABLE_SHA256",
+        "HYSTERIA_PATH",
         "--full-selftest",
         "--regression",
         "GUI CHECK FAILED",
