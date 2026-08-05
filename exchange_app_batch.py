@@ -11,6 +11,8 @@ from exchange_app_base import (
     FUTURES_LEVERAGE_DEFAULT,
     FUTURES_ROUNDS_DEFAULT,
     FUTURES_SIDE_DEFAULT,
+    LADDER_LAYOUT_DEFAULT,
+    LADDER_MIN_POOL_NOTIONAL_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_ORDER_COUNT_DEFAULT,
     REPRICE_THRESHOLD_DEFAULT,
@@ -22,6 +24,7 @@ from exchange_app_base import (
     TRADE_ACCOUNT_TYPE_SPOT,
     TRADE_MODE_CONVERT,
     TRADE_MODE_DEFAULT,
+    TRADE_MODE_LADDER,
     TRADE_MODE_LIMIT,
     TRADE_MODE_MARKET,
     TRADE_MODE_PREMIUM,
@@ -85,6 +88,7 @@ class ExchangeAppBatchMixin(object):
             "btn_export_accounts",
             "btn_import_accounts",
             "btn_paste_accounts",
+            "btn_query_monthly_volume",
             "btn_destroy_all_accounts",
         ):
             btn = getattr(self, name, None)
@@ -100,6 +104,7 @@ class ExchangeAppBatchMixin(object):
             "trade_mode_combo",
             "futures_margin_type_combo",
             "futures_side_combo",
+            "ladder_layout_combo",
             "withdraw_net_combo",
             "acc_network_combo",
             "withdraw_coin_combo",
@@ -229,7 +234,7 @@ class ExchangeAppBatchMixin(object):
                             base_asset,
                             float(base_balance_dec),
                         )
-                    elif mode_name == TRADE_MODE_LIMIT:
+                    elif mode_name in {TRADE_MODE_LIMIT, TRADE_MODE_LADDER}:
                         base_balance_dec = c.spot_asset_balance_decimal(base_asset)
                         log_progress_throttled(
                             "spot-balance-limit",
@@ -271,7 +276,7 @@ class ExchangeAppBatchMixin(object):
             balance_ready = quote_balance > 0
             if trade_type == TRADE_ACCOUNT_TYPE_SPOT and spot_base_to_quote_only:
                 balance_ready = base_balance_dec > 0
-            elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+            elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name in {TRADE_MODE_LIMIT, TRADE_MODE_LADDER}:
                 balance_ready = Decimal(str(quote_balance)) > 0 or base_balance_dec > 0
             elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_CONVERT:
                 balance_ready = Decimal(str(quote_balance)) > 0 or base_balance_dec > 0
@@ -281,7 +286,7 @@ class ExchangeAppBatchMixin(object):
             if balance_ready:
                 if trade_type == TRADE_ACCOUNT_TYPE_SPOT and spot_base_to_quote_only:
                     logger.info("检测到可兑换 %s 余额，开始执行后续策略", base_asset)
-                elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+                elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name in {TRADE_MODE_LIMIT, TRADE_MODE_LADDER}:
                     logger.info("检测到可挂单余额，开始执行后续策略")
                 elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_CONVERT:
                     logger.info("检测到可闪兑余额，开始执行后续策略")
@@ -294,7 +299,7 @@ class ExchangeAppBatchMixin(object):
                 continue
             if trade_type == TRADE_ACCOUNT_TYPE_SPOT and spot_base_to_quote_only:
                 log_progress_throttled("retry-zero-round", "未检测到可兑换 %s 余额，%.3f 秒后重试", base_asset, delay_seconds)
-            elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+            elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name in {TRADE_MODE_LIMIT, TRADE_MODE_LADDER}:
                 log_progress_throttled("retry-limit", "未检测到可挂单余额，%.3f 秒后重试", delay_seconds)
             elif trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_CONVERT:
                 log_progress_throttled("retry-convert", "未检测到可闪兑余额，%.3f 秒后重试", delay_seconds)
@@ -310,7 +315,7 @@ class ExchangeAppBatchMixin(object):
         if trade_type == TRADE_ACCOUNT_TYPE_SPOT and spot_base_to_quote_only:
             logger.error("在 %d 秒内未检测到可兑换 %s 余额，终止任务", timeout_sec, base_asset)
             return False
-        if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_LIMIT:
+        if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name in {TRADE_MODE_LIMIT, TRADE_MODE_LADDER}:
             logger.error("在 %d 秒内未检测到可挂单余额，终止任务", timeout_sec)
             return False
         if trade_type == TRADE_ACCOUNT_TYPE_SPOT and mode_name == TRADE_MODE_CONVERT:
@@ -341,6 +346,8 @@ class ExchangeAppBatchMixin(object):
             bnb_fee_stop_value = trade_settings["bnb_fee_stop_value"]
             bnb_topup_amount_value = trade_settings["bnb_topup_amount_value"]
             reprice_threshold_value = trade_settings["reprice_threshold_value"]
+            ladder_layout = str(trade_settings["ladder_layout"])
+            ladder_min_pool_notional_value = trade_settings["ladder_min_pool_notional_value"]
             futures_symbol = str(trade_settings["futures_symbol"])
             futures_rounds = int(trade_settings["futures_rounds"])
             futures_amount_value = trade_settings["futures_amount_value"]
@@ -350,6 +357,8 @@ class ExchangeAppBatchMixin(object):
             earn_asset = str(trade_settings["earn_asset"])
             earn_amount_value = trade_settings["earn_amount_value"]
             earn_amount_all = bool(trade_settings.get("earn_amount_all"))
+            earn_auto_subscribe = bool(trade_settings.get("earn_auto_subscribe"))
+            earn_auto_subscribe_only = bool(trade_settings.get("earn_auto_subscribe_only"))
             withdraw_buffer = float(self.withdraw_buffer_var.get())
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "\u6700\u5c0f")
             max_delay = self._delay_var_value(self.max_delay_var, 3000, "\u6700\u5927")
@@ -378,7 +387,7 @@ class ExchangeAppBatchMixin(object):
             if trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
                 earn_product = client.find_simple_earn_flexible_product(
                     earn_asset,
-                    None if earn_amount_all else earn_amount_value,
+                    None if earn_amount_all or earn_auto_subscribe_only else earn_amount_value,
                 )
                 validated_earn_product_id = str(earn_product.get("productId") or "").strip()
             else:
@@ -390,7 +399,11 @@ class ExchangeAppBatchMixin(object):
                     futures_symbol,
                     spot_rounds,
                 )
-            if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode in {TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}:
+            if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode in {
+                TRADE_MODE_LIMIT,
+                TRADE_MODE_PREMIUM,
+                TRADE_MODE_LADDER,
+            }:
                 premium_append_mode_enabled = (
                     trade_mode == TRADE_MODE_PREMIUM
                     and premium_order_count > 1
@@ -454,44 +467,53 @@ class ExchangeAppBatchMixin(object):
                 failure_text = ""
                 try:
                     asset_u = str(earn_asset or "").strip().upper()
+                    action_text = "开启自动申购" if earn_auto_subscribe_only else "理财存入"
                     if not self._wait_batch_random_delay(
                         self.stop_event,
                         min_delay,
                         max_delay,
-                        log_prefix="单账号理财存入前",
+                        log_prefix=f"单账号{action_text}前",
                     ):
                         return
-                    self._dispatch_ui(lambda: self.status_var.set(f"状态：存入理财 {asset_u}..."))
-                    amount_dec = self._resolve_earn_subscribe_amount(
-                        client,
-                        asset_u,
-                        earn_amount_value,
-                        earn_amount_all,
-                    )
                     product_id = validated_earn_product_id
-                    if earn_amount_all or not product_id:
-                        earn_product = client.find_simple_earn_flexible_product(asset_u, amount_dec)
-                        product_id = str(earn_product.get("productId") or "").strip()
-                    result = client.subscribe_simple_earn_flexible_product(
-                        product_id,
-                        amount_dec,
-                        source_account="SPOT",
-                        auto_subscribe=False,
-                    )
-                    amount_text = BinanceClient._format_decimal(amount_dec)
-                    purchase_id = str((result or {}).get("purchaseId") or "").strip() if isinstance(result, dict) else ""
-                    logger.info(
-                        "单账号活期理财存入已提交：资产=%s，数量=%s，productId=%s，purchaseId=%s",
-                        asset_u,
-                        amount_text,
-                        product_id,
-                        purchase_id or "--",
-                    )
+                    if earn_auto_subscribe_only:
+                        self._dispatch_ui(lambda: self.status_var.set(f"状态：开启 {asset_u} 自动申购..."))
+                        client.set_simple_earn_flexible_auto_subscribe(product_id, True)
+                        logger.info("单账号已开启活期理财自动申购：资产=%s，productId=%s", asset_u, product_id)
+                        done_text = f"已开启 {asset_u} 自动申购"
+                    else:
+                        self._dispatch_ui(lambda: self.status_var.set(f"状态：存入理财 {asset_u}..."))
+                        amount_dec = self._resolve_earn_subscribe_amount(
+                            client,
+                            asset_u,
+                            earn_amount_value,
+                            earn_amount_all,
+                        )
+                        if earn_amount_all or not product_id:
+                            earn_product = client.find_simple_earn_flexible_product(asset_u, amount_dec)
+                            product_id = str(earn_product.get("productId") or "").strip()
+                        result = client.subscribe_simple_earn_flexible_product(
+                            product_id,
+                            amount_dec,
+                            source_account="SPOT",
+                            auto_subscribe=earn_auto_subscribe,
+                        )
+                        amount_text = BinanceClient._format_decimal(amount_dec)
+                        purchase_id = str((result or {}).get("purchaseId") or "").strip() if isinstance(result, dict) else ""
+                        logger.info(
+                            "单账号活期理财存入已提交：资产=%s，数量=%s，自动申购=%s，productId=%s，purchaseId=%s",
+                            asset_u,
+                            amount_text,
+                            "开启" if earn_auto_subscribe else "关闭",
+                            product_id,
+                            purchase_id or "--",
+                        )
+                        done_text = f"理财存入 {amount_text} {asset_u}"
 
                     def _done():
                         self.progress["maximum"] = 1
                         self.progress["value"] = 1
-                        self.status_var.set(f"状态：理财存入 {amount_text} {asset_u}")
+                        self.status_var.set(f"状态：{done_text}")
 
                     self._dispatch_ui(_done)
                 except Exception as e:
@@ -523,6 +545,8 @@ class ExchangeAppBatchMixin(object):
             bnb_fee_stop_value=bnb_fee_stop_value,
             bnb_topup_amount=bnb_topup_amount_value,
             reprice_threshold_amount=reprice_threshold_value,
+            ladder_layout=ladder_layout,
+            ladder_min_pool_notional=ladder_min_pool_notional_value,
             futures_symbol=futures_symbol,
             futures_rounds=futures_rounds,
             futures_amount=futures_amount_value,
@@ -561,7 +585,7 @@ class ExchangeAppBatchMixin(object):
                     required_quote_amount=required_quote_amount,
                     spot_base_to_quote_only=zero_round_spot_conversion,
                 ):
-                    if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                    if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode in {TRADE_MODE_LIMIT, TRADE_MODE_LADDER}:
                         logger.info("挂单余额检测未通过，任务结束")
                     else:
                         logger.info("%s 检测未通过，任务结束", wait_asset)
@@ -586,6 +610,17 @@ class ExchangeAppBatchMixin(object):
                 elif trade_mode == TRADE_MODE_LIMIT:
                     logger.info(
                         "开始执行策略：挂单模式，预买BNB金额=%s，剩余bnb手续费=%s，重挂阈值=%s %s",
+                        bnb_topup_amount_value,
+                        bnb_fee_stop_value,
+                        BinanceClient._format_decimal(effective_reprice_threshold or Decimal("0")),
+                        quote_asset,
+                    )
+                elif trade_mode == TRADE_MODE_LADDER:
+                    logger.info(
+                        "开始执行策略：分仓挂单，档位模式=%s，最小分仓成交额=%s %s，预买BNB金额=%s，剩余bnb手续费=%s，重挂阈值=%s %s",
+                        ladder_layout,
+                        BinanceClient._format_decimal(ladder_min_pool_notional_value),
+                        quote_asset,
                         bnb_topup_amount_value,
                         bnb_fee_stop_value,
                         BinanceClient._format_decimal(effective_reprice_threshold or Decimal("0")),
@@ -872,6 +907,11 @@ class ExchangeAppBatchMixin(object):
             batch_total_asset_only=True,
             require_confirm=False,
         )
+    def run_context_account_monthly_trade_volume(self):
+        acc = self._get_context_account_or_warn()
+        if acc is None:
+            return
+        self.run_query_monthly_trade_volume(accounts_to_run=[acc])
     def run_context_account_stop(self):
         acc = self._get_context_account_or_warn()
         if acc is None:
@@ -900,6 +940,25 @@ class ExchangeAppBatchMixin(object):
         if acc is None:
             return
         self.batch_manual_withdraw(accounts_to_run=[acc], require_confirm=True)
+    def run_context_account_enable_earn_auto_subscribe(self):
+        acc = self._get_context_account_or_warn()
+        if acc is None:
+            return
+        try:
+            trade_settings = self._collect_trade_mode_settings(
+                trade_account_type_override=TRADE_ACCOUNT_TYPE_EARN,
+                earn_amount_override="0",
+                earn_amount_all_override=False,
+                earn_auto_subscribe_override=True,
+            )
+        except RuntimeError as e:
+            messagebox.showerror("错误", str(e))
+            return
+        self.run_selected_accounts(
+            accounts_to_run=[acc],
+            trade_settings_override=trade_settings,
+            require_confirm=True,
+        )
     def run_context_account_redeem_earn(self):
         acc = self._get_context_account_or_warn()
         if acc is None:
@@ -1203,6 +1262,9 @@ class ExchangeAppBatchMixin(object):
                 f"结果汇总：成功{success_count} | 失败{failed_count} | "
                 f"理财存入总额={earn_subscribe_text}"
             )
+        if runner == "batch_enable_flexible_earn_auto_subscribe":
+            auto_enabled_count = self._sum_batch_count_metrics(data.get("auto_enabled_by_account") or {})
+            return f"结果汇总：成功{success_count} | 失败{failed_count} | 开启自动申购{auto_enabled_count}"
         withdraw_text = self._format_batch_metric_totals(data.get("withdraw_by_account") or {})
         balance_text = self._format_batch_metric_totals(data.get("balance_by_account") or {})
         text = f"结果汇总：成功{success_count} | 失败{failed_count} | 提现总额={withdraw_text} | 余额总额={balance_text}"
@@ -1441,16 +1503,24 @@ class ExchangeAppBatchMixin(object):
         withdraw_network: str,
         enable_withdraw: bool,
         bnb_topup_amount: Decimal | None = None,
+        ladder_layout: str = LADDER_LAYOUT_DEFAULT,
+        ladder_min_pool_notional: Decimal | str | None = None,
         earn_asset: str = "",
         earn_amount: Decimal | str | None = None,
         earn_amount_all: bool = False,
+        earn_auto_subscribe: bool = False,
+        earn_auto_subscribe_only: bool = False,
     ) -> list[str]:
         lines = [f"批量账号数：{int(account_count)}"]
         lines.append(f"交易类型：{trade_account_type}")
         if trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
             lines.append(f"理财币种：{str(earn_asset or '').strip().upper() or '-'}")
-            amount_text = "全部" if earn_amount_all else BinanceClient._format_decimal(Decimal(str(earn_amount or "0")))
-            lines.append(f"存入数量：{amount_text}")
+            if earn_auto_subscribe_only:
+                lines.append("执行内容：仅开启自动申购")
+            else:
+                amount_text = "全部" if earn_amount_all else BinanceClient._format_decimal(Decimal(str(earn_amount or "0")))
+                lines.append(f"存入数量：{amount_text}")
+            lines.append(f"自动申购：{'开启' if earn_auto_subscribe else '关闭'}")
         elif trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
             lines.append(f"交易对：{str(futures_symbol or '').strip().upper() or '-'}")
             lines.append(f"轮次：{int(futures_rounds)}")
@@ -1458,7 +1528,13 @@ class ExchangeAppBatchMixin(object):
             lines.append(f"交易模式：{trade_mode}")
             lines.append(f"交易对：{str(spot_symbol or '').strip().upper() or '-'}")
             lines.append(f"轮次：{int(spot_rounds)}")
-            if trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}:
+            if trade_mode == TRADE_MODE_LADDER:
+                lines.append(f"档位模式：{ladder_layout}")
+                lines.append(
+                    "最小分仓成交额：%s"
+                    % BinanceClient._format_decimal(Decimal(str(ladder_min_pool_notional or "0")))
+                )
+            if trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER}:
                 lines.append(
                     "预购买BNB金额：%s" % BinanceClient._format_decimal(Decimal(str(bnb_topup_amount or "0")))
                 )
@@ -1486,9 +1562,13 @@ class ExchangeAppBatchMixin(object):
         bnb_topup_amount: Decimal | None = None,
         enable_bnb_topup: bool = False,
         show_bnb_topup_option: bool = False,
+        ladder_layout: str = LADDER_LAYOUT_DEFAULT,
+        ladder_min_pool_notional: Decimal | str | None = None,
         earn_asset: str = "",
         earn_amount: Decimal | str | None = None,
         earn_amount_all: bool = False,
+        earn_auto_subscribe: bool = False,
+        earn_auto_subscribe_only: bool = False,
     ) -> tuple[bool, bool, bool]:
         dialog = tk.Toplevel(self)
         dialog.title("确认批量执行")
@@ -1525,9 +1605,13 @@ class ExchangeAppBatchMixin(object):
             withdraw_network=withdraw_network,
             enable_withdraw=enable_withdraw,
             bnb_topup_amount=bnb_topup_amount,
+            ladder_layout=ladder_layout,
+            ladder_min_pool_notional=ladder_min_pool_notional,
             earn_asset=earn_asset,
             earn_amount=earn_amount,
             earn_amount_all=earn_amount_all,
+            earn_auto_subscribe=earn_auto_subscribe,
+            earn_auto_subscribe_only=earn_auto_subscribe_only,
         ):
             ttk.Label(summary, text=line, foreground="#444444").pack(anchor="w", pady=(0, 2))
 
@@ -1641,6 +1725,155 @@ class ExchangeAppBatchMixin(object):
             messagebox.showinfo("提示", "请至少勾选一个账号")
             return
         self.run_selected_accounts(accounts_to_run=selected_accounts, batch_total_asset_only=True, require_confirm=False)
+    def run_query_monthly_trade_volume(self, accounts_to_run=None):
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("提示", "已有任务在运行中，请先停止当前任务")
+            return
+
+        selected = list(accounts_to_run) if accounts_to_run is not None else self._get_selected_accounts()
+        if not selected:
+            messagebox.showinfo("提示", "请至少勾选一个账号")
+            return
+
+        symbol = BinanceClient.normalize_trade_symbol(self.spot_symbol_var.get())
+        if not symbol:
+            messagebox.showerror("错误", "现货交易对不能为空")
+            return
+        try:
+            quote_asset = BinanceClient.get_spot_quote_asset(symbol)
+            max_threads = max(1, int(self.max_threads_var.get()))
+        except Exception as exc:
+            messagebox.showerror("错误", str(exc) or "交易对或线程数格式不正确")
+            return
+
+        end_time_ms = int(time.time() * 1000)
+        start_time_ms = end_time_ms - (30 * 24 * 60 * 60 * 1000)
+        self.stop_event = threading.Event()
+        request_gate = SharedRateLimitGate(10, stop_event=self.stop_event)
+        self._batch_task_active = True
+        self._prepare_accounts_for_batch(selected)
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.btn_run_accounts.config(state="disabled")
+        self.btn_query_all_assets.config(state="disabled")
+        self.btn_collect_bnb_combo.config(state="disabled")
+        self.btn_batch_withdraw.config(state="disabled")
+        self.btn_batch_redeem_earn.config(state="disabled")
+        self.btn_refresh.config(state="disabled")
+        self.btn_withdraw.config(state="disabled")
+        self._set_account_manage_buttons_state("disabled")
+        self._set_combo_states_for_run(True)
+        self.status_var.set(f"状态：查询 {symbol} 近30天成交额...")
+        self.progress["value"] = 0
+        self.progress["maximum"] = len(selected)
+
+        task_queue = queue.Queue()
+        for batch_pos, acc in enumerate(selected, start=1):
+            task_queue.put((self._account_display_index(acc, batch_pos), acc))
+
+        result_lock = threading.Lock()
+        completed_count = 0
+        success_count = 0
+        total_quote_volume = Decimal("0")
+
+        def finish_one():
+            nonlocal completed_count
+            with result_lock:
+                completed_count += 1
+                current = completed_count
+            self._dispatch_ui(lambda: self.progress.config(value=current))
+
+        def query_worker(thread_id):
+            nonlocal success_count, total_quote_volume
+            while not self.stop_event.is_set():
+                try:
+                    idx, acc = task_queue.get(timeout=1)
+                except queue.Empty:
+                    clear_exchange_account_log_index()
+                    return
+                set_exchange_account_log_index(idx)
+                client = None
+                combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
+                try:
+                    self._schedule_account_status(acc, f"查询 {symbol} 近30天成交额...")
+                    client = self._create_binance_client(
+                        acc["api_key"],
+                        acc["api_secret"],
+                        request_gate=request_gate,
+                        request_stop_event=combined_stop,
+                    )
+                    summary = client.spot_trade_volume_summary(
+                        symbol,
+                        start_time_ms=start_time_ms,
+                        end_time_ms=end_time_ms,
+                        stop_event=combined_stop,
+                    )
+                    quote_volume = Decimal(str(summary["quoteVolume"]))
+                    trade_count = int(summary["tradeCount"])
+                    order_count = int(summary["orderCount"])
+                    volume_text = BinanceClient._format_decimal(quote_volume)
+                    self._schedule_account_status(
+                        acc,
+                        self._exchange_success_status_text(
+                            f"{symbol}近30天成交额 {volume_text} {quote_asset}（{order_count}单/{trade_count}笔）"
+                        ),
+                    )
+                    with result_lock:
+                        success_count += 1
+                        total_quote_volume += quote_volume
+                    logger.info(
+                        "账号 #%d %s 近30天成交额：%s %s，订单=%d，成交明细=%d",
+                        idx,
+                        symbol,
+                        volume_text,
+                        quote_asset,
+                        order_count,
+                        trade_count,
+                    )
+                except InterruptedError:
+                    self._schedule_account_status(acc, "已停止")
+                except Exception as exc:
+                    logger.error("账号 #%d 查询 %s 近30天成交额失败: %s", idx, symbol, exc)
+                    self._schedule_account_status(
+                        acc,
+                        self._exchange_error_status_text("月成交额查询失败", exc, fallback="查询失败"),
+                    )
+                finally:
+                    self._close_binance_client_instance(client)
+                    self._set_account_batch_active(acc, False)
+                    task_queue.task_done()
+                    finish_one()
+                    clear_exchange_account_log_index()
+
+        def controller():
+            threads = []
+            for thread_id in range(min(max_threads, len(selected))):
+                thread = threading.Thread(target=query_worker, args=(thread_id + 1,), daemon=True)
+                thread.start()
+                threads.append(thread)
+            for thread in threads:
+                thread.join()
+
+            with result_lock:
+                success = success_count
+                total = total_quote_volume
+            total_text = BinanceClient._format_decimal(total)
+            logger.info(
+                "%s 近30天成交额查询完成：成功账号=%d/%d，合计=%s %s",
+                symbol,
+                success,
+                len(selected),
+                total_text,
+                quote_asset,
+            )
+            status_text = (
+                f"状态：{symbol}近30天成交额合计 {total_text} {quote_asset}（成功{success}/{len(selected)}）"
+            )
+            self._dispatch_ui(
+                lambda: self._restore_batch_ui_to_idle(status_text=status_text, finish_summary=False)
+            )
+
+        self.worker_thread = self._start_managed_thread(controller, name="exchange-monthly-trade-volume")
     def batch_redeem_flexible_earn(self, accounts_to_run=None, *, require_confirm: bool = True):
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("提示", "已有任务在运行中，请先停止当前任务")
@@ -1960,6 +2193,7 @@ class ExchangeAppBatchMixin(object):
         batch_collect_bnb_mode: bool = False,
         batch_enable_withdraw_override: bool | None = None,
         batch_enable_bnb_topup_override: bool | None = None,
+        trade_settings_override: dict[str, object] | None = None,
         require_confirm: bool = True,
     ):
         if self.worker_thread and self.worker_thread.is_alive():
@@ -1979,7 +2213,11 @@ class ExchangeAppBatchMixin(object):
             usdt_timeout = int(self.usdt_timeout_var.get())
             max_threads = int(self.max_threads_var.get())
             if (not batch_total_asset_only) and (not batch_collect_bnb_mode):
-                trade_settings = self._collect_trade_mode_settings()
+                trade_settings = (
+                    dict(trade_settings_override)
+                    if trade_settings_override is not None
+                    else self._collect_trade_mode_settings()
+                )
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("错误", str(e) or "参数格式不正确 (请检查轮数/线程数/延迟等)")
             return
@@ -2005,6 +2243,8 @@ class ExchangeAppBatchMixin(object):
             bnb_fee_stop_value = trade_settings["bnb_fee_stop_value"]
             bnb_topup_amount_value = trade_settings["bnb_topup_amount_value"]
             reprice_threshold_value = trade_settings["reprice_threshold_value"]
+            ladder_layout = str(trade_settings["ladder_layout"])
+            ladder_min_pool_notional_value = trade_settings["ladder_min_pool_notional_value"]
             futures_symbol = str(trade_settings["futures_symbol"])
             futures_rounds = int(trade_settings["futures_rounds"])
             futures_amount_value = trade_settings["futures_amount_value"]
@@ -2014,6 +2254,8 @@ class ExchangeAppBatchMixin(object):
             earn_asset = str(trade_settings["earn_asset"])
             earn_amount_value = trade_settings["earn_amount_value"]
             earn_amount_all = bool(trade_settings.get("earn_amount_all"))
+            earn_auto_subscribe = bool(trade_settings.get("earn_auto_subscribe"))
+            earn_auto_subscribe_only = bool(trade_settings.get("earn_auto_subscribe_only"))
         else:
             trade_account_type = TRADE_ACCOUNT_TYPE_SPOT
             spot_rounds = max(1, int(self.spot_rounds_var.get() or SPOT_ROUNDS_DEFAULT))
@@ -2025,6 +2267,8 @@ class ExchangeAppBatchMixin(object):
             bnb_fee_stop_value = None
             bnb_topup_amount_value = Decimal("0")
             reprice_threshold_value = Decimal(REPRICE_THRESHOLD_DEFAULT)
+            ladder_layout = LADDER_LAYOUT_DEFAULT
+            ladder_min_pool_notional_value = Decimal(LADDER_MIN_POOL_NOTIONAL_DEFAULT)
             futures_symbol = BinanceClient.normalize_trade_symbol(self.futures_symbol_var.get())
             try:
                 futures_rounds = max(1, int(self.futures_rounds_var.get() or FUTURES_ROUNDS_DEFAULT))
@@ -2043,6 +2287,8 @@ class ExchangeAppBatchMixin(object):
             earn_asset = ""
             earn_amount_value = None
             earn_amount_all = False
+            earn_auto_subscribe = False
+            earn_auto_subscribe_only = False
 
         use_shared_rate_limit_gate = bool(
             trade_settings
@@ -2060,7 +2306,7 @@ class ExchangeAppBatchMixin(object):
         show_bnb_topup_option = (
             trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
             and spot_rounds != 0
-            and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}
+            and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER}
         )
         enable_bnb_topup = (
             bool(batch_enable_bnb_topup_override)
@@ -2085,9 +2331,13 @@ class ExchangeAppBatchMixin(object):
                 bnb_topup_amount=configured_bnb_topup_amount_value,
                 enable_bnb_topup=enable_bnb_topup,
                 show_bnb_topup_option=show_bnb_topup_option,
+                ladder_layout=ladder_layout,
+                ladder_min_pool_notional=ladder_min_pool_notional_value,
                 earn_asset=earn_asset,
                 earn_amount=earn_amount_value,
                 earn_amount_all=earn_amount_all,
+                earn_auto_subscribe=earn_auto_subscribe,
+                earn_auto_subscribe_only=earn_auto_subscribe_only,
             )
             if not confirmed:
                 return
@@ -2109,14 +2359,17 @@ class ExchangeAppBatchMixin(object):
         elif batch_collect_bnb_mode:
             batch_action_label = "归集BNB并提现"
         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
-            batch_action_label = "理财存入"
+            batch_action_label = "开启自动申购" if earn_auto_subscribe_only else "理财存入"
         else:
             batch_action_label = "批量执行"
-        batch_summary_runner = (
-            "batch_subscribe_flexible_earn"
-            if trade_account_type == TRADE_ACCOUNT_TYPE_EARN and not batch_total_asset_only and not batch_collect_bnb_mode
-            else "run_selected_accounts"
-        )
+        if trade_account_type == TRADE_ACCOUNT_TYPE_EARN and not batch_total_asset_only and not batch_collect_bnb_mode:
+            batch_summary_runner = (
+                "batch_enable_flexible_earn_auto_subscribe"
+                if earn_auto_subscribe_only
+                else "batch_subscribe_flexible_earn"
+            )
+        else:
+            batch_summary_runner = "run_selected_accounts"
         preflight_required = bool(trade_settings)
         validated_quote_asset = None
         validated_earn_product_id = None
@@ -2184,7 +2437,8 @@ class ExchangeAppBatchMixin(object):
         elif batch_collect_bnb_mode:
             self.status_var.set(f"状态：归集BNB并提现中 (并发 {max_threads} 线程)...")
         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
-            self.status_var.set(f"状态：理财存入中 (并发 {max_threads} 线程)...")
+            action_text = "开启自动申购" if earn_auto_subscribe_only else "理财存入"
+            self.status_var.set(f"状态：{action_text}中 (并发 {max_threads} 线程)...")
         else:
             self.status_var.set(f"状态：批量执行中 (并发 {max_threads} 线程)...")
 
@@ -2466,19 +2720,16 @@ class ExchangeAppBatchMixin(object):
                             set_status(self._exchange_error_status_text(f"{collect_withdraw_coin}提现失败", e, fallback=f"{collect_withdraw_coin}提现失败"))
                             op_success = False
 
-                    # 3) 活期理财存入
+                    # 3) 活期理财存入 / 自动申购开关
                     elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
                         asset_u = str(earn_asset or "").strip().upper()
                         product_id = str(validated_earn_product_id or "").strip()
-                        if (not earn_amount_all) and (not product_id):
+                        if not product_id:
                             set_status(f"查询{asset_u}理财...")
-                            amount_dec = self._resolve_earn_subscribe_amount(
-                                client,
+                            product = client.find_simple_earn_flexible_product(
                                 asset_u,
-                                earn_amount_value,
-                                earn_amount_all,
+                                None if earn_auto_subscribe_only else earn_amount_value,
                             )
-                            product = client.find_simple_earn_flexible_product(asset_u, amount_dec)
                             product_id = str(product.get("productId") or "").strip()
                         if combined_stop.is_set():
                             finish_current_now("已停止", success=False)
@@ -2488,42 +2739,59 @@ class ExchangeAppBatchMixin(object):
                             combined_stop,
                             min_delay,
                             max_delay,
-                            log_prefix=f"账号 #{idx} 理财存入前",
+                            log_prefix=(
+                                f"账号 #{idx} 开启自动申购前"
+                                if earn_auto_subscribe_only
+                                else f"账号 #{idx} 理财存入前"
+                            ),
                         )
                         if not delay_ok:
                             finish_current_now("已停止", success=False)
                             continue
 
-                        set_status(f"存入理财 {asset_u}...")
-                        amount_dec = self._resolve_earn_subscribe_amount(
-                            client,
-                            asset_u,
-                            earn_amount_value,
-                            earn_amount_all,
-                        )
-                        if earn_amount_all or not product_id:
-                            set_status(f"查询{asset_u}理财...")
-                            product = client.find_simple_earn_flexible_product(asset_u, amount_dec)
-                            product_id = str(product.get("productId") or "").strip()
+                        if earn_auto_subscribe_only:
+                            set_status(f"开启 {asset_u} 自动申购...")
+                            client.set_simple_earn_flexible_auto_subscribe(product_id, True)
+                            self._record_batch_count_metric(acc, "auto_enabled_by_account", 1)
+                            logger.info(
+                                "账号 #%d 已开启活期理财自动申购：资产=%s，productId=%s",
+                                idx,
+                                asset_u,
+                                product_id,
+                            )
+                            set_status(self._exchange_success_status_text(f"已开启 {asset_u} 自动申购"))
+                        else:
                             set_status(f"存入理财 {asset_u}...")
-                        result = client.subscribe_simple_earn_flexible_product(
-                            product_id,
-                            amount_dec,
-                            source_account="SPOT",
-                            auto_subscribe=False,
-                        )
-                        amount_text = BinanceClient._format_decimal(amount_dec)
-                        purchase_id = str((result or {}).get("purchaseId") or "").strip() if isinstance(result, dict) else ""
-                        self._record_batch_amount_metric(acc, "earn_subscribe_by_account", amount_dec, asset_u)
-                        logger.info(
-                            "账号 #%d 活期理财存入已提交：资产=%s，数量=%s，productId=%s，purchaseId=%s",
-                            idx,
-                            asset_u,
-                            amount_text,
-                            product_id,
-                            purchase_id or "--",
-                        )
-                        set_status(self._exchange_success_status_text(f"理财存入 {amount_text} {asset_u}"))
+                            amount_dec = self._resolve_earn_subscribe_amount(
+                                client,
+                                asset_u,
+                                earn_amount_value,
+                                earn_amount_all,
+                            )
+                            if earn_amount_all:
+                                set_status(f"查询{asset_u}理财...")
+                                product = client.find_simple_earn_flexible_product(asset_u, amount_dec)
+                                product_id = str(product.get("productId") or "").strip()
+                                set_status(f"存入理财 {asset_u}...")
+                            result = client.subscribe_simple_earn_flexible_product(
+                                product_id,
+                                amount_dec,
+                                source_account="SPOT",
+                                auto_subscribe=earn_auto_subscribe,
+                            )
+                            amount_text = BinanceClient._format_decimal(amount_dec)
+                            purchase_id = str((result or {}).get("purchaseId") or "").strip() if isinstance(result, dict) else ""
+                            self._record_batch_amount_metric(acc, "earn_subscribe_by_account", amount_dec, asset_u)
+                            logger.info(
+                                "账号 #%d 活期理财存入已提交：资产=%s，数量=%s，自动申购=%s，productId=%s，purchaseId=%s",
+                                idx,
+                                asset_u,
+                                amount_text,
+                                "开启" if earn_auto_subscribe else "关闭",
+                                product_id,
+                                purchase_id or "--",
+                            )
+                            set_status(self._exchange_success_status_text(f"理财存入 {amount_text} {asset_u}"))
                         op_success = True
 
                     # 4) 原批量现货/合约策略
@@ -2539,7 +2807,7 @@ class ExchangeAppBatchMixin(object):
                         wait_asset = base_asset if zero_round_spot_conversion else quote_asset
                         if zero_round_spot_conversion:
                             set_status(f"检测{base_asset} 到账...")
-                        elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                        elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode in {TRADE_MODE_LIMIT, TRADE_MODE_LADDER}:
                             set_status("检测挂单余额...")
                         else:
                             set_status(f"检测 {quote_asset} 到账...")
@@ -2569,7 +2837,7 @@ class ExchangeAppBatchMixin(object):
                                 if zero_round_spot_conversion:
                                     logger.info(f"账号 #{idx} {base_asset} 检测超时，跳过")
                                     set_status(self._exchange_failed_status_text(f"{base_asset} 未到账"))
-                                elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_LIMIT:
+                                elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode in {TRADE_MODE_LIMIT, TRADE_MODE_LADDER}:
                                     logger.info(f"账号 #{idx} 挂单余额检测超时，跳过")
                                     set_status(self._exchange_failed_status_text("无可挂单余额"))
                                 else:
@@ -2608,6 +2876,26 @@ class ExchangeAppBatchMixin(object):
                             logger.info(
                                 "账号 #%d 开始执行挂单策略：预买BNB金额=%s，剩余bnb手续费=%s，重挂阈值=%s %s",
                                 idx,
+                                bnb_topup_amount_value,
+                                bnb_fee_stop_value,
+                                BinanceClient._format_decimal(effective_reprice_threshold),
+                                quote_asset,
+                            )
+                        elif trade_mode == TRADE_MODE_LADDER:
+                            if reprice_threshold_value > 0:
+                                effective_reprice_threshold = client.normalize_price_delta(
+                                    spot_symbol,
+                                    reprice_threshold_value,
+                                    min_one_tick=True,
+                                )
+                            else:
+                                effective_reprice_threshold = Decimal("0")
+                            logger.info(
+                                "账号 #%d 开始执行分仓挂单策略：档位模式=%s，最小分仓成交额=%s %s，预买BNB金额=%s，剩余bnb手续费=%s，重挂阈值=%s %s",
+                                idx,
+                                ladder_layout,
+                                BinanceClient._format_decimal(ladder_min_pool_notional_value),
+                                quote_asset,
                                 bnb_topup_amount_value,
                                 bnb_fee_stop_value,
                                 BinanceClient._format_decimal(effective_reprice_threshold),
@@ -2728,6 +3016,8 @@ class ExchangeAppBatchMixin(object):
                             bnb_fee_stop_value=bnb_fee_stop_value,
                             bnb_topup_amount=bnb_topup_amount_value,
                             reprice_threshold_amount=reprice_threshold_value,
+                            ladder_layout=ladder_layout,
+                            ladder_min_pool_notional=ladder_min_pool_notional_value,
                             futures_symbol=futures_symbol,
                             futures_rounds=futures_rounds,
                             futures_amount=futures_amount_value,
@@ -2833,7 +3123,7 @@ class ExchangeAppBatchMixin(object):
                     if trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
                         earn_product = validate_client.find_simple_earn_flexible_product(
                             earn_asset,
-                            None if earn_amount_all else earn_amount_value,
+                            None if earn_amount_all or earn_auto_subscribe_only else earn_amount_value,
                         )
                         validated_earn_product_id = str(earn_product.get("productId") or "").strip()
                     else:
@@ -2870,6 +3160,11 @@ class ExchangeAppBatchMixin(object):
                                 )
                                 else None
                             ),
+                            "trade_settings_override": (
+                                dict(trade_settings_override)
+                                if trade_settings_override is not None
+                                else None
+                            ),
                         },
                         selected_accounts=selected,
                     )
@@ -2882,7 +3177,8 @@ class ExchangeAppBatchMixin(object):
                         elif batch_collect_bnb_mode:
                             self.status_var.set(f"状态：归集BNB并提现中 (并发 {max_threads} 线程)...")
                         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
-                            self.status_var.set(f"状态：理财存入中 (并发 {max_threads} 线程)...")
+                            action_text = "开启自动申购" if earn_auto_subscribe_only else "理财存入"
+                            self.status_var.set(f"状态：{action_text}中 (并发 {max_threads} 线程)...")
                         else:
                             self.status_var.set(f"状态：批量执行中 (并发 {max_threads} 线程)...")
 

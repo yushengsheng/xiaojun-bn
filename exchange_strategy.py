@@ -6,7 +6,7 @@ from __future__ import annotations
 import time
 from decimal import Decimal
 
-from exchange_binance_client import BinanceClient
+from exchange_binance_client import BinanceAPIError, BinanceClient
 from retry_utils import RetryAborted, RetryPolicy, run_with_retries
 from exchange_constants import (
     FUTURES_LEVERAGE_DEFAULT,
@@ -18,6 +18,13 @@ from exchange_constants import (
     FUTURES_SIDE_LONG,
     FUTURES_SIDE_OPTIONS,
     FUTURES_SYMBOL_DEFAULT,
+    LADDER_LAYOUT_BUY1_SELL1,
+    LADDER_LAYOUT_BUY1_SELL2,
+    LADDER_LAYOUT_BUY2_SELL1,
+    LADDER_LAYOUT_BUY2_SELL2,
+    LADDER_LAYOUT_DEFAULT,
+    LADDER_LAYOUT_OPTIONS,
+    LADDER_MIN_POOL_NOTIONAL_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_ORDER_COUNT_DEFAULT,
     PREMIUM_PARTIAL_FILL_DEFAULT,
@@ -28,6 +35,7 @@ from exchange_constants import (
     TRADE_MODE_CONVERT,
     TRADE_MODE_DEFAULT,
     TRADE_MODE_LIMIT,
+    TRADE_MODE_LADDER,
     TRADE_MODE_MARKET,
     TRADE_MODE_OPTIONS,
     TRADE_MODE_PREMIUM,
@@ -47,6 +55,9 @@ def _normalize_futures_margin_type(value) -> str:
 
 class Strategy:
     TRADE_OPERATION_RETRY_POLICY = RetryPolicy(attempts=10, delay_seconds=1)
+    LADDER_POLL_INTERVAL_SECONDS = 1.0
+    LADDER_ORDER_RECONCILE_INTERVAL_SECONDS = 5.0
+    LADDER_MAX_ACTIVE_CHILD_ORDERS_PER_SIDE = 20
 
     def __init__(
         self,
@@ -69,6 +80,8 @@ class Strategy:
         bnb_fee_stop_value: Decimal | None = None,
         bnb_topup_amount: Decimal | None = None,
         reprice_threshold_amount: Decimal | None = None,
+        ladder_layout: str = LADDER_LAYOUT_DEFAULT,
+        ladder_min_pool_notional: Decimal | None = None,
         futures_symbol: str = FUTURES_SYMBOL_DEFAULT,
         futures_rounds: int = FUTURES_ROUNDS_DEFAULT,
         futures_amount: Decimal | None = None,
@@ -100,6 +113,16 @@ class Strategy:
         self.bnb_topup_amount = Decimal(str(bnb_topup_amount if bnb_topup_amount is not None else "0"))
         self.reprice_threshold_amount = Decimal(
             str(reprice_threshold_amount if reprice_threshold_amount is not None else REPRICE_THRESHOLD_DEFAULT)
+        )
+        self.ladder_layout = str(ladder_layout or LADDER_LAYOUT_DEFAULT).strip()
+        if self.ladder_layout not in LADDER_LAYOUT_OPTIONS:
+            self.ladder_layout = LADDER_LAYOUT_DEFAULT
+        self.ladder_min_pool_notional = Decimal(
+            str(
+                ladder_min_pool_notional
+                if ladder_min_pool_notional is not None
+                else LADDER_MIN_POOL_NOTIONAL_DEFAULT
+            )
         )
         self.futures_symbol = BinanceClient.normalize_trade_symbol(futures_symbol or FUTURES_SYMBOL_DEFAULT)
         self.futures_rounds = max(1, int(futures_rounds or FUTURES_ROUNDS_DEFAULT))
@@ -261,7 +284,7 @@ class Strategy:
         return (not self._is_futures_mode()) and self._mode_name() == TRADE_MODE_CONVERT
 
     def _limit_like_mode(self) -> bool:
-        return self._mode_name() in {TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM}
+        return self._mode_name() in {TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER}
 
     def _premium_split_order_count(self) -> int:
         return max(0, int(self.premium_order_count or 0))
@@ -1536,6 +1559,519 @@ class Strategy:
                     return
                 logger.error("%s分笔模式执行异常: %s", mode_name, e)
 
+    @staticmethod
+    def _ladder_layout_level_counts(layout: str) -> tuple[int, int]:
+        normalized = str(layout or LADDER_LAYOUT_DEFAULT).strip()
+        mapping = {
+            LADDER_LAYOUT_BUY2_SELL2: (2, 2),
+            LADDER_LAYOUT_BUY1_SELL2: (1, 2),
+            LADDER_LAYOUT_BUY2_SELL1: (2, 1),
+            LADDER_LAYOUT_BUY1_SELL1: (1, 1),
+        }
+        return mapping.get(normalized, mapping[LADDER_LAYOUT_DEFAULT])
+
+    def _ladder_min_pool_value(self) -> Decimal:
+        value = Decimal(str(self.ladder_min_pool_notional or "0"))
+        return value if value > 0 else Decimal("0")
+
+    def _ladder_target_prices(self, bid_anchor: Decimal, ask_anchor: Decimal) -> dict[str, list[Decimal]]:
+        tick_size = Decimal(str(self.c.get_symbol_tick_size(self.spot_symbol) or "0"))
+        if tick_size <= 0:
+            raise RuntimeError(f"无法读取 {self.spot_symbol} 的最小价格精度 tickSize")
+        buy_levels, sell_levels = self._ladder_layout_level_counts(self.ladder_layout)
+        bid_price = self.c.adjust_price_to_valid_tick(self.spot_symbol, Decimal(str(bid_anchor)))
+        ask_price = self.c.adjust_price_to_valid_tick(
+            self.spot_symbol,
+            Decimal(str(ask_anchor)),
+            round_up=True,
+        )
+        buy_prices = [bid_price]
+        sell_prices = [ask_price]
+        if buy_levels > 1:
+            buy_prices.append(self.c.adjust_price_to_valid_tick(self.spot_symbol, bid_price - tick_size))
+        if sell_levels > 1:
+            sell_prices.append(
+                self.c.adjust_price_to_valid_tick(
+                    self.spot_symbol,
+                    ask_price + tick_size,
+                    round_up=True,
+                )
+            )
+        if any(price <= 0 for price in buy_prices + sell_prices):
+            raise RuntimeError(f"{self.spot_symbol} 档位价格无效")
+        return {"BUY": buy_prices, "SELL": sell_prices}
+
+    @staticmethod
+    def _ladder_split_amount(amount: Decimal, level_count: int) -> list[Decimal]:
+        total = Decimal(str(amount))
+        count = max(1, int(level_count or 1))
+        if total <= 0:
+            return []
+        if count == 1:
+            return [total]
+        first = total / Decimal(str(count))
+        result = [first for _ in range(count - 1)]
+        result.append(total - sum(result, Decimal("0")))
+        return result
+
+    def _ladder_validate_pool_threshold(self) -> None:
+        threshold = self._ladder_min_pool_value()
+        if threshold <= 0:
+            raise RuntimeError("最小分仓成交额必须大于 0")
+        rules = self.c.get_symbol_trade_rules(self.spot_symbol) or {}
+        min_notional = Decimal(str(rules.get("minNotional", "0") or "0"))
+        buy_levels, sell_levels = self._ladder_layout_level_counts(self.ladder_layout)
+        required_threshold = min_notional * Decimal(str(max(buy_levels, sell_levels)))
+        if min_notional > 0 and threshold < required_threshold:
+            quote_asset = self.c.get_spot_quote_asset(self.spot_symbol)
+            raise RuntimeError(
+                "最小分仓成交额过小：当前档位模式至少需要 "
+                f"{BinanceClient._format_decimal(required_threshold)} {quote_asset}"
+            )
+
+    @staticmethod
+    def _ladder_pending_amount(pending_allocations: list[dict[str, object]], side: str) -> Decimal:
+        side_u = str(side or "").strip().upper()
+        return sum(
+            (
+                Decimal(str(item.get("amount", "0") or "0"))
+                for item in pending_allocations
+                if str(item.get("side") or "").strip().upper() == side_u
+            ),
+            Decimal("0"),
+        )
+
+    def _ladder_enqueue_allocations(
+        self,
+        pending_allocations: list[dict[str, object]],
+        side: str,
+        amount: Decimal,
+    ) -> None:
+        side_u = str(side or "").strip().upper()
+        buy_levels, sell_levels = self._ladder_layout_level_counts(self.ladder_layout)
+        level_count = buy_levels if side_u == "BUY" else sell_levels
+        for level_index, split_amount in enumerate(self._ladder_split_amount(amount, level_count)):
+            if split_amount <= 0:
+                continue
+            pending_allocations.append(
+                {
+                    "side": side_u,
+                    "level_index": level_index,
+                    "amount": split_amount,
+                    "source": "pool",
+                }
+            )
+
+    def _ladder_submit_pending_allocations(
+        self,
+        pending_allocations: list[dict[str, object]],
+        active_orders: dict[str, dict[str, object]],
+        target_prices: dict[str, list[Decimal]],
+    ) -> dict[str, Decimal]:
+        if not pending_allocations:
+            return {}
+        active_counts = {
+            side: sum(
+                1
+                for state in active_orders.values()
+                if str(state.get("side") or "").strip().upper() == side
+            )
+            for side in ("BUY", "SELL")
+        }
+        pending_sides = {
+            str(item.get("side") or "").strip().upper()
+            for item in pending_allocations
+        }
+        if pending_sides and all(
+            active_counts.get(side, 0) >= self.LADDER_MAX_ACTIVE_CHILD_ORDERS_PER_SIDE
+            for side in pending_sides
+        ):
+            return {}
+        latest_book = self.c.get_book_ticker(self.spot_symbol)
+        live_target_prices = self._ladder_target_prices(
+            Decimal(str(latest_book["bidPrice"])),
+            Decimal(str(latest_book["askPrice"])),
+        )
+        ordered_allocations = sorted(
+            pending_allocations,
+            key=lambda item: 0 if item.get("source") == "reprice" else 1,
+        )
+        submitted_anchors: dict[str, Decimal] = {}
+        for allocation in ordered_allocations:
+            side_u = str(allocation.get("side") or "").strip().upper()
+            amount = Decimal(str(allocation.get("amount", "0") or "0"))
+            prices = list(live_target_prices.get(side_u) or target_prices.get(side_u) or [])
+            if amount <= 0 or not prices:
+                pending_allocations.remove(allocation)
+                continue
+            if active_counts.get(side_u, 0) >= self.LADDER_MAX_ACTIVE_CHILD_ORDERS_PER_SIDE:
+                continue
+            level_index = min(max(0, int(allocation.get("level_index", 0) or 0)), len(prices) - 1)
+            order_price = Decimal(str(prices[level_index]))
+            try:
+                if side_u == "BUY":
+                    order = self.c.spot_limit_buy_quote_amount(
+                        self.spot_symbol,
+                        order_price,
+                        amount,
+                        maker_only=True,
+                    )
+                else:
+                    order = self.c.spot_limit_sell_quantity(
+                        self.spot_symbol,
+                        order_price,
+                        amount,
+                        maker_only=True,
+                    )
+            except BinanceAPIError as exc:
+                if exc.code == -2010 and "immediately match and take" in str(exc.msg or "").lower():
+                    logger.warning(
+                        "分仓挂单%s%d提交时盘口已变化，保留额度等待下一轮：金额/数量=%s，价格=%s",
+                        "买" if side_u == "BUY" else "卖",
+                        level_index + 1,
+                        BinanceClient._format_decimal(amount),
+                        BinanceClient._format_decimal(order_price),
+                    )
+                    break
+                raise
+            if not order:
+                logger.warning(
+                    "分仓挂单%s%d未挂出，将保留可用余额等待后续处理：金额/数量=%s，价格=%s",
+                    "买" if side_u == "BUY" else "卖",
+                    level_index + 1,
+                    BinanceClient._format_decimal(amount),
+                    BinanceClient._format_decimal(order_price),
+                )
+                pending_allocations.remove(allocation)
+                continue
+            order_id = order.get("orderId")
+            if not order_id:
+                raise RuntimeError("分仓挂单返回缺少 orderId")
+            actual_price = self._order_price_decimal(order, order_price)
+            active_orders[str(order_id)] = {
+                "order_id": order_id,
+                "side": side_u,
+                "price": actual_price,
+                "level_index": level_index,
+            }
+            active_counts[side_u] = active_counts.get(side_u, 0) + 1
+            submitted_anchors[side_u] = (
+                Decimal(str(latest_book["bidPrice"]))
+                if side_u == "BUY"
+                else Decimal(str(latest_book["askPrice"]))
+            )
+            self._journal_open_order(order_id, side_u)
+            pending_allocations.remove(allocation)
+            logger.info(
+                "分仓挂单%s%s%d子订单：金额/数量=%s，价格=%s，订单#%s",
+                "重挂补档" if allocation.get("source") == "reprice" else "追加",
+                "买" if side_u == "BUY" else "卖",
+                level_index + 1,
+                BinanceClient._format_decimal(amount),
+                BinanceClient._format_decimal(actual_price),
+                order_id,
+            )
+        return submitted_anchors
+
+    def _ladder_reconcile_order_states(self, active_orders: dict[str, dict[str, object]]) -> None:
+        for order_key, state in list(active_orders.items()):
+            side_u = str(state.get("side") or "").strip().upper()
+            order_id = state.get("order_id")
+            order = self.c.get_order(self.spot_symbol, order_id)
+            status = str(order.get("status") or "").strip().upper()
+            state["price"] = self._order_price_decimal(order, Decimal(str(state.get("price", "0") or "0")))
+            if status == "FILLED":
+                self._journal_order_state(order_id, side_u, "completed", exchange_status=status)
+                active_orders.pop(order_key, None)
+                logger.info("分仓挂单子订单已成交：%s #%s", side_u, order_id)
+            elif self._order_terminal_status(status):
+                self._journal_order_state(order_id, side_u, "cancelled", exchange_status=status)
+                active_orders.pop(order_key, None)
+                logger.info("分仓挂单子订单已结束：%s #%s 状态=%s", side_u, order_id, status)
+
+    def _ladder_cancel_order_state(
+        self,
+        state: dict[str, object],
+        *,
+        reason: str,
+    ) -> tuple[dict, str]:
+        side_u = str(state.get("side") or "").strip().upper()
+        order_id = state.get("order_id")
+        latest_order = self._cancel_limit_order_with_fill_guard(order_id, side_u)
+        latest_status = str(latest_order.get("status") or "").strip().upper()
+        if not self._order_terminal_status(latest_status):
+            raise RuntimeError(f"订单 #{order_id} 撤销后状态未确认：{latest_status or '--'}")
+        if latest_status == "FILLED":
+            self._journal_order_state(order_id, side_u, "completed", exchange_status=latest_status)
+        else:
+            self._journal_order_state(
+                order_id,
+                side_u,
+                "cancelled",
+                reason=reason,
+                exchange_status=latest_status,
+            )
+        return latest_order, latest_status
+
+    def _ladder_cancel_orders_outside_targets(
+        self,
+        active_orders: dict[str, dict[str, object]],
+        pending_allocations: list[dict[str, object]],
+        side: str,
+        allowed_prices: list[Decimal],
+        *,
+        reason: str,
+    ) -> None:
+        side_u = str(side or "").strip().upper()
+        target_prices = [Decimal(str(price)) for price in allowed_prices]
+        allowed = set(target_prices)
+        occupied_levels = {
+            level_index
+            for level_index, target_price in enumerate(target_prices)
+            if any(
+                str(state.get("side") or "").strip().upper() == side_u
+                and Decimal(str(state.get("price", "0") or "0")) == target_price
+                for state in active_orders.values()
+            )
+            or any(
+                str(item.get("side") or "").strip().upper() == side_u
+                and int(item.get("level_index", -1) or 0) == level_index
+                for item in pending_allocations
+            )
+        }
+        for order_key, state in list(active_orders.items()):
+            if str(state.get("side") or "").strip().upper() != side_u:
+                continue
+            order_price = Decimal(str(state.get("price", "0") or "0"))
+            if order_price in allowed:
+                continue
+            order_id = state.get("order_id")
+            latest_order, latest_status = self._ladder_cancel_order_state(state, reason=reason)
+            active_orders.pop(order_key, None)
+
+            missing_level = next(
+                (level_index for level_index in range(len(target_prices)) if level_index not in occupied_levels),
+                None,
+            )
+            if latest_status != "FILLED" and missing_level is not None:
+                remaining_qty = max(
+                    Decimal("0"),
+                    Decimal(str(latest_order.get("origQty", "0") or "0"))
+                    - Decimal(str(latest_order.get("executedQty", "0") or "0")),
+                )
+                released_amount = (
+                    remaining_qty * self._order_price_decimal(latest_order, order_price)
+                    if side_u == "BUY"
+                    else remaining_qty
+                )
+                released_notional = (
+                    released_amount
+                    if side_u == "BUY"
+                    else released_amount * target_prices[missing_level]
+                )
+                if released_amount > 0 and released_notional >= self._ladder_min_pool_value():
+                    pending_allocations.append(
+                        {
+                            "side": side_u,
+                            "level_index": missing_level,
+                            "amount": released_amount,
+                            "source": "reprice",
+                        }
+                    )
+                    occupied_levels.add(missing_level)
+            logger.info(
+                "分仓挂单撤销移出目标档位的%s单：旧价=%s，订单#%s，状态=%s",
+                "买" if side_u == "BUY" else "卖",
+                BinanceClient._format_decimal(order_price),
+                order_id,
+                latest_status or "--",
+            )
+
+    def _ladder_cancel_all_orders(self, active_orders: dict[str, dict[str, object]], *, reason: str) -> None:
+        for order_key, state in list(active_orders.items()):
+            side_u = str(state.get("side") or "").strip().upper()
+            order_id = state.get("order_id")
+            try:
+                self._ladder_cancel_order_state(state, reason=reason)
+                active_orders.pop(order_key, None)
+            except Exception as exc:
+                logger.warning("分仓挂单停止时撤销订单失败 %s #%s: %s", side_u, order_id, exc)
+
+    def _run_ladder_mode(self, stop_event, progress_cb=None):
+        mode_name = self._mode_name()
+        base_asset, quote_asset = self._spot_pair_assets()
+        self._ladder_validate_pool_threshold()
+        min_pool = self._ladder_min_pool_value()
+        buy_levels, sell_levels = self._ladder_layout_level_counts(self.ladder_layout)
+        active_orders: dict[str, dict[str, object]] = {}
+        pending_allocations: list[dict[str, object]] = []
+        bid_anchor: Decimal | None = None
+        ask_anchor: Decimal | None = None
+        buy_reprice_pending = False
+        sell_reprice_pending = False
+        last_reconcile_at = time.monotonic()
+        loop_count = 0
+
+        self.c.collect_asset_to_spot(quote_asset, context="交易前")
+        logger.info(
+            "启用分仓挂单：档位模式=%s，买档=%d，卖档=%d，最小分仓成交额=%s %s，轮询=%g秒，对账=%g秒",
+            self.ladder_layout,
+            buy_levels,
+            sell_levels,
+            BinanceClient._format_decimal(min_pool),
+            quote_asset,
+            self.LADDER_POLL_INTERVAL_SECONDS,
+            self.LADDER_ORDER_RECONCILE_INTERVAL_SECONDS,
+        )
+
+        while True:
+            if stop_event and stop_event.is_set():
+                self._ladder_cancel_all_orders(active_orders, reason="stop")
+                logger.info("检测到停止信号，已撤销分仓挂单策略未完成订单")
+                return
+
+            try:
+                loop_count += 1
+                book_ticker = self.c.get_book_ticker(self.spot_symbol)
+                current_bid = Decimal(str(book_ticker["bidPrice"]))
+                current_ask = Decimal(str(book_ticker["askPrice"]))
+
+                now = time.monotonic()
+                if (now - last_reconcile_at) >= self.LADDER_ORDER_RECONCILE_INTERVAL_SECONDS:
+                    self._ladder_reconcile_order_states(active_orders)
+                    last_reconcile_at = now
+
+                has_active_buy = any(str(state.get("side") or "").upper() == "BUY" for state in active_orders.values())
+                has_active_sell = any(str(state.get("side") or "").upper() == "SELL" for state in active_orders.values())
+                if bid_anchor is None or not has_active_buy:
+                    bid_anchor = current_bid
+                if ask_anchor is None or not has_active_sell:
+                    ask_anchor = current_ask
+
+                reprice_threshold = self._reprice_threshold_value()
+                buy_reprice_from: Decimal | None = None
+                sell_reprice_from: Decimal | None = None
+                if has_active_buy and reprice_threshold > 0 and current_bid >= bid_anchor + reprice_threshold:
+                    buy_reprice_from = bid_anchor
+                    bid_anchor = current_bid
+                    buy_reprice_pending = True
+
+                if has_active_sell and reprice_threshold > 0 and current_ask <= ask_anchor - reprice_threshold:
+                    sell_reprice_from = ask_anchor
+                    ask_anchor = current_ask
+                    sell_reprice_pending = True
+
+                target_prices = self._ladder_target_prices(bid_anchor, ask_anchor)
+                if buy_reprice_from is not None:
+                    logger.info(
+                        "分仓挂单买侧触发重挂：旧买1=%s，新买1=%s，目标=%s",
+                        BinanceClient._format_decimal(buy_reprice_from),
+                        BinanceClient._format_decimal(bid_anchor),
+                        "/".join(BinanceClient._format_decimal(price) for price in target_prices["BUY"]),
+                    )
+                if sell_reprice_from is not None:
+                    logger.info(
+                        "分仓挂单卖侧触发重挂：旧卖1=%s，新卖1=%s，目标=%s",
+                        BinanceClient._format_decimal(sell_reprice_from),
+                        BinanceClient._format_decimal(ask_anchor),
+                        "/".join(BinanceClient._format_decimal(price) for price in target_prices["SELL"]),
+                    )
+                if buy_reprice_pending:
+                    self._ladder_cancel_orders_outside_targets(
+                        active_orders,
+                        pending_allocations,
+                        "BUY",
+                        target_prices["BUY"],
+                        reason="target-reconcile",
+                    )
+                    buy_reprice_pending = False
+                if sell_reprice_pending:
+                    self._ladder_cancel_orders_outside_targets(
+                        active_orders,
+                        pending_allocations,
+                        "SELL",
+                        target_prices["SELL"],
+                        reason="target-reconcile",
+                    )
+                    sell_reprice_pending = False
+                snapshot = self.c.spot_balance_snapshot({base_asset, quote_asset, "BNB"})
+                current_bnb = Decimal(str((snapshot.get("BNB") or {}).get("free", "0") or "0"))
+                bnb_stop = max(Decimal("0"), Decimal(str(self.bnb_fee_stop_value or "0")))
+                if current_bnb < bnb_stop:
+                    logger.info(
+                        "%s模式停止：当前 BNB 手续费余额 %s 低于停止值 %s",
+                        mode_name,
+                        BinanceClient._format_decimal(current_bnb),
+                        BinanceClient._format_decimal(bnb_stop),
+                    )
+                    self._ladder_cancel_all_orders(active_orders, reason="bnb-fee-stop")
+                    return
+
+                quote_free = Decimal(str((snapshot.get(quote_asset) or {}).get("free", "0") or "0"))
+                base_free = Decimal(str((snapshot.get(base_asset) or {}).get("free", "0") or "0"))
+                if base_asset == "BNB" and bnb_stop > 0:
+                    base_free = max(Decimal("0"), base_free - bnb_stop)
+                reserved_quote = self._ladder_pending_amount(pending_allocations, "BUY")
+                reserved_base = self._ladder_pending_amount(pending_allocations, "SELL")
+                available_quote = max(Decimal("0"), quote_free - reserved_quote)
+                available_base = max(Decimal("0"), base_free - reserved_base)
+
+                if available_quote >= min_pool:
+                    self._ladder_enqueue_allocations(pending_allocations, "BUY", available_quote)
+                    logger.info(
+                        "待买池达到阈值：可用=%s %s，按%d档分配",
+                        BinanceClient._format_decimal(available_quote),
+                        quote_asset,
+                        buy_levels,
+                    )
+                available_base_notional = available_base * current_ask
+                if available_base > 0 and available_base_notional >= min_pool:
+                    self._ladder_enqueue_allocations(pending_allocations, "SELL", available_base)
+                    logger.info(
+                        "待卖池达到阈值：可用=%s %s（约%s %s），按%d档分配",
+                        BinanceClient._format_decimal(available_base),
+                        base_asset,
+                        BinanceClient._format_decimal(available_base_notional),
+                        quote_asset,
+                        sell_levels,
+                    )
+
+                submitted_anchors = self._ladder_submit_pending_allocations(
+                    pending_allocations,
+                    active_orders,
+                    target_prices,
+                )
+                submitted_bid = submitted_anchors.get("BUY")
+                if submitted_bid is not None:
+                    bid_anchor = min(bid_anchor, submitted_bid)
+                submitted_ask = submitted_anchors.get("SELL")
+                if submitted_ask is not None:
+                    ask_anchor = max(ask_anchor, submitted_ask)
+
+                if progress_cb:
+                    progress_cb(
+                        loop_count,
+                        max(loop_count, 1),
+                        f"分仓挂单 活动订单{len(active_orders)} 待提交{len(pending_allocations)}",
+                    )
+
+                if not active_orders and not pending_allocations:
+                    logger.info(
+                        "分仓挂单无活动订单，且可用余额均未达到最小分仓成交额 %s %s，结束本次运行",
+                        BinanceClient._format_decimal(min_pool),
+                        quote_asset,
+                    )
+                    return
+            except Exception as exc:
+                if isinstance(exc, RetryAborted) or (stop_event and stop_event.is_set()):
+                    self._ladder_cancel_all_orders(active_orders, reason="stop")
+                    logger.info("检测到停止信号，已停止后续执行（%s模式）", mode_name)
+                    return
+                logger.error("分仓挂单轮询异常: %s", exc)
+
+            if self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS):
+                continue
+
     def _run_market_mode(self, stop_event, progress_cb=None):
         self._reset_market_round_tracking()
         total_steps = self.spot_rounds if self.spot_rounds > 0 else 1
@@ -1828,6 +2364,9 @@ class Strategy:
     def _run_limit_like_mode(self, stop_event, progress_cb=None):
         if self._mode_name() == TRADE_MODE_LIMIT:
             self._run_limit_mode(stop_event, progress_cb=progress_cb)
+            return
+        if self._mode_name() == TRADE_MODE_LADDER:
+            self._run_ladder_mode(stop_event, progress_cb=progress_cb)
             return
         self._run_premium_mode(stop_event, progress_cb=progress_cb)
 

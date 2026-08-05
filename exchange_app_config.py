@@ -9,6 +9,7 @@ from exchange_app_base import (
     BinanceClient,
     EARN_AMOUNT_DEFAULT,
     EARN_AMOUNT_ALL_DEFAULT,
+    EARN_AUTO_SUBSCRIBE_DEFAULT,
     EARN_ASSET_DEFAULT,
     EXCHANGE_PROXY_CONFIG_FILE,
     EXCHANGE_PROXY_DEFAULT,
@@ -22,6 +23,8 @@ from exchange_app_base import (
     FUTURES_SIDE_DEFAULT,
     FUTURES_SIDE_OPTIONS,
     FUTURES_SYMBOL_DEFAULT,
+    LADDER_LAYOUT_DEFAULT,
+    LADDER_MIN_POOL_NOTIONAL_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_DELTA_DEFAULT,
     PREMIUM_ORDER_COUNT_DEFAULT,
@@ -304,6 +307,8 @@ class ExchangeAppConfigMixin(object):
             "bnb_fee_stop": trade_settings["bnb_fee_stop"],
             "bnb_topup_amount": trade_settings["bnb_topup_amount"],
             "reprice_threshold": trade_settings["reprice_threshold"],
+            "ladder_layout": trade_settings["ladder_layout"],
+            "ladder_min_pool_notional": trade_settings["ladder_min_pool_notional"],
             "spot_symbol": str(trade_settings["spot_symbol"] or "").strip().upper(),
             "futures_symbol": str(trade_settings["futures_symbol"] or "").strip().upper(),
             "futures_rounds": int(trade_settings["stored_futures_rounds"]),
@@ -314,6 +319,7 @@ class ExchangeAppConfigMixin(object):
             "earn_asset": str(trade_settings["earn_asset"] or "").strip().upper(),
             "earn_amount": str(trade_settings["earn_amount"] or "").strip(),
             "earn_amount_all": bool(trade_settings.get("earn_amount_all")),
+            "earn_auto_subscribe": bool(trade_settings.get("earn_auto_subscribe")),
             "withdraw_address": self.withdraw_addr_var.get().strip(),
             "withdraw_network": self.withdraw_net_var.get().strip(),
             "withdraw_coin": self.withdraw_coin_var.get().strip().upper(),
@@ -440,6 +446,15 @@ class ExchangeAppConfigMixin(object):
             self.reprice_threshold_var.set(
                 str(raw.get("reprice_threshold", raw.get("reprice_threshold_percent", REPRICE_THRESHOLD_DEFAULT)) or REPRICE_THRESHOLD_DEFAULT).strip()
             )
+            self.ladder_layout_var.set(
+                str(raw.get("ladder_layout", LADDER_LAYOUT_DEFAULT) or LADDER_LAYOUT_DEFAULT).strip()
+            )
+            self.ladder_min_pool_notional_var.set(
+                str(
+                    raw.get("ladder_min_pool_notional", LADDER_MIN_POOL_NOTIONAL_DEFAULT)
+                    or LADDER_MIN_POOL_NOTIONAL_DEFAULT
+                ).strip()
+            )
             self.spot_symbol_var.set(
                 BinanceClient.normalize_trade_symbol(raw.get("spot_symbol", SPOT_SYMBOL_DEFAULT) or SPOT_SYMBOL_DEFAULT)
             )
@@ -460,6 +475,9 @@ class ExchangeAppConfigMixin(object):
             self.earn_asset_var.set(str(raw.get("earn_asset", EARN_ASSET_DEFAULT) or EARN_ASSET_DEFAULT).strip().upper())
             self.earn_amount_var.set(str(raw.get("earn_amount", EARN_AMOUNT_DEFAULT) or EARN_AMOUNT_DEFAULT).strip())
             self.earn_amount_all_var.set(bool(raw.get("earn_amount_all", EARN_AMOUNT_ALL_DEFAULT)))
+            self.earn_auto_subscribe_var.set(
+                bool(raw.get("earn_auto_subscribe", EARN_AUTO_SUBSCRIBE_DEFAULT))
+            )
             self.withdraw_addr_var.set(str(raw.get("withdraw_address", WITHDRAW_ADDRESS_DEFAULT) or WITHDRAW_ADDRESS_DEFAULT).strip())
             self.withdraw_net_var.set(str(raw.get("withdraw_network", WITHDRAW_NETWORK_DEFAULT) or WITHDRAW_NETWORK_DEFAULT).strip())
             self.withdraw_coin_var.set(str(raw.get("withdraw_coin", WITHDRAW_COIN_DEFAULT) or WITHDRAW_COIN_DEFAULT).strip().upper())

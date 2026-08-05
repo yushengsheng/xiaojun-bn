@@ -615,6 +615,124 @@ class BinanceClient:
                 })
         return result
 
+    def spot_balance_snapshot(self, assets: set[str] | list[str] | tuple[str, ...] | None = None) -> dict[str, dict[str, Decimal]]:
+        requested_assets = {
+            str(asset or "").strip().upper()
+            for asset in (assets or ())
+            if str(asset or "").strip()
+        }
+        data = self.request(self.spot, "GET", "/api/v3/account")
+        result: dict[str, dict[str, Decimal]] = {}
+        for item in data.get("balances", []):
+            asset_u = str(item.get("asset") or "").strip().upper()
+            if not asset_u or (requested_assets and asset_u not in requested_assets):
+                continue
+            free_amount = self._decimal_from_str(item.get("free", "0"), "0")
+            locked_amount = self._decimal_from_str(item.get("locked", "0"), "0")
+            result[asset_u] = {
+                "free": free_amount,
+                "locked": locked_amount,
+                "total": free_amount + locked_amount,
+            }
+        for asset_u in requested_assets:
+            result.setdefault(
+                asset_u,
+                {"free": Decimal("0"), "locked": Decimal("0"), "total": Decimal("0")},
+            )
+        return result
+
+    def spot_trade_volume_summary(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int,
+        end_time_ms: int,
+        stop_event=None,
+    ) -> dict[str, object]:
+        symbol_u = self.normalize_trade_symbol(symbol)
+        start_ms = int(start_time_ms)
+        end_ms = int(end_time_ms)
+        if not symbol_u:
+            raise RuntimeError("现货交易对不能为空")
+        if start_ms < 0 or end_ms < start_ms:
+            raise RuntimeError("成交额查询时间范围无效")
+
+        limit = 1000
+        params: dict[str, object] = {
+            "symbol": symbol_u,
+            "startTime": start_ms,
+            "limit": limit,
+        }
+        seen_trade_ids: set[str] = set()
+        order_ids: set[str] = set()
+        quote_volume = Decimal("0")
+        trade_count = 0
+        last_trade_id: int | None = None
+
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError("成交额查询已停止")
+            page = self.request(self.spot, "GET", "/api/v3/myTrades", params)
+            if not isinstance(page, list):
+                raise RuntimeError("成交明细返回格式异常")
+            if not page:
+                break
+
+            reached_end = False
+            for item in page:
+                if not isinstance(item, dict):
+                    continue
+                trade_time = int(item.get("time", 0) or 0)
+                if trade_time > end_ms:
+                    reached_end = True
+                    continue
+                if trade_time < start_ms:
+                    continue
+                raw_trade_id = item.get("id")
+                trade_id = str(raw_trade_id) if raw_trade_id is not None else ""
+                if trade_id and trade_id in seen_trade_ids:
+                    continue
+                if trade_id:
+                    seen_trade_ids.add(trade_id)
+                quote_qty_raw = item.get("quoteQty")
+                if quote_qty_raw in (None, ""):
+                    quote_qty = self._decimal_from_str(item.get("price"), "0") * self._decimal_from_str(
+                        item.get("qty"),
+                        "0",
+                    )
+                else:
+                    quote_qty = self._decimal_from_str(quote_qty_raw, "0")
+                quote_volume += max(Decimal("0"), quote_qty)
+                trade_count += 1
+                raw_order_id = item.get("orderId")
+                if raw_order_id not in (None, ""):
+                    order_ids.add(str(raw_order_id))
+
+            if reached_end or len(page) < limit:
+                break
+            page_trade_ids = [
+                int(item["id"])
+                for item in page
+                if isinstance(item, dict) and item.get("id") not in (None, "")
+            ]
+            if not page_trade_ids:
+                raise RuntimeError("成交明细缺少分页ID")
+            next_trade_id = max(page_trade_ids) + 1
+            if last_trade_id is not None and next_trade_id <= last_trade_id:
+                raise RuntimeError("成交明细分页未向前推进")
+            last_trade_id = next_trade_id
+            params = {"symbol": symbol_u, "fromId": next_trade_id, "limit": limit}
+
+        return {
+            "symbol": symbol_u,
+            "quoteAsset": self.get_spot_quote_asset(symbol_u),
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "quoteVolume": quote_volume,
+            "tradeCount": trade_count,
+            "orderCount": len(order_ids),
+        }
+
     def query_total_wallet_balance(self, quote_asset="USDT", *, fast: bool = False):
         requester = self.request_query if fast else self.request
         request_kwargs = {"timeout": 8, "max_retries": 2} if fast else {}
@@ -1942,7 +2060,15 @@ class BinanceClient:
             "askPrice": ask_price,
         }
 
-    def place_limit_order(self, symbol: str, side: str, quantity: Decimal, price: Decimal):
+    def place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        *,
+        maker_only: bool = False,
+    ):
         symbol_u = self.normalize_trade_symbol(symbol)
         side_u = side.upper()
         rules = self.get_symbol_trade_rules(symbol_u)
@@ -1978,11 +2104,12 @@ class BinanceClient:
         params = {
             "symbol": symbol_u,
             "side": side_u,
-            "type": "LIMIT",
-            "timeInForce": "GTC",
+            "type": "LIMIT_MAKER" if maker_only else "LIMIT",
             "quantity": self._format_decimal(qty),
             "price": self._format_decimal(order_price),
         }
+        if not maker_only:
+            params["timeInForce"] = "GTC"
         data = self.request(self.spot, "POST", "/api/v3/order", params)
         logger.info(
             "限价挂单 %s %s：数量=%s 价格=%s",
@@ -2080,7 +2207,14 @@ class BinanceClient:
         qty = self._floor_to_step(amount_quote / price_dec, rules["stepSize"])
         return self.place_limit_order(symbol, "BUY", qty, price_dec)
 
-    def spot_limit_buy_quote_amount(self, symbol: str, price: Decimal, quote_amount: Decimal | str | float | int):
+    def spot_limit_buy_quote_amount(
+        self,
+        symbol: str,
+        price: Decimal,
+        quote_amount: Decimal | str | float | int,
+        *,
+        maker_only: bool = False,
+    ):
         rules = self.get_symbol_trade_rules(symbol)
         if not rules:
             return None
@@ -2099,9 +2233,16 @@ class BinanceClient:
             return None
 
         qty = self._floor_to_step(amount_quote / price_dec, rules["stepSize"])
-        return self.place_limit_order(symbol, "BUY", qty, price_dec)
+        return self.place_limit_order(symbol, "BUY", qty, price_dec, maker_only=maker_only)
 
-    def spot_limit_sell_quantity(self, symbol: str, price: Decimal, quantity: Decimal | str | float | int):
+    def spot_limit_sell_quantity(
+        self,
+        symbol: str,
+        price: Decimal,
+        quantity: Decimal | str | float | int,
+        *,
+        maker_only: bool = False,
+    ):
         rules = self.get_symbol_trade_rules(symbol)
         if not rules:
             return None
@@ -2120,7 +2261,7 @@ class BinanceClient:
             return None
 
         qty = self._floor_to_step(qty, rules["stepSize"])
-        return self.place_limit_order(symbol, "SELL", qty, price_dec)
+        return self.place_limit_order(symbol, "SELL", qty, price_dec, maker_only=maker_only)
 
     def spot_buy_quote_amount(
         self,

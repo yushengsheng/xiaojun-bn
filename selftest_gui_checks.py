@@ -122,6 +122,23 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：交易所账号销毁按钮缺失")
                 if str(app.btn_destroy_all_accounts.cget("fg")).lower() != "#c62828":
                     raise RuntimeError("GUI 自检失败：交易所账号销毁按钮未使用红色字体")
+                batch_controls = list(app.btn_paste_accounts.master.pack_slaves())
+                paste_index = batch_controls.index(app.btn_paste_accounts)
+                monthly_volume_index = batch_controls.index(app.btn_query_monthly_volume)
+                if str(app.btn_query_monthly_volume.cget("text")) != "查询月成交额":
+                    raise RuntimeError("GUI 自检失败：月成交额查询按钮缺失")
+                if monthly_volume_index != paste_index + 1:
+                    raise RuntimeError("GUI 自检失败：月成交额查询按钮未紧随粘贴导入")
+                checks.append("exchange-monthly-volume-control-gui=ok")
+                context_menu_labels = [
+                    str(app.account_row_menu.entrycget(index, "label") or "")
+                    for index in range(int(app.account_row_menu.index("end") or 0) + 1)
+                    if str(app.account_row_menu.type(index)) == "command"
+                ]
+                if "自动申购" not in context_menu_labels:
+                    raise RuntimeError("GUI 自检失败：账号右键自动申购菜单缺失")
+                if "查询月成交额" not in context_menu_labels:
+                    raise RuntimeError("GUI 自检失败：账号右键月成交额查询菜单缺失")
                 header_children = list(app.btn_clear_account_search.master.pack_slaves())
                 if header_children.index(app.btn_destroy_all_accounts) != header_children.index(app.btn_clear_account_search) + 1:
                     raise RuntimeError("GUI 自检失败：交易所账号销毁按钮未紧随清空按钮")
@@ -145,6 +162,7 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     ("现货", "闪兑", True),
                     ("现货", "挂单", False),
                     ("现货", "溢价单", False),
+                    ("现货", "分仓挂单", False),
                     ("合约", "市价", True),
                     ("理财", "市价", False),
                 ]
@@ -161,6 +179,49 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                         )
                     if visible and labels.index("限流等待(秒):") > labels.index("提现预留:"):
                         raise RuntimeError("GUI 自检失败：限流等待未放在提现预留前")
+                app.trade_account_type_var.set("现货")
+                app.trade_mode_var.set("分仓挂单")
+                app.spot_rounds_var.set(1)
+                app.bnb_fee_stop_var.set("0")
+                app.ladder_layout_var.set("买2卖1")
+                app.ladder_min_pool_notional_var.set("50")
+                app._refresh_strategy_panel_layout()
+                pump_tk_events(app, timeout=2.0)
+                ladder_labels = [
+                    str(widget.cget("text") or "")
+                    for widget in app._strategy_row3_left.pack_slaves()
+                    if "text" in widget.keys()
+                ]
+                if "档位模式:" not in ladder_labels or "最小分仓成交额:" not in ladder_labels:
+                    raise RuntimeError(f"GUI 自检失败：分仓挂单控件缺失（{ladder_labels}）")
+                ladder_settings = app._collect_trade_mode_settings()
+                if (
+                    ladder_settings.get("ladder_layout") != "买2卖1"
+                    or str(ladder_settings.get("ladder_min_pool_notional_value")) != "50"
+                ):
+                    raise RuntimeError(f"GUI 自检失败：分仓挂单参数未生效（{ladder_settings}）")
+                checks.append("exchange-ladder-control-gui=ok")
+                app.trade_account_type_var.set("理财")
+                app._refresh_strategy_panel_layout()
+                pump_tk_events(app, timeout=2.0)
+                earn_controls = [
+                    str(widget.cget("text") or "")
+                    for widget in app._strategy_row2_left.pack_slaves()
+                    if "text" in widget.keys()
+                ]
+                if "全部" not in earn_controls or "自动申购" not in earn_controls:
+                    raise RuntimeError(f"GUI 自检失败：理财自动申购控件缺失（{earn_controls}）")
+                if earn_controls.index("自动申购") != earn_controls.index("全部") + 1:
+                    raise RuntimeError("GUI 自检失败：自动申购未紧随全部选项")
+                app.earn_amount_var.set("")
+                app.earn_auto_subscribe_var.set(True)
+                earn_settings = app._collect_trade_mode_settings()
+                if (
+                    earn_settings.get("earn_auto_subscribe") is not True
+                    or earn_settings.get("earn_auto_subscribe_only") is not True
+                ):
+                    raise RuntimeError("GUI 自检失败：理财仅开启自动申购设置未生效")
+                checks.append("earn-auto-subscribe-control-gui=ok")
                 app.trade_account_type_var.set("现货")
                 app.trade_mode_var.set("市价")
                 app.rate_limit_wait_var.set("17")
@@ -227,6 +288,8 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：销毁误删共享策略参数或代理配置")
                 if strategy_payload.get("rate_limit_wait_sec") != 17:
                     raise RuntimeError("GUI 自检失败：限流等待配置未保存")
+                if strategy_payload.get("earn_auto_subscribe") is not True:
+                    raise RuntimeError("GUI 自检失败：理财自动申购配置未保存")
                 checks.append("exchange-destroy-execution-gui=ok")
 
                 app._show_main_page("onchain")

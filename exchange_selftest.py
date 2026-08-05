@@ -20,7 +20,19 @@ from exchange_app_base import ExchangeAppBase
 from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_app_config import ExchangeAppConfigMixin
 from exchange_binance_client import BinanceAPIError, BinanceClient
-from exchange_constants import TRADE_ACCOUNT_TYPE_EARN, TRADE_ACCOUNT_TYPE_FUTURES, TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_LIMIT, TRADE_MODE_MARKET, TRADE_MODE_PREMIUM
+from exchange_constants import (
+    LADDER_LAYOUT_BUY1_SELL2,
+    LADDER_LAYOUT_DEFAULT,
+    LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+    TRADE_ACCOUNT_TYPE_EARN,
+    TRADE_ACCOUNT_TYPE_FUTURES,
+    TRADE_ACCOUNT_TYPE_SPOT,
+    TRADE_MODE_CONVERT,
+    TRADE_MODE_LADDER,
+    TRADE_MODE_LIMIT,
+    TRADE_MODE_MARKET,
+    TRADE_MODE_PREMIUM,
+)
 from exchange_logging import logger, runtime_log_path
 from onchain_relay_wallets import RelayWalletFileStore
 from onchain_relay_runner import (
@@ -2004,6 +2016,9 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             earn_asset="USDT",
             earn_amount="12.5",
             earn_amount_all=False,
+            earn_auto_subscribe=False,
+            ladder_layout=LADDER_LAYOUT_DEFAULT,
+            ladder_min_pool_notional=LADDER_MIN_POOL_NOTIONAL_DEFAULT,
         ):
             self.trade_account_type_var = _SimpleVar(account_type)
             self.trade_mode_var = _SimpleVar(mode)
@@ -2017,6 +2032,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.bnb_fee_stop_var = _SimpleVar("")
             self.bnb_topup_amount_var = _SimpleVar("0")
             self.reprice_threshold_var = _SimpleVar("0")
+            self.ladder_layout_var = _SimpleVar(ladder_layout)
+            self.ladder_min_pool_notional_var = _SimpleVar(ladder_min_pool_notional)
             self.futures_symbol_var = _SimpleVar("BTCUSDT")
             self.futures_amount_var = _SimpleVar("100")
             self.futures_margin_type_var = _SimpleVar("CROSSED")
@@ -2025,6 +2042,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.earn_asset_var = _SimpleVar(earn_asset)
             self.earn_amount_var = _SimpleVar(earn_amount)
             self.earn_amount_all_var = _SimpleVar(earn_amount_all)
+            self.earn_auto_subscribe_var = _SimpleVar(earn_auto_subscribe)
 
     market_zero_settings = _SelftestTradeSettingsProbe(
         mode=TRADE_MODE_MARKET,
@@ -2038,6 +2056,17 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     )._collect_trade_mode_settings()
     if limit_zero_settings.get("spot_rounds") != 0 or limit_zero_settings.get("bnb_fee_stop_value") is not None:
         raise RuntimeError(f"0轮挂单参数自检失败：0轮不应强制挂单专属参数（{limit_zero_settings}）")
+    ladder_settings = _SelftestTradeSettingsProbe(
+        mode=TRADE_MODE_LADDER,
+        spot_rounds=1,
+        ladder_layout=LADDER_LAYOUT_BUY1_SELL2,
+        ladder_min_pool_notional="50",
+    )._collect_trade_mode_settings()
+    if (
+        ladder_settings.get("ladder_layout") != LADDER_LAYOUT_BUY1_SELL2
+        or ladder_settings.get("ladder_min_pool_notional_value") != Decimal("50")
+    ):
+        raise RuntimeError(f"分仓挂单参数自检失败：参数解析异常（{ladder_settings}）")
     premium_zero_settings = _SelftestTradeSettingsProbe(
         mode=TRADE_MODE_PREMIUM,
         spot_rounds=0,
@@ -2055,6 +2084,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         earn_settings.get("earn_asset") != "USDT"
         or earn_settings.get("earn_amount_value") != Decimal("12.5")
         or earn_settings.get("earn_amount_all") is not False
+        or earn_settings.get("earn_auto_subscribe") is not False
     ):
         raise RuntimeError(f"理财存入参数自检失败：参数解析异常（{earn_settings}）")
     earn_all_settings = _SelftestTradeSettingsProbe(
@@ -2062,13 +2092,30 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         earn_asset="USDC",
         earn_amount="",
         earn_amount_all=True,
+        earn_auto_subscribe=True,
     )._collect_trade_mode_settings()
     if (
         earn_all_settings.get("earn_asset") != "USDC"
         or earn_all_settings.get("earn_amount_value") is not None
         or earn_all_settings.get("earn_amount_all") is not True
+        or earn_all_settings.get("earn_auto_subscribe") is not True
+        or earn_all_settings.get("earn_auto_subscribe_only") is not False
     ):
         raise RuntimeError(f"理财全部存入参数自检失败：参数解析异常（{earn_all_settings}）")
+    for auto_only_amount in ("", "0"):
+        earn_auto_only_settings = _SelftestTradeSettingsProbe(
+            account_type=TRADE_ACCOUNT_TYPE_EARN,
+            earn_amount=auto_only_amount,
+            earn_amount_all=False,
+            earn_auto_subscribe=True,
+        )._collect_trade_mode_settings()
+        if (
+            earn_auto_only_settings.get("earn_amount_value") != Decimal("0")
+            or earn_auto_only_settings.get("earn_auto_subscribe_only") is not True
+        ):
+            raise RuntimeError(
+                f"理财仅开启自动申购参数自检失败：参数解析异常（{earn_auto_only_settings}）"
+            )
     try:
         _SelftestTradeSettingsProbe(
             account_type=TRADE_ACCOUNT_TYPE_EARN,
@@ -2508,6 +2555,14 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             "sourceAccount": "SPOT",
         }:
             raise RuntimeError(f"活期理财存入自检失败：请求参数异常（{subscribe_params}）")
+        simple_earn_client.subscribe_simple_earn_flexible_product(
+            "P-USDT",
+            Decimal("1"),
+            auto_subscribe=True,
+        )
+        auto_subscribe_params = simple_earn_client.requests_made[-1][3]
+        if auto_subscribe_params.get("autoSubscribe") != "true":
+            raise RuntimeError(f"活期理财存入自动申购自检失败：请求参数异常（{auto_subscribe_params}）")
 
         redeem_result = simple_earn_client.redeem_simple_earn_flexible_product("P-USDT", redeem_all=True, dest_account="SPOT")
         if str(redeem_result.get("redeemId") or "") != "R-123":
@@ -2567,6 +2622,16 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     expected_subscribe_summary_text = "结果汇总：成功1 | 失败1 | 理财存入总额=12.5 USDT"
     if subscribe_summary_text != expected_subscribe_summary_text:
         raise RuntimeError(f"理财存入汇总自检失败：{subscribe_summary_text}")
+    auto_subscribe_summary_text = summary_probe._build_batch_summary_text(
+        {
+            "runner": "batch_enable_flexible_earn_auto_subscribe",
+            "results": {"ok": True, "failed": False},
+            "auto_enabled_by_account": {"ok": 1},
+        }
+    )
+    expected_auto_subscribe_summary_text = "结果汇总：成功1 | 失败1 | 开启自动申购1"
+    if auto_subscribe_summary_text != expected_auto_subscribe_summary_text:
+        raise RuntimeError(f"开启自动申购汇总自检失败：{auto_subscribe_summary_text}")
     checks.append("simple-earn-summary=ok")
 
 def _emit_selftest_console(message: str, *, error: bool = False) -> None:

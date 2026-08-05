@@ -41,6 +41,7 @@ from exchange_constants import (
     BNB_TOPUP_AMOUNT_DEFAULT,
     EARN_AMOUNT_DEFAULT,
     EARN_AMOUNT_ALL_DEFAULT,
+    EARN_AUTO_SUBSCRIBE_DEFAULT,
     EARN_ASSET_DEFAULT,
     EXCHANGE_RATE_LIMIT_WAIT_SECONDS_DEFAULT,
     EXCHANGE_PROXY_DEFAULT,
@@ -57,6 +58,9 @@ from exchange_constants import (
     FUTURES_SIDE_DEFAULT,
     FUTURES_SIDE_OPTIONS,
     FUTURES_SYMBOL_DEFAULT,
+    LADDER_LAYOUT_DEFAULT,
+    LADDER_LAYOUT_OPTIONS,
+    LADDER_MIN_POOL_NOTIONAL_DEFAULT,
     MAX_THREADS_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_DELTA_DEFAULT,
@@ -72,6 +76,7 @@ from exchange_constants import (
     TRADE_ACCOUNT_TYPE_SPOT,
     TRADE_MODE_CONVERT,
     TRADE_MODE_DEFAULT,
+    TRADE_MODE_LADDER,
     TRADE_MODE_LIMIT,
     TRADE_MODE_MARKET,
     TRADE_MODE_OPTIONS,
@@ -369,6 +374,8 @@ class ExchangeAppBase(tk.Tk):
         self.bnb_fee_stop_var = tk.StringVar(value=BNB_FEE_STOP_DEFAULT)
         self.bnb_topup_amount_var = tk.StringVar(value=BNB_TOPUP_AMOUNT_DEFAULT)
         self.reprice_threshold_var = tk.StringVar(value=REPRICE_THRESHOLD_DEFAULT)
+        self.ladder_layout_var = tk.StringVar(value=LADDER_LAYOUT_DEFAULT)
+        self.ladder_min_pool_notional_var = tk.StringVar(value=LADDER_MIN_POOL_NOTIONAL_DEFAULT)
         self.spot_symbol_var = tk.StringVar(value=SPOT_SYMBOL_DEFAULT)
         self.futures_symbol_var = tk.StringVar(value=FUTURES_SYMBOL_DEFAULT)
         self.futures_rounds_var = tk.IntVar(value=FUTURES_ROUNDS_DEFAULT)
@@ -379,6 +386,7 @@ class ExchangeAppBase(tk.Tk):
         self.earn_asset_var = tk.StringVar(value=EARN_ASSET_DEFAULT)
         self.earn_amount_var = tk.StringVar(value=EARN_AMOUNT_DEFAULT)
         self.earn_amount_all_var = tk.BooleanVar(value=EARN_AMOUNT_ALL_DEFAULT)
+        self.earn_auto_subscribe_var = tk.BooleanVar(value=EARN_AUTO_SUBSCRIBE_DEFAULT)
         self.earn_amount_all_var.trace_add("write", lambda *_args: self._sync_earn_amount_entry_state())
 
         self.withdraw_addr_var = tk.StringVar(value=WITHDRAW_ADDRESS_DEFAULT)
@@ -579,9 +587,11 @@ class ExchangeAppBase(tk.Tk):
         self.account_row_menu.add_command(label="复制提现地址", command=self.copy_context_account_withdraw_address)
         self.account_row_menu.add_separator()
         self.account_row_menu.add_command(label="查询", command=self.run_context_account_query)
+        self.account_row_menu.add_command(label="查询月成交额", command=self.run_context_account_monthly_trade_volume)
         self.account_row_menu.add_command(label="执行", command=self.run_context_account_execute)
         self.account_row_menu.add_command(label="停止", command=self.run_context_account_stop)
         self.account_row_menu.add_command(label="提现", command=self.run_context_account_withdraw)
+        self.account_row_menu.add_command(label="自动申购", command=self.run_context_account_enable_earn_auto_subscribe)
         self.account_row_menu.add_command(label="赎回理财", command=self.run_context_account_redeem_earn)
         self.account_row_menu.add_command(label="归集BNB并提现", command=self.run_context_account_collect_bnb)
         self.account_row_menu.add_separator()
@@ -634,6 +644,12 @@ class ExchangeAppBase(tk.Tk):
 
         self.btn_paste_accounts = ttk.Button(frame_batch_ctrl, text="粘贴导入", command=self.import_accounts_from_clipboard)
         self.btn_paste_accounts.pack(side="left", padx=5)
+        self.btn_query_monthly_volume = ttk.Button(
+            frame_batch_ctrl,
+            text="查询月成交额",
+            command=self.run_query_monthly_trade_volume,
+        )
+        self.btn_query_monthly_volume.pack(side="left", padx=5)
         ttk.Label(frame_batch_ctrl, text="绾跨▼鏁?").pack(side="left", padx=(10, 2))
         ttk.Spinbox(frame_batch_ctrl, from_=1, to=50, textvariable=self.max_threads_var, width=3).pack(side="left", padx=2)
         try:
@@ -1012,8 +1028,20 @@ class ExchangeAppBase(tk.Tk):
         if value < Decimal(str(min_value)):
             raise RuntimeError(f"{field_label}不能小于 {min_value}")
         return value
-    def _collect_trade_mode_settings(self) -> dict[str, object]:
-        trade_account_type = self._normalize_trade_account_type(self.trade_account_type_var.get())
+    def _collect_trade_mode_settings(
+        self,
+        *,
+        trade_account_type_override=None,
+        earn_amount_override=None,
+        earn_amount_all_override=None,
+        earn_auto_subscribe_override=None,
+    ) -> dict[str, object]:
+        account_type_raw = (
+            self.trade_account_type_var.get()
+            if trade_account_type_override is None
+            else trade_account_type_override
+        )
+        trade_account_type = self._normalize_trade_account_type(account_type_raw)
         mode = self._normalize_trade_mode(self.trade_mode_var.get())
         spot_symbol_raw = str(self.spot_symbol_var.get() or "")
         spot_symbol = BinanceClient.normalize_trade_symbol(spot_symbol_raw)
@@ -1035,6 +1063,13 @@ class ExchangeAppBase(tk.Tk):
         fee_stop_text = str(self.bnb_fee_stop_var.get() or "").strip()
         bnb_topup_text = str(self.bnb_topup_amount_var.get() or "").strip()
         reprice_threshold_text = str(self.reprice_threshold_var.get() or "").strip()
+        ladder_layout = str(self.ladder_layout_var.get() or LADDER_LAYOUT_DEFAULT).strip()
+        if ladder_layout not in LADDER_LAYOUT_OPTIONS:
+            ladder_layout = LADDER_LAYOUT_DEFAULT
+            self.ladder_layout_var.set(ladder_layout)
+        ladder_min_pool_notional_text = str(
+            self.ladder_min_pool_notional_var.get() or LADDER_MIN_POOL_NOTIONAL_DEFAULT
+        ).strip()
         futures_symbol_raw = str(self.futures_symbol_var.get() or "")
         futures_symbol = BinanceClient.normalize_trade_symbol(futures_symbol_raw)
         if futures_symbol_raw.strip() and futures_symbol_raw != futures_symbol:
@@ -1046,14 +1081,26 @@ class ExchangeAppBase(tk.Tk):
         earn_asset = earn_asset_raw.strip().upper()
         if earn_asset_raw.strip() and earn_asset_raw != earn_asset:
             self.earn_asset_var.set(earn_asset)
-        earn_amount_text = str(self.earn_amount_var.get() or "").strip()
-        earn_amount_all = bool(self.earn_amount_all_var.get())
+        earn_amount_raw = self.earn_amount_var.get() if earn_amount_override is None else earn_amount_override
+        earn_amount_text = str(earn_amount_raw or "").strip()
+        earn_amount_all = bool(
+            self.earn_amount_all_var.get()
+            if earn_amount_all_override is None
+            else earn_amount_all_override
+        )
+        earn_auto_subscribe = bool(
+            self.earn_auto_subscribe_var.get()
+            if earn_auto_subscribe_override is None
+            else earn_auto_subscribe_override
+        )
+        earn_auto_subscribe_only = False
         premium_value: Decimal | None = None
         premium_order_count = PREMIUM_ORDER_COUNT_DEFAULT
         premium_append_threshold_value = Decimal(PREMIUM_APPEND_THRESHOLD_DEFAULT)
         fee_stop_value: Decimal | None = None
         bnb_topup_value = Decimal("0")
         reprice_threshold_value = Decimal(REPRICE_THRESHOLD_DEFAULT)
+        ladder_min_pool_notional_value = Decimal(LADDER_MIN_POOL_NOTIONAL_DEFAULT)
         futures_rounds = stored_futures_rounds if stored_futures_rounds > 0 else FUTURES_ROUNDS_DEFAULT
         futures_amount_value: Decimal | None = None
         earn_amount_value: Decimal | None = None
@@ -1071,6 +1118,14 @@ class ExchangeAppBase(tk.Tk):
                 reprice_threshold_text = REPRICE_THRESHOLD_DEFAULT
             bnb_topup_value = self._decimal_field_value(bnb_topup_text, "预买BNB金额", min_value=0)
             reprice_threshold_value = self._decimal_field_value(reprice_threshold_text, "重挂阈值", min_value=0)
+            if mode == TRADE_MODE_LADDER:
+                ladder_min_pool_notional_value = self._decimal_field_value(
+                    ladder_min_pool_notional_text,
+                    "最小分仓成交额",
+                    min_value=0,
+                )
+                if ladder_min_pool_notional_value <= 0:
+                    raise RuntimeError("最小分仓成交额必须大于 0")
 
             if mode in {TRADE_MODE_MARKET, TRADE_MODE_CONVERT}:
                 try:
@@ -1082,7 +1137,14 @@ class ExchangeAppBase(tk.Tk):
             else:
                 runtime_rounds = stored_rounds if stored_rounds >= 0 else SPOT_ROUNDS_DEFAULT
                 if runtime_rounds != 0:
-                    fee_stop_value = self._decimal_field_value(fee_stop_text, "剩余bnb手续费", min_value=0)
+                    effective_fee_stop_text = fee_stop_text
+                    if mode == TRADE_MODE_LADDER and not effective_fee_stop_text:
+                        effective_fee_stop_text = "0"
+                    fee_stop_value = self._decimal_field_value(
+                        effective_fee_stop_text,
+                        "剩余bnb手续费",
+                        min_value=0,
+                    )
                     if mode == TRADE_MODE_PREMIUM:
                         premium_value = self._decimal_field_value(premium_text, "溢价", min_value=0)
                         if not premium_append_threshold_text:
@@ -1105,9 +1167,16 @@ class ExchangeAppBase(tk.Tk):
             if earn_amount_all:
                 earn_amount_value = None
             else:
-                earn_amount_value = self._decimal_field_value(earn_amount_text, "理财存入数量", min_value=0)
+                earn_amount_value = (
+                    self._decimal_field_value(earn_amount_text, "理财存入数量", min_value=0)
+                    if earn_amount_text
+                    else Decimal("0")
+                )
                 if earn_amount_value <= 0:
-                    raise RuntimeError("理财存入数量必须大于 0")
+                    if earn_auto_subscribe:
+                        earn_auto_subscribe_only = True
+                    else:
+                        raise RuntimeError("理财存入数量必须大于 0")
         else:
             runtime_rounds = stored_rounds if stored_rounds > 0 else SPOT_ROUNDS_DEFAULT
             try:
@@ -1149,6 +1218,9 @@ class ExchangeAppBase(tk.Tk):
             "bnb_topup_amount_value": bnb_topup_value,
             "reprice_threshold": reprice_threshold_text,
             "reprice_threshold_value": reprice_threshold_value,
+            "ladder_layout": ladder_layout,
+            "ladder_min_pool_notional": ladder_min_pool_notional_text,
+            "ladder_min_pool_notional_value": ladder_min_pool_notional_value,
             "futures_symbol": futures_symbol,
             "futures_rounds": futures_rounds,
             "stored_futures_rounds": stored_futures_rounds,
@@ -1161,6 +1233,8 @@ class ExchangeAppBase(tk.Tk):
             "earn_amount": earn_amount_text,
             "earn_amount_value": earn_amount_value,
             "earn_amount_all": earn_amount_all,
+            "earn_auto_subscribe": earn_auto_subscribe,
+            "earn_auto_subscribe_only": earn_auto_subscribe_only,
         }
     def _rate_limit_wait_seconds_value(self) -> int:
         try:
@@ -1297,6 +1371,7 @@ class ExchangeAppBase(tk.Tk):
         self.trade_account_type_combo = None
         self.futures_margin_type_combo = None
         self.futures_side_combo = None
+        self.ladder_layout_combo = None
         self.earn_amount_entry = None
 
         ttk.Label(row2_left, text="交易类型:").pack(side="left")
@@ -1355,6 +1430,11 @@ class ExchangeAppBase(tk.Tk):
                 text="全部",
                 variable=self.earn_amount_all_var,
                 command=self._sync_earn_amount_entry_state,
+            ).pack(side="left", padx=(0, 4))
+            ttk.Checkbutton(
+                row2_left,
+                text="自动申购",
+                variable=self.earn_auto_subscribe_var,
             ).pack(side="left", padx=(0, 12))
             self._sync_earn_amount_entry_state()
 
@@ -1394,6 +1474,26 @@ class ExchangeAppBase(tk.Tk):
                 ttk.Label(row3_left, text=self._reprice_threshold_label_text()).pack(side="left")
                 ttk.Entry(row3_left, textvariable=self.reprice_threshold_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
                 ttk.Checkbutton(row3_left, text="部分成交循环", variable=self.premium_partial_fill_var).pack(side="left", padx=(0, 8))
+            elif current_trade_mode == TRADE_MODE_LADDER:
+                ttk.Label(row3_left, text="剩余bnb手续费:").pack(side="left")
+                ttk.Entry(row3_left, textvariable=self.bnb_fee_stop_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
+                ttk.Label(row3_left, text="档位模式:").pack(side="left")
+                self.ladder_layout_combo = ttk.Combobox(
+                    row3_left,
+                    textvariable=self.ladder_layout_var,
+                    values=LADDER_LAYOUT_OPTIONS,
+                    width=8,
+                    state="readonly",
+                )
+                self.ladder_layout_combo.pack(side="left", padx=row3_item_pad)
+                ttk.Label(row3_left, text="最小分仓成交额:").pack(side="left")
+                ttk.Entry(
+                    row3_left,
+                    textvariable=self.ladder_min_pool_notional_var,
+                    width=row3_compact_entry_width,
+                ).pack(side="left", padx=row3_item_pad)
+                ttk.Label(row3_left, text=self._reprice_threshold_label_text()).pack(side="left")
+                ttk.Entry(row3_left, textvariable=self.reprice_threshold_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
 
             if current_trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_CONVERT}:
                 ttk.Label(row3_right, text="限流等待(秒):").pack(side="left")

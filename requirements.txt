@@ -4,7 +4,7 @@ certifi==2025.11.12
 cffi==2.0.0
 charset-normalizer==3.3.2
 ckzg==2.1.7
-cryptography==48.0.1
+cryptography==50.0.0
 cytoolz==1.1.0
 eth-abi==6.0.0b1
 eth-account==0.13.7
