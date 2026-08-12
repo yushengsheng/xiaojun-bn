@@ -22,7 +22,7 @@
 
 - 目标 commit 已通过固定入口完成回归：`python3 tools/run_full_regression.py`。
 - 若本地 GUI/Tk 环境异常，必须明确标记为阻断项，并在 GitHub Actions 上完成等价 GUI 自检后才能发版。
-- CI 使用 `pip install --require-hashes -r requirements-build.lock` 安装构建依赖。
+- CI 使用 `python -m pip install --require-hashes -r requirements-build.lock` 安装构建依赖。
 - release workflow 下载 `xray`、`sing-box` 和 `hysteria` 时必须校验 `XRAY_SHA256`、`SING_BOX_SHA256` 和 `HYSTERIA_SHA256`。
 - 打包前必须运行源码回归。
 - 打包后必须分别对 onefile 和 portable 执行 `--selftest --selftest-gui`。

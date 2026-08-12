@@ -58,7 +58,7 @@ def check_release_guardrails() -> None:
 
     for needle in (
         "runs-on: windows-latest",
-        "pip install --require-hashes -r requirements-build.lock",
+        "python -m pip install --require-hashes -r requirements-build.lock",
         "XRAY_SHA256",
         "SING_BOX_SHA256",
         "HYSTERIA_SHA256",

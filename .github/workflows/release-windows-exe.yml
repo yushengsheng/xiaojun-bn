@@ -40,7 +40,7 @@ jobs:
       - name: Install build dependencies
         shell: pwsh
         run: |
-          pip install --require-hashes -r requirements-build.lock
+          python -m pip install --require-hashes -r requirements-build.lock
 
       - name: Download proxy runtimes
         shell: pwsh

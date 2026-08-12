@@ -67,7 +67,7 @@ Rules:
   - pinned proxy runtimes downloaded during CI (`xray`, `sing-box`, `hysteria`)
   - both onefile and portable onedir packages
 - Keep runtime dependency sources in `requirements.txt` and build dependency sources in `requirements-build.txt`; regenerate and commit `requirements.lock` and `requirements-build.lock` with SHA-256 hashes whenever either source file changes.
-- Install CI and release dependencies only with `pip install --require-hashes -r requirements-build.lock`.
+- Install CI and release dependencies only with `python -m pip install --require-hashes -r requirements-build.lock`.
 - Run `python tools/run_regression.py --skip-pip-check --skip-app-selftest` before building release packages on CI. The command audits both locked dependency sets and must fail on known vulnerabilities.
 - Smoke test both packaged apps with `--selftest --selftest-gui` before publishing release assets.
   - `--selftest` should stay offline-friendly and focus on packaged integrity.
