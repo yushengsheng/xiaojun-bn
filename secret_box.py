@@ -53,6 +53,11 @@ def _atomic_write_secret_text(path: Path, content: str, encoding: str = "utf-8")
         raise
 
 
+def atomic_write_private_text(path: Path | str, content: str, encoding: str = "utf-8") -> None:
+    """Atomically write sensitive plaintext with owner-only permissions where supported."""
+    _atomic_write_secret_text(Path(path), content, encoding=encoding)
+
+
 class SecretBox:
     """
     轻量本地密钥封装：敏感字段落盘加密，内存中保持明文。

@@ -10,6 +10,7 @@ from app_defaults import (
     ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT,
     ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT,
 )
+from secret_box import atomic_write_private_text
 from page_onchain_base import (
     Decimal,
     InvalidOperation,
@@ -222,7 +223,7 @@ class OnchainImportMixin(object):
                 lines = list(self.store.one_to_many_addresses)
             else:
                 lines = list(self.store.many_to_one_sources)
-            Path(path).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            atomic_write_private_text(path, "\n".join(lines) + ("\n" if lines else ""))
             self.log(f"TXT 导出完成：{path}")
             messagebox.showinfo("导出完成", f"已导出 {len(lines)} 条")
         except Exception as exc:

@@ -29,7 +29,7 @@ _LABEL_SECRET_RE = re.compile(
 _CN_LABEL_SECRET_RE = re.compile(
     r"(私钥|助记词|代理链接|代理配置|代理|密钥|密码|签名)(\s*[：:=]\s*)([^\s,，;；&]+)"
 )
-_ENCRYPTED_VALUE_RE = re.compile(r"\benc::v[12]::[A-Za-z0-9_.=-]+")
+_ENCRYPTED_VALUE_RE = re.compile(r"\benc::v[123]::[A-Za-z0-9_.=-]+")
 _PLUS_RESULT_API_KEY_RE = re.compile(r"((?:^|[^\d])\d+\+)([A-Za-z0-9]{24,})(?=\+)")
 _RAW_HEX_SECRET_RE = re.compile(r"(?<!0x)(?<!0X)(?<![A-Fa-f0-9])([A-Fa-f0-9]{64})(?![A-Fa-f0-9])")
 

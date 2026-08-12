@@ -666,6 +666,9 @@ class BinanceClient:
         seen_trade_ids: set[str] = set()
         order_ids: set[str] = set()
         quote_volume = Decimal("0")
+        buy_quote_volume = Decimal("0")
+        sell_quote_volume = Decimal("0")
+        commission_by_asset: dict[str, Decimal] = {}
         trade_count = 0
         last_trade_id: int | None = None
 
@@ -702,7 +705,18 @@ class BinanceClient:
                     )
                 else:
                     quote_qty = self._decimal_from_str(quote_qty_raw, "0")
-                quote_volume += max(Decimal("0"), quote_qty)
+                quote_qty = max(Decimal("0"), quote_qty)
+                quote_volume += quote_qty
+                if self._bool_from_value(item.get("isBuyer")):
+                    buy_quote_volume += quote_qty
+                else:
+                    sell_quote_volume += quote_qty
+                commission_asset = str(item.get("commissionAsset") or "").strip().upper()
+                commission = max(Decimal("0"), self._decimal_from_str(item.get("commission"), "0"))
+                if commission_asset and commission > 0:
+                    commission_by_asset[commission_asset] = (
+                        commission_by_asset.get(commission_asset, Decimal("0")) + commission
+                    )
                 trade_count += 1
                 raw_order_id = item.get("orderId")
                 if raw_order_id not in (None, ""):
@@ -729,6 +743,10 @@ class BinanceClient:
             "startTime": start_ms,
             "endTime": end_ms,
             "quoteVolume": quote_volume,
+            "buyQuoteVolume": buy_quote_volume,
+            "sellQuoteVolume": sell_quote_volume,
+            "orderPnl": sell_quote_volume - buy_quote_volume,
+            "commissionByAsset": commission_by_asset,
             "tradeCount": trade_count,
             "orderCount": len(order_ids),
         }

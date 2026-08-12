@@ -54,13 +54,14 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
                 "price": "10",
                 "qty": "0.125",
                 "quoteQty": "1.25",
+                "isBuyer": trade_id % 2 == 1,
                 "time": 1_000 + trade_id,
             }
             for trade_id in range(1, 1001)
         ]
         second_page = [
-            {"id": 1001, "orderId": 1001, "quoteQty": "2.5", "time": 2_500},
-            {"id": 1002, "orderId": 1002, "quoteQty": "99", "time": 3_001},
+            {"id": 1001, "orderId": 1001, "quoteQty": "2.5", "isBuyer": True, "time": 2_500},
+            {"id": 1002, "orderId": 1002, "quoteQty": "99", "isBuyer": False, "time": 3_001},
         ]
         client = _TradeHistoryClient([first_page, second_page])
 
@@ -71,6 +72,9 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         )
 
         self.assertEqual(summary["quoteVolume"], Decimal("1252.50"))
+        self.assertEqual(summary["buyQuoteVolume"], Decimal("627.50"))
+        self.assertEqual(summary["sellQuoteVolume"], Decimal("625.00"))
+        self.assertEqual(summary["orderPnl"], Decimal("-2.50"))
         self.assertEqual(summary["tradeCount"], 1001)
         self.assertEqual(summary["orderCount"], 1001)
         self.assertEqual(client.requests[0], {"symbol": "BTCUSDT", "startTime": 1_000, "limit": 1000})
@@ -78,8 +82,27 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
 
     def test_counts_distinct_orders_and_falls_back_to_price_times_quantity(self) -> None:
         client = _TradeHistoryClient([[
-            {"id": 1, "orderId": 7, "price": "10", "qty": "2", "time": 1_100},
-            {"id": 2, "orderId": 7, "price": "12", "qty": "1", "quoteQty": "12", "time": 1_200},
+            {
+                "id": 1,
+                "orderId": 7,
+                "price": "10",
+                "qty": "2",
+                "isBuyer": True,
+                "commission": "0.002",
+                "commissionAsset": "BTC",
+                "time": 1_100,
+            },
+            {
+                "id": 2,
+                "orderId": 7,
+                "price": "12",
+                "qty": "1",
+                "quoteQty": "12",
+                "isBuyer": False,
+                "commission": "0.01",
+                "commissionAsset": "USDT",
+                "time": 1_200,
+            },
         ]])
 
         summary = client.spot_trade_volume_summary(
@@ -89,6 +112,13 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         )
 
         self.assertEqual(summary["quoteVolume"], Decimal("32"))
+        self.assertEqual(summary["buyQuoteVolume"], Decimal("20"))
+        self.assertEqual(summary["sellQuoteVolume"], Decimal("12"))
+        self.assertEqual(summary["orderPnl"], Decimal("-8"))
+        self.assertEqual(summary["commissionByAsset"], {
+            "BTC": Decimal("0.002"),
+            "USDT": Decimal("0.01"),
+        })
         self.assertEqual(summary["tradeCount"], 2)
         self.assertEqual(summary["orderCount"], 1)
         self.assertEqual(summary["quoteAsset"], "USDT")

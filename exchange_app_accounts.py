@@ -32,6 +32,7 @@ from exchange_account_destruction import (
     scrub_exchange_strategy_account_credentials,
 )
 from sensitive_data import mask_api_key
+from secret_box import atomic_write_private_text
 
 
 class ExchangeAppAccountsMixin(object):
@@ -896,15 +897,16 @@ class ExchangeAppAccountsMixin(object):
             return
 
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                for acc in self.accounts:
-                    line = "|".join([
-                        acc["api_key"],
-                        acc["api_secret"],
-                        acc["address"],
-                        self._account_network_value(acc),
-                    ])
-                    f.write(line + "\n")
+            lines = [
+                "|".join([
+                    acc["api_key"],
+                    acc["api_secret"],
+                    acc["address"],
+                    self._account_network_value(acc),
+                ])
+                for acc in self.accounts
+            ]
+            atomic_write_private_text(path, "\n".join(lines) + "\n")
             logger.info("账号列表已导出到文件：%s", path)
             messagebox.showinfo("成功", f"账号列表已导出到：\n{path}")
         except Exception as e:

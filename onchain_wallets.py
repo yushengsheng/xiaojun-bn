@@ -5,11 +5,11 @@ from __future__ import annotations
 
 from time import perf_counter
 
+from secret_box import atomic_write_private_text
 from page_onchain_base import (
     BOTH,
     END,
     LEFT,
-    Path,
     RIGHT,
     VERTICAL,
     bind_paste_shortcuts,
@@ -263,7 +263,7 @@ class OnchainWalletMixin(object):
             return
         try:
             lines = self._wallet_export_lines(self.wallet_export_format_var.get().strip())
-            Path(path).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+            atomic_write_private_text(path, "\n".join(lines) + ("\n" if lines else ""))
             self.log(f"钱包生成器 TXT 导出完成：{path}")
             messagebox.showinfo("导出完成", f"已导出 {len(lines)} 条", parent=getattr(self, "wallet_generator_window", None) or self.root)
         except Exception as exc:

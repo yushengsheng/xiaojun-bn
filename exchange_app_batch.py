@@ -47,6 +47,8 @@ from exchange_order_recovery import exchange_operation_scope, reconcile_exchange
 
 
 class ExchangeAppBatchMixin(object):
+    COLLECT_BNB_RESIDUAL_IGNORE_USDT = Decimal("0.1")
+
     @staticmethod
     def _uses_shared_rate_limit_gate(trade_account_type: str, trade_mode: str) -> bool:
         return trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES or (
@@ -1092,6 +1094,28 @@ class ExchangeAppBatchMixin(object):
                 remaining_assets.append(asset)
         return remaining_assets
     @staticmethod
+    def _collect_bnb_spot_residual_usdt(client, residual_assets: list[str]) -> Decimal:
+        balances = {
+            str((item or {}).get("asset") or "").strip().upper(): Decimal(
+                str((item or {}).get("free") or "0")
+            )
+            for item in client.spot_positive_assets()
+        }
+        total_usdt = Decimal("0")
+        for asset in residual_assets:
+            asset_u = str(asset or "").strip().upper()
+            amount = balances.get(asset_u, Decimal("0"))
+            if amount <= 0:
+                continue
+            if asset_u == "USDT":
+                total_usdt += amount
+                continue
+            price = client.get_symbol_price(f"{asset_u}USDT")
+            if price is None:
+                raise RuntimeError(f"无法获取 {asset_u}/USDT 价格")
+            total_usdt += amount * Decimal(str(price))
+        return total_usdt
+    @staticmethod
     def _collect_bnb_simple_earn_assets(client) -> list[str]:
         if not hasattr(client, "get_simple_earn_flexible_positions"):
             return []
@@ -1775,6 +1799,12 @@ class ExchangeAppBatchMixin(object):
         completed_count = 0
         success_count = 0
         total_quote_volume = Decimal("0")
+        total_order_pnl = Decimal("0")
+        total_commissions: dict[str, Decimal] = {}
+
+        def format_pnl(value: Decimal) -> str:
+            text = BinanceClient._format_decimal(value)
+            return f"+{text}" if value > 0 else text
 
         def finish_one():
             nonlocal completed_count
@@ -1784,7 +1814,7 @@ class ExchangeAppBatchMixin(object):
             self._dispatch_ui(lambda: self.progress.config(value=current))
 
         def query_worker(thread_id):
-            nonlocal success_count, total_quote_volume
+            nonlocal success_count, total_quote_volume, total_order_pnl
             while not self.stop_event.is_set():
                 try:
                     idx, acc = task_queue.get(timeout=1)
@@ -1809,24 +1839,40 @@ class ExchangeAppBatchMixin(object):
                         stop_event=combined_stop,
                     )
                     quote_volume = Decimal(str(summary["quoteVolume"]))
+                    order_pnl = Decimal(str(summary["orderPnl"]))
+                    commissions = dict(summary.get("commissionByAsset") or {})
                     trade_count = int(summary["tradeCount"])
                     order_count = int(summary["orderCount"])
                     volume_text = BinanceClient._format_decimal(quote_volume)
+                    pnl_text = format_pnl(order_pnl)
+                    commission_text = self._format_asset_breakdown_text(commissions)
                     self._schedule_account_status(
                         acc,
                         self._exchange_success_status_text(
-                            f"{symbol}近30天成交额 {volume_text} {quote_asset}（{order_count}单/{trade_count}笔）"
+                            f"{symbol}近30天成交额 {volume_text} {quote_asset}，"
+                            f"订单盈亏 {pnl_text} {quote_asset}，手续费 {commission_text}"
+                            f"（{order_count}单/{trade_count}笔）"
                         ),
                     )
                     with result_lock:
                         success_count += 1
                         total_quote_volume += quote_volume
+                        total_order_pnl += order_pnl
+                        for asset, amount in commissions.items():
+                            asset_u = str(asset or "").strip().upper()
+                            if asset_u:
+                                total_commissions[asset_u] = (
+                                    total_commissions.get(asset_u, Decimal("0")) + Decimal(str(amount or "0"))
+                                )
                     logger.info(
-                        "账号 #%d %s 近30天成交额：%s %s，订单=%d，成交明细=%d",
+                        "账号 #%d %s 近30天成交额：%s %s，订单盈亏=%s %s，手续费=%s，订单=%d，成交明细=%d",
                         idx,
                         symbol,
                         volume_text,
                         quote_asset,
+                        pnl_text,
+                        quote_asset,
+                        commission_text,
                         order_count,
                         trade_count,
                     )
@@ -1857,17 +1903,26 @@ class ExchangeAppBatchMixin(object):
             with result_lock:
                 success = success_count
                 total = total_quote_volume
+                pnl = total_order_pnl
+                commissions = dict(total_commissions)
             total_text = BinanceClient._format_decimal(total)
+            pnl_text = format_pnl(pnl)
+            commission_text = self._format_asset_breakdown_text(commissions)
             logger.info(
-                "%s 近30天成交额查询完成：成功账号=%d/%d，合计=%s %s",
+                "%s 近30天成交额查询完成：成功账号=%d/%d，合计=%s %s，订单盈亏=%s %s，手续费=%s",
                 symbol,
                 success,
                 len(selected),
                 total_text,
                 quote_asset,
+                pnl_text,
+                quote_asset,
+                commission_text,
             )
             status_text = (
-                f"状态：{symbol}近30天成交额合计 {total_text} {quote_asset}（成功{success}/{len(selected)}）"
+                f"状态：{symbol}近30天成交额 {total_text} {quote_asset}，"
+                f"订单盈亏 {pnl_text} {quote_asset}，手续费 {commission_text}"
+                f"（成功{success}/{len(selected)}）"
             )
             self._dispatch_ui(
                 lambda: self._restore_batch_ui_to_idle(status_text=status_text, finish_summary=False)
@@ -2657,6 +2712,22 @@ class ExchangeAppBatchMixin(object):
                             set_status(self._exchange_error_status_text("归集校验失败", e, fallback="归集校验失败"))
                             op_success = False
                             continue
+                        if residual_assets:
+                            try:
+                                residual_total_usdt = self._collect_bnb_spot_residual_usdt(
+                                    client,
+                                    residual_assets,
+                                )
+                                if residual_total_usdt < self.COLLECT_BNB_RESIDUAL_IGNORE_USDT:
+                                    logger.info(
+                                        "账号 #%d 残留现货资产总额约 %s USDT，小于 0.1 USDT，忽略残留：%s",
+                                        idx,
+                                        BinanceClient._format_decimal(residual_total_usdt),
+                                        residual_assets,
+                                    )
+                                    residual_assets.clear()
+                            except Exception as e:
+                                logger.warning("账号 #%d 残留资产估值失败，继续按残留处理: %s", idx, e)
                         if residual_assets:
                             asset_preview = self._asset_list_preview(residual_assets)
                             logger.warning("账号 #%d 仍有残留现货资产，已停止 BNB 提现: %s", idx, residual_assets)
