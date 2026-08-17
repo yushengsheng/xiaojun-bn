@@ -235,15 +235,22 @@ class Strategy:
             logger.info("检测到停止信号，跳过 0 轮现货兑换")
             return
         try:
+            market_mode = self._mode_name() == TRADE_MODE_MARKET
+            trade_action = (
+                (lambda: self.c.spot_sell_all_base(symbol=self.spot_symbol))
+                if market_mode
+                else (lambda: self.c.convert_base_to_quote_all(symbol=self.spot_symbol))
+            )
             result = self._run_trade_action_with_retry(
                 stop_event,
                 "0轮兑换 %s->%s" % (base_asset, quote_asset),
-                lambda: self.c.convert_base_to_quote_all(symbol=self.spot_symbol),
+                trade_action,
             )
             if result:
                 logger.info("0 轮现货兑换完成：%s -> %s", base_asset, quote_asset)
             else:
-                logger.info("0 轮现货兑换未执行：可能 %s 余额不足或不满足最小闪兑金额", base_asset)
+                minimum_text = "市价最小下单额" if market_mode else "最小闪兑金额"
+                logger.info("0 轮现货兑换未执行：可能 %s 余额不足或不满足%s", base_asset, minimum_text)
         except Exception as e:
             if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                 logger.info("检测到停止信号，跳过 0 轮现货兑换")

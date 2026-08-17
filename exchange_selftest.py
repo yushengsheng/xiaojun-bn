@@ -676,16 +676,6 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             pass
         else:
             raise RuntimeError("USDTU现货校验自检失败：不应把USDTU误判为现货交易对")
-        quote_asset_for_zero_round = ExchangeAppConfigMixin._ensure_trade_symbol_supported(
-            symbol_client,
-            TRADE_ACCOUNT_TYPE_SPOT,
-            TRADE_MODE_MARKET,
-            "USDTU",
-            "BTCUSDT",
-            0,
-        )
-        if quote_asset_for_zero_round != "U":
-            raise RuntimeError("0轮USDTU校验自检失败：未按闪兑资产对放行")
         try:
             ExchangeAppConfigMixin._ensure_trade_symbol_supported(
                 symbol_client,
@@ -693,12 +683,12 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                 TRADE_MODE_MARKET,
                 "USDTU",
                 "BTCUSDT",
-                1,
+                0,
             )
         except RuntimeError:
             pass
         else:
-            raise RuntimeError("非0轮USDTU校验自检失败：普通市价不应放行非现货交易对")
+            raise RuntimeError("0轮USDTU校验自检失败：市价模式不应放行非现货交易对")
         quote_asset_for_convert = ExchangeAppConfigMixin._ensure_trade_symbol_supported(
             symbol_client,
             TRADE_ACCOUNT_TYPE_SPOT,
@@ -852,6 +842,11 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self._record_event("convert")
             return {"status": "ok"}
 
+        def spot_sell_all_base(self, symbol: str, small_qty_log_text=None):
+            self.calls.append(("sell", str(symbol or "").strip().upper()))
+            self._record_event("sell")
+            return {"status": "ok"}
+
         def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
             self.calls.append(("withdraw", str(coin or "").strip().upper()))
             self._record_event("withdraw")
@@ -859,9 +854,6 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
 
         def spot_buy_all_usdt(self, symbol: str):
             raise RuntimeError("0轮现货兑换不应执行市价买入")
-
-        def spot_sell_all_base(self, symbol: str, small_qty_log_text=None):
-            raise RuntimeError("0轮现货兑换不应执行市价卖出")
 
         def buy_bnb_with_quote_amount(self, symbol: str, quote_amount):
             raise RuntimeError("0轮现货兑换不应执行预买BNB")
@@ -893,11 +885,11 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         stop_event=None,
         progress_cb=lambda step, total, text: zero_round_progress.append((step, total, text)),
     )
-    zero_round_convert_calls = [
-        call for call in zero_round_client.calls if call == ("convert-base-to-quote", "BTCUSDT")
+    zero_round_sell_calls = [
+        call for call in zero_round_client.calls if call == ("sell", "BTCUSDT")
     ]
-    if len(zero_round_convert_calls) != 1:
-        raise RuntimeError(f"0轮现货兑换自检失败：兑换调用次数异常（{zero_round_client.calls}）")
+    if len(zero_round_sell_calls) != 1 or ("convert-base-to-quote", "BTCUSDT") in zero_round_client.calls:
+        raise RuntimeError(f"0轮市价卖出自检失败：交易调用异常（{zero_round_client.calls}）")
     expected_zero_round_progress = [
         (0, 1, "0轮兑换 BTC->USDT"),
         (1, 1, "0轮兑换 BTC->USDT 完成"),
@@ -906,11 +898,11 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError(f"0轮现货兑换自检失败：进度回调异常（{zero_round_progress}）")
     if zero_round_sleep_calls["count"] != 2:
         raise RuntimeError(f"0轮现货兑换自检失败：随机延迟未在兑换前和最终提现前执行（{zero_round_sleep_calls}）")
-    if zero_round_events != ["sleep", "convert", "sleep", "withdraw"]:
+    if zero_round_events != ["sleep", "sell", "sleep", "withdraw"]:
         raise RuntimeError(f"0轮现货兑换自检失败：随机延迟和提现顺序异常（{zero_round_events}）")
     if not zero_round_result or zero_round_result.get("withdraw_attempted") is not True:
         raise RuntimeError("0轮现货兑换自检失败：未保持既有最终提现流程")
-    checks.append("spot-zero-round-convert=ok")
+    checks.append("spot-zero-round-market-sell=ok")
 
     stop_withdraw_events: list[str] = []
     stop_withdraw_client = _SelftestZeroRoundClient(stop_withdraw_events)
@@ -942,7 +934,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError(f"最终提现停止自检失败：停止后仍执行提现（{stop_withdraw_client.calls}）")
     if stop_withdraw_result.get("withdraw_attempted") is not False:
         raise RuntimeError(f"最终提现停止自检失败：停止后提现状态异常（{stop_withdraw_result}）")
-    if stop_withdraw_events != ["sleep", "convert", "sleep"]:
+    if stop_withdraw_events != ["sleep", "sell", "sleep"]:
         raise RuntimeError(f"最终提现停止自检失败：随机延迟和停止顺序异常（{stop_withdraw_events}）")
     checks.append("final-withdraw-delay-stop=ok")
 
@@ -972,7 +964,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError(f"无提现地址自检失败：仍调用了提现（{missing_address_client.calls}）")
     if missing_address_result.get("withdraw_attempted") is not False:
         raise RuntimeError(f"无提现地址自检失败：提现状态异常（{missing_address_result}）")
-    if missing_address_events != ["sleep", "convert"] or missing_address_sleep_calls["count"] != 1:
+    if missing_address_events != ["sleep", "sell"] or missing_address_sleep_calls["count"] != 1:
         raise RuntimeError(f"无提现地址自检失败：仍执行提现前步骤（{missing_address_events}）")
     checks.append("withdraw-skip-without-address=ok")
 
@@ -1019,7 +1011,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             sleep_fn=lambda: None,
             enable_withdraw=False,
             trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
-            trade_mode=TRADE_MODE_MARKET,
+            trade_mode=TRADE_MODE_CONVERT,
             bnb_topup_amount=Decimal("10"),
         )
         stable_u_strategy.run(stop_event=None)

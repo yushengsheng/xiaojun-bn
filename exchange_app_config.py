@@ -38,6 +38,7 @@ from exchange_app_base import (
     TRADE_ACCOUNT_TYPE_FUTURES,
     TRADE_MODE_CONVERT,
     TRADE_MODE_DEFAULT,
+    TRADE_MODE_MARKET,
     WITHDRAW_ADDRESS_DEFAULT,
     WITHDRAW_COIN_DEFAULT,
     WITHDRAW_FEE_BUFFER_DEFAULT,
@@ -277,7 +278,7 @@ class ExchangeAppConfigMixin(object):
                 zero_round = int(spot_rounds) == 0
             except Exception:
                 zero_round = False
-        if trade_mode == TRADE_MODE_CONVERT or zero_round:
+        if trade_mode == TRADE_MODE_CONVERT or (zero_round and trade_mode != TRADE_MODE_MARKET):
             _base_asset, quote_asset = client.ensure_convert_symbol_supported(spot_symbol)
             return quote_asset
         _base_asset, quote_asset = client.ensure_spot_symbol_supported(spot_symbol)

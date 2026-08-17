@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from exchange_app_accounts import ExchangeAppAccountsMixin
 from exchange_app_batch import ExchangeAppBatchMixin
-from exchange_constants import TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_MARKET
+from exchange_constants import TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_MARKET
 from exchange_strategy import Strategy
 
 
@@ -68,6 +68,45 @@ class _MarketRoundPermanentFailureClient(_MarketRoundTransientFailureClient):
 
 
 class ExchangeMarketRoundFailureTests(unittest.TestCase):
+    def test_zero_round_uses_selected_trade_mode(self):
+        market_client = _MarketRoundTransientFailureClient()
+        market_strategy = Strategy(
+            client=market_client,
+            spot_rounds=0,
+            withdraw_coin="USDT",
+            withdraw_address="",
+            withdraw_network="BSC",
+            withdraw_fee_buffer=0,
+            spot_symbol="BTCUSDT",
+            sleep_fn=lambda: None,
+            enable_withdraw=False,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            trade_mode=TRADE_MODE_MARKET,
+        )
+        market_strategy.run(stop_event=_NoDelayStop())
+        self.assertEqual(market_client.calls.count(("sell", "BTCUSDT")), 1)
+
+        convert_client = _MarketRoundTransientFailureClient()
+        convert_client.convert_base_to_quote_all = lambda symbol: convert_client.calls.append(
+            ("convert", str(symbol or "").strip().upper())
+        ) or True
+        convert_strategy = Strategy(
+            client=convert_client,
+            spot_rounds=0,
+            withdraw_coin="USDT",
+            withdraw_address="",
+            withdraw_network="BSC",
+            withdraw_fee_buffer=0,
+            spot_symbol="BTCUSDT",
+            sleep_fn=lambda: None,
+            enable_withdraw=False,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            trade_mode=TRADE_MODE_CONVERT,
+        )
+        convert_strategy.run(stop_event=_NoDelayStop())
+        self.assertEqual(convert_client.calls.count(("convert", "BTCUSDT")), 1)
+        self.assertNotIn(("sell", "BTCUSDT"), convert_client.calls)
+
     def test_market_round_transient_failure_retries_without_failed_round(self):
         client = _MarketRoundTransientFailureClient()
         strategy = Strategy(
