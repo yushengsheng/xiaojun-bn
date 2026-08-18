@@ -434,7 +434,7 @@ class BinanceClient:
             return
         remaining = gate.pause(retry_after)
         logger.warning(
-            "检测到 Binance API 限流/繁忙保护，整个批次暂停 %.3g 秒后重试当前请求: %s",
+            "检测到 Binance API 限流/繁忙保护，当前任务暂停 %.3g 秒后重试当前请求: %s",
             remaining,
             exc,
         )

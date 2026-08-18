@@ -24,6 +24,8 @@ from exchange_constants import (
     LADDER_LAYOUT_BUY1_SELL2,
     LADDER_LAYOUT_DEFAULT,
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+    MARKET_STOP_MODE_BNB,
+    MARKET_STOP_MODE_DEFAULT,
     TRADE_ACCOUNT_TYPE_EARN,
     TRADE_ACCOUNT_TYPE_FUTURES,
     TRADE_ACCOUNT_TYPE_SPOT,
@@ -2005,6 +2007,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             account_type=TRADE_ACCOUNT_TYPE_SPOT,
             mode=TRADE_MODE_MARKET,
             spot_rounds=0,
+            market_stop_mode=MARKET_STOP_MODE_DEFAULT,
+            bnb_fee_stop="",
             earn_asset="USDT",
             earn_amount="12.5",
             earn_amount_all=False,
@@ -2014,6 +2018,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         ):
             self.trade_account_type_var = _SimpleVar(account_type)
             self.trade_mode_var = _SimpleVar(mode)
+            self.market_stop_mode_var = _SimpleVar(market_stop_mode)
             self.spot_symbol_var = _SimpleVar("BTCUSDT")
             self.spot_rounds_var = _SimpleVar(spot_rounds)
             self.futures_rounds_var = _SimpleVar(20)
@@ -2021,7 +2026,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.premium_order_count_var = _SimpleVar(0)
             self.premium_append_threshold_var = _SimpleVar("")
             self.premium_partial_fill_var = _SimpleVar(False)
-            self.bnb_fee_stop_var = _SimpleVar("")
+            self.bnb_fee_stop_var = _SimpleVar(bnb_fee_stop)
             self.bnb_topup_amount_var = _SimpleVar("0")
             self.reprice_threshold_var = _SimpleVar("0")
             self.ladder_layout_var = _SimpleVar(ladder_layout)
@@ -2040,8 +2045,32 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         mode=TRADE_MODE_MARKET,
         spot_rounds=0,
     )._collect_trade_mode_settings()
-    if market_zero_settings.get("spot_rounds") != 0:
+    if (
+        market_zero_settings.get("spot_rounds") != 0
+        or market_zero_settings.get("market_stop_mode") != MARKET_STOP_MODE_DEFAULT
+    ):
         raise RuntimeError(f"0轮市价参数自检失败：轮次未保留为0（{market_zero_settings}）")
+    market_bnb_stop_settings = _SelftestTradeSettingsProbe(
+        mode=TRADE_MODE_MARKET,
+        spot_rounds=0,
+        market_stop_mode=MARKET_STOP_MODE_BNB,
+        bnb_fee_stop="0.01",
+    )._collect_trade_mode_settings()
+    if (
+        market_bnb_stop_settings.get("market_stop_mode") != MARKET_STOP_MODE_BNB
+        or market_bnb_stop_settings.get("bnb_fee_stop_value") != Decimal("0.01")
+    ):
+        raise RuntimeError(f"市价剩余BNB停止参数自检失败（{market_bnb_stop_settings}）")
+    try:
+        _SelftestTradeSettingsProbe(
+            mode=TRADE_MODE_MARKET,
+            market_stop_mode=MARKET_STOP_MODE_BNB,
+            bnb_fee_stop="0",
+        )._collect_trade_mode_settings()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("市价剩余BNB停止参数自检失败：停止值0未被拒绝")
     limit_zero_settings = _SelftestTradeSettingsProbe(
         mode=TRADE_MODE_LIMIT,
         spot_rounds=0,

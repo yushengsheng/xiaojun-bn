@@ -16,6 +16,7 @@ from exchange_constants import (
     TRADE_ACCOUNT_TYPE_FUTURES,
     TRADE_ACCOUNT_TYPE_SPOT,
     TRADE_MODE_CONVERT,
+    TRADE_MODE_LADDER,
     TRADE_MODE_LIMIT,
     TRADE_MODE_MARKET,
     TRADE_MODE_PREMIUM,
@@ -238,14 +239,15 @@ class ExchangeRetryPolicyTests(unittest.TestCase):
             probe._run_request_with_retry(action, max_retries=1, delay=0)
         self.assertEqual(calls, 0)
 
-    def test_shared_gate_only_applies_to_requested_three_trade_options(self):
+    def test_shared_gate_applies_to_all_trade_and_earn_modes(self):
         uses_gate = ExchangeAppBatchMixin._uses_shared_rate_limit_gate
         self.assertTrue(uses_gate(TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_MARKET))
         self.assertTrue(uses_gate(TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT))
         self.assertTrue(uses_gate(TRADE_ACCOUNT_TYPE_FUTURES, TRADE_MODE_MARKET))
-        self.assertFalse(uses_gate(TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_LIMIT))
-        self.assertFalse(uses_gate(TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_PREMIUM))
-        self.assertFalse(uses_gate(TRADE_ACCOUNT_TYPE_EARN, TRADE_MODE_MARKET))
+        self.assertTrue(uses_gate(TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_LIMIT))
+        self.assertTrue(uses_gate(TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_PREMIUM))
+        self.assertTrue(uses_gate(TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_LADDER))
+        self.assertTrue(uses_gate(TRADE_ACCOUNT_TYPE_EARN, TRADE_MODE_MARKET))
 
 
 if __name__ == "__main__":

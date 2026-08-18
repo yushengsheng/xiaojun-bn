@@ -13,6 +13,8 @@ from exchange_app_base import (
     FUTURES_SIDE_DEFAULT,
     LADDER_LAYOUT_DEFAULT,
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+    MARKET_STOP_MODE_BNB,
+    MARKET_STOP_MODE_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_ORDER_COUNT_DEFAULT,
     REPRICE_THRESHOLD_DEFAULT,
@@ -51,10 +53,11 @@ class ExchangeAppBatchMixin(object):
 
     @staticmethod
     def _uses_shared_rate_limit_gate(trade_account_type: str, trade_mode: str) -> bool:
-        return trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES or (
-            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
-            and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_CONVERT}
-        )
+        return trade_account_type in {
+            TRADE_ACCOUNT_TYPE_SPOT,
+            TRADE_ACCOUNT_TYPE_FUTURES,
+            TRADE_ACCOUNT_TYPE_EARN,
+        }
 
     @staticmethod
     def _exchange_operation_scope(api_key: str) -> str:
@@ -104,6 +107,7 @@ class ExchangeAppBatchMixin(object):
         for name in (
             "trade_account_type_combo",
             "trade_mode_combo",
+            "market_stop_mode_combo",
             "futures_margin_type_combo",
             "futures_side_combo",
             "ladder_layout_combo",
@@ -341,6 +345,7 @@ class ExchangeAppBatchMixin(object):
             trade_account_type = str(trade_settings["trade_account_type"])
             spot_rounds = int(trade_settings["spot_rounds"])
             trade_mode = str(trade_settings["trade_mode"])
+            market_stop_mode = str(trade_settings.get("market_stop_mode", MARKET_STOP_MODE_DEFAULT))
             premium_delta_value = trade_settings["premium_delta_value"]
             premium_order_count = int(trade_settings["premium_order_count"])
             premium_append_threshold_value = trade_settings["premium_append_threshold_value"]
@@ -365,11 +370,17 @@ class ExchangeAppBatchMixin(object):
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "\u6700\u5c0f")
             max_delay = self._delay_var_value(self.max_delay_var, 3000, "\u6700\u5927")
             usdt_timeout = int(self.usdt_timeout_var.get())
+            rate_limit_wait_seconds = self._rate_limit_wait_seconds_value()
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("错误", str(e) or "参数格式不正确")
             return
 
         spot_symbol = BinanceClient.normalize_trade_symbol(self.spot_symbol_var.get())
+        market_bnb_stop_mode = (
+            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
+            and trade_mode == TRADE_MODE_MARKET
+            and market_stop_mode == MARKET_STOP_MODE_BNB
+        )
         trade_symbol = futures_symbol if trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES else spot_symbol
         enable_withdraw = bool(self.enable_withdraw_var.get())
         withdraw_address = self.withdraw_addr_var.get().strip()
@@ -384,8 +395,15 @@ class ExchangeAppBatchMixin(object):
         quote_asset = ""
         validated_earn_product_id = ""
         effective_reprice_threshold = None
+        runtime_stop_event = threading.Event()
+        request_gate = SharedRateLimitGate(rate_limit_wait_seconds, stop_event=runtime_stop_event)
         try:
-            client = self._create_binance_client(key, secret)
+            client = self._create_binance_client(
+                key,
+                secret,
+                request_gate=request_gate,
+                request_stop_event=runtime_stop_event,
+            )
             if trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
                 earn_product = client.find_simple_earn_flexible_product(
                     earn_asset,
@@ -433,7 +451,8 @@ class ExchangeAppBatchMixin(object):
         self._replace_current_binance_client(client)
 
         logger.info("交易所单账号链路：%s", self._exchange_proxy_route_text())
-        self.stop_event = threading.Event()
+        logger.info("单账号 API 限流等待已启用：%d 秒", rate_limit_wait_seconds)
+        self.stop_event = runtime_stop_event
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.btn_run_accounts.config(state="disabled")
@@ -452,7 +471,11 @@ class ExchangeAppBatchMixin(object):
         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
             total_steps = 1
         else:
-            total_steps = max(spot_rounds, 1) if trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_CONVERT} else 1
+            total_steps = (
+                1
+                if market_bnb_stop_mode
+                else (max(spot_rounds, 1) if trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_CONVERT} else 1)
+            )
         self.progress["maximum"] = total_steps
 
         def sleep_fn():
@@ -540,6 +563,7 @@ class ExchangeAppBatchMixin(object):
             withdraw_callback=withdraw_callback,
             trade_account_type=trade_account_type,
             trade_mode=trade_mode,
+            market_stop_mode=market_stop_mode,
             premium_delta=premium_delta_value,
             premium_order_count=premium_order_count,
             premium_append_threshold=premium_append_threshold_value,
@@ -570,7 +594,9 @@ class ExchangeAppBatchMixin(object):
             failure_text = ""
             try:
                 zero_round_spot_conversion = (
-                    trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and spot_rounds == 0
+                    trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
+                    and not market_bnb_stop_mode
+                    and spot_rounds == 0
                 )
                 wait_asset = (
                     BinanceClient.get_spot_base_asset(spot_symbol)
@@ -603,10 +629,17 @@ class ExchangeAppBatchMixin(object):
                         futures_leverage,
                         futures_margin_type,
                     )
-                elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and spot_rounds == 0:
+                elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and not market_bnb_stop_mode and spot_rounds == 0:
                     logger.info("开始执行策略：0轮现货兑换，交易对=%s", spot_symbol)
                 elif trade_mode == TRADE_MODE_MARKET:
-                    logger.info("开始执行策略：市价 %d 轮，预买BNB金额=%s", spot_rounds, bnb_topup_amount_value)
+                    if market_bnb_stop_mode:
+                        logger.info(
+                            "开始执行策略：市价按剩余BNB停止，停止值=%s BNB，预买BNB金额=%s",
+                            BinanceClient._format_decimal(bnb_fee_stop_value),
+                            bnb_topup_amount_value,
+                        )
+                    else:
+                        logger.info("开始执行策略：市价 %d 轮，预买BNB金额=%s", spot_rounds, bnb_topup_amount_value)
                 elif trade_mode == TRADE_MODE_CONVERT:
                     logger.info("开始执行策略：闪兑 %d 轮，交易对=%s", spot_rounds, spot_symbol)
                 elif trade_mode == TRADE_MODE_LIMIT:
@@ -1519,6 +1552,8 @@ class ExchangeAppBatchMixin(object):
         trade_mode: str,
         spot_symbol: str,
         spot_rounds: int,
+        market_stop_mode: str = MARKET_STOP_MODE_DEFAULT,
+        bnb_fee_stop_value: Decimal | str | None = None,
         futures_symbol: str,
         futures_rounds: int,
         min_delay: int,
@@ -1551,7 +1586,13 @@ class ExchangeAppBatchMixin(object):
         else:
             lines.append(f"交易模式：{trade_mode}")
             lines.append(f"交易对：{str(spot_symbol or '').strip().upper() or '-'}")
-            lines.append(f"轮次：{int(spot_rounds)}")
+            if trade_mode == TRADE_MODE_MARKET and market_stop_mode == MARKET_STOP_MODE_BNB:
+                lines.append(
+                    "停止方式：剩余BNB低于 %s"
+                    % BinanceClient._format_decimal(Decimal(str(bnb_fee_stop_value or "0")))
+                )
+            else:
+                lines.append(f"轮次：{int(spot_rounds)}")
             if trade_mode == TRADE_MODE_LADDER:
                 lines.append(f"档位模式：{ladder_layout}")
                 lines.append(
@@ -1576,6 +1617,8 @@ class ExchangeAppBatchMixin(object):
         trade_mode: str,
         spot_symbol: str,
         spot_rounds: int,
+        market_stop_mode: str = MARKET_STOP_MODE_DEFAULT,
+        bnb_fee_stop_value: Decimal | str | None = None,
         futures_symbol: str,
         futures_rounds: int,
         min_delay: int,
@@ -1621,6 +1664,8 @@ class ExchangeAppBatchMixin(object):
             trade_mode=trade_mode,
             spot_symbol=spot_symbol,
             spot_rounds=spot_rounds,
+            market_stop_mode=market_stop_mode,
+            bnb_fee_stop_value=bnb_fee_stop_value,
             futures_symbol=futures_symbol,
             futures_rounds=futures_rounds,
             min_delay=min_delay,
@@ -2291,6 +2336,7 @@ class ExchangeAppBatchMixin(object):
             trade_account_type = str(trade_settings["trade_account_type"])
             spot_rounds = int(trade_settings["spot_rounds"])
             trade_mode = str(trade_settings["trade_mode"])
+            market_stop_mode = str(trade_settings.get("market_stop_mode", MARKET_STOP_MODE_DEFAULT))
             premium_delta_value = trade_settings["premium_delta_value"]
             premium_order_count = int(trade_settings["premium_order_count"])
             premium_append_threshold_value = trade_settings["premium_append_threshold_value"]
@@ -2315,6 +2361,7 @@ class ExchangeAppBatchMixin(object):
             trade_account_type = TRADE_ACCOUNT_TYPE_SPOT
             spot_rounds = max(1, int(self.spot_rounds_var.get() or SPOT_ROUNDS_DEFAULT))
             trade_mode = TRADE_MODE_MARKET
+            market_stop_mode = MARKET_STOP_MODE_DEFAULT
             premium_delta_value = None
             premium_order_count = PREMIUM_ORDER_COUNT_DEFAULT
             premium_append_threshold_value = Decimal(PREMIUM_APPEND_THRESHOLD_DEFAULT)
@@ -2345,6 +2392,12 @@ class ExchangeAppBatchMixin(object):
             earn_auto_subscribe = False
             earn_auto_subscribe_only = False
 
+        market_bnb_stop_mode = (
+            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
+            and trade_mode == TRADE_MODE_MARKET
+            and market_stop_mode == MARKET_STOP_MODE_BNB
+        )
+
         use_shared_rate_limit_gate = bool(
             trade_settings
             and self._uses_shared_rate_limit_gate(trade_account_type, trade_mode)
@@ -2360,7 +2413,7 @@ class ExchangeAppBatchMixin(object):
         configured_bnb_topup_amount_value = Decimal(str(bnb_topup_amount_value or "0"))
         show_bnb_topup_option = (
             trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
-            and spot_rounds != 0
+            and (market_bnb_stop_mode or spot_rounds != 0)
             and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER}
         )
         enable_bnb_topup = (
@@ -2376,6 +2429,8 @@ class ExchangeAppBatchMixin(object):
                 trade_mode=trade_mode,
                 spot_symbol=spot_symbol,
                 spot_rounds=spot_rounds,
+                market_stop_mode=market_stop_mode,
+                bnb_fee_stop_value=bnb_fee_stop_value,
                 futures_symbol=futures_symbol,
                 futures_rounds=futures_rounds,
                 min_delay=min_delay,
@@ -2868,7 +2923,9 @@ class ExchangeAppBatchMixin(object):
                     # 4) 原批量现货/合约策略
                     else:
                         zero_round_spot_conversion = (
-                            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and spot_rounds == 0
+                            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
+                            and not market_bnb_stop_mode
+                            and spot_rounds == 0
                         )
                         base_asset = (
                             BinanceClient.get_spot_base_asset(spot_symbol)
@@ -2929,10 +2986,18 @@ class ExchangeAppBatchMixin(object):
                                 futures_leverage,
                                 futures_margin_type,
                             )
-                        elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and spot_rounds == 0:
+                        elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and not market_bnb_stop_mode and spot_rounds == 0:
                             logger.info("账号 #%d 开始执行0轮现货兑换，交易对=%s", idx, spot_symbol)
                         elif trade_mode == TRADE_MODE_MARKET:
-                            logger.info("账号 #%d 开始执行市价策略：%d 轮，预买BNB金额=%s", idx, spot_rounds, bnb_topup_amount_value)
+                            if market_bnb_stop_mode:
+                                logger.info(
+                                    "账号 #%d 开始执行市价策略：按剩余BNB停止，停止值=%s BNB，预买BNB金额=%s",
+                                    idx,
+                                    BinanceClient._format_decimal(bnb_fee_stop_value),
+                                    bnb_topup_amount_value,
+                                )
+                            else:
+                                logger.info("账号 #%d 开始执行市价策略：%d 轮，预买BNB金额=%s", idx, spot_rounds, bnb_topup_amount_value)
                         elif trade_mode == TRADE_MODE_CONVERT:
                             logger.info("账号 #%d 开始执行闪兑策略：%d 轮，交易对=%s", idx, spot_rounds, spot_symbol)
                         elif trade_mode == TRADE_MODE_LIMIT:
@@ -3080,6 +3145,7 @@ class ExchangeAppBatchMixin(object):
                             withdraw_callback=withdraw_callback,
                             trade_account_type=trade_account_type,
                             trade_mode=trade_mode,
+                            market_stop_mode=market_stop_mode,
                             premium_delta=premium_delta_value,
                             premium_order_count=premium_order_count,
                             premium_append_threshold=premium_append_threshold_value,

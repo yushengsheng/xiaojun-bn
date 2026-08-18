@@ -61,6 +61,9 @@ from exchange_constants import (
     LADDER_LAYOUT_DEFAULT,
     LADDER_LAYOUT_OPTIONS,
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+    MARKET_STOP_MODE_BNB,
+    MARKET_STOP_MODE_DEFAULT,
+    MARKET_STOP_MODE_OPTIONS,
     MAX_THREADS_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_DELTA_DEFAULT,
@@ -366,6 +369,7 @@ class ExchangeAppBase(tk.Tk):
         self.use_exchange_config_proxy_var.trace_add("write", self._on_exchange_proxy_config_changed)
         self.trade_account_type_var = tk.StringVar(value=TRADE_ACCOUNT_TYPE_DEFAULT)
         self.spot_rounds_var = tk.IntVar(value=SPOT_ROUNDS_DEFAULT)
+        self.market_stop_mode_var = tk.StringVar(value=MARKET_STOP_MODE_DEFAULT)
         self.trade_mode_var = tk.StringVar(value=TRADE_MODE_DEFAULT)
         self.premium_delta_var = tk.StringVar(value=PREMIUM_DELTA_DEFAULT)
         self.premium_order_count_var = tk.IntVar(value=PREMIUM_ORDER_COUNT_DEFAULT)
@@ -914,6 +918,10 @@ class ExchangeAppBase(tk.Tk):
         text = str(value or "").strip()
         return text if text in TRADE_MODE_OPTIONS else TRADE_MODE_DEFAULT
     @staticmethod
+    def _normalize_market_stop_mode(value) -> str:
+        text = str(value or "").strip()
+        return text if text in MARKET_STOP_MODE_OPTIONS else MARKET_STOP_MODE_DEFAULT
+    @staticmethod
     def _normalize_futures_margin_type(value) -> str:
         text = str(value or "").strip()
         if not text:
@@ -1043,6 +1051,10 @@ class ExchangeAppBase(tk.Tk):
         )
         trade_account_type = self._normalize_trade_account_type(account_type_raw)
         mode = self._normalize_trade_mode(self.trade_mode_var.get())
+        stop_mode_var = getattr(self, "market_stop_mode_var", None)
+        market_stop_mode = self._normalize_market_stop_mode(
+            stop_mode_var.get() if stop_mode_var is not None else MARKET_STOP_MODE_DEFAULT
+        )
         spot_symbol_raw = str(self.spot_symbol_var.get() or "")
         spot_symbol = BinanceClient.normalize_trade_symbol(spot_symbol_raw)
         if spot_symbol_raw.strip() and spot_symbol_raw != spot_symbol:
@@ -1134,6 +1146,14 @@ class ExchangeAppBase(tk.Tk):
                     raise RuntimeError(f"{mode}模式下必须填写现货轮次") from exc
                 if runtime_rounds < 0:
                     raise RuntimeError(f"{mode}模式下现货轮次必须大于等于 0")
+                if mode == TRADE_MODE_MARKET and market_stop_mode == MARKET_STOP_MODE_BNB:
+                    fee_stop_value = self._decimal_field_value(
+                        fee_stop_text,
+                        "剩余bnb手续费",
+                        min_value=0,
+                    )
+                    if fee_stop_value <= 0:
+                        raise RuntimeError("剩余bnb手续费必须大于 0")
             else:
                 runtime_rounds = stored_rounds if stored_rounds >= 0 else SPOT_ROUNDS_DEFAULT
                 if runtime_rounds != 0:
@@ -1203,6 +1223,7 @@ class ExchangeAppBase(tk.Tk):
         return {
             "trade_account_type": trade_account_type,
             "trade_mode": mode,
+            "market_stop_mode": market_stop_mode,
             "spot_rounds": runtime_rounds,
             "stored_spot_rounds": stored_rounds,
             "spot_symbol": spot_symbol,
@@ -1368,6 +1389,7 @@ class ExchangeAppBase(tk.Tk):
         row2_right.grid(row=0, column=1, sticky="w")
         row2.grid_columnconfigure(2, weight=1)
         self.trade_mode_combo = None
+        self.market_stop_mode_combo = None
         self.trade_account_type_combo = None
         self.futures_margin_type_combo = None
         self.futures_side_combo = None
@@ -1399,8 +1421,24 @@ class ExchangeAppBase(tk.Tk):
 
             ttk.Label(row2_left, text="现货交易对:", style="ExchangeAccent.TLabel").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.spot_symbol_var, width=14).pack(side="left", padx=(4, 12))
-            ttk.Label(row2_left, text="现货轮次:").pack(side="left")
-            ttk.Spinbox(row2_left, from_=0, to=100, textvariable=self.spot_rounds_var, width=6).pack(side="left", padx=(4, 12))
+            if current_trade_mode == TRADE_MODE_MARKET:
+                ttk.Label(row2_left, text="停止方式:").pack(side="left")
+                self.market_stop_mode_combo = ttk.Combobox(
+                    row2_left,
+                    textvariable=self.market_stop_mode_var,
+                    values=MARKET_STOP_MODE_OPTIONS,
+                    width=8,
+                    state="readonly",
+                )
+                self.market_stop_mode_combo.pack(side="left", padx=(4, 6))
+                self.market_stop_mode_combo.bind("<<ComboboxSelected>>", self._on_trade_mode_changed, add="+")
+                if self._normalize_market_stop_mode(self.market_stop_mode_var.get()) == MARKET_STOP_MODE_BNB:
+                    ttk.Entry(row2_left, textvariable=self.bnb_fee_stop_var, width=8).pack(side="left", padx=(0, 12))
+                else:
+                    ttk.Spinbox(row2_left, from_=0, to=100, textvariable=self.spot_rounds_var, width=6).pack(side="left", padx=(0, 12))
+            else:
+                ttk.Label(row2_left, text="现货轮次:").pack(side="left")
+                ttk.Spinbox(row2_left, from_=0, to=100, textvariable=self.spot_rounds_var, width=6).pack(side="left", padx=(4, 12))
             ttk.Label(row2_left, text="预购买BNB金额:").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.bnb_topup_amount_var, width=10).pack(side="left", padx=(4, 12))
         elif current_trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
@@ -1495,9 +1533,8 @@ class ExchangeAppBase(tk.Tk):
                 ttk.Label(row3_left, text=self._reprice_threshold_label_text()).pack(side="left")
                 ttk.Entry(row3_left, textvariable=self.reprice_threshold_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
 
-            if current_trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_CONVERT}:
-                ttk.Label(row3_right, text="限流等待(秒):").pack(side="left")
-                ttk.Entry(row3_right, textvariable=self.rate_limit_wait_var, width=row3_rate_limit_width).pack(side="left", padx=row3_item_pad)
+            ttk.Label(row3_right, text="限流等待(秒):").pack(side="left")
+            ttk.Entry(row3_right, textvariable=self.rate_limit_wait_var, width=row3_rate_limit_width).pack(side="left", padx=row3_item_pad)
             ttk.Label(row3_right, text="提现预留:").pack(side="left")
             ttk.Entry(row3_right, textvariable=self.withdraw_buffer_var, width=row3_withdraw_width).pack(side="left", padx=row3_withdraw_pad)
             ttk.Checkbutton(row3_right, text="\u81ea\u52a8\u63d0\u73b0", variable=self.enable_withdraw_var, style="AutoWithdraw.TCheckbutton").pack(side="left")
@@ -1518,6 +1555,9 @@ class ExchangeAppBase(tk.Tk):
             ttk.Label(row3_right, text="提现预留:").pack(side="left")
             ttk.Entry(row3_right, textvariable=self.withdraw_buffer_var, width=row3_withdraw_width).pack(side="left", padx=row3_withdraw_pad)
             ttk.Checkbutton(row3_right, text="\u81ea\u52a8\u63d0\u73b0", variable=self.enable_withdraw_var, style="AutoWithdraw.TCheckbutton").pack(side="left")
+        else:
+            ttk.Label(row3_right, text="限流等待(秒):").pack(side="left")
+            ttk.Entry(row3_right, textvariable=self.rate_limit_wait_var, width=row3_rate_limit_width).pack(side="left", padx=row3_item_pad)
 
         self.after_idle(self._align_trade_mode_sections)
     def _on_close(self):

@@ -8,7 +8,12 @@ from decimal import Decimal
 
 from exchange_app_accounts import ExchangeAppAccountsMixin
 from exchange_app_batch import ExchangeAppBatchMixin
-from exchange_constants import TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, TRADE_MODE_MARKET
+from exchange_constants import (
+    MARKET_STOP_MODE_BNB,
+    TRADE_ACCOUNT_TYPE_SPOT,
+    TRADE_MODE_CONVERT,
+    TRADE_MODE_MARKET,
+)
 from exchange_strategy import Strategy
 
 
@@ -67,7 +72,129 @@ class _MarketRoundPermanentFailureClient(_MarketRoundTransientFailureClient):
         return True
 
 
+class _MarketBnbStopClient:
+    def __init__(self, bnb_balances):
+        self.bnb_balances = list(bnb_balances)
+        self.calls: list[tuple[str, str]] = []
+        self.buy_calls = 0
+
+    def get_spot_base_asset(self, _symbol: str) -> str:
+        return "BTC"
+
+    def get_spot_quote_asset(self, _symbol: str) -> str:
+        return "USDT"
+
+    def spot_asset_balance_decimal(self, asset: str) -> Decimal:
+        self.calls.append(("topup-balance", str(asset or "").strip().upper()))
+        return Decimal("0.01")
+
+    def buy_bnb_with_quote_amount(self, quote_asset: str, quote_amount, *, return_order: bool = False):
+        self.calls.append(("topup", str(quote_asset or "").strip().upper()))
+        return {"toAmount": "0.01"} if return_order else True
+
+    @staticmethod
+    def _decimal_from_str(value, default="0") -> Decimal:
+        return Decimal(str(value or default))
+
+    def ensure_bnb_fee_ready_in_spot(self, **_kwargs) -> Decimal:
+        self.calls.append(("topup-ready", "BNB"))
+        return Decimal("0.02")
+
+    def spot_balance(self, asset: str):
+        self.calls.append(("bnb-check", str(asset or "").strip().upper()))
+        return self.bnb_balances.pop(0)
+
+    def collect_asset_to_spot(self, asset: str, *, context: str = "提现前"):
+        self.calls.append(("collect", str(asset or "").strip().upper()))
+        return 1
+
+    def spot_buy_all_usdt(self, symbol: str, *, assume_spot_funds_ready: bool = False):
+        self.buy_calls += 1
+        self.calls.append(("buy", str(symbol or "").strip().upper()))
+        return True
+
+    def spot_sell_all_base(self, symbol: str, small_qty_log_text=None):
+        self.calls.append(("sell", str(symbol or "").strip().upper()))
+        return True
+
+    def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
+        self.calls.append(("withdraw", "%s:%s" % (str(coin or "").strip().upper(), fee_buffer)))
+        return 0
+
+
 class ExchangeMarketRoundFailureTests(unittest.TestCase):
+    def test_market_bnb_stop_ignores_rounds_and_keeps_topup_before_trading(self):
+        client = _MarketBnbStopClient([Decimal("0.02"), Decimal("0.005")])
+        strategy = Strategy(
+            client=client,
+            spot_rounds=0,
+            withdraw_coin="USDT",
+            withdraw_address="0x0000000000000000000000000000000000000001",
+            withdraw_network="BSC",
+            withdraw_fee_buffer=0.5,
+            spot_symbol="BTCUSDT",
+            sleep_fn=lambda: None,
+            enable_withdraw=True,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            trade_mode=TRADE_MODE_MARKET,
+            market_stop_mode=MARKET_STOP_MODE_BNB,
+            bnb_fee_stop_value=Decimal("0.01"),
+            bnb_topup_amount=Decimal("10"),
+        )
+
+        result = strategy.run(stop_event=_NoDelayStop())
+
+        self.assertEqual(client.buy_calls, 1)
+        self.assertEqual(client.calls.count(("bnb-check", "BNB")), 2)
+        self.assertLess(client.calls.index(("topup", "USDT")), client.calls.index(("bnb-check", "BNB")))
+        self.assertIn(("withdraw", "USDT:0.5"), client.calls)
+        self.assertTrue(result.get("withdraw_attempted"))
+        self.assertEqual(result.get("market_round_total"), 1)
+        self.assertEqual(result.get("market_round_completed"), 1)
+
+    def test_market_bnb_stop_before_first_buy_when_balance_is_below_threshold(self):
+        client = _MarketBnbStopClient([Decimal("0.005")])
+        strategy = Strategy(
+            client=client,
+            spot_rounds=50,
+            withdraw_coin="USDT",
+            withdraw_address="",
+            withdraw_network="BSC",
+            withdraw_fee_buffer=0,
+            spot_symbol="BTCUSDT",
+            sleep_fn=lambda: None,
+            enable_withdraw=False,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            trade_mode=TRADE_MODE_MARKET,
+            market_stop_mode=MARKET_STOP_MODE_BNB,
+            bnb_fee_stop_value=Decimal("0.01"),
+        )
+
+        result = strategy.run(stop_event=_NoDelayStop())
+
+        self.assertEqual(client.buy_calls, 0)
+        self.assertEqual(result.get("market_round_completed"), 0)
+
+    def test_batch_summary_shows_market_bnb_stop_instead_of_rounds(self):
+        lines = ExchangeAppBatchMixin()._build_batch_execute_summary_lines(
+            account_count=2,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            trade_mode=TRADE_MODE_MARKET,
+            spot_symbol="BTCUSDT",
+            spot_rounds=20,
+            market_stop_mode=MARKET_STOP_MODE_BNB,
+            bnb_fee_stop_value=Decimal("0.01"),
+            futures_symbol="BTCUSDT",
+            futures_rounds=1,
+            min_delay=1000,
+            max_delay=2000,
+            withdraw_coin="USDT",
+            withdraw_network="BSC",
+            enable_withdraw=False,
+        )
+        self.assertIn("停止方式：剩余BNB低于 0.01", lines)
+        self.assertNotIn("轮次：20", lines)
+
     def test_zero_round_uses_selected_trade_mode(self):
         market_client = _MarketRoundTransientFailureClient()
         market_strategy = Strategy(

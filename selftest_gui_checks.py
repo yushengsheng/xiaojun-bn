@@ -160,11 +160,11 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 expected_gate_modes = [
                     ("现货", "市价", True),
                     ("现货", "闪兑", True),
-                    ("现货", "挂单", False),
-                    ("现货", "溢价单", False),
-                    ("现货", "分仓挂单", False),
+                    ("现货", "挂单", True),
+                    ("现货", "溢价单", True),
+                    ("现货", "分仓挂单", True),
                     ("合约", "市价", True),
-                    ("理财", "市价", False),
+                    ("理财", "市价", True),
                 ]
                 for account_type, trade_mode, expected_visible in expected_gate_modes:
                     app.trade_account_type_var.set(account_type)
@@ -177,8 +177,24 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                         raise RuntimeError(
                             f"GUI 自检失败：{account_type}/{trade_mode} 限流等待显示状态异常（{labels}）"
                         )
-                    if visible and labels.index("限流等待(秒):") > labels.index("提现预留:"):
+                    if visible and "提现预留:" in labels and labels.index("限流等待(秒):") > labels.index("提现预留:"):
                         raise RuntimeError("GUI 自检失败：限流等待未放在提现预留前")
+                app.trade_account_type_var.set("现货")
+                app.trade_mode_var.set("市价")
+                app.market_stop_mode_var.set("剩余BNB")
+                app.bnb_fee_stop_var.set("0.01")
+                app._refresh_strategy_panel_layout()
+                pump_tk_events(app, timeout=2.0)
+                if tuple(app.market_stop_mode_combo.cget("values")) != ("现货轮次", "剩余BNB"):
+                    raise RuntimeError("GUI 自检失败：市价停止方式不是固定二选一")
+                market_bnb_settings = app._collect_trade_mode_settings()
+                if (
+                    market_bnb_settings.get("market_stop_mode") != "剩余BNB"
+                    or str(market_bnb_settings.get("bnb_fee_stop_value")) != "0.01"
+                ):
+                    raise RuntimeError(f"GUI 自检失败：市价剩余BNB停止参数未生效（{market_bnb_settings}）")
+                app.market_stop_mode_var.set("现货轮次")
+                checks.append("exchange-market-stop-mode-gui=ok")
                 app.trade_account_type_var.set("现货")
                 app.trade_mode_var.set("分仓挂单")
                 app.spot_rounds_var.set(1)
@@ -288,6 +304,8 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：销毁误删共享策略参数或代理配置")
                 if strategy_payload.get("rate_limit_wait_sec") != 17:
                     raise RuntimeError("GUI 自检失败：限流等待配置未保存")
+                if strategy_payload.get("market_stop_mode") != "现货轮次":
+                    raise RuntimeError("GUI 自检失败：市价停止方式配置未保存")
                 if strategy_payload.get("earn_auto_subscribe") is not True:
                     raise RuntimeError("GUI 自检失败：理财自动申购配置未保存")
                 checks.append("exchange-destroy-execution-gui=ok")

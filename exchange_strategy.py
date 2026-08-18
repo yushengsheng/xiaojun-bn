@@ -25,6 +25,9 @@ from exchange_constants import (
     LADDER_LAYOUT_DEFAULT,
     LADDER_LAYOUT_OPTIONS,
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+    MARKET_STOP_MODE_BNB,
+    MARKET_STOP_MODE_DEFAULT,
+    MARKET_STOP_MODE_OPTIONS,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_ORDER_COUNT_DEFAULT,
     PREMIUM_PARTIAL_FILL_DEFAULT,
@@ -73,6 +76,7 @@ class Strategy:
         withdraw_callback=None,
         trade_account_type: str = TRADE_ACCOUNT_TYPE_DEFAULT,
         trade_mode: str = TRADE_MODE_DEFAULT,
+        market_stop_mode: str = MARKET_STOP_MODE_DEFAULT,
         premium_delta: Decimal | None = None,
         premium_order_count: int = PREMIUM_ORDER_COUNT_DEFAULT,
         premium_append_threshold: Decimal | None = None,
@@ -103,6 +107,7 @@ class Strategy:
         self.withdraw_callback = withdraw_callback
         self.trade_account_type = str(trade_account_type or TRADE_ACCOUNT_TYPE_DEFAULT)
         self.trade_mode = str(trade_mode or TRADE_MODE_DEFAULT)
+        self.market_stop_mode = str(market_stop_mode or MARKET_STOP_MODE_DEFAULT)
         self.premium_delta = Decimal(str(premium_delta if premium_delta is not None else "0"))
         self.premium_order_count = max(0, int(premium_order_count or 0))
         self.premium_append_threshold = Decimal(
@@ -145,7 +150,7 @@ class Strategy:
         self.market_round_failure_details: list[dict[str, object]] = []
 
     def _reset_market_round_tracking(self) -> None:
-        self.market_round_total = max(0, int(self.spot_rounds or 0))
+        self.market_round_total = 0 if self._is_market_bnb_stop_mode() else max(0, int(self.spot_rounds or 0))
         self.market_round_completed = 0
         self.market_round_failed_rounds = []
         self.market_round_failure_details = []
@@ -206,7 +211,7 @@ class Strategy:
             rounds = int(self.spot_rounds)
         except Exception:
             return False
-        return (not self._is_futures_mode()) and rounds == 0
+        return (not self._is_futures_mode()) and (not self._is_market_bnb_stop_mode()) and rounds == 0
 
     @staticmethod
     def _emit_progress(progress_cb, step: int, total: int, text: str) -> None:
@@ -287,6 +292,13 @@ class Strategy:
         mode = str(self.trade_mode or TRADE_MODE_DEFAULT)
         return mode if mode in TRADE_MODE_OPTIONS else TRADE_MODE_DEFAULT
 
+    def _market_stop_mode_name(self) -> str:
+        mode = str(self.market_stop_mode or MARKET_STOP_MODE_DEFAULT)
+        return mode if mode in MARKET_STOP_MODE_OPTIONS else MARKET_STOP_MODE_DEFAULT
+
+    def _is_market_bnb_stop_mode(self) -> bool:
+        return self._mode_name() == TRADE_MODE_MARKET and self._market_stop_mode_name() == MARKET_STOP_MODE_BNB
+
     def _is_convert_mode(self) -> bool:
         return (not self._is_futures_mode()) and self._mode_name() == TRADE_MODE_CONVERT
 
@@ -313,11 +325,13 @@ class Strategy:
         return self._mode_name() == TRADE_MODE_PREMIUM and self._premium_append_threshold_value() > 0
 
     def _should_stop_for_bnb_fee(self) -> bool:
-        if not self._limit_like_mode():
+        if not self._limit_like_mode() and not self._is_market_bnb_stop_mode():
             return False
         threshold = Decimal(str(self.bnb_fee_stop_value or "0"))
         if threshold < 0:
             threshold = Decimal("0")
+        if self._is_market_bnb_stop_mode() and threshold <= 0:
+            raise RuntimeError("市价剩余BNB停止值必须大于 0")
         current_bnb = Decimal(str(self.c.spot_balance("BNB")))
         if current_bnb < threshold:
             logger.info(
@@ -2081,7 +2095,8 @@ class Strategy:
 
     def _run_market_mode(self, stop_event, progress_cb=None):
         self._reset_market_round_tracking()
-        total_steps = self.spot_rounds if self.spot_rounds > 0 else 1
+        bnb_stop_mode = self._is_market_bnb_stop_mode()
+        total_steps = 1 if bnb_stop_mode else (self.spot_rounds if self.spot_rounds > 0 else 1)
         step = 0
         base_asset, quote_asset = self._spot_pair_assets()
 
@@ -2098,24 +2113,32 @@ class Strategy:
                 return
             logger.error("现货轮开始前归集 %s 到现货失败：%s；后续轮次将仅使用现货账户已有余额", quote_asset, e)
 
-        for i in range(self.spot_rounds):
+        i = 0
+        while bnb_stop_mode or i < self.spot_rounds:
             if stop_event and stop_event.is_set():
                 logger.info("检测到停止信号，停止后续执行（现货阶段）")
                 return
 
             self.ensure_base_sold()
-            logger.info("--- 现货轮 %d/%d 开始 ---", i + 1, self.spot_rounds)
+            if bnb_stop_mode and self._should_stop_for_bnb_fee():
+                break
+
+            round_number = i + 1
+            round_label = str(round_number) if bnb_stop_mode else "%d/%d" % (round_number, self.spot_rounds)
+            total_steps = round_number if bnb_stop_mode else total_steps
+            stop_after_round = False
+            logger.info("--- 现货轮 %s 开始 ---", round_label)
 
             try:
                 self._emit_progress(
                     progress_cb,
                     step,
                     total_steps,
-                    "现货轮 %d/%d 买入 %s" % (i + 1, self.spot_rounds, base_asset),
+                    "现货轮 %s 买入 %s" % (round_label, base_asset),
                 )
                 buy_success = self._run_trade_action_with_retry(
                     stop_event,
-                    "现货轮 %d/%d 买入 %s" % (i + 1, self.spot_rounds, base_asset),
+                    "现货轮 %s 买入 %s" % (round_label, base_asset),
                     lambda: self.c.spot_buy_all_usdt(symbol=self.spot_symbol, assume_spot_funds_ready=True),
                 )
                 if buy_success:
@@ -2123,43 +2146,56 @@ class Strategy:
                         progress_cb,
                         step,
                         total_steps,
-                        "现货轮 %d/%d 等待卖出 %s" % (i + 1, self.spot_rounds, base_asset),
+                        "现货轮 %s 等待卖出 %s" % (round_label, base_asset),
                     )
                     self.sleep_fn()
                     self._emit_progress(
                         progress_cb,
                         step,
                         total_steps,
-                        "现货轮 %d/%d 卖出 %s" % (i + 1, self.spot_rounds, base_asset),
+                        "现货轮 %s 卖出 %s" % (round_label, base_asset),
                     )
                     self._run_trade_action_with_retry(
                         stop_event,
-                        "现货轮 %d/%d 卖出 %s" % (i + 1, self.spot_rounds, base_asset),
+                        "现货轮 %s 卖出 %s" % (round_label, base_asset),
                         lambda: self.c.spot_sell_all_base(symbol=self.spot_symbol),
                     )
                 else:
                     logger.info("买入未执行（可能余额不足），跳过本轮卖出")
+                    stop_after_round = bnb_stop_mode
 
-                logger.info("--- 现货轮 %d 完成 ---", i + 1)
+                logger.info("--- 现货轮 %d 完成 ---", round_number)
 
             except Exception as e:
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（现货阶段）")
                     return
-                self._record_market_round_failure(i + 1, e)
-                logger.error(f"现货轮 %d 执行异常: {e}", i + 1)
+                self._record_market_round_failure(round_number, e)
+                logger.error(f"现货轮 %d 执行异常: {e}", round_number)
+                stop_after_round = bnb_stop_mode
 
             step += 1
             self.market_round_completed = step
+            if bnb_stop_mode:
+                self.market_round_total = step
             failure_suffix = ""
             if self.market_round_failed_rounds:
                 failure_suffix = "，失败%d轮" % len(self.market_round_failed_rounds)
+            progress_text = (
+                "现货轮%s%d完成%s" % (base_asset.upper(), round_number, failure_suffix)
+                if bnb_stop_mode
+                else "现货轮%s%d/%d完成%s"
+                % (base_asset.upper(), round_number, self.spot_rounds, failure_suffix)
+            )
             self._emit_progress(
                 progress_cb,
                 step,
-                total_steps,
-                "现货轮%s%d/%d完成%s" % (base_asset.upper(), i + 1, self.spot_rounds, failure_suffix),
+                step if bnb_stop_mode else total_steps,
+                progress_text,
             )
+            i += 1
+            if stop_after_round:
+                break
             self.sleep_fn()
 
         self.ensure_base_sold()
