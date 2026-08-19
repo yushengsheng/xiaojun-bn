@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from decimal import Decimal
 
 from exchange_binance_client import BinanceAPIError, BinanceClient
@@ -58,8 +59,10 @@ def _normalize_futures_margin_type(value) -> str:
 
 class Strategy:
     TRADE_OPERATION_RETRY_POLICY = RetryPolicy(attempts=10, delay_seconds=1)
-    LADDER_POLL_INTERVAL_SECONDS = 1.0
+    LADDER_POLL_INTERVAL_SECONDS = 1.5
     LADDER_ORDER_RECONCILE_INTERVAL_SECONDS = 5.0
+    LADDER_CLEANUP_CONFIRM_TIMEOUT_SECONDS = 12.0
+    LADDER_CLEANUP_CONFIRM_POLL_INTERVAL_SECONDS = 0.5
     LADDER_MAX_ACTIVE_CHILD_ORDERS_PER_SIDE = 20
 
     def __init__(
@@ -148,6 +151,8 @@ class Strategy:
         self.market_round_completed = 0
         self.market_round_failed_rounds: list[int] = []
         self.market_round_failure_details: list[dict[str, object]] = []
+        self.ladder_cleanup_confirmed = False
+        self.ladder_cleanup_error = ""
 
     def _reset_market_round_tracking(self) -> None:
         self.market_round_total = 0 if self._is_market_bnb_stop_mode() else max(0, int(self.spot_rounds or 0))
@@ -606,11 +611,22 @@ class Strategy:
                 return payload
             premium_reprice_by_market = True
 
-    def _cancel_limit_order_with_fill_guard(self, order_id: int | str, side: str) -> dict:
+    def _cancel_limit_order_with_fill_guard(
+        self,
+        order_id: int | str,
+        side: str,
+        *,
+        cleanup_after_stop: bool = False,
+    ) -> dict:
         symbol_u = self.spot_symbol.upper()
+        get_order = self.c.get_order
+        cancel_order = self.c.cancel_order
+        if cleanup_after_stop:
+            get_order = getattr(self.c, "get_order_for_cleanup", get_order)
+            cancel_order = getattr(self.c, "cancel_order_for_cleanup", cancel_order)
         latest_order = None
         try:
-            latest_order = self.c.get_order(symbol_u, order_id)
+            latest_order = get_order(symbol_u, order_id)
         except Exception:
             latest_order = None
 
@@ -620,10 +636,10 @@ class Strategy:
                 return latest_order
 
         try:
-            self.c.cancel_order(symbol_u, order_id)
+            cancel_result = cancel_order(symbol_u, order_id)
         except Exception as cancel_exc:
             try:
-                latest_order = self.c.get_order(symbol_u, order_id)
+                latest_order = get_order(symbol_u, order_id)
             except Exception:
                 latest_order = None
             if latest_order is not None and str(latest_order.get("status") or "").upper() == "FILLED":
@@ -631,8 +647,17 @@ class Strategy:
             raise cancel_exc
 
         try:
-            latest_order = self.c.get_order(symbol_u, order_id)
+            latest_order = get_order(symbol_u, order_id)
         except Exception:
+            cancel_status = (
+                str(cancel_result.get("status") or "").upper()
+                if isinstance(cancel_result, dict)
+                else ""
+            )
+            if cancel_status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+                return dict(cancel_result)
+            if cleanup_after_stop:
+                raise RuntimeError(f"订单 #{order_id} 撤销后状态未确认")
             if latest_order is None:
                 latest_order = {
                     "orderId": order_id,
@@ -1818,7 +1843,11 @@ class Strategy:
     ) -> tuple[dict, str]:
         side_u = str(state.get("side") or "").strip().upper()
         order_id = state.get("order_id")
-        latest_order = self._cancel_limit_order_with_fill_guard(order_id, side_u)
+        latest_order = self._cancel_limit_order_with_fill_guard(
+            order_id,
+            side_u,
+            cleanup_after_stop=reason == "stop",
+        )
         latest_status = str(latest_order.get("status") or "").strip().upper()
         if not self._order_terminal_status(latest_status):
             raise RuntimeError(f"订单 #{order_id} 撤销后状态未确认：{latest_status or '--'}")
@@ -1908,7 +1937,8 @@ class Strategy:
                 latest_status or "--",
             )
 
-    def _ladder_cancel_all_orders(self, active_orders: dict[str, dict[str, object]], *, reason: str) -> None:
+    def _ladder_cancel_all_orders(self, active_orders: dict[str, dict[str, object]], *, reason: str) -> bool:
+        all_cancelled = True
         for order_key, state in list(active_orders.items()):
             side_u = str(state.get("side") or "").strip().upper()
             order_id = state.get("order_id")
@@ -1916,7 +1946,59 @@ class Strategy:
                 self._ladder_cancel_order_state(state, reason=reason)
                 active_orders.pop(order_key, None)
             except Exception as exc:
+                all_cancelled = False
                 logger.warning("分仓挂单停止时撤销订单失败 %s #%s: %s", side_u, order_id, exc)
+        return all_cancelled
+
+    def _ladder_cleanup_after_manual_stop(
+        self,
+        active_orders: dict[str, dict[str, object]],
+        base_asset: str,
+    ) -> None:
+        cleanup_context = getattr(self.c, "cleanup_requests_after_stop", None)
+        context = cleanup_context() if callable(cleanup_context) else nullcontext()
+        with context:
+            all_cancelled = self._ladder_cancel_all_orders(active_orders, reason="stop")
+            try:
+                self._ladder_sell_all_base_and_confirm(base_asset, reason="手动停止分仓挂单后")
+            except Exception as exc:
+                self._set_ladder_cleanup_failure(f"市价清仓未确认：{exc}")
+        if not all_cancelled:
+            self._set_ladder_cleanup_failure("部分分仓挂单撤销未确认")
+        elif not self.ladder_cleanup_error:
+            self.ladder_cleanup_confirmed = True
+            logger.info("检测到停止信号，已确认撤销全部分仓挂单并完成清仓")
+
+    def _set_ladder_cleanup_failure(self, reason: object) -> None:
+        reason_text = str(reason or "").strip() or "未知原因"
+        self.ladder_cleanup_confirmed = False
+        self.ladder_cleanup_error = reason_text
+        self.trade_error = reason_text
+        self.trade_error_stage = "分仓挂单结束清理"
+        logger.error("分仓挂单结束清理失败：%s", reason_text)
+
+    def _ladder_sell_all_base_and_confirm(self, base_asset: str, *, reason: str) -> None:
+        sold = self.c.spot_sell_all_base(self.spot_symbol)
+        sellable_quantity = getattr(self.c, "spot_market_sellable_base_quantity", None)
+        if not callable(sellable_quantity):
+            if sold:
+                logger.info("%s已市价卖出全部 %s", reason, base_asset)
+                return
+            logger.info("%s无可市价卖出的 %s", reason, base_asset)
+            return
+
+        deadline = time.monotonic() + max(0.0, float(self.LADDER_CLEANUP_CONFIRM_TIMEOUT_SECONDS))
+        while True:
+            remaining = Decimal(str(sellable_quantity(self.spot_symbol)))
+            if remaining <= 0:
+                logger.info("%s已确认 %s 无可交易余额", reason, base_asset)
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "确认超时，仍有可交易 %s 数量 %s"
+                    % (base_asset, BinanceClient._format_decimal(remaining))
+                )
+            time.sleep(max(0.0, float(self.LADDER_CLEANUP_CONFIRM_POLL_INTERVAL_SECONDS)))
 
     def _run_ladder_mode(self, stop_event, progress_cb=None):
         mode_name = self._mode_name()
@@ -1947,8 +2029,7 @@ class Strategy:
 
         while True:
             if stop_event and stop_event.is_set():
-                self._ladder_cancel_all_orders(active_orders, reason="stop")
-                logger.info("检测到停止信号，已撤销分仓挂单策略未完成订单")
+                self._ladder_cleanup_after_manual_stop(active_orders, base_asset)
                 return
 
             try:
@@ -2025,7 +2106,19 @@ class Strategy:
                         BinanceClient._format_decimal(current_bnb),
                         BinanceClient._format_decimal(bnb_stop),
                     )
-                    self._ladder_cancel_all_orders(active_orders, reason="bnb-fee-stop")
+                    all_cancelled = self._ladder_cancel_all_orders(active_orders, reason="bnb-fee-stop")
+                    try:
+                        self._ladder_sell_all_base_and_confirm(
+                            base_asset,
+                            reason="分仓挂单BNB手续费不足停止后",
+                        )
+                    except Exception as exc:
+                        self._set_ladder_cleanup_failure(f"市价清仓未确认：{exc}")
+                    if not all_cancelled:
+                        self._set_ladder_cleanup_failure("部分分仓挂单撤销未确认")
+                    elif not self.ladder_cleanup_error:
+                        self.ladder_cleanup_confirmed = True
+                        logger.info("分仓挂单BNB手续费不足停止后，已确认撤销全部挂单并完成清仓")
                     return
 
                 quote_free = Decimal(str((snapshot.get(quote_asset) or {}).get("free", "0") or "0"))
@@ -2085,7 +2178,7 @@ class Strategy:
                     return
             except Exception as exc:
                 if isinstance(exc, RetryAborted) or (stop_event and stop_event.is_set()):
-                    self._ladder_cancel_all_orders(active_orders, reason="stop")
+                    self._ladder_cleanup_after_manual_stop(active_orders, base_asset)
                     logger.info("检测到停止信号，已停止后续执行（%s模式）", mode_name)
                     return
                 logger.error("分仓挂单轮询异常: %s", exc)
@@ -2595,6 +2688,8 @@ class Strategy:
         withdraw_attempted = False
         self.trade_error = ""
         self.trade_error_stage = ""
+        self.ladder_cleanup_confirmed = False
+        self.ladder_cleanup_error = ""
 
         def result_payload():
             return {
@@ -2609,6 +2704,8 @@ class Strategy:
                 "market_round_failed_count": len(self.market_round_failed_rounds),
                 "market_round_failed_rounds": list(self.market_round_failed_rounds),
                 "market_round_failure_details": list(self.market_round_failure_details),
+                "ladder_cleanup_confirmed": self.ladder_cleanup_confirmed,
+                "ladder_cleanup_error": self.ladder_cleanup_error,
             }
 
         zero_round_spot_conversion = self._is_zero_round_spot_conversion()

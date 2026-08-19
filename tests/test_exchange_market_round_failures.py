@@ -335,6 +335,17 @@ class ExchangeMarketRoundFailureTests(unittest.TestCase):
             "现货市价失败轮次：1（涉及账号 1 个）"
         ])
 
+    def test_ladder_completion_status_is_visible_when_withdraw_is_disabled(self):
+        status, success = ExchangeAppBatchMixin._format_batch_strategy_completion_status(
+            0,
+            "USDT",
+            enable_withdraw=False,
+            completion_text="分仓挂单已结束",
+        )
+
+        self.assertTrue(success)
+        self.assertIn("分仓挂单已结束", status)
+
 
 if __name__ == "__main__":
     unittest.main()

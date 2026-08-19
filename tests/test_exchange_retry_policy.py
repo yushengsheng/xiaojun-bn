@@ -239,6 +239,40 @@ class ExchangeRetryPolicyTests(unittest.TestCase):
             probe._run_request_with_retry(action, max_retries=1, delay=0)
         self.assertEqual(calls, 0)
 
+    def test_cleanup_request_can_pass_gate_after_stop(self):
+        stop_event = threading.Event()
+        gate = SharedRateLimitGate(0, stop_event=stop_event)
+        probe = _RequestRetryProbe(gate, request_stop_event=stop_event)
+        stop_event.set()
+        calls = 0
+
+        def action():
+            nonlocal calls
+            calls += 1
+            return "cancelled"
+
+        result = probe._run_request_with_retry(
+            action,
+            max_retries=1,
+            delay=0,
+            ignore_stop_event=True,
+        )
+
+        self.assertEqual(result, "cancelled")
+        self.assertEqual(calls, 1)
+
+    def test_cleanup_context_allows_followup_requests_after_stop(self):
+        stop_event = threading.Event()
+        probe = _RequestRetryProbe(SharedRateLimitGate(0), request_stop_event=stop_event)
+        stop_event.set()
+
+        with probe.cleanup_requests_after_stop():
+            result = probe._run_request_with_retry(lambda: "cleaned", max_retries=1, delay=0)
+
+        self.assertEqual(result, "cleaned")
+        with self.assertRaisesRegex(RuntimeError, "停止信号"):
+            probe._run_request_with_retry(lambda: "unexpected", max_retries=1, delay=0)
+
     def test_shared_gate_applies_to_all_trade_and_earn_modes(self):
         uses_gate = ExchangeAppBatchMixin._uses_shared_rate_limit_gate
         self.assertTrue(uses_gate(TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_MARKET))

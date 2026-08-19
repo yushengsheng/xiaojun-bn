@@ -1058,9 +1058,9 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         spot_base_to_quote_only=True,
     ):
         raise RuntimeError("0轮现货兑换到账检测自检失败：未检测前置币种余额")
-    if zero_round_wait_client.collected_assets != ["BTC"]:
+    if zero_round_wait_client.collected_assets != ["USDT", "BTC"]:
         raise RuntimeError(
-            f"0轮现货兑换到账检测自检失败：错误检测了后置币种（{zero_round_wait_client.collected_assets}）"
+            f"0轮现货兑换到账检测自检失败：未同时检测交易对两侧币种（{zero_round_wait_client.collected_assets}）"
         )
     checks.append("spot-zero-round-wait=ok")
 
@@ -1868,9 +1868,9 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         trade_mode=TRADE_MODE_MARKET,
     ):
         raise RuntimeError("普通市价到账检测自检失败：未检测后置币种余额")
-    if quote_wait_client.collected_assets != ["USDT"]:
+    if quote_wait_client.collected_assets != ["USDT", "BTC"]:
         raise RuntimeError(
-            f"普通市价到账检测自检失败：错误检测了前置币种（{quote_wait_client.collected_assets}）"
+            f"普通市价到账检测自检失败：未同时检测交易对两侧币种（{quote_wait_client.collected_assets}）"
         )
     checks.append("spot-quote-wait=ok")
 
@@ -1902,8 +1902,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         trade_mode=TRADE_MODE_MARKET,
     ):
         raise RuntimeError("现货交易前归集自检失败：后置币种归集后未通过到账检测")
-    if pretrade_quote_client.collect_calls != [("USDT", "交易前")]:
-        raise RuntimeError(f"现货交易前归集自检失败：后置币种归集路径异常（{pretrade_quote_client.collect_calls}）")
+    if pretrade_quote_client.collect_calls != [("USDT", "交易前"), ("BTC", "交易前")]:
+        raise RuntimeError(f"现货交易前归集自检失败：交易对两侧归集路径异常（{pretrade_quote_client.collect_calls}）")
 
     pretrade_base_client = _SelftestSpotPretradeCollectClient()
     pretrade_base_probe = _SelftestZeroRoundWaitProbe(pretrade_base_client)
@@ -1917,8 +1917,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         spot_base_to_quote_only=True,
     ):
         raise RuntimeError("现货交易前归集自检失败：前置币种归集后未通过0轮到账检测")
-    if pretrade_base_client.collect_calls != [("BTC", "交易前")]:
-        raise RuntimeError(f"现货交易前归集自检失败：前置币种归集路径异常（{pretrade_base_client.collect_calls}）")
+    if pretrade_base_client.collect_calls != [("USDT", "交易前"), ("BTC", "交易前")]:
+        raise RuntimeError(f"现货交易前归集自检失败：0轮交易对两侧归集路径异常（{pretrade_base_client.collect_calls}）")
 
     class _SelftestSpotPretradeCollectRetryClient:
         def __init__(self):
@@ -1955,9 +1955,9 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         trade_mode=TRADE_MODE_MARKET,
     ):
         raise RuntimeError("现货交易前归集自检失败：资金账户后续归集未保持重试")
-    if pretrade_retry_client.collect_calls != [("USDT", "交易前")]:
+    if pretrade_retry_client.collect_calls != [("USDT", "交易前"), ("BTC", "交易前")]:
         raise RuntimeError(f"现货交易前归集自检失败：完整归集重复执行（{pretrade_retry_client.collect_calls}）")
-    if pretrade_retry_client.funding_calls != ["USDT"]:
+    if pretrade_retry_client.funding_calls != ["USDT", "BTC"]:
         raise RuntimeError(f"现货交易前归集自检失败：资金账户后续归集异常（{pretrade_retry_client.funding_calls}）")
     checks.append("spot-pretrade-collect=ok")
 
@@ -1984,9 +1984,9 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         trade_mode=TRADE_MODE_MARKET,
     ):
         raise RuntimeError("USDC后置币种到账检测自检失败：未检测USDC余额")
-    if usdc_quote_wait_client.collected_assets != ["USDC"]:
+    if usdc_quote_wait_client.collected_assets != ["USDC", "BTC"]:
         raise RuntimeError(
-            f"USDC后置币种到账检测自检失败：错误检测了其他币种（{usdc_quote_wait_client.collected_assets}）"
+            f"USDC交易对到账检测自检失败：未同时检测两侧币种（{usdc_quote_wait_client.collected_assets}）"
         )
     checks.append("spot-usdc-quote-wait=ok")
 

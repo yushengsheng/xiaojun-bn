@@ -10,6 +10,7 @@ import logging
 import re
 import threading
 import time
+from contextlib import contextmanager
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
 from typing import Any, Dict, Optional
 from urllib.parse import urlencode
@@ -177,8 +178,8 @@ class SharedRateLimitGate:
             self._pause_until = max(self._pause_until, now + pause_seconds)
             return max(0.0, self._pause_until - now)
 
-    def wait(self, stop_event=None) -> bool:
-        effective_stop_event = stop_event or self.stop_event
+    def wait(self, stop_event=None, *, ignore_stop: bool = False) -> bool:
+        effective_stop_event = None if ignore_stop else (stop_event or self.stop_event)
 
         def is_stopped() -> bool:
             if effective_stop_event is None:
@@ -265,6 +266,7 @@ class BinanceClient:
         self._proxy_url = str(proxy_url or "").strip()
         self._request_gate = request_gate
         self._request_stop_event = request_stop_event
+        self._cleanup_request_depth = 0
         self.spot = "https://api.binance.com"
         self.um_futures = "https://fapi.binance.com"
         self.cm_futures = "https://dapi.binance.com"
@@ -423,10 +425,22 @@ class BinanceClient:
             retry_after = self._retry_after_from_response(response)
         return status_code in self.SHARED_RATE_LIMIT_HTTP_STATUS_CODES, retry_after
 
-    def _wait_for_request_gate(self) -> None:
+    def _wait_for_request_gate(self, *, ignore_stop_event: bool = False) -> None:
         gate = self._request_gate
-        if gate is not None and not gate.wait(self._request_stop_event):
+        cleanup_active = int(getattr(self, "_cleanup_request_depth", 0) or 0) > 0
+        if gate is not None and not gate.wait(
+            self._request_stop_event,
+            ignore_stop=bool(ignore_stop_event or cleanup_active),
+        ):
             raise RuntimeError("检测到停止信号，已停止限流等待")
+
+    @contextmanager
+    def cleanup_requests_after_stop(self):
+        self._cleanup_request_depth = int(getattr(self, "_cleanup_request_depth", 0) or 0) + 1
+        try:
+            yield
+        finally:
+            self._cleanup_request_depth = max(0, int(getattr(self, "_cleanup_request_depth", 1) or 1) - 1)
 
     def _pause_for_shared_rate_limit(self, exc: Exception, retry_after: float | None) -> None:
         gate = self._request_gate
@@ -447,6 +461,7 @@ class BinanceClient:
         delay: float,
         base: str = "",
         path: str = "",
+        ignore_stop_event: bool = False,
     ):
         last_exception = None
         retry_count = max(1, int(max_retries or self.DEFAULT_REQUEST_RETRY_COUNT))
@@ -464,7 +479,7 @@ class BinanceClient:
 
         attempt = 0
         while attempt < retry_count:
-            self._wait_for_request_gate()
+            self._wait_for_request_gate(ignore_stop_event=ignore_stop_event)
             try:
                 return request_fn()
             except requests.exceptions.HTTPError as e:
@@ -546,13 +561,14 @@ class BinanceClient:
             raise last_error
         raise RuntimeError("签名请求失败")
 
-    def request(self, base, method, path, params=None):
+    def request(self, base, method, path, params=None, *, ignore_stop_event: bool = False):
         return self._run_request_with_retry(
             lambda: self._request_impl(base, method, path, params, timeout=15),
             max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
             delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
             base=base,
             path=path,
+            ignore_stop_event=ignore_stop_event,
         )
 
     def request_query(self, base, method, path, params=None, *, timeout: float = 6, max_retries: int | None = None):
@@ -2160,6 +2176,30 @@ class BinanceClient:
             },
         )
 
+    def get_order_for_cleanup(self, symbol: str, order_id: int | str):
+        return self.request(
+            self.spot,
+            "GET",
+            "/api/v3/order",
+            {
+                "symbol": self.normalize_trade_symbol(symbol),
+                "orderId": int(order_id),
+            },
+            ignore_stop_event=True,
+        )
+
+    def cancel_order_for_cleanup(self, symbol: str, order_id: int | str):
+        return self.request(
+            self.spot,
+            "DELETE",
+            "/api/v3/order",
+            {
+                "symbol": self.normalize_trade_symbol(symbol),
+                "orderId": int(order_id),
+            },
+            ignore_stop_event=True,
+        )
+
     def wait_order_filled(self, symbol: str, order_id: int | str, stop_event=None, poll_interval: float = 1.0):
         symbol_u = self.normalize_trade_symbol(symbol)
         while True:
@@ -2615,6 +2655,29 @@ class BinanceClient:
             reserve_ratio=Decimal("1"),
             small_qty_log_text=small_qty_log_text,
         )
+
+    def spot_market_sellable_base_quantity(self, symbol: str) -> Decimal:
+        symbol_u = self.normalize_trade_symbol(symbol)
+        base = self.get_spot_base_asset(symbol_u)
+        snapshot = self.spot_balance_snapshot({base})
+        balance = Decimal(str((snapshot.get(base) or {}).get("total", "0") or "0"))
+        if balance <= 0:
+            return Decimal("0")
+
+        rules = self.get_symbol_trade_rules(symbol_u)
+        if not rules or rules.get("status") != "TRADING":
+            raise RuntimeError(f"无法确认 {symbol_u} 清仓：交易对规则不可用或不可交易")
+
+        qty = self._floor_to_step(balance, rules["stepSize"])
+        if qty <= 0 or qty < rules["minQty"]:
+            return Decimal("0")
+        if qty > rules["maxQty"]:
+            qty = rules["maxQty"]
+
+        price = self.get_symbol_price(symbol_u)
+        if rules["minNotional"] > 0 and (not price or qty * price < rules["minNotional"]):
+            return Decimal("0")
+        return qty
 
     # -------- 提现 --------
     def withdraw_all_coin(

@@ -200,6 +200,83 @@ class _RoundTripLadderClient(_RunningLadderClient):
         return dict(order)
 
 
+class _StopCleanupLadderClient(_RunningLadderClient):
+    def __init__(self, stop_event: _StopAfterOrders):
+        super().__init__(stop_event, stop_after_placements=4)
+        self.base_free = Decimal("10")
+        self.cleanup_cancel_calls: list[str] = []
+        self.liquidated_base = Decimal("0")
+
+    def get_order(self, _symbol: str, _order_id):
+        raise RuntimeError("普通请求已被停止信号拦截")
+
+    def cancel_order(self, _symbol: str, _order_id):
+        raise RuntimeError("普通请求已被停止信号拦截")
+
+    def get_order_for_cleanup(self, symbol: str, order_id) -> dict[str, object]:
+        return super().get_order(symbol, order_id)
+
+    def cancel_order_for_cleanup(self, symbol: str, order_id) -> dict[str, object]:
+        self.cleanup_cancel_calls.append(str(order_id))
+        order = super().cancel_order(symbol, order_id)
+        remaining_qty = Decimal(str(order.get("origQty", "0"))) - Decimal(str(order.get("executedQty", "0")))
+        if str(order.get("side") or "").upper() == "BUY":
+            self.quote_free += remaining_qty * Decimal(str(order.get("price", "0")))
+        else:
+            self.base_free += remaining_qty
+        return order
+
+    def spot_sell_all_base(self, _symbol: str):
+        self.liquidated_base = self.base_free
+        self.base_free = Decimal("0")
+        return self.liquidated_base > 0
+
+    def spot_market_sellable_base_quantity(self, _symbol: str) -> Decimal:
+        return self.base_free
+
+
+class _BnbStopLadderClient(_RunningLadderClient):
+    def __init__(self, stop_event: _StopAfterOrders):
+        super().__init__(stop_event, stop_after_placements=None)
+        self.base_free = Decimal("10")
+        self.snapshot_count = 0
+        self.events: list[str] = []
+        self.liquidated_base = Decimal("0")
+
+    def spot_balance_snapshot(self, assets) -> dict[str, dict[str, Decimal]]:
+        snapshot = super().spot_balance_snapshot(assets)
+        self.snapshot_count += 1
+        bnb_free = Decimal("1") if self.snapshot_count == 1 else Decimal("0.001")
+        snapshot["BNB"] = {"free": bnb_free, "locked": Decimal("0"), "total": bnb_free}
+        return snapshot
+
+    def cancel_order(self, symbol: str, order_id) -> dict[str, object]:
+        order = super().cancel_order(symbol, order_id)
+        side = str(order.get("side") or "").upper()
+        remaining_qty = Decimal(str(order.get("origQty", "0"))) - Decimal(str(order.get("executedQty", "0")))
+        if side == "BUY":
+            self.quote_free += remaining_qty * Decimal(str(order.get("price", "0")))
+        elif side == "SELL":
+            self.base_free += remaining_qty
+        self.events.append("cancel-%s" % order_id)
+        return order
+
+    def spot_sell_all_base(self, symbol: str):
+        self.events.append("market-sell-%s" % str(symbol or "").upper())
+        self.liquidated_base = self.base_free
+        self.base_free = Decimal("0")
+        return self.liquidated_base > 0
+
+    def spot_market_sellable_base_quantity(self, _symbol: str) -> Decimal:
+        return self.base_free
+
+
+class _UnconfirmedCleanupLadderClient(_StopCleanupLadderClient):
+    @staticmethod
+    def spot_market_sellable_base_quantity(_symbol: str) -> Decimal:
+        return Decimal("1")
+
+
 class _RecordingBinanceClient(BinanceClient):
     def __init__(self):
         self.spot = "spot"
@@ -269,6 +346,26 @@ def _strategy(client, *, layout=LADDER_LAYOUT_BUY2_SELL2, min_pool=Decimal("50")
 
 
 class ExchangeLadderStrategyTests(unittest.TestCase):
+    def test_ladder_poll_interval_is_one_and_half_seconds(self) -> None:
+        self.assertEqual(Strategy.LADDER_POLL_INTERVAL_SECONDS, 1.5)
+
+    def test_liquidation_confirmation_counts_locked_base_balance(self) -> None:
+        client = object.__new__(BinanceClient)
+        client.get_spot_base_asset = lambda _symbol: "ALLO"
+        client.spot_balance_snapshot = lambda _assets: {
+            "ALLO": {"free": Decimal("0"), "locked": Decimal("10"), "total": Decimal("10")}
+        }
+        client.get_symbol_trade_rules = lambda _symbol: {
+            "status": "TRADING",
+            "stepSize": Decimal("0.1"),
+            "minQty": Decimal("0.1"),
+            "maxQty": Decimal("1000000"),
+            "minNotional": Decimal("5"),
+        }
+        client.get_symbol_price = lambda _symbol: Decimal("1")
+
+        self.assertEqual(client.spot_market_sellable_base_quantity("ALLOUSDT"), Decimal("10"))
+
     def test_four_layouts_map_to_expected_side_levels(self) -> None:
         expected = {
             LADDER_LAYOUT_BUY2_SELL2: (2, 2),
@@ -312,6 +409,63 @@ class ExchangeLadderStrategyTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(order["status"] == "CANCELED" for order in client.orders.values()))
+
+    def test_manual_stop_uses_cleanup_path_to_cancel_all_ladder_orders(self) -> None:
+        stop_event = _StopAfterOrders()
+        client = _StopCleanupLadderClient(stop_event)
+        strategy = _strategy(client)
+
+        strategy._run_ladder_mode(stop_event)
+
+        self.assertEqual(client.cleanup_cancel_calls, ["1", "2", "3", "4"])
+        self.assertTrue(all(order["status"] == "CANCELED" for order in client.orders.values()))
+        self.assertEqual(client.liquidated_base, Decimal("10"))
+        self.assertEqual(client.base_free, Decimal("0"))
+        self.assertTrue(strategy.ladder_cleanup_confirmed)
+        self.assertEqual(strategy.ladder_cleanup_error, "")
+
+    def test_bnb_stop_cancels_orders_then_market_sells_all_base(self) -> None:
+        stop_event = _StopAfterOrders()
+        client = _BnbStopLadderClient(stop_event)
+        strategy = _strategy(client)
+        strategy.bnb_fee_stop_value = Decimal("0.01")
+        strategy.LADDER_POLL_INTERVAL_SECONDS = 0
+
+        strategy._run_ladder_mode(stop_event)
+
+        self.assertEqual(len(client.orders), 4)
+        self.assertTrue(all(order["status"] == "CANCELED" for order in client.orders.values()))
+        self.assertEqual(client.liquidated_base, Decimal("10"))
+        self.assertEqual(client.base_free, Decimal("0"))
+        self.assertEqual(client.events[-1], "market-sell-BTCUSDT")
+        self.assertTrue(strategy.ladder_cleanup_confirmed)
+        self.assertEqual(strategy.ladder_cleanup_error, "")
+
+    def test_manual_stop_is_failure_until_liquidation_is_confirmed(self) -> None:
+        stop_event = _StopAfterOrders()
+        client = _UnconfirmedCleanupLadderClient(stop_event)
+        strategy = _strategy(client)
+        strategy.LADDER_CLEANUP_CONFIRM_TIMEOUT_SECONDS = 0
+
+        strategy._run_ladder_mode(stop_event)
+
+        self.assertFalse(strategy.ladder_cleanup_confirmed)
+        self.assertIn("确认超时", strategy.ladder_cleanup_error)
+        self.assertEqual(strategy.trade_error_stage, "分仓挂单结束清理")
+
+    def test_bnb_stop_before_first_order_market_sells_existing_base(self) -> None:
+        stop_event = _StopAfterOrders()
+        client = _BnbStopLadderClient(stop_event)
+        client.snapshot_count = 1
+        strategy = _strategy(client)
+        strategy.bnb_fee_stop_value = Decimal("0.01")
+
+        strategy._run_ladder_mode(stop_event)
+
+        self.assertEqual(client.orders, {})
+        self.assertEqual(client.liquidated_base, Decimal("10"))
+        self.assertEqual(client.base_free, Decimal("0"))
+        self.assertEqual(client.events, ["market-sell-BTCUSDT"])
 
     def test_target_cleanup_only_runs_after_reprice_trigger(self) -> None:
         stop_event = _StopAfterOrders()
