@@ -212,6 +212,8 @@ class ExchangeAppBase(tk.Tk):
         self._loading_accounts = False
         self.exchange_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="exchange")
         self.onchain_proxy_runtime = ExchangeProxyRuntime(STRATEGY_CONFIG_FILE.parent, runtime_name="onchain")
+        self.exchange_proxy_runtime.cleanup_stale_runtime()
+        self.onchain_proxy_runtime.cleanup_stale_runtime()
         self.account_store = AccountStore(DATA_FILE)
         self.exchange_operation_journal = OperationJournal(EXCHANGE_OPERATION_JOURNAL_FILE)
 
@@ -523,7 +525,7 @@ class ExchangeAppBase(tk.Tk):
         self.frame_list_canvas.columnconfigure(0, weight=1)
         self.frame_list_canvas.rowconfigure(0, weight=1)
 
-        tree_cols = ("checked", "idx", "api_key", "address", "network", "status")
+        tree_cols = ("checked", "idx", "api_key", "address", "network", "bnb_topup", "status")
         try:
             account_tree_style = ttk.Style(self)
             account_tree_style.map(
@@ -547,12 +549,14 @@ class ExchangeAppBase(tk.Tk):
         self.account_tree.heading("api_key", text="API KEY")
         self.account_tree.heading("address", text="提现地址")
         self.account_tree.heading("network", text="网络")
+        self.account_tree.heading("bnb_topup", text="BNB预买全选", command=self.select_all_bnb_topup_accounts)
         self.account_tree.heading("status", text="状态")
         self.account_tree.column("checked", width=52, minwidth=52, stretch=False, anchor="center")
         self.account_tree.column("idx", width=52, minwidth=52, stretch=False, anchor="center")
         self.account_tree.column("api_key", width=150, minwidth=130, stretch=False, anchor="w")
         self.account_tree.column("address", width=190, minwidth=160, stretch=False, anchor="w")
         self.account_tree.column("network", width=76, minwidth=68, stretch=False, anchor="center")
+        self.account_tree.column("bnb_topup", width=84, minwidth=84, stretch=False, anchor="center")
         self.account_tree.column("status", width=740, minwidth=260, stretch=True, anchor="w")
         self.account_tree.tag_configure("acc_ready", foreground="#111111", background="#F2F2F2")
         self.account_tree.tag_configure("acc_running", foreground="#111111", background="#CFE3FF")
@@ -577,6 +581,7 @@ class ExchangeAppBase(tk.Tk):
             anchor="center",
         )
         self.account_tree.bind("<Button-1>", self._focus_account_list_for_paste, add="+")
+        self.account_tree.bind("<Button-1>", self._on_account_tree_bnb_topup_click, add="+")
         self.account_tree.bind("<<TreeviewSelect>>", self._on_account_tree_selection_changed, add="+")
         self.account_tree.bind("<Double-Button-1>", self._on_account_tree_double_click, add="+")
         self.account_tree.bind("<Button-2>", self._on_account_tree_right_click, add="+")
@@ -1002,13 +1007,14 @@ class ExchangeAppBase(tk.Tk):
         else:
             api_width, address_width, status_min = 150, 190, 320
 
-        fixed = 52 + 52 + api_width + address_width + 76
+        fixed = 52 + 52 + api_width + address_width + 76 + 84
         status_width = max(status_min, width - fixed)
         tree.column("checked", width=52, minwidth=52, stretch=False, anchor="center")
         tree.column("idx", width=52, minwidth=52, stretch=False, anchor="center")
         tree.column("api_key", width=api_width, minwidth=130, stretch=False, anchor="w")
         tree.column("address", width=address_width, minwidth=160, stretch=False, anchor="w")
         tree.column("network", width=76, minwidth=68, stretch=False, anchor="center")
+        tree.column("bnb_topup", width=84, minwidth=84, stretch=False, anchor="center")
         tree.column("status", width=status_width, minwidth=status_min, stretch=True, anchor="w")
     def _on_trade_mode_changed(self, _event=None):
         self._refresh_strategy_panel_layout()

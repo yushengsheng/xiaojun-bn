@@ -710,14 +710,24 @@ class ExchangeAppAccountsMixin(object):
         if s.startswith("✔") or any(k in s for k in ("成功", "完成", "总资产", "无可提", "提现额度")):
             return "acc_success"
         return "acc_running"
-    def _account_tree_values(self, acc: dict) -> tuple[str, str, str, str, str, str]:
+    @staticmethod
+    def _account_bnb_topup_enabled(acc: dict) -> bool:
+        value_var = acc.get("bnb_topup_var")
+        if value_var is None:
+            return True
+        try:
+            return bool(value_var.get())
+        except Exception:
+            return True
+    def _account_tree_values(self, acc: dict) -> tuple[str, str, str, str, str, str, str]:
         checked = "✓" if bool(acc.get("selected_var").get()) else ""
         index_text = str(acc.get("index_var").get() or "")
         api_key = self._mask_key(str(acc.get("api_key") or ""))
         address = self._mask_addr(str(acc.get("address") or ""))
         network = self._account_network_value(acc)
+        bnb_topup = "✓" if self._account_bnb_topup_enabled(acc) else ""
         status = str(acc.get("status_var").get() or "")
-        return checked, index_text, api_key, address, network, status
+        return checked, index_text, api_key, address, network, bnb_topup, status
     def _refresh_account_tree_row(self, acc: dict) -> None:
         tree = getattr(self, "account_tree", None)
         if tree is None:
@@ -766,11 +776,13 @@ class ExchangeAppAccountsMixin(object):
         net = self._normalize_account_network_text(net)
         index_var = tk.StringVar(value=str(len(self.accounts) + 1))
         selected_var = tk.BooleanVar(value=selected)
+        bnb_topup_var = tk.BooleanVar(value=True)
         network_var = tk.StringVar(value=net)
         status_var = tk.StringVar(value="就绪")
         acc = {
             "index_var": index_var,
             "selected_var": selected_var,
+            "bnb_topup_var": bnb_topup_var,
             "network_var": network_var,
             "status_var": status_var,
             "stop_event": threading.Event(),
@@ -782,6 +794,7 @@ class ExchangeAppAccountsMixin(object):
             "tree_id": "",
         }
         selected_var.trace_add("write", lambda *_args, a=acc: (self._update_toggle_select_button_text(), self._refresh_account_tree_row(a)))
+        bnb_topup_var.trace_add("write", lambda *_args, a=acc: self._refresh_account_tree_row(a))
         network_var.trace_add("write", lambda *_args, a=acc: self._sync_account_network_var(a))
         self.accounts.append(acc)
         self._insert_account_tree_row(acc)
@@ -877,6 +890,29 @@ class ExchangeAppAccountsMixin(object):
             self.deselect_all_accounts()
         else:
             self.select_all_accounts()
+    def select_all_bnb_topup_accounts(self):
+        if self._batch_task_active or (self.worker_thread and self.worker_thread.is_alive()):
+            return
+        for acc in self.accounts:
+            value_var = acc.get("bnb_topup_var")
+            if value_var is not None:
+                value_var.set(True)
+        logger.info("已为 %d 个账号勾选预购买BNB", len(self.accounts))
+    def _on_account_tree_bnb_topup_click(self, event):
+        if self._batch_task_active or (self.worker_thread and self.worker_thread.is_alive()):
+            return None
+        tree = getattr(self, "account_tree", None)
+        if tree is None or tree.identify("region", event.x, event.y) != "cell":
+            return None
+        if tree.identify_column(event.x) != "#6":
+            return None
+        acc = self._account_from_tree_row_id(tree.identify_row(event.y))
+        if acc is None:
+            return "break"
+        value_var = acc.get("bnb_topup_var")
+        if value_var is not None:
+            value_var.set(not bool(value_var.get()))
+        return "break"
     def _update_toggle_select_button_text(self):
         btn = getattr(self, "btn_toggle_select_accounts", None)
         if btn is None:

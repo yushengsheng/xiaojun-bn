@@ -279,6 +279,9 @@ class ExchangeAppConfigMixin(object):
                 zero_round = int(spot_rounds) == 0
             except Exception:
                 zero_round = False
+        if zero_round and trade_mode == TRADE_MODE_MARKET:
+            route = client.resolve_spot_market_conversion(spot_symbol)
+            return str(route.get("toAsset") or "").strip().upper()
         if trade_mode == TRADE_MODE_CONVERT or (zero_round and trade_mode != TRADE_MODE_MARKET):
             _base_asset, quote_asset = client.ensure_convert_symbol_supported(spot_symbol)
             return quote_asset

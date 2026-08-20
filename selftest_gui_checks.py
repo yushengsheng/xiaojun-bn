@@ -118,6 +118,22 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 pump_tk_events(app, timeout=5.0)
                 if int(app.account_tree.cget("height")) != 10:
                     raise RuntimeError("GUI 自检失败：交易所账号列表高度不是10行")
+                account_columns = tuple(app.account_tree.cget("columns"))
+                if account_columns[-3:] != ("network", "bnb_topup", "status"):
+                    raise RuntimeError(f"GUI 自检失败：预买BNB列位置异常（{account_columns}）")
+                if str(app.account_tree.heading("bnb_topup", "text")) != "BNB预买全选":
+                    raise RuntimeError("GUI 自检失败：预买BNB全选表头缺失")
+                topup_probe = app._append_account_row("A" * 32, "b" * 32, "", "BSC")
+                if not bool(topup_probe["bnb_topup_var"].get()):
+                    raise RuntimeError("GUI 自检失败：新账号未默认勾选预购买BNB")
+                topup_probe["bnb_topup_var"].set(False)
+                if app._account_tree_values(topup_probe)[5] != "":
+                    raise RuntimeError("GUI 自检失败：单账号预购买BNB取消未刷新")
+                app.select_all_bnb_topup_accounts()
+                if app._account_tree_values(topup_probe)[5] != "✓":
+                    raise RuntimeError("GUI 自检失败：预购买BNB全选未生效")
+                app._delete_accounts([topup_probe], require_confirm=False)
+                checks.append("exchange-account-bnb-topup-control-gui=ok")
                 if str(app.btn_destroy_all_accounts.cget("text")) != "销毁所有":
                     raise RuntimeError("GUI 自检失败：交易所账号销毁按钮缺失")
                 if str(app.btn_destroy_all_accounts.cget("fg")).lower() != "#c62828":

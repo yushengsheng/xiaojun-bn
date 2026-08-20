@@ -51,6 +51,38 @@ from exchange_order_recovery import exchange_operation_scope, reconcile_exchange
 class ExchangeAppBatchMixin(object):
     COLLECT_BNB_RESIDUAL_IGNORE_USDT = Decimal("0.1")
 
+    @classmethod
+    def _batch_account_bnb_topup_amount(
+        cls,
+        acc: dict,
+        configured_amount,
+        enabled_account_keys: set[str],
+    ) -> Decimal:
+        if cls._account_batch_key(acc) not in enabled_account_keys:
+            return Decimal("0")
+        return Decimal(str(configured_amount or "0"))
+
+    @staticmethod
+    def _batch_supports_bnb_topup(
+        trade_account_type: str,
+        trade_mode: str,
+        spot_rounds: int,
+        market_stop_mode: str,
+    ) -> bool:
+        return bool(
+            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
+            and (
+                (trade_mode == TRADE_MODE_MARKET and market_stop_mode == MARKET_STOP_MODE_BNB)
+                or int(spot_rounds) != 0
+            )
+            and trade_mode in {
+                TRADE_MODE_MARKET,
+                TRADE_MODE_LIMIT,
+                TRADE_MODE_PREMIUM,
+                TRADE_MODE_LADDER,
+            }
+        )
+
     @staticmethod
     def _uses_shared_rate_limit_gate(trade_account_type: str, trade_mode: str) -> bool:
         return trade_account_type in {
@@ -143,6 +175,14 @@ class ExchangeAppBatchMixin(object):
             if trade_type == TRADE_ACCOUNT_TYPE_FUTURES:
                 quote_asset = c.get_um_futures_margin_asset(symbol)
                 base_asset = ""
+            elif (
+                spot_base_to_quote_only
+                and mode_name == TRADE_MODE_MARKET
+                and callable(getattr(c, "resolve_spot_market_conversion", None))
+            ):
+                route = c.resolve_spot_market_conversion(symbol)
+                base_asset = str(route.get("fromAsset") or "").strip().upper()
+                quote_asset = str(route.get("toAsset") or "").strip().upper()
             else:
                 quote_asset = BinanceClient.get_spot_quote_asset(symbol)
                 base_asset = BinanceClient.get_spot_base_asset(symbol)
@@ -569,11 +609,12 @@ class ExchangeAppBatchMixin(object):
                     and not market_bnb_stop_mode
                     and spot_rounds == 0
                 )
-                wait_asset = (
-                    BinanceClient.get_spot_base_asset(spot_symbol)
-                    if zero_round_spot_conversion
-                    else quote_asset
-                )
+                if zero_round_spot_conversion and trade_mode == TRADE_MODE_MARKET:
+                    wait_asset = client.resolve_spot_market_conversion(spot_symbol)["fromAsset"]
+                elif zero_round_spot_conversion:
+                    wait_asset = BinanceClient.get_spot_base_asset(spot_symbol)
+                else:
+                    wait_asset = quote_asset
                 if not self.wait_for_usdt(
                     usdt_timeout,
                     self.stop_event,
@@ -833,6 +874,8 @@ class ExchangeAppBatchMixin(object):
         tree = getattr(self, "account_tree", None)
         if tree is None or tree.identify("region", event.x, event.y) != "cell":
             return None
+        if tree.identify_column(event.x) == "#6":
+            return "break"
         row_id = tree.identify_row(event.y)
         acc = self._account_from_tree_row_id(row_id)
         if acc is None:
@@ -1672,7 +1715,7 @@ class ExchangeAppBatchMixin(object):
         if show_bnb_topup_option and trade_account_type != TRADE_ACCOUNT_TYPE_EARN:
             tk.Checkbutton(
                 body,
-                text="本次批量执行启用预购买BNB",
+                text="对账号列表中已勾选的账号预购买BNB",
                 variable=enable_bnb_topup_var,
                 fg="#C62828",
                 activeforeground="#C62828",
@@ -1681,7 +1724,7 @@ class ExchangeAppBatchMixin(object):
             ).pack(anchor="w")
             ttk.Label(
                 body,
-                text="使用当前配置的预购买BNB金额，仅对本次批量执行生效。",
+                text="使用当前配置金额；未勾选账号不会执行预购买。",
                 foreground="#666666",
             ).pack(anchor="w", pady=(6, 0))
 
@@ -2276,6 +2319,7 @@ class ExchangeAppBatchMixin(object):
         batch_collect_bnb_mode: bool = False,
         batch_enable_withdraw_override: bool | None = None,
         batch_enable_bnb_topup_override: bool | None = None,
+        batch_bnb_topup_account_keys_override: list[str] | tuple[str, ...] | set[str] | None = None,
         trade_settings_override: dict[str, object] | None = None,
         require_confirm: bool = True,
     ):
@@ -2394,10 +2438,11 @@ class ExchangeAppBatchMixin(object):
             return
 
         configured_bnb_topup_amount_value = Decimal(str(bnb_topup_amount_value or "0"))
-        show_bnb_topup_option = (
-            trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
-            and (market_bnb_stop_mode or spot_rounds != 0)
-            and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER}
+        show_bnb_topup_option = self._batch_supports_bnb_topup(
+            trade_account_type,
+            trade_mode,
+            spot_rounds,
+            market_stop_mode,
         )
         enable_bnb_topup = (
             bool(batch_enable_bnb_topup_override)
@@ -2443,6 +2488,19 @@ class ExchangeAppBatchMixin(object):
             bnb_topup_amount_value = Decimal("0")
         else:
             bnb_topup_amount_value = configured_bnb_topup_amount_value
+
+        if batch_bnb_topup_account_keys_override is None:
+            bnb_topup_account_keys = {
+                self._account_batch_key(acc)
+                for acc in selected
+                if self._account_bnb_topup_enabled(acc)
+            }
+        else:
+            bnb_topup_account_keys = {
+                str(account_key)
+                for account_key in batch_bnb_topup_account_keys_override
+                if str(account_key)
+            }
 
         if batch_total_asset_only:
             self.total_asset_results = {}
@@ -2501,6 +2559,11 @@ class ExchangeAppBatchMixin(object):
                             and trade_account_type != TRADE_ACCOUNT_TYPE_EARN
                             and show_bnb_topup_option
                         )
+                        else None
+                    ),
+                    "batch_bnb_topup_account_keys_override": (
+                        sorted(bnb_topup_account_keys)
+                        if show_bnb_topup_option and enable_bnb_topup
                         else None
                     ),
                 },
@@ -2565,6 +2628,11 @@ class ExchangeAppBatchMixin(object):
                     clear_exchange_account_log_index()
                     return
                 set_exchange_account_log_index(idx)
+                account_bnb_topup_amount_value = self._batch_account_bnb_topup_amount(
+                    acc,
+                    bnb_topup_amount_value,
+                    bnb_topup_account_keys,
+                )
 
                 def set_status(text, acc_ref=acc):
                     self._schedule_account_status(acc_ref, text)
@@ -2910,11 +2978,12 @@ class ExchangeAppBatchMixin(object):
                             and not market_bnb_stop_mode
                             and spot_rounds == 0
                         )
-                        base_asset = (
-                            BinanceClient.get_spot_base_asset(spot_symbol)
-                            if zero_round_spot_conversion
-                            else ""
-                        )
+                        if zero_round_spot_conversion and trade_mode == TRADE_MODE_MARKET:
+                            base_asset = client.resolve_spot_market_conversion(spot_symbol)["fromAsset"]
+                        elif zero_round_spot_conversion:
+                            base_asset = BinanceClient.get_spot_base_asset(spot_symbol)
+                        else:
+                            base_asset = ""
                         wait_asset = base_asset if zero_round_spot_conversion else quote_asset
                         if zero_round_spot_conversion:
                             set_status(f"检测{base_asset}/{quote_asset} 任一方余额...")
@@ -2974,10 +3043,10 @@ class ExchangeAppBatchMixin(object):
                                     "账号 #%d 开始执行市价策略：按剩余BNB停止，停止值=%s BNB，预买BNB金额=%s",
                                     idx,
                                     BinanceClient._format_decimal(bnb_fee_stop_value),
-                                    bnb_topup_amount_value,
+                                    account_bnb_topup_amount_value,
                                 )
                             else:
-                                logger.info("账号 #%d 开始执行市价策略：%d 轮，预买BNB金额=%s", idx, spot_rounds, bnb_topup_amount_value)
+                                logger.info("账号 #%d 开始执行市价策略：%d 轮，预买BNB金额=%s", idx, spot_rounds, account_bnb_topup_amount_value)
                         elif trade_mode == TRADE_MODE_CONVERT:
                             logger.info("账号 #%d 开始执行闪兑策略：%d 轮，交易对=%s", idx, spot_rounds, spot_symbol)
                         elif trade_mode == TRADE_MODE_LIMIT:
@@ -2992,7 +3061,7 @@ class ExchangeAppBatchMixin(object):
                             logger.info(
                                 "账号 #%d 开始执行挂单策略：预买BNB金额=%s，剩余bnb手续费=%s，重挂阈值=%s %s",
                                 idx,
-                                bnb_topup_amount_value,
+                                account_bnb_topup_amount_value,
                                 bnb_fee_stop_value,
                                 BinanceClient._format_decimal(effective_reprice_threshold),
                                 quote_asset,
@@ -3012,7 +3081,7 @@ class ExchangeAppBatchMixin(object):
                                 ladder_layout,
                                 BinanceClient._format_decimal(ladder_min_pool_notional_value),
                                 quote_asset,
-                                bnb_topup_amount_value,
+                                account_bnb_topup_amount_value,
                                 bnb_fee_stop_value,
                                 BinanceClient._format_decimal(effective_reprice_threshold),
                                 quote_asset,
@@ -3041,7 +3110,7 @@ class ExchangeAppBatchMixin(object):
                             logger.info(
                                 "账号 #%d 开始执行溢价单策略：预买BNB金额=%s，溢价=%s %s，笔数=%s，追加挂单=%s %s，部分成交循环=%s，剩余bnb手续费=%s，重挂阈值=%s %s",
                                 idx,
-                                bnb_topup_amount_value,
+                                account_bnb_topup_amount_value,
                                 premium_delta_value,
                                 quote_asset,
                                 premium_order_count,
@@ -3131,7 +3200,7 @@ class ExchangeAppBatchMixin(object):
                             premium_append_threshold=premium_append_threshold_value,
                             premium_partial_fill=premium_partial_fill,
                             bnb_fee_stop_value=bnb_fee_stop_value,
-                            bnb_topup_amount=bnb_topup_amount_value,
+                            bnb_topup_amount=account_bnb_topup_amount_value,
                             reprice_threshold_amount=reprice_threshold_value,
                             ladder_layout=ladder_layout,
                             ladder_min_pool_notional=ladder_min_pool_notional_value,
@@ -3290,6 +3359,11 @@ class ExchangeAppBatchMixin(object):
                                     and trade_account_type != TRADE_ACCOUNT_TYPE_EARN
                                     and show_bnb_topup_option
                                 )
+                                else None
+                            ),
+                            "batch_bnb_topup_account_keys_override": (
+                                sorted(bnb_topup_account_keys)
+                                if show_bnb_topup_option and enable_bnb_topup
                                 else None
                             ),
                             "trade_settings_override": (

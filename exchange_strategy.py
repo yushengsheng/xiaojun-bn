@@ -232,7 +232,13 @@ class Strategy:
             logger.info("检测到停止信号，跳过 0 轮现货兑换")
             return
 
-        base_asset, quote_asset = self._spot_pair_assets()
+        market_mode = self._mode_name() == TRADE_MODE_MARKET
+        if market_mode:
+            route = self.c.resolve_spot_market_conversion(self.spot_symbol)
+            base_asset = str(route.get("fromAsset") or "").strip().upper()
+            quote_asset = str(route.get("toAsset") or "").strip().upper()
+        else:
+            base_asset, quote_asset = self._spot_pair_assets()
         self._emit_progress(progress_cb, 0, 1, "0轮兑换 %s->%s" % (base_asset, quote_asset))
         logger.info(
             "现货轮次为 0，执行前置币种兑换为后置币种：%s -> %s，交易对=%s",
@@ -245,9 +251,8 @@ class Strategy:
             logger.info("检测到停止信号，跳过 0 轮现货兑换")
             return
         try:
-            market_mode = self._mode_name() == TRADE_MODE_MARKET
             trade_action = (
-                (lambda: self.c.spot_sell_all_base(symbol=self.spot_symbol))
+                (lambda: self.c.spot_market_convert_base_to_quote_all(symbol=self.spot_symbol))
                 if market_mode
                 else (lambda: self.c.convert_base_to_quote_all(symbol=self.spot_symbol))
             )
@@ -265,7 +270,10 @@ class Strategy:
             if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                 logger.info("检测到停止信号，跳过 0 轮现货兑换")
                 return
+            self.trade_error = str(e)
+            self.trade_error_stage = "0轮现货兑换"
             logger.error("0 轮现货兑换异常: %s", e)
+            return
         self._emit_progress(progress_cb, 1, 1, "0轮兑换 %s->%s 完成" % (base_asset, quote_asset))
 
     def _futures_side_order(self) -> str:
@@ -2712,6 +2720,9 @@ class Strategy:
 
         if zero_round_spot_conversion:
             self._run_zero_round_spot_conversion(stop_event, progress_cb=progress_cb)
+            if self.trade_error:
+                logger.error("0 轮现货兑换失败，已中止后续提现: %s", self.trade_error)
+                return result_payload()
         else:
             self._run_bnb_topup_if_needed(stop_event)
 

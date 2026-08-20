@@ -62,14 +62,28 @@ class ExchangeRetryPolicyTests(unittest.TestCase):
         def action():
             nonlocal calls
             calls += 1
-            if calls < 10:
+            if calls < 3:
                 raise BinanceAPIError(-2015, "Invalid API-key, IP, or permissions for action.")
             return {"ok": True}
 
         result = probe._run_request_with_retry(action, max_retries=10, delay=0)
 
         self.assertEqual(result, {"ok": True})
-        self.assertEqual(calls, 10)
+        self.assertEqual(calls, 3)
+
+    def test_binance_permission_error_never_exceeds_three_requests(self):
+        probe = _RequestRetryProbe()
+        calls = 0
+
+        def action():
+            nonlocal calls
+            calls += 1
+            raise BinanceAPIError(-2015, "Invalid API-key, IP, or permissions for action.")
+
+        with self.assertRaises(BinanceAPIError):
+            probe._run_request_with_retry(action, max_retries=10, delay=0)
+
+        self.assertEqual(calls, 3)
 
     def test_non_retryable_binance_error_still_fails_immediately(self):
         probe = _RequestRetryProbe()

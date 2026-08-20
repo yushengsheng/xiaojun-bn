@@ -239,12 +239,16 @@ class BinanceClient:
     DEFAULT_RECV_WINDOW_MS = 20000
     DEFAULT_REQUEST_RETRY_COUNT = 10
     DEFAULT_REQUEST_RETRY_DELAY_SECONDS = 1.0
+    INVALID_PERMISSION_RETRY_COUNT = 3
     RETRYABLE_BINANCE_ERROR_CODES = {-1001, -1003, -2015}
     SHARED_RATE_LIMIT_ERROR_CODES = {-1003, -1008, -1015}
     SHARED_RATE_LIMIT_HTTP_STATUS_CODES = {418, 429}
     _shared_convert_exchange_info_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     _shared_convert_asset_info_cache: dict[str, int] | None = None
     _shared_convert_cache_lock = threading.Lock()
+    _shared_spot_market_direct_routes: dict[str, dict[str, str]] | None = None
+    _shared_spot_market_reverse_routes: dict[str, list[dict[str, str]]] | None = None
+    _shared_spot_market_route_lock = threading.Lock()
     _shared_server_time_offset_ms: dict[str, int] = {}
     _shared_server_time_synced_at: dict[str, float] = {}
     _shared_server_time_lock = threading.Lock()
@@ -465,6 +469,7 @@ class BinanceClient:
     ):
         last_exception = None
         retry_count = max(1, int(max_retries or self.DEFAULT_REQUEST_RETRY_COUNT))
+        final_attempt_limit = retry_count
         retry_delay = max(0.0, float(delay if delay is not None else self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS))
 
         def sleep_before_retry() -> None:
@@ -510,13 +515,19 @@ class BinanceClient:
                     continue
                 attempt += 1
                 if e.code in self.RETRYABLE_BINANCE_ERROR_CODES:
-                    if attempt >= retry_count:
+                    attempt_limit = (
+                        min(retry_count, self.INVALID_PERMISSION_RETRY_COUNT)
+                        if e.code == -2015
+                        else retry_count
+                    )
+                    final_attempt_limit = attempt_limit
+                    if attempt >= attempt_limit:
                         break
-                    logger.warning(f"{retryable_binance_error_label(e.code)} ({attempt}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
+                    logger.warning(f"{retryable_binance_error_label(e.code)} ({attempt}/{attempt_limit}): {e}，将在 {retry_delay:g} 秒后重试...")
                     sleep_before_retry()
                     continue
                 raise e
-        logger.error(f"重试 {retry_count} 次后仍然失败。")
+        logger.error(f"重试 {final_attempt_limit} 次后仍然失败。")
         if last_exception:
             raise last_exception
         raise RuntimeError("未知错误：重试失败")
@@ -1139,6 +1150,78 @@ class BinanceClient:
         if str(info.get("status") or "").strip().upper() != "TRADING":
             raise RuntimeError(f"现货交易对不可交易：{symbol_u}")
         return base_asset, quote_asset
+
+    def _spot_market_conversion_routes(
+        self,
+    ) -> tuple[dict[str, dict[str, str]], dict[str, list[dict[str, str]]]]:
+        client_type = type(self)
+        with self._shared_spot_market_route_lock:
+            direct_cached = getattr(client_type, "_shared_spot_market_direct_routes", None)
+            reverse_cached = getattr(client_type, "_shared_spot_market_reverse_routes", None)
+            if direct_cached is not None and reverse_cached is not None:
+                return direct_cached, reverse_cached
+
+            data = self.public_get(
+                self.spot,
+                "/api/v3/exchangeInfo",
+                {"permissions": "SPOT", "showPermissionSets": "false"},
+            )
+            direct_routes: dict[str, dict[str, str]] = {}
+            reverse_routes: dict[str, list[dict[str, str]]] = {}
+            for item in data.get("symbols", []) if isinstance(data, dict) else []:
+                if not isinstance(item, dict):
+                    continue
+                symbol_u = str(item.get("symbol") or "").strip().upper()
+                base_asset = str(item.get("baseAsset") or "").strip().upper()
+                quote_asset = str(item.get("quoteAsset") or "").strip().upper()
+                order_types = {str(value or "").strip().upper() for value in item.get("orderTypes", [])}
+                if (
+                    not symbol_u
+                    or not base_asset
+                    or not quote_asset
+                    or str(item.get("status") or "").strip().upper() != "TRADING"
+                    or item.get("isSpotTradingAllowed") is False
+                    or "MARKET" not in order_types
+                ):
+                    continue
+
+                direct_routes[symbol_u] = {
+                    "symbol": symbol_u,
+                    "fromAsset": base_asset,
+                    "toAsset": quote_asset,
+                    "side": "SELL",
+                }
+                if self._bool_from_value(item.get("quoteOrderQtyMarketAllowed")):
+                    reverse_key = quote_asset + base_asset
+                    reverse_routes.setdefault(reverse_key, []).append(
+                        {
+                            "symbol": symbol_u,
+                            "fromAsset": quote_asset,
+                            "toAsset": base_asset,
+                            "side": "BUY",
+                        }
+                    )
+
+            client_type._shared_spot_market_direct_routes = direct_routes
+            client_type._shared_spot_market_reverse_routes = reverse_routes
+            return direct_routes, reverse_routes
+
+    def resolve_spot_market_conversion(self, symbol: str) -> dict[str, str]:
+        direction_key = self.normalize_trade_symbol(symbol)
+        if not direction_key:
+            raise RuntimeError("现货0轮兑换方向不能为空")
+
+        direct_routes, reverse_routes = self._spot_market_conversion_routes()
+        direct_route = direct_routes.get(direction_key)
+        if direct_route is not None:
+            return dict(direct_route)
+
+        reverse_candidates = reverse_routes.get(direction_key, [])
+        if len(reverse_candidates) == 1:
+            return dict(reverse_candidates[0])
+        if len(reverse_candidates) > 1:
+            raise RuntimeError(f"现货0轮兑换方向存在歧义：{direction_key}")
+        raise RuntimeError(f"找不到支持市价0轮兑换的方向：{direction_key}")
 
     # -------- 公共行情 / 交易规则 --------
     def get_exchange_info(self, symbol: str):
@@ -2327,6 +2410,7 @@ class BinanceClient:
         quote_amount: Decimal | str | float | int,
         *,
         assume_spot_funds_ready: bool = False,
+        quote_asset_override: str = "",
     ):
         symbol_u = self.normalize_trade_symbol(symbol)
         amount = Decimal(str(quote_amount))
@@ -2342,7 +2426,14 @@ class BinanceClient:
             logger.info("交易对 %s 非 TRADING，跳过买入", symbol_u)
             return False
 
-        quote_asset = self.get_spot_quote_asset(symbol_u)
+        quote_asset = str(quote_asset_override or "").strip().upper()
+        if not quote_asset:
+            quote_asset = self.get_spot_quote_asset(symbol_u)
+        rules_quote_asset = str(rules.get("quoteAsset") or "").strip().upper()
+        if rules_quote_asset and quote_asset != rules_quote_asset:
+            raise RuntimeError(
+                f"{symbol_u} 后置币种不匹配：交易规则={rules_quote_asset}，下单资产={quote_asset}"
+            )
         if not assume_spot_funds_ready:
             self.collect_asset_to_spot(quote_asset, context="交易前")
         quote_balance = self.spot_asset_balance_decimal(quote_asset)
@@ -2375,6 +2466,38 @@ class BinanceClient:
         )
         logger.info("现货市价买入 %s，使用 %s 金额 %s", symbol_u, quote_asset, self._format_decimal(amount))
         return True
+
+    def spot_market_convert_base_to_quote_all(self, symbol: str):
+        route = self.resolve_spot_market_conversion(symbol)
+        actual_symbol = route["symbol"]
+        from_asset = route["fromAsset"]
+        to_asset = route["toAsset"]
+        side = route["side"]
+        logger.info(
+            "现货0轮方向解析：%s -> %s，实际交易对=%s，方向=%s",
+            from_asset,
+            to_asset,
+            actual_symbol,
+            side,
+        )
+        if side == "SELL":
+            base_balance = self.spot_asset_balance_decimal(from_asset)
+            if base_balance <= 0:
+                logger.info("现货 %s 余额不足，跳过0轮市价兑换", from_asset)
+                return False
+            return self.sell_asset_market(actual_symbol, base_balance, reserve_ratio=Decimal("1"))
+
+        self.collect_asset_to_spot(from_asset, context="交易前")
+        quote_balance = self.spot_asset_balance_decimal(from_asset)
+        if quote_balance <= 0:
+            logger.info("现货 %s 余额不足，跳过0轮市价兑换", from_asset)
+            return False
+        return self.spot_buy_quote_amount(
+            actual_symbol,
+            quote_balance,
+            assume_spot_funds_ready=True,
+            quote_asset_override=from_asset,
+        )
 
     def buy_bnb_with_quote_amount(
         self,

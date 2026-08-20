@@ -634,7 +634,22 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
                     "baseAsset": "BTC",
                     "quoteAsset": "U",
                 }
+            if symbol_u == "ETHBTC":
+                return {
+                    "symbol": symbol_u,
+                    "status": "TRADING",
+                    "baseAsset": "ETH",
+                    "quoteAsset": "BTC",
+                    "orderTypes": ["MARKET"],
+                    "isSpotTradingAllowed": True,
+                    "quoteOrderQtyMarketAllowed": True,
+                }
             return None
+
+        def public_get(self, _base, path, params=None):
+            if path == "/api/v3/exchangeInfo" and params == {"permissions": "SPOT", "showPermissionSets": "false"}:
+                return {"symbols": [self.get_exchange_info("XAUTUSDT"), self.get_exchange_info("ETHBTC")]}
+            raise RuntimeError(f"交易对校验自检遇到未知公开请求：{path} {params}")
 
         def get_convert_pair_info(self, from_asset: str, to_asset: str):
             key = (str(from_asset or "").strip().upper(), str(to_asset or "").strip().upper())
@@ -701,6 +716,14 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         )
         if quote_asset_for_convert != "U":
             raise RuntimeError("闪兑模式USDTU校验自检失败：未按闪兑资产对放行")
+        btc_to_eth_route = symbol_client.resolve_spot_market_conversion("BTC/ETH")
+        if btc_to_eth_route != {
+            "symbol": "ETHBTC",
+            "fromAsset": "BTC",
+            "toAsset": "ETH",
+            "side": "BUY",
+        }:
+            raise RuntimeError(f"0轮现货双向解析自检失败：{btc_to_eth_route}")
         if symbol_client.get_um_futures_margin_asset("BTCUSDT") != "USDT":
             raise RuntimeError("交易对校验自检失败：合约保证金币种解析异常")
         try:
@@ -848,6 +871,17 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.calls.append(("sell", str(symbol or "").strip().upper()))
             self._record_event("sell")
             return {"status": "ok"}
+
+        def resolve_spot_market_conversion(self, symbol: str):
+            return {
+                "symbol": str(symbol or "").strip().upper(),
+                "fromAsset": "BTC",
+                "toAsset": "USDT",
+                "side": "SELL",
+            }
+
+        def spot_market_convert_base_to_quote_all(self, symbol: str):
+            return self.spot_sell_all_base(symbol)
 
         def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
             self.calls.append(("withdraw", str(coin or "").strip().upper()))
@@ -2452,9 +2486,65 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     account_tree_probe = _SelftestAccountTreeProbe()
     ExchangeAppBase._resize_account_tree_columns(account_tree_probe)
     address_width = int(account_tree_probe.account_tree.columns.get("address", {}).get("width") or 0)
+    bnb_topup_width = int(account_tree_probe.account_tree.columns.get("bnb_topup", {}).get("width") or 0)
     status_width = int(account_tree_probe.account_tree.columns.get("status", {}).get("width") or 0)
-    if address_width != 190 or status_width != 1505:
-        raise RuntimeError(f"账号列表列宽自检失败：address={address_width}, status={status_width}")
+    if address_width != 190 or bnb_topup_width != 84 or status_width != 1421:
+        raise RuntimeError(
+            f"账号列表列宽自检失败：address={address_width}, bnb_topup={bnb_topup_width}, status={status_width}"
+        )
+    if not ExchangeAppAccountsMixin._account_bnb_topup_enabled({}):
+        raise RuntimeError("账号预购买BNB自检失败：旧账号默认值未保持启用")
+    if ExchangeAppAccountsMixin._account_bnb_topup_enabled({"bnb_topup_var": _SimpleVar(False)}):
+        raise RuntimeError("账号预购买BNB自检失败：单账号关闭未生效")
+    topup_enabled_acc = {"api_key": "topup-enabled"}
+    topup_disabled_acc = {"api_key": "topup-disabled"}
+    enabled_topup_keys = {ExchangeAppBatchMixin._account_batch_key(topup_enabled_acc)}
+    if ExchangeAppBatchMixin._batch_account_bnb_topup_amount(
+        topup_enabled_acc,
+        Decimal("5"),
+        enabled_topup_keys,
+    ) != Decimal("5"):
+        raise RuntimeError("账号预购买BNB自检失败：勾选账号未收到配置金额")
+    if ExchangeAppBatchMixin._batch_account_bnb_topup_amount(
+        topup_disabled_acc,
+        Decimal("5"),
+        enabled_topup_keys,
+    ) != Decimal("0"):
+        raise RuntimeError("账号预购买BNB自检失败：未勾选账号仍收到配置金额")
+    for supported_mode in (
+        TRADE_MODE_MARKET,
+        TRADE_MODE_LIMIT,
+        TRADE_MODE_PREMIUM,
+        TRADE_MODE_LADDER,
+    ):
+        if not ExchangeAppBatchMixin._batch_supports_bnb_topup(
+            TRADE_ACCOUNT_TYPE_SPOT,
+            supported_mode,
+            1,
+            MARKET_STOP_MODE_DEFAULT,
+        ):
+            raise RuntimeError(f"账号预购买BNB自检失败：{supported_mode}模式未覆盖")
+    if not ExchangeAppBatchMixin._batch_supports_bnb_topup(
+        TRADE_ACCOUNT_TYPE_SPOT,
+        TRADE_MODE_MARKET,
+        0,
+        MARKET_STOP_MODE_BNB,
+    ):
+        raise RuntimeError("账号预购买BNB自检失败：剩余BNB停止模式未覆盖")
+    if ExchangeAppBatchMixin._batch_supports_bnb_topup(
+        TRADE_ACCOUNT_TYPE_SPOT,
+        TRADE_MODE_CONVERT,
+        1,
+        MARKET_STOP_MODE_DEFAULT,
+    ):
+        raise RuntimeError("账号预购买BNB自检失败：闪兑模式被意外扩展")
+    if ExchangeAppBatchMixin._batch_supports_bnb_topup(
+        TRADE_ACCOUNT_TYPE_SPOT,
+        TRADE_MODE_LIMIT,
+        0,
+        MARKET_STOP_MODE_BNB,
+    ):
+        raise RuntimeError("账号预购买BNB自检失败：0轮挂单被意外扩展")
     checks.append("collect-bnb-earn-skip=ok")
 
     class _SelftestSimpleEarnClient(BinanceClient):

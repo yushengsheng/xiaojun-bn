@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 import platform
+import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -76,6 +78,9 @@ class ExchangeProxyRuntime:
         "hysteria-windows-arm64.exe": "668d8d36650df0bd0c26b606ed6cf45e9dfb22e63b276e72e3d33fc345c9635d",
     }
     _RUNTIME_MANIFEST_VERSION = 1
+    _RUNTIME_CONFIG_NAME_RE_TEMPLATE = (
+        r"^{runtime_name}_(ss_proxy_xray|hysteria2_proxy|ss_proxy)_(\d+)_([0-9a-f]{{10}})\.json$"
+    )
 
     def __init__(self, work_dir: Path, runtime_name: str = "exchange"):
         self.work_dir = Path(work_dir)
@@ -88,6 +93,236 @@ class ExchangeProxyRuntime:
         self._log_path: Path | None = None
         self._log_handle = None
         self._backend = ""
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        pid_i = int(pid or 0)
+        if pid_i <= 0:
+            return False
+        if os.name == "nt":
+            try:
+                return ExchangeProxyRuntime._windows_pid_is_alive(pid_i)
+            except Exception:
+                return True
+        try:
+            os.kill(pid_i, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _windows_pid_is_alive(pid: int, *, kernel32=None, get_last_error=None) -> bool:
+        """Probe a Windows PID without requiring Windows APIs in unit tests."""
+        import ctypes
+
+        if kernel32 is None:
+            from ctypes import wintypes
+
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            kernel.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel.CloseHandle.restype = wintypes.BOOL
+        else:
+            kernel = kernel32
+        last_error = get_last_error if get_last_error is not None else ctypes.get_last_error
+        process = kernel.OpenProcess(0x1000, False, int(pid))
+        if not process:
+            # ERROR_ACCESS_DENIED means the process exists but cannot be queried.
+            return int(last_error()) == 5
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                return True
+            return int(exit_code.value) == 259
+        finally:
+            kernel.CloseHandle(process)
+
+    @classmethod
+    def _runtime_process_commands(cls) -> list[tuple[int, str]] | None:
+        if os.name == "nt":
+            command = [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "Get-CimInstance Win32_Process | ForEach-Object { "
+                    "\"{0}`t{1}\" -f $_.ProcessId, $_.CommandLine }"
+                ),
+            ]
+        else:
+            command = ["ps", "-ww", "-axo", "pid=,command="]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+                **cls._hidden_process_kwargs(),
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+
+        processes: list[tuple[int, str]] = []
+        for raw_line in str(result.stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if os.name == "nt":
+                parts = line.split("\t", 1)
+            else:
+                parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except (TypeError, ValueError):
+                continue
+            processes.append((pid, parts[1]))
+        return processes
+
+    @staticmethod
+    def _command_references_runtime_config(command: str, config_path: Path, backend_kind: str) -> bool:
+        command_text = str(command or "")
+        path_text = str(Path(config_path).absolute())
+        if os.name == "nt":
+            command_text = command_text.replace("\\", "/").lower()
+            path_text = path_text.replace("\\", "/").lower()
+        expected_backend = {
+            "ss_proxy": "sing-box",
+            "ss_proxy_xray": "xray",
+            "hysteria2_proxy": "hysteria",
+        }.get(str(backend_kind or ""), "")
+        if not expected_backend or expected_backend not in command_text.lower():
+            return False
+        path_pattern = r"(?:^|[\s\"'])" + re.escape(path_text) + r"(?:$|[\s\"'])"
+        return re.search(path_pattern, command_text) is not None
+
+    @classmethod
+    def _terminate_runtime_processes(cls, pids: set[int]) -> set[int]:
+        remaining = {int(pid) for pid in pids if int(pid) > 0 and int(pid) != os.getpid()}
+        remaining = {pid for pid in remaining if cls._pid_is_alive(pid)}
+        if not remaining:
+            return set()
+
+        if os.name == "nt":
+            for pid in sorted(remaining):
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T"],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                        **cls._hidden_process_kwargs(),
+                    )
+                except Exception:
+                    pass
+        else:
+            for pid in sorted(remaining):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+
+        deadline = time.monotonic() + 2.0
+        while remaining and time.monotonic() < deadline:
+            remaining = {pid for pid in remaining if cls._pid_is_alive(pid)}
+            if remaining:
+                time.sleep(0.05)
+
+        if os.name == "nt":
+            for pid in sorted(remaining):
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(pid), "/T"],
+                        capture_output=True,
+                        timeout=5,
+                        check=False,
+                        **cls._hidden_process_kwargs(),
+                    )
+                except Exception:
+                    pass
+        else:
+            for pid in sorted(remaining):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+        deadline = time.monotonic() + 1.0
+        while remaining and time.monotonic() < deadline:
+            remaining = {pid for pid in remaining if cls._pid_is_alive(pid)}
+            if remaining:
+                time.sleep(0.05)
+        return remaining
+
+    def cleanup_stale_runtime(self) -> tuple[int, int]:
+        """Remove only orphaned proxy processes/configs created by this runtime name."""
+        try:
+            name_pattern = re.compile(
+                self._RUNTIME_CONFIG_NAME_RE_TEMPLATE.format(runtime_name=re.escape(self.runtime_name))
+            )
+            candidates: list[tuple[Path, str]] = []
+            for config_path in self.work_dir.glob(f"{self.runtime_name}_*.json"):
+                match = name_pattern.fullmatch(config_path.name)
+                if match is None:
+                    continue
+                owner_pid = int(match.group(2))
+                if owner_pid == os.getpid() or self._pid_is_alive(owner_pid):
+                    continue
+                candidates.append((config_path, match.group(1)))
+            if not candidates:
+                return 0, 0
+
+            process_commands = self._runtime_process_commands()
+            if process_commands is None:
+                logger.warning("无法枚举进程，已保留 %d 个待清理代理配置", len(candidates))
+                return 0, 0
+
+            config_processes: dict[Path, set[int]] = {}
+            stale_process_ids: set[int] = set()
+            for config_path, backend_kind in candidates:
+                matched_pids = {
+                    pid
+                    for pid, command in process_commands
+                    if self._command_references_runtime_config(command, config_path, backend_kind)
+                }
+                config_processes[config_path] = matched_pids
+                stale_process_ids.update(matched_pids)
+
+            remaining_pids = self._terminate_runtime_processes(stale_process_ids)
+            removed_configs = 0
+            for config_path, _backend_kind in candidates:
+                if config_processes.get(config_path, set()) & remaining_pids:
+                    logger.warning("代理残留进程未能停止，保留配置：%s", config_path.name)
+                    continue
+                try:
+                    config_path.unlink(missing_ok=True)
+                    removed_configs += 1
+                except Exception as exc:
+                    logger.warning("代理残留配置清理失败 %s: %s", config_path.name, exc)
+
+            stopped_processes = len(stale_process_ids - remaining_pids)
+            if stopped_processes or removed_configs:
+                logger.info(
+                    "已清理代理残留：进程 %d 个，配置 %d 个",
+                    stopped_processes,
+                    removed_configs,
+                )
+            return stopped_processes, removed_configs
+        except Exception as exc:
+            logger.warning("代理残留清理失败: %s", exc)
+            return 0, 0
 
     @staticmethod
     def _decode_ss_userinfo(userinfo: str) -> tuple[str, str]:

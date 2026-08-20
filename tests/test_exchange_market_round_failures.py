@@ -10,9 +10,13 @@ from exchange_app_accounts import ExchangeAppAccountsMixin
 from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_constants import (
     MARKET_STOP_MODE_BNB,
+    MARKET_STOP_MODE_DEFAULT,
     TRADE_ACCOUNT_TYPE_SPOT,
     TRADE_MODE_CONVERT,
+    TRADE_MODE_LADDER,
+    TRADE_MODE_LIMIT,
     TRADE_MODE_MARKET,
+    TRADE_MODE_PREMIUM,
 )
 from exchange_strategy import Strategy
 
@@ -40,6 +44,17 @@ class _MarketRoundTransientFailureClient:
     def spot_sell_all_base(self, symbol: str, small_qty_log_text=None):
         self.calls.append(("sell", str(symbol or "").strip().upper()))
         return False
+
+    def resolve_spot_market_conversion(self, symbol: str):
+        return {
+            "symbol": str(symbol or "").strip().upper(),
+            "fromAsset": "BTC",
+            "toAsset": "USDT",
+            "side": "SELL",
+        }
+
+    def spot_market_convert_base_to_quote_all(self, symbol: str):
+        return self.spot_sell_all_base(symbol)
 
     def collect_asset_to_spot(self, asset: str, *, context: str = "提现前"):
         self.calls.append(("collect", "%s:%s" % (str(context or "").strip(), str(asset or "").strip().upper())))
@@ -123,6 +138,53 @@ class _MarketBnbStopClient:
 
 
 class ExchangeMarketRoundFailureTests(unittest.TestCase):
+    def test_account_bnb_topup_selection_controls_only_that_account(self):
+        enabled_account = {"api_key": "enabled-key"}
+        recreated_enabled_account = {"api_key": "enabled-key"}
+        disabled_account = {"api_key": "disabled-key"}
+        enabled_keys = {ExchangeAppBatchMixin._account_batch_key(enabled_account)}
+
+        self.assertEqual(
+            ExchangeAppBatchMixin._batch_account_bnb_topup_amount(
+                recreated_enabled_account,
+                Decimal("5"),
+                enabled_keys,
+            ),
+            Decimal("5"),
+        )
+        self.assertEqual(
+            ExchangeAppBatchMixin._batch_account_bnb_topup_amount(disabled_account, Decimal("5"), enabled_keys),
+            Decimal("0"),
+        )
+
+    def test_account_bnb_topup_covers_every_existing_supported_spot_mode(self):
+        for trade_mode in (TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER):
+            with self.subTest(trade_mode=trade_mode):
+                self.assertTrue(
+                    ExchangeAppBatchMixin._batch_supports_bnb_topup(
+                        TRADE_ACCOUNT_TYPE_SPOT,
+                        trade_mode,
+                        1,
+                        MARKET_STOP_MODE_DEFAULT,
+                    )
+                )
+        self.assertTrue(
+            ExchangeAppBatchMixin._batch_supports_bnb_topup(
+                TRADE_ACCOUNT_TYPE_SPOT,
+                TRADE_MODE_MARKET,
+                0,
+                MARKET_STOP_MODE_BNB,
+            )
+        )
+        self.assertFalse(
+            ExchangeAppBatchMixin._batch_supports_bnb_topup(
+                TRADE_ACCOUNT_TYPE_SPOT,
+                TRADE_MODE_CONVERT,
+                1,
+                MARKET_STOP_MODE_DEFAULT,
+            )
+        )
+
     def test_market_bnb_stop_ignores_rounds_and_keeps_topup_before_trading(self):
         client = _MarketBnbStopClient([Decimal("0.02"), Decimal("0.005")])
         strategy = Strategy(
@@ -233,6 +295,35 @@ class ExchangeMarketRoundFailureTests(unittest.TestCase):
         convert_strategy.run(stop_event=_NoDelayStop())
         self.assertEqual(convert_client.calls.count(("convert", "BTCUSDT")), 1)
         self.assertNotIn(("sell", "BTCUSDT"), convert_client.calls)
+
+    def test_zero_round_failure_is_reported_and_blocks_withdrawal(self):
+        class _FailingZeroRoundClient(_MarketRoundTransientFailureClient):
+            def spot_market_convert_base_to_quote_all(self, symbol: str):
+                self.calls.append(("sell", str(symbol or "").strip().upper()))
+                raise RuntimeError("zero-round order rejected")
+
+        client = _FailingZeroRoundClient()
+        strategy = Strategy(
+            client=client,
+            spot_rounds=0,
+            withdraw_coin="USDT",
+            withdraw_address="0x0000000000000000000000000000000000000001",
+            withdraw_network="BSC",
+            withdraw_fee_buffer=0,
+            spot_symbol="BTCUSDT",
+            sleep_fn=lambda: None,
+            enable_withdraw=True,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            trade_mode=TRADE_MODE_MARKET,
+        )
+
+        result = strategy.run(stop_event=_NoDelayStop())
+
+        self.assertTrue(result.get("trade_failed"))
+        self.assertEqual(result.get("trade_error_stage"), "0轮现货兑换")
+        self.assertIn("zero-round order rejected", result.get("trade_error", ""))
+        self.assertFalse(result.get("withdraw_attempted"))
+        self.assertNotIn(("withdraw", "USDT"), client.calls)
 
     def test_market_round_transient_failure_retries_without_failed_round(self):
         client = _MarketRoundTransientFailureClient()

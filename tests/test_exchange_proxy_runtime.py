@@ -6,9 +6,10 @@ from __future__ import annotations
 import unittest
 import tempfile
 import json
+import os
 from pathlib import Path
 import threading
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from exchange_proxy_runtime import ExchangeProxyRuntime
 from secret_box import SecretBox
@@ -132,6 +133,119 @@ class PinnedProxyRuntimeTests(unittest.TestCase):
             with patch.dict("exchange_proxy_runtime.os.environ", {"SING_BOX_EXECUTABLE_SHA256": "0" * 64}, clear=False):
                 with self.assertRaisesRegex(RuntimeError, "哈希校验失败"):
                     ExchangeProxyRuntime._verify_external_sing_box_override(executable)
+
+    def test_windows_pid_probe_distinguishes_running_exited_and_access_denied(self) -> None:
+        def kernel_with_exit_code(exit_code: int):
+            kernel = Mock()
+            kernel.OpenProcess.return_value = 123
+            kernel.GetExitCodeProcess.side_effect = lambda _handle, output: setattr(
+                output._obj,
+                "value",
+                exit_code,
+            ) or 1
+            return kernel
+
+        running_kernel = kernel_with_exit_code(259)
+        self.assertTrue(
+            ExchangeProxyRuntime._windows_pid_is_alive(
+                12345,
+                kernel32=running_kernel,
+                get_last_error=lambda: 0,
+            )
+        )
+        running_kernel.CloseHandle.assert_called_once_with(123)
+
+        exited_kernel = kernel_with_exit_code(0)
+        self.assertFalse(
+            ExchangeProxyRuntime._windows_pid_is_alive(
+                12345,
+                kernel32=exited_kernel,
+                get_last_error=lambda: 0,
+            )
+        )
+
+        denied_kernel = Mock()
+        denied_kernel.OpenProcess.return_value = 0
+        self.assertTrue(
+            ExchangeProxyRuntime._windows_pid_is_alive(
+                12345,
+                kernel32=denied_kernel,
+                get_last_error=lambda: 5,
+            )
+        )
+        self.assertFalse(
+            ExchangeProxyRuntime._windows_pid_is_alive(
+                12345,
+                kernel32=denied_kernel,
+                get_last_error=lambda: 87,
+            )
+        )
+
+    def test_windows_process_enumeration_parses_pid_and_command_line(self) -> None:
+        completed = type(
+            "Completed",
+            (),
+            {
+                "returncode": 0,
+                "stdout": "54321\tC:\\runtime\\sing-box.exe run -c C:\\data\\exchange.json\n",
+            },
+        )()
+        with patch("exchange_proxy_runtime.os.name", "nt"), patch.object(
+            ExchangeProxyRuntime,
+            "_hidden_process_kwargs",
+            return_value={},
+        ), patch("exchange_proxy_runtime.subprocess.run", return_value=completed) as run:
+            processes = ExchangeProxyRuntime._runtime_process_commands()
+
+        self.assertEqual(
+            processes,
+            [(54321, "C:\\runtime\\sing-box.exe run -c C:\\data\\exchange.json")],
+        )
+        self.assertEqual(run.call_args.args[0][0], "powershell.exe")
+
+    def test_stale_runtime_cleanup_stops_matching_process_and_removes_config(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-proxy-cleanup-test-") as tmpdir:
+            runtime = ExchangeProxyRuntime(Path(tmpdir), runtime_name="exchange")
+            config_path = Path(tmpdir) / "exchange_ss_proxy_12345_0123456789.json"
+            config_path.write_text("{}", encoding="utf-8")
+            command = f"/trusted/sing-box run -c {config_path}"
+            with patch.object(runtime, "_pid_is_alive", side_effect=lambda pid: int(pid) != 12345), patch.object(
+                runtime, "_runtime_process_commands", return_value=[(54321, command)]
+            ), patch.object(runtime, "_terminate_runtime_processes", return_value=set()) as terminate:
+                result = runtime.cleanup_stale_runtime()
+
+            self.assertEqual(result, (1, 1))
+            self.assertFalse(config_path.exists())
+            terminate.assert_called_once_with({54321})
+
+    def test_stale_runtime_cleanup_does_not_touch_active_owner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-proxy-cleanup-test-") as tmpdir:
+            runtime = ExchangeProxyRuntime(Path(tmpdir), runtime_name="exchange")
+            config_path = Path(tmpdir) / f"exchange_ss_proxy_{os.getpid()}_0123456789.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with patch.object(runtime, "_runtime_process_commands") as process_commands, patch.object(
+                runtime, "_terminate_runtime_processes"
+            ) as terminate:
+                result = runtime.cleanup_stale_runtime()
+
+            self.assertEqual(result, (0, 0))
+            self.assertTrue(config_path.exists())
+            process_commands.assert_not_called()
+            terminate.assert_not_called()
+
+    def test_stale_runtime_cleanup_keeps_config_when_process_cannot_stop(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="xiaojun-proxy-cleanup-test-") as tmpdir:
+            runtime = ExchangeProxyRuntime(Path(tmpdir), runtime_name="exchange")
+            config_path = Path(tmpdir) / "exchange_hysteria2_proxy_12345_0123456789.json"
+            config_path.write_text("{}", encoding="utf-8")
+            command = f"/trusted/hysteria -c {config_path}"
+            with patch.object(runtime, "_pid_is_alive", side_effect=lambda pid: int(pid) != 12345), patch.object(
+                runtime, "_runtime_process_commands", return_value=[(54321, command)]
+            ), patch.object(runtime, "_terminate_runtime_processes", return_value={54321}):
+                result = runtime.cleanup_stale_runtime()
+
+            self.assertEqual(result, (0, 0))
+            self.assertTrue(config_path.exists())
 
 
 if __name__ == "__main__":
