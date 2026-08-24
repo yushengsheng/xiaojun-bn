@@ -1635,6 +1635,11 @@ class ExchangeAppBatchMixin(object):
             lines.append(f"提现网络：{str(withdraw_network or '').strip().upper() or WITHDRAW_NETWORK_DEFAULT}")
             lines.append(f"自动提现：{'开启' if enable_withdraw else '关闭'}")
         return lines
+    @staticmethod
+    def _format_bnb_topup_account_count_text(account_count: int, topup_count: int) -> str:
+        total = max(0, int(account_count))
+        enabled = max(0, min(total, int(topup_count)))
+        return f"预购：{enabled} 个账号；不预购：{total - enabled} 个账号。"
     def _show_batch_execute_confirm_dialog(
         self,
         *,
@@ -1655,6 +1660,7 @@ class ExchangeAppBatchMixin(object):
         bnb_topup_amount: Decimal | None = None,
         enable_bnb_topup: bool = False,
         show_bnb_topup_option: bool = False,
+        bnb_topup_account_count: int = 0,
         ladder_layout: str = LADDER_LAYOUT_DEFAULT,
         ladder_min_pool_notional: Decimal | str | None = None,
         earn_asset: str = "",
@@ -1724,7 +1730,7 @@ class ExchangeAppBatchMixin(object):
             ).pack(anchor="w")
             ttk.Label(
                 body,
-                text="使用当前配置金额；未勾选账号不会执行预购买。",
+                text=self._format_bnb_topup_account_count_text(account_count, bnb_topup_account_count),
                 foreground="#666666",
             ).pack(anchor="w", pady=(6, 0))
 
@@ -2469,6 +2475,9 @@ class ExchangeAppBatchMixin(object):
                 bnb_topup_amount=configured_bnb_topup_amount_value,
                 enable_bnb_topup=enable_bnb_topup,
                 show_bnb_topup_option=show_bnb_topup_option,
+                bnb_topup_account_count=sum(
+                    1 for acc in selected if self._account_bnb_topup_enabled(acc)
+                ),
                 ladder_layout=ladder_layout,
                 ladder_min_pool_notional=ladder_min_pool_notional_value,
                 earn_asset=earn_asset,

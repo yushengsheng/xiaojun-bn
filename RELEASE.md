@@ -56,6 +56,9 @@ failed local/remote tag, recreate the same version tag on the verified commit,
 and wait for its new workflow run. Do not skip to another version number and do
 not publish assets manually.
 
+Never overwrite assets in an existing GitHub Release. An existing release is a
+hard stop that requires diagnosis rather than `--clobber`.
+
 `RELEASE_GUARDRAILS.md` is mandatory. Any crash such as `Python 意外退出`, exit code `134`, failed GUI selftest, proxy runtime authentication failure, or failed GitHub Actions release is a blocking release issue, not a warning.
 
 Rules:
@@ -66,6 +69,10 @@ Rules:
   - Python runtime dependencies collected by PyInstaller
   - pinned proxy runtimes downloaded during CI (`xray`, `sing-box`, `hysteria`)
   - both onefile and portable onedir packages
+- Keep the CI and release proxy runtime tags, asset names, and SHA-256 values identical.
+- The generated Xray Shadowsocks configuration does not use geo routing. Exclude
+  `geoip.dat` and `geosite.dat` from Windows packages while retaining and smoke
+  testing `xray.exe`; revisit this rule if Xray routing rules are introduced.
 - Keep runtime dependency sources in `requirements.txt` and build dependency sources in `requirements-build.txt`; regenerate and commit `requirements.lock` and `requirements-build.lock` with SHA-256 hashes whenever either source file changes.
 - Install CI and release dependencies only with `python -m pip install --require-hashes -r requirements-build.lock`.
 - Run `python tools/run_regression.py --skip-pip-check --skip-app-selftest` before building release packages on CI. The command audits both locked dependency sets and must fail on known vulnerabilities.

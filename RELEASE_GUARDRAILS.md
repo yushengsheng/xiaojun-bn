@@ -24,6 +24,8 @@
 - 若本地 GUI/Tk 环境异常，必须明确标记为阻断项，并在 GitHub Actions 上完成等价 GUI 自检后才能发版。
 - CI 使用 `python -m pip install --require-hashes -r requirements-build.lock` 安装构建依赖。
 - release workflow 下载 `xray`、`sing-box` 和 `hysteria` 时必须校验 `XRAY_SHA256`、`SING_BOX_SHA256` 和 `HYSTERIA_SHA256`。
+- CI 与 release workflow 的代理版本、资产名和 SHA-256 必须完全一致。
+- Xray 当前仅用于 Shadowsocks 出站，不使用地理路由；Windows 包保留并实测 `xray.exe`，不打包未使用的 `geoip.dat` 和 `geosite.dat`。
 - 打包前必须运行源码回归。
 - 打包后必须分别对 onefile 和 portable 执行 `--selftest --selftest-gui`。
 - portable 打包必须从干净 staging 目录生成，不能把测试产生的 `data/`、日志、查询结果、钱包文件带入 release zip。
@@ -53,6 +55,7 @@
 - 本地回归通过；如果 GUI 自检因本机环境无法执行，必须在最终说明里明确，并等待 GitHub Actions GUI 自检通过。
 - tag 推送前必须确认远端没有同名 tag，release workflow 不会覆盖错误版本。
 - GitHub Actions 失败时禁止继续追加 tag 或重复上传，应先修复根因。
+- 已存在的 GitHub Release 不得用 `--clobber` 覆盖资产。
 
 ## 以后修改时必须遵守
 

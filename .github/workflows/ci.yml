@@ -60,6 +60,7 @@ jobs:
           if ((Get-FileHash (Join-Path $proxyRoot "${{ env.XRAY_ASSET }}") -Algorithm SHA256).Hash.ToLower() -ne "${{ env.XRAY_SHA256 }}".ToLower()) { throw "xray asset digest mismatch." }
           Expand-Archive -Path (Join-Path $proxyRoot "${{ env.XRAY_ASSET }}") -DestinationPath $xrayDir -Force
           Remove-Item (Join-Path $proxyRoot "${{ env.XRAY_ASSET }}") -Force
+          Get-ChildItem $xrayDir -File -Recurse | Where-Object { $_.Name -in @("geoip.dat", "geosite.dat") } | Remove-Item -Force
 
           gh release download "${{ env.SING_BOX_TAG }}" --repo SagerNet/sing-box --pattern "${{ env.SING_BOX_ASSET }}" --dir $proxyRoot
           if ((Get-FileHash (Join-Path $proxyRoot "${{ env.SING_BOX_ASSET }}") -Algorithm SHA256).Hash.ToLower() -ne "${{ env.SING_BOX_SHA256 }}".ToLower()) { throw "sing-box asset digest mismatch." }

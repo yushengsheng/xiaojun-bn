@@ -62,6 +62,7 @@ jobs:
           if ((Get-FileHash (Join-Path $proxyRoot $xrayAsset) -Algorithm SHA256).Hash.ToLower() -ne "${{ env.XRAY_SHA256 }}".ToLower()) { throw "xray asset digest mismatch." }
           Expand-Archive -Path (Join-Path $proxyRoot $xrayAsset) -DestinationPath $xrayDir -Force
           Remove-Item (Join-Path $proxyRoot $xrayAsset) -Force
+          Get-ChildItem $xrayDir -File -Recurse | Where-Object { $_.Name -in @("geoip.dat", "geosite.dat") } | Remove-Item -Force
 
           $singBoxTag = "${{ env.SING_BOX_TAG }}"
           $singBoxAsset = "${{ env.SING_BOX_ASSET }}"
@@ -233,7 +234,7 @@ jobs:
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $assets --clobber
-          } else {
-            gh release create $tag $assets --generate-notes
+            throw "GitHub Release $tag already exists; refusing to overwrite published assets."
           }
+          $global:LASTEXITCODE = 0
+          gh release create $tag $assets --generate-notes

@@ -257,6 +257,12 @@ class ExchangeMarketRoundFailureTests(unittest.TestCase):
         self.assertIn("停止方式：剩余BNB低于 0.01", lines)
         self.assertNotIn("轮次：20", lines)
 
+    def test_batch_confirm_shows_bnb_topup_account_counts(self):
+        text = ExchangeAppBatchMixin._format_bnb_topup_account_count_text(15, 10)
+
+        self.assertEqual(text, "预购：10 个账号；不预购：5 个账号。")
+        self.assertNotIn("BNB", text)
+
     def test_zero_round_uses_selected_trade_mode(self):
         market_client = _MarketRoundTransientFailureClient()
         market_strategy = Strategy(
