@@ -25,6 +25,8 @@ from exchange_app_base import (
     FUTURES_SYMBOL_DEFAULT,
     LADDER_LAYOUT_DEFAULT,
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+    LADDER_SELL_PREMIUM_DEFAULT,
+    LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
     MARKET_STOP_MODE_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_DELTA_DEFAULT,
@@ -315,6 +317,8 @@ class ExchangeAppConfigMixin(object):
             "reprice_threshold": trade_settings["reprice_threshold"],
             "ladder_layout": trade_settings["ladder_layout"],
             "ladder_min_pool_notional": trade_settings["ladder_min_pool_notional"],
+            "ladder_sell_premium_enabled": bool(trade_settings["ladder_sell_premium_enabled"]),
+            "ladder_sell_premium": trade_settings["ladder_sell_premium"],
             "spot_symbol": str(trade_settings["spot_symbol"] or "").strip().upper(),
             "futures_symbol": str(trade_settings["futures_symbol"] or "").strip().upper(),
             "futures_rounds": int(trade_settings["stored_futures_rounds"]),
@@ -462,6 +466,15 @@ class ExchangeAppConfigMixin(object):
                 str(
                     raw.get("ladder_min_pool_notional", LADDER_MIN_POOL_NOTIONAL_DEFAULT)
                     or LADDER_MIN_POOL_NOTIONAL_DEFAULT
+                ).strip()
+            )
+            self.ladder_sell_premium_enabled_var.set(
+                bool(raw.get("ladder_sell_premium_enabled", LADDER_SELL_PREMIUM_ENABLED_DEFAULT))
+            )
+            self.ladder_sell_premium_var.set(
+                str(
+                    raw.get("ladder_sell_premium", LADDER_SELL_PREMIUM_DEFAULT)
+                    or LADDER_SELL_PREMIUM_DEFAULT
                 ).strip()
             )
             self.spot_symbol_var.set(

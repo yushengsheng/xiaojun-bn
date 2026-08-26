@@ -13,6 +13,8 @@ from exchange_app_base import (
     FUTURES_SIDE_DEFAULT,
     LADDER_LAYOUT_DEFAULT,
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+    LADDER_SELL_PREMIUM_DEFAULT,
+    LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
     MARKET_STOP_MODE_BNB,
     MARKET_STOP_MODE_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
@@ -366,6 +368,8 @@ class ExchangeAppBatchMixin(object):
             reprice_threshold_value = trade_settings["reprice_threshold_value"]
             ladder_layout = str(trade_settings["ladder_layout"])
             ladder_min_pool_notional_value = trade_settings["ladder_min_pool_notional_value"]
+            ladder_sell_premium_enabled = bool(trade_settings["ladder_sell_premium_enabled"])
+            ladder_sell_premium_value = trade_settings["ladder_sell_premium_value"]
             futures_symbol = str(trade_settings["futures_symbol"])
             futures_rounds = int(trade_settings["futures_rounds"])
             futures_amount_value = trade_settings["futures_amount_value"]
@@ -584,6 +588,8 @@ class ExchangeAppBatchMixin(object):
             reprice_threshold_amount=reprice_threshold_value,
             ladder_layout=ladder_layout,
             ladder_min_pool_notional=ladder_min_pool_notional_value,
+            ladder_sell_premium_enabled=ladder_sell_premium_enabled,
+            ladder_sell_premium=ladder_sell_premium_value,
             futures_symbol=futures_symbol,
             futures_rounds=futures_rounds,
             futures_amount=futures_amount_value,
@@ -2379,6 +2385,8 @@ class ExchangeAppBatchMixin(object):
             reprice_threshold_value = trade_settings["reprice_threshold_value"]
             ladder_layout = str(trade_settings["ladder_layout"])
             ladder_min_pool_notional_value = trade_settings["ladder_min_pool_notional_value"]
+            ladder_sell_premium_enabled = bool(trade_settings["ladder_sell_premium_enabled"])
+            ladder_sell_premium_value = trade_settings["ladder_sell_premium_value"]
             futures_symbol = str(trade_settings["futures_symbol"])
             futures_rounds = int(trade_settings["futures_rounds"])
             futures_amount_value = trade_settings["futures_amount_value"]
@@ -2404,6 +2412,8 @@ class ExchangeAppBatchMixin(object):
             reprice_threshold_value = Decimal(REPRICE_THRESHOLD_DEFAULT)
             ladder_layout = LADDER_LAYOUT_DEFAULT
             ladder_min_pool_notional_value = Decimal(LADDER_MIN_POOL_NOTIONAL_DEFAULT)
+            ladder_sell_premium_enabled = LADDER_SELL_PREMIUM_ENABLED_DEFAULT
+            ladder_sell_premium_value = Decimal(LADDER_SELL_PREMIUM_DEFAULT)
             futures_symbol = BinanceClient.normalize_trade_symbol(self.futures_symbol_var.get())
             try:
                 futures_rounds = max(1, int(self.futures_rounds_var.get() or FUTURES_ROUNDS_DEFAULT))
@@ -3213,6 +3223,8 @@ class ExchangeAppBatchMixin(object):
                             reprice_threshold_amount=reprice_threshold_value,
                             ladder_layout=ladder_layout,
                             ladder_min_pool_notional=ladder_min_pool_notional_value,
+                            ladder_sell_premium_enabled=ladder_sell_premium_enabled,
+                            ladder_sell_premium=ladder_sell_premium_value,
                             futures_symbol=futures_symbol,
                             futures_rounds=futures_rounds,
                             futures_amount=futures_amount_value,

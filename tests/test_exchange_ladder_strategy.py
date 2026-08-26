@@ -325,7 +325,14 @@ class _CancelClient(_PriceRulesClient):
         return dict(self.orders[order_key])
 
 
-def _strategy(client, *, layout=LADDER_LAYOUT_BUY2_SELL2, min_pool=Decimal("50")) -> Strategy:
+def _strategy(
+    client,
+    *,
+    layout=LADDER_LAYOUT_BUY2_SELL2,
+    min_pool=Decimal("50"),
+    sell_premium_enabled: bool = False,
+    sell_premium: Decimal = Decimal("0"),
+) -> Strategy:
     return Strategy(
         client=client,
         spot_rounds=1,
@@ -340,6 +347,8 @@ def _strategy(client, *, layout=LADDER_LAYOUT_BUY2_SELL2, min_pool=Decimal("50")
         trade_mode=TRADE_MODE_LADDER,
         ladder_layout=layout,
         ladder_min_pool_notional=min_pool,
+        ladder_sell_premium_enabled=sell_premium_enabled,
+        ladder_sell_premium=sell_premium,
         bnb_fee_stop_value=Decimal("0"),
         reprice_threshold_amount=Decimal("0.001"),
     )
@@ -383,6 +392,20 @@ class ExchangeLadderStrategyTests(unittest.TestCase):
         self.assertEqual(targets["BUY"], [Decimal("10.111"), Decimal("10.110")])
         self.assertEqual(targets["SELL"], [Decimal("10.112"), Decimal("10.113")])
 
+    def test_enabled_sell_premium_uses_current_bid_plus_absolute_value(self) -> None:
+        strategy = _strategy(
+            _PriceRulesClient(),
+            sell_premium_enabled=True,
+            sell_premium=Decimal("0.1"),
+        )
+        targets = strategy._ladder_target_prices(
+            Decimal("10.111"),
+            Decimal("10.500"),
+            sell_bid_anchor=Decimal("10.111"),
+        )
+        self.assertEqual(targets["BUY"], [Decimal("10.111"), Decimal("10.110")])
+        self.assertEqual(targets["SELL"], [Decimal("10.211"), Decimal("10.212")])
+
     def test_one_level_uses_all_pool_and_two_levels_split_pool(self) -> None:
         one_level = _strategy(_PriceRulesClient(), layout=LADDER_LAYOUT_BUY1_SELL1)
         one_pending: list[dict[str, object]] = []
@@ -409,6 +432,24 @@ class ExchangeLadderStrategyTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(order["status"] == "CANCELED" for order in client.orders.values()))
+
+    def test_enabled_sell_premium_keeps_initial_base_at_current_ask(self) -> None:
+        stop_event = _StopAfterOrders()
+        client = _RunningLadderClient(stop_event)
+        client.quote_free = Decimal("0")
+        client.base_free = Decimal("10")
+        strategy = _strategy(
+            client,
+            sell_premium_enabled=True,
+            sell_premium=Decimal("0.1"),
+        )
+
+        strategy._run_ladder_mode(stop_event)
+
+        self.assertEqual(
+            [item["price"] for item in client.placements],
+            [Decimal("10.112"), Decimal("10.113")],
+        )
 
     def test_manual_stop_uses_cleanup_path_to_cancel_all_ladder_orders(self) -> None:
         stop_event = _StopAfterOrders()
@@ -618,6 +659,28 @@ class ExchangeLadderStrategyTests(unittest.TestCase):
             "SELL": Decimal("10.114"),
         })
 
+    def test_enabled_sell_premium_reprice_refill_uses_live_bid(self) -> None:
+        stop_event = _StopAfterOrders()
+        client = _RunningLadderClient(stop_event, stop_after_placements=None)
+        client.base_free = Decimal("5")
+        strategy = _strategy(
+            client,
+            sell_premium_enabled=True,
+            sell_premium=Decimal("0.1"),
+        )
+        pending_allocations = [
+            {"side": "SELL", "level_index": 0, "amount": Decimal("5"), "source": "reprice"},
+        ]
+
+        strategy._ladder_submit_pending_allocations(
+            pending_allocations,
+            {},
+            {"BUY": [Decimal("10.111"), Decimal("10.110")], "SELL": [Decimal("10.500")]},
+            sell_from_bid=True,
+        )
+
+        self.assertEqual(client.placements[-1]["price"], Decimal("10.211"))
+
     def test_submission_price_drift_updates_anchor_and_reprices_on_rebound(self) -> None:
         stop_event = _StopAfterTwoLoops()
         client = _RunningLadderClient(stop_event, stop_after_placements=None)
@@ -801,6 +864,24 @@ class ExchangeLadderStrategyTests(unittest.TestCase):
         self.assertGreaterEqual(
             sum((item["amount"] * item["price"] for item in client.placements[2:4]), Decimal("0")),
             Decimal("50"),
+        )
+
+    def test_enabled_sell_premium_prices_later_sell_pool_from_live_bid(self) -> None:
+        stop_event = _StopAfterOrders()
+        client = _RoundTripLadderClient(stop_event)
+        strategy = _strategy(
+            client,
+            sell_premium_enabled=True,
+            sell_premium=Decimal("0.1"),
+        )
+        strategy.LADDER_ORDER_RECONCILE_INTERVAL_SECONDS = 0
+        strategy.LADDER_POLL_INTERVAL_SECONDS = 0
+
+        strategy._run_ladder_mode(stop_event)
+
+        self.assertEqual(
+            [item["price"] for item in client.placements[2:4]],
+            [Decimal("10.211"), Decimal("10.212")],
         )
 
     def test_maker_limit_order_uses_limit_maker_without_time_in_force(self) -> None:

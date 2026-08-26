@@ -26,6 +26,8 @@ from exchange_constants import (
     LADDER_LAYOUT_DEFAULT,
     LADDER_LAYOUT_OPTIONS,
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+    LADDER_SELL_PREMIUM_DEFAULT,
+    LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
     MARKET_STOP_MODE_BNB,
     MARKET_STOP_MODE_DEFAULT,
     MARKET_STOP_MODE_OPTIONS,
@@ -89,6 +91,8 @@ class Strategy:
         reprice_threshold_amount: Decimal | None = None,
         ladder_layout: str = LADDER_LAYOUT_DEFAULT,
         ladder_min_pool_notional: Decimal | None = None,
+        ladder_sell_premium_enabled: bool = LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
+        ladder_sell_premium: Decimal | None = None,
         futures_symbol: str = FUTURES_SYMBOL_DEFAULT,
         futures_rounds: int = FUTURES_ROUNDS_DEFAULT,
         futures_amount: Decimal | None = None,
@@ -131,6 +135,10 @@ class Strategy:
                 if ladder_min_pool_notional is not None
                 else LADDER_MIN_POOL_NOTIONAL_DEFAULT
             )
+        )
+        self.ladder_sell_premium_enabled = bool(ladder_sell_premium_enabled)
+        self.ladder_sell_premium = Decimal(
+            str(ladder_sell_premium if ladder_sell_premium is not None else LADDER_SELL_PREMIUM_DEFAULT)
         )
         self.futures_symbol = BinanceClient.normalize_trade_symbol(futures_symbol or FUTURES_SYMBOL_DEFAULT)
         self.futures_rounds = max(1, int(futures_rounds or FUTURES_ROUNDS_DEFAULT))
@@ -1628,17 +1636,29 @@ class Strategy:
         value = Decimal(str(self.ladder_min_pool_notional or "0"))
         return value if value > 0 else Decimal("0")
 
-    def _ladder_target_prices(self, bid_anchor: Decimal, ask_anchor: Decimal) -> dict[str, list[Decimal]]:
+    def _ladder_sell_premium_value(self) -> Decimal:
+        value = Decimal(str(self.ladder_sell_premium or "0"))
+        if value <= 0:
+            return Decimal("0")
+        return self.c.normalize_price_delta(self.spot_symbol, value, min_one_tick=True)
+
+    def _ladder_target_prices(
+        self,
+        bid_anchor: Decimal,
+        ask_anchor: Decimal,
+        *,
+        sell_bid_anchor: Decimal | None = None,
+    ) -> dict[str, list[Decimal]]:
         tick_size = Decimal(str(self.c.get_symbol_tick_size(self.spot_symbol) or "0"))
         if tick_size <= 0:
             raise RuntimeError(f"无法读取 {self.spot_symbol} 的最小价格精度 tickSize")
         buy_levels, sell_levels = self._ladder_layout_level_counts(self.ladder_layout)
         bid_price = self.c.adjust_price_to_valid_tick(self.spot_symbol, Decimal(str(bid_anchor)))
-        ask_price = self.c.adjust_price_to_valid_tick(
-            self.spot_symbol,
-            Decimal(str(ask_anchor)),
-            round_up=True,
-        )
+        if self.ladder_sell_premium_enabled and sell_bid_anchor is not None:
+            sell_price = Decimal(str(sell_bid_anchor)) + self._ladder_sell_premium_value()
+        else:
+            sell_price = Decimal(str(ask_anchor))
+        ask_price = self.c.adjust_price_to_valid_tick(self.spot_symbol, sell_price, round_up=True)
         buy_prices = [bid_price]
         sell_prices = [ask_price]
         if buy_levels > 1:
@@ -1672,6 +1692,8 @@ class Strategy:
         threshold = self._ladder_min_pool_value()
         if threshold <= 0:
             raise RuntimeError("最小分仓成交额必须大于 0")
+        if self.ladder_sell_premium_enabled and self._ladder_sell_premium_value() <= 0:
+            raise RuntimeError("勾选溢价挂卖时，卖出溢价必须大于 0")
         rules = self.c.get_symbol_trade_rules(self.spot_symbol) or {}
         min_notional = Decimal(str(rules.get("minNotional", "0") or "0"))
         buy_levels, sell_levels = self._ladder_layout_level_counts(self.ladder_layout)
@@ -1721,6 +1743,8 @@ class Strategy:
         pending_allocations: list[dict[str, object]],
         active_orders: dict[str, dict[str, object]],
         target_prices: dict[str, list[Decimal]],
+        *,
+        sell_from_bid: bool = False,
     ) -> dict[str, Decimal]:
         if not pending_allocations:
             return {}
@@ -1745,6 +1769,7 @@ class Strategy:
         live_target_prices = self._ladder_target_prices(
             Decimal(str(latest_book["bidPrice"])),
             Decimal(str(latest_book["askPrice"])),
+            sell_bid_anchor=(Decimal(str(latest_book["bidPrice"])) if sell_from_bid else None),
         )
         ordered_allocations = sorted(
             pending_allocations,
@@ -2024,13 +2049,19 @@ class Strategy:
         loop_count = 0
 
         self.c.collect_asset_to_spot(quote_asset, context="交易前")
+        sell_price_text = "卖1"
+        if self.ladder_sell_premium_enabled:
+            sell_price_text = "后续买1+%s（初始持币仍按卖1）" % BinanceClient._format_decimal(
+                self._ladder_sell_premium_value()
+            )
         logger.info(
-            "启用分仓挂单：档位模式=%s，买档=%d，卖档=%d，最小分仓成交额=%s %s，轮询=%g秒，对账=%g秒",
+            "启用分仓挂单：档位模式=%s，买档=%d，卖档=%d，最小分仓成交额=%s %s，卖价=%s，轮询=%g秒，对账=%g秒",
             self.ladder_layout,
             buy_levels,
             sell_levels,
             BinanceClient._format_decimal(min_pool),
             quote_asset,
+            sell_price_text,
             self.LADDER_POLL_INTERVAL_SECONDS,
             self.LADDER_ORDER_RECONCILE_INTERVAL_SECONDS,
         )
@@ -2071,7 +2102,12 @@ class Strategy:
                     ask_anchor = current_ask
                     sell_reprice_pending = True
 
-                target_prices = self._ladder_target_prices(bid_anchor, ask_anchor)
+                premium_sell_pricing = bool(self.ladder_sell_premium_enabled and loop_count > 1)
+                target_prices = self._ladder_target_prices(
+                    bid_anchor,
+                    ask_anchor,
+                    sell_bid_anchor=(current_bid if premium_sell_pricing else None),
+                )
                 if buy_reprice_from is not None:
                     logger.info(
                         "分仓挂单买侧触发重挂：旧买1=%s，新买1=%s，目标=%s",
@@ -2162,6 +2198,7 @@ class Strategy:
                     pending_allocations,
                     active_orders,
                     target_prices,
+                    sell_from_bid=premium_sell_pricing,
                 )
                 submitted_bid = submitted_anchors.get("BUY")
                 if submitted_bid is not None:

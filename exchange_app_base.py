@@ -61,6 +61,8 @@ from exchange_constants import (
     LADDER_LAYOUT_DEFAULT,
     LADDER_LAYOUT_OPTIONS,
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+    LADDER_SELL_PREMIUM_DEFAULT,
+    LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
     MARKET_STOP_MODE_BNB,
     MARKET_STOP_MODE_DEFAULT,
     MARKET_STOP_MODE_OPTIONS,
@@ -382,6 +384,8 @@ class ExchangeAppBase(tk.Tk):
         self.reprice_threshold_var = tk.StringVar(value=REPRICE_THRESHOLD_DEFAULT)
         self.ladder_layout_var = tk.StringVar(value=LADDER_LAYOUT_DEFAULT)
         self.ladder_min_pool_notional_var = tk.StringVar(value=LADDER_MIN_POOL_NOTIONAL_DEFAULT)
+        self.ladder_sell_premium_enabled_var = tk.BooleanVar(value=LADDER_SELL_PREMIUM_ENABLED_DEFAULT)
+        self.ladder_sell_premium_var = tk.StringVar(value=LADDER_SELL_PREMIUM_DEFAULT)
         self.spot_symbol_var = tk.StringVar(value=SPOT_SYMBOL_DEFAULT)
         self.futures_symbol_var = tk.StringVar(value=FUTURES_SYMBOL_DEFAULT)
         self.futures_rounds_var = tk.IntVar(value=FUTURES_ROUNDS_DEFAULT)
@@ -1088,6 +1092,10 @@ class ExchangeAppBase(tk.Tk):
         ladder_min_pool_notional_text = str(
             self.ladder_min_pool_notional_var.get() or LADDER_MIN_POOL_NOTIONAL_DEFAULT
         ).strip()
+        ladder_sell_premium_enabled = bool(self.ladder_sell_premium_enabled_var.get())
+        ladder_sell_premium_text = str(
+            self.ladder_sell_premium_var.get() or LADDER_SELL_PREMIUM_DEFAULT
+        ).strip()
         futures_symbol_raw = str(self.futures_symbol_var.get() or "")
         futures_symbol = BinanceClient.normalize_trade_symbol(futures_symbol_raw)
         if futures_symbol_raw.strip() and futures_symbol_raw != futures_symbol:
@@ -1119,6 +1127,7 @@ class ExchangeAppBase(tk.Tk):
         bnb_topup_value = Decimal("0")
         reprice_threshold_value = Decimal(REPRICE_THRESHOLD_DEFAULT)
         ladder_min_pool_notional_value = Decimal(LADDER_MIN_POOL_NOTIONAL_DEFAULT)
+        ladder_sell_premium_value = Decimal(LADDER_SELL_PREMIUM_DEFAULT)
         futures_rounds = stored_futures_rounds if stored_futures_rounds > 0 else FUTURES_ROUNDS_DEFAULT
         futures_amount_value: Decimal | None = None
         earn_amount_value: Decimal | None = None
@@ -1144,6 +1153,14 @@ class ExchangeAppBase(tk.Tk):
                 )
                 if ladder_min_pool_notional_value <= 0:
                     raise RuntimeError("最小分仓成交额必须大于 0")
+                if ladder_sell_premium_enabled:
+                    ladder_sell_premium_value = self._decimal_field_value(
+                        ladder_sell_premium_text,
+                        "卖出溢价",
+                        min_value=0,
+                    )
+                    if ladder_sell_premium_value <= 0:
+                        raise RuntimeError("勾选溢价挂卖时，卖出溢价必须大于 0")
 
             if mode in {TRADE_MODE_MARKET, TRADE_MODE_CONVERT}:
                 try:
@@ -1248,6 +1265,9 @@ class ExchangeAppBase(tk.Tk):
             "ladder_layout": ladder_layout,
             "ladder_min_pool_notional": ladder_min_pool_notional_text,
             "ladder_min_pool_notional_value": ladder_min_pool_notional_value,
+            "ladder_sell_premium_enabled": ladder_sell_premium_enabled,
+            "ladder_sell_premium": ladder_sell_premium_text,
+            "ladder_sell_premium_value": ladder_sell_premium_value,
             "futures_symbol": futures_symbol,
             "futures_rounds": futures_rounds,
             "stored_futures_rounds": stored_futures_rounds,
@@ -1538,6 +1558,16 @@ class ExchangeAppBase(tk.Tk):
                 ).pack(side="left", padx=row3_item_pad)
                 ttk.Label(row3_left, text=self._reprice_threshold_label_text()).pack(side="left")
                 ttk.Entry(row3_left, textvariable=self.reprice_threshold_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
+                ttk.Checkbutton(
+                    row3_left,
+                    text="溢价挂卖",
+                    variable=self.ladder_sell_premium_enabled_var,
+                ).pack(side="left", padx=(0, 4))
+                ttk.Entry(
+                    row3_left,
+                    textvariable=self.ladder_sell_premium_var,
+                    width=row3_compact_entry_width,
+                ).pack(side="left", padx=(0, 8))
 
             ttk.Label(row3_right, text="限流等待(秒):").pack(side="left")
             ttk.Entry(row3_right, textvariable=self.rate_limit_wait_var, width=row3_rate_limit_width).pack(side="left", padx=row3_item_pad)

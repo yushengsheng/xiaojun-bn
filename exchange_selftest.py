@@ -2049,6 +2049,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             earn_auto_subscribe=False,
             ladder_layout=LADDER_LAYOUT_DEFAULT,
             ladder_min_pool_notional=LADDER_MIN_POOL_NOTIONAL_DEFAULT,
+            ladder_sell_premium_enabled=False,
+            ladder_sell_premium="0",
         ):
             self.trade_account_type_var = _SimpleVar(account_type)
             self.trade_mode_var = _SimpleVar(mode)
@@ -2065,6 +2067,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.reprice_threshold_var = _SimpleVar("0")
             self.ladder_layout_var = _SimpleVar(ladder_layout)
             self.ladder_min_pool_notional_var = _SimpleVar(ladder_min_pool_notional)
+            self.ladder_sell_premium_enabled_var = _SimpleVar(ladder_sell_premium_enabled)
+            self.ladder_sell_premium_var = _SimpleVar(ladder_sell_premium)
             self.futures_symbol_var = _SimpleVar("BTCUSDT")
             self.futures_amount_var = _SimpleVar("100")
             self.futures_margin_type_var = _SimpleVar("CROSSED")
@@ -2120,8 +2124,20 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     if (
         ladder_settings.get("ladder_layout") != LADDER_LAYOUT_BUY1_SELL2
         or ladder_settings.get("ladder_min_pool_notional_value") != Decimal("50")
+        or ladder_settings.get("ladder_sell_premium_enabled") is not False
     ):
         raise RuntimeError(f"分仓挂单参数自检失败：参数解析异常（{ladder_settings}）")
+    ladder_premium_settings = _SelftestTradeSettingsProbe(
+        mode=TRADE_MODE_LADDER,
+        spot_rounds=1,
+        ladder_sell_premium_enabled=True,
+        ladder_sell_premium="0.0001",
+    )._collect_trade_mode_settings()
+    if (
+        ladder_premium_settings.get("ladder_sell_premium_enabled") is not True
+        or ladder_premium_settings.get("ladder_sell_premium_value") != Decimal("0.0001")
+    ):
+        raise RuntimeError(f"分仓溢价挂卖参数自检失败：参数解析异常（{ladder_premium_settings}）")
     premium_zero_settings = _SelftestTradeSettingsProbe(
         mode=TRADE_MODE_PREMIUM,
         spot_rounds=0,
