@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -20,12 +21,15 @@ from onchain_relay_runner import (
     _relay_manual_account_copy_lines,
     _relay_native_main_recovery_status_text,
     _relay_preflight_1m_native_source,
+    _relay_resolve_1m_native_transfer,
+    _resolve_record_amount_local,
     _pick_or_create_relay_records,
     _relay_prepare_items,
     _relay_native_dust_below_threshold,
     _relay_submit_auto_sweep,
     _relay_snapshot_cleanup_allowed,
     _relay_source_stage,
+    _relay_simple_stage,
     _relay_terminal_snapshot_can_be_ignored,
     _relay_token_dust_below_threshold,
     _relay_token_dust_requires_native_recovery,
@@ -58,7 +62,7 @@ class _FakeClient:
     def get_confirmed_nonce(self, _network: str, address: str) -> int:
         return self.nonce_by_addr.setdefault(address, 0)
 
-    def get_transaction_receipt(self, _network: str, _txid: str) -> dict | None:
+    def get_transaction_receipt(self, _network: str, _txid: str, **_kwargs) -> dict | None:
         self.receipt_requests.append(str(_txid or ""))
         if len(self.receipts) > 1:
             return self.receipts.pop(0)
@@ -668,6 +672,175 @@ class OnchainRelayPipelineTests(unittest.TestCase):
 
         self.assertEqual(receipt["status"], "0x1")
 
+    def test_receipt_after_tenth_poll_still_succeeds_within_confirmation_timeout(self) -> None:
+        owner = _FakeOwner()
+        owner.client.receipts = [None] * 10 + [{"status": "0x1"}]
+        params = replace(_params(), confirm_timeout_seconds=180, receipt_retry_count=10,
+                         receipt_poll_interval_seconds=3)
+        now = [0.0]
+
+        def wait(seconds):
+            now[0] += seconds
+            return False
+
+        with (
+            patch("onchain_relay_runner.time.monotonic", side_effect=lambda: now[0]),
+            patch.object(owner.stop_requested, "wait", side_effect=wait),
+        ):
+            receipt = _wait_for_receipt_success(owner, params, "0x" + "1" * 64, label="测试交易")
+        self.assertEqual(receipt["status"], "0x1")
+        self.assertEqual(len(owner.client.receipt_requests), 11)
+        self.assertEqual(now[0], 30)
+
+    def test_pending_receipt_waits_until_deadline_and_preserves_hash_in_error(self) -> None:
+        owner = _FakeOwner()
+        owner.client.receipts = [None]
+        params = replace(_params(), confirm_timeout_seconds=10, receipt_retry_count=2,
+                         receipt_poll_interval_seconds=3)
+        now = [0.0]
+        txid = "0x" + "2" * 64
+
+        def wait(seconds):
+            now[0] += seconds
+            return False
+
+        with (
+            patch("onchain_relay_runner.time.monotonic", side_effect=lambda: now[0]),
+            patch.object(owner.stop_requested, "wait", side_effect=wait),
+            self.assertRaisesRegex(RuntimeError, f"等待 10.0 秒.*{txid}.*尚未确认"),
+        ):
+            _wait_for_receipt_success(owner, params, txid, label="测试交易")
+        self.assertEqual(now[0], 10)
+        self.assertEqual(len(owner.client.receipt_requests), 4)
+
+    def test_receipt_wait_stops_promptly_on_user_stop(self) -> None:
+        owner = _FakeOwner()
+        owner.client.receipts = [None]
+        with patch.object(owner.stop_requested, "wait", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "任务已停止"):
+                _wait_for_receipt_success(owner, _params(), "0x" + "1" * 64, label="测试交易")
+        self.assertEqual(len(owner.client.receipt_requests), 1)
+
+    def test_slow_rpc_does_not_extend_confirmation_to_minimum_retry_count(self) -> None:
+        owner = _FakeOwner()
+        params = replace(_params(), confirm_timeout_seconds=10, receipt_retry_count=10,
+                         receipt_poll_interval_seconds=3)
+        now = [0.0]
+
+        def slow_receipt(*_args, timeout_seconds, stop_event):
+            self.assertIs(stop_event, owner.stop_requested)
+            now[0] += timeout_seconds
+            raise RuntimeError("RPC 查询超时")
+
+        with (
+            patch("onchain_relay_runner.time.monotonic", side_effect=lambda: now[0]),
+            patch.object(owner.client, "get_transaction_receipt", side_effect=slow_receipt) as query,
+            patch.object(owner.stop_requested, "wait") as wait,
+            self.assertRaisesRegex(RuntimeError, "等待 10.0 秒.*查询 receipt 1 次"),
+        ):
+            _wait_for_receipt_success(owner, params, "0x" + "1" * 64, label="慢节点")
+        query.assert_called_once()
+        wait.assert_not_called()
+
+    def test_failed_onchain_receipt_is_not_retried_until_deadline(self) -> None:
+        owner = _FakeOwner()
+        owner.client.receipts = [{"status": "0x0"}]
+        with self.assertRaisesRegex(RuntimeError, "receipt status=0"):
+            _wait_for_receipt_success(owner, _params(), "0x" + "1" * 64, label="测试交易")
+        self.assertEqual(len(owner.client.receipt_requests), 1)
+
+    def test_second_hop_mixed_receipts_finish_and_retry_without_rebroadcast(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        params = replace(_params(coin="BNB", token_is_native=True), threads=8,
+                         confirm_timeout_seconds=1, receipt_retry_count=10)
+        items = [_item(i) for i in range(1, 9)]
+        calls = {}
+
+        def receipt(_network, txid, **_kwargs):
+            index = int(txid, 16)
+            calls[index] = calls.get(index, 0) + 1
+            if index == 7:
+                return None
+            if index == 8:
+                raise RuntimeError("RPC 节点超时")
+            if index == 6 and calls[index] == 1:
+                return None
+            return {"status": "0x1"}
+
+        submit = Mock(side_effect=lambda item, nonce: f"0x{item.index:064x}")
+        stage_args = dict(
+            stage_label="中转第二跳", tx_attr="token_forward_txid", nonce_attr="token_forward_nonce",
+            submitted_status="token_forward_submitted", done_status="forwarded",
+            done_statuses={"forwarded", "completed"}, submit_one=submit, status_text="第二跳",
+        )
+        owner.client.get_transaction_receipt = receipt
+        _relay_simple_stage(owner, params, items, **stage_args)
+        self.assertEqual(submit.call_count, 8)
+        self.assertEqual([item.relay_record.status for item in items], ["forwarded"] * 6 + ["failed"] * 2)
+        for item in items[6:]:
+            self.assertEqual(item.relay_record.token_forward_txid, f"0x{item.index:064x}")
+            self.assertIn("尚未确认", item.relay_record.last_error)
+
+        # 模拟重新载入保存记录，已提交的第二跳只确认，不再次转账。
+        resumed = [replace(item, failed=False, failure_reason="") for item in items]
+        owner.client.get_transaction_receipt = Mock(return_value={"status": "0x1"})
+        submit.reset_mock()
+        _relay_simple_stage(owner, params, resumed, **stage_args)
+        submit.assert_not_called()
+        self.assertEqual(owner.client.get_transaction_receipt.call_count, 2)
+        self.assertTrue(all(item.relay_record.status == "forwarded" for item in resumed))
+
+    def test_second_hop_stop_retains_transaction_for_resume(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        item = _item(1)
+        submit = Mock(return_value="0x" + "a" * 64)
+        stage_args = dict(
+            stage_label="中转第二跳", tx_attr="token_forward_txid", nonce_attr="token_forward_nonce",
+            submitted_status="token_forward_submitted", done_status="forwarded",
+            done_statuses={"forwarded"}, submit_one=submit, status_text="第二跳",
+        )
+
+        def stopped_receipt(*_args, **_kwargs):
+            owner.stop_requested.set()
+            raise RuntimeError("任务已停止")
+
+        owner.client.get_transaction_receipt = stopped_receipt
+        _relay_simple_stage(owner, _params(), [item], **stage_args)
+        self.assertEqual(item.relay_record.last_error, "任务已停止")
+        self.assertEqual(item.relay_record.token_forward_txid, "0x" + "a" * 64)
+        owner.stop_requested.clear()
+        resumed = replace(item, failed=False, failure_reason="")
+        owner.client.get_transaction_receipt = Mock(return_value={"status": "0x1"})
+        submit.reset_mock()
+        _relay_simple_stage(owner, _params(), [resumed], **stage_args)
+        submit.assert_not_called()
+        self.assertEqual(resumed.relay_record.status, "forwarded")
+
+    def test_1m_retry_confirms_original_successful_transaction_without_resubmitting(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        item = _item(1)
+        txid = "0x" + "b" * 64
+        item.relay_record = owner.relay_wallet_store.update_record(
+            item.relay_addr, batch_id="batch", status="failed",
+            token_funded_txid=txid, token_funded_nonce="7", last_error="receipt 未返回",
+        )
+        params = _params(coin="BNB", token_is_native=True)
+        _relay_clear_missing_source_txids(
+            owner, params, [item], tx_attr="token_funded_txid",
+            nonce_attr="token_funded_nonce", done_status="token_funded", done_statuses={"token_funded"},
+        )
+        submit = Mock(side_effect=AssertionError("不得重复转账"))
+        _relay_source_stage(
+            owner, params, [item], stage_label="源钱包原生币转入中转",
+            tx_attr="token_funded_txid", nonce_attr="token_funded_nonce",
+            submitted_status="token_funding_submitted", done_status="token_funded",
+            done_statuses={"token_funded"}, submit_one=submit, status_text="原生币转入",
+        )
+        submit.assert_not_called()
+        self.assertEqual(item.relay_record.status, "token_funded")
+        self.assertEqual(item.relay_record.token_funded_txid, txid)
+        self.assertEqual(item.relay_record.last_error, "")
+
     def test_auto_sweep_waits_for_receipt_before_success(self) -> None:
         owner = _FakeOwner()
         owner.client.native_balance_wei = 100_000
@@ -746,6 +919,102 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(owner.client.submitted_native_transfers, [])
+
+    def test_1m_native_transfer_refreshes_preflight_gas_price_without_changing_amount(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        item = _item(1)
+        item.reserve_units = 10**15
+        item.source_token_gas_price = 50_000_000
+        owner.client.gas_price_wei = 110_000_000
+        owner.client.native_balance_wei = item.value_units + item.reserve_units + 110_000_000 * 21000
+        original = (item.value_units, item.amount_text, item.reserve_units, item.source_addr, item.relay_addr, item.target)
+
+        _relay_resolve_1m_native_transfer(owner, _params(coin="BNB", token_is_native=True), item)
+
+        self.assertEqual(item.source_token_gas_price, 110_000_000)
+        self.assertEqual(item.source_token_gas_limit, 21000)
+        self.assertEqual((item.value_units, item.amount_text, item.reserve_units, item.source_addr, item.relay_addr, item.target), original)
+        self.assertEqual(owner.client.submitted_native_transfers, [])
+
+    def test_1m_native_transfer_rechecks_balance_after_gas_price_increases(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        item = _item(1)
+        item.source_token_gas_price = 50_000_000
+        owner.client.gas_price_wei = 110_000_000
+        owner.client.native_balance_wei = item.value_units + item.reserve_units + 50_000_000 * 21000
+
+        with self.assertRaisesRegex(RuntimeError, "源钱包原生币余额不足"):
+            _relay_resolve_1m_native_transfer(owner, _params(coin="BNB", token_is_native=True), item)
+
+        self.assertEqual(owner.client.submitted_native_transfers, [])
+        self.assertEqual(item.value_units, 10**18)
+
+    def test_1m_native_preflight_failure_uses_new_amount_on_next_start(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        owner.client.gas_price_wei = 2
+        items = [_item(1), _item(2)]
+        for item in items:
+            item.value_units = 10**18
+            item.amount_text = "1"
+            item.relay_record = owner.relay_wallet_store.update_record(
+                item.relay_addr,
+                batch_id=item.relay_record.batch_id,
+                transfer_amount="1",
+                transfer_units=str(10**18),
+            )
+        owner.client.native_balance_wei = 1
+
+        with self.assertRaisesRegex(RuntimeError, "一对多中转整批余额不足"):
+            _relay_preflight_1m_native_source(
+                owner,
+                _params(coin="BNB", token_is_native=True),
+                items,
+                tx_attr="token_funded_txid",
+                done_statuses={"token_funded"},
+            )
+
+        updated_params = replace(_params(coin="BNB", token_is_native=True), amount="0.0001")
+        for item in items:
+            saved = _RECORDS[(item.relay_addr, "batch")]
+            self.assertEqual(saved.transfer_amount, "")
+            self.assertEqual(saved.transfer_units, "")
+            value_units, amount_text = _resolve_record_amount_local(owner, saved, updated_params)
+            self.assertEqual(value_units, 10**14)
+            self.assertEqual(amount_text, "0.0001")
+
+    def test_1m_native_resume_ignores_stale_unsubmitted_amount(self) -> None:
+        owner = _FakeOwner(mode_1m=True)
+        item = _item(1)
+        stale_record = owner.relay_wallet_store.update_record(
+            item.relay_addr,
+            batch_id=item.relay_record.batch_id,
+            transfer_amount="1",
+            transfer_units=str(10**18),
+        )
+        params = replace(_params(coin="BNB", token_is_native=True), amount="0.0001")
+        jobs = [(item.row_key, item.source_raw, item.target)]
+        source_wallets = {item.row_key: (item.source_private_key, item.source_addr)}
+        candidates = {(item.source_addr.lower(), item.target.lower()): [stale_record]}
+
+        records, resumed_count, _batch_id = _pick_or_create_relay_records(
+            owner,
+            jobs,
+            params,
+            source_wallets,
+            candidates,
+        )
+        prepared = _relay_prepare_items(
+            owner,
+            jobs,
+            params,
+            {item.row_key: 1},
+            records,
+            source_wallets,
+        )
+
+        self.assertEqual(resumed_count, 1)
+        self.assertEqual(prepared[0].amount_text, "0.0001")
+        self.assertEqual(prepared[0].value_units, 10**14)
 
     def test_1m_native_retry_clears_missing_txid_and_keeps_nonce(self) -> None:
         owner = _FakeOwner(mode_1m=True)
@@ -954,9 +1223,9 @@ class OnchainRelayPipelineTests(unittest.TestCase):
 
         original_receipt = owner.client.get_transaction_receipt
 
-        def receipt_after_submits(network: str, txid: str):
+        def receipt_after_submits(network: str, txid: str, **kwargs):
             events.append("receipt")
-            return original_receipt(network, txid)
+            return original_receipt(network, txid, **kwargs)
 
         owner.client.get_transaction_receipt = receipt_after_submits
 

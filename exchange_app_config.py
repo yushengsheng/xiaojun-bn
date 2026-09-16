@@ -27,6 +27,7 @@ from exchange_app_base import (
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
     LADDER_SELL_PREMIUM_DEFAULT,
     LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
+    MARKET_STAGGER_ENABLED_DEFAULT,
     MARKET_STOP_MODE_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
     PREMIUM_DELTA_DEFAULT,
@@ -308,6 +309,7 @@ class ExchangeAppConfigMixin(object):
             "spot_rounds": int(trade_settings["stored_spot_rounds"]),
             "trade_mode": trade_settings["trade_mode"],
             "market_stop_mode": trade_settings["market_stop_mode"],
+            "market_stagger_enabled": bool(trade_settings["market_stagger_enabled"]),
             "premium_delta": trade_settings["premium_delta"],
             "premium_order_count": int(trade_settings["premium_order_count"]),
             "premium_append_threshold": trade_settings["premium_append_threshold"],
@@ -434,6 +436,9 @@ class ExchangeAppConfigMixin(object):
             self.trade_mode_var.set(self._normalize_trade_mode(raw.get("trade_mode", TRADE_MODE_DEFAULT)))
             self.market_stop_mode_var.set(
                 self._normalize_market_stop_mode(raw.get("market_stop_mode", MARKET_STOP_MODE_DEFAULT))
+            )
+            self.market_stagger_enabled_var.set(
+                bool(raw.get("market_stagger_enabled", MARKET_STAGGER_ENABLED_DEFAULT))
             )
             premium_delta_text = str(raw.get("premium_delta", PREMIUM_DELTA_DEFAULT) or PREMIUM_DELTA_DEFAULT).strip()
             legacy_premium_percent_text = str(raw.get("premium_percent", "") or "").strip()

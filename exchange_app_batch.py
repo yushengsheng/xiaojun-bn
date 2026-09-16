@@ -15,6 +15,7 @@ from exchange_app_base import (
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
     LADDER_SELL_PREMIUM_DEFAULT,
     LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
+    MARKET_STAGGER_ENABLED_DEFAULT,
     MARKET_STOP_MODE_BNB,
     MARKET_STOP_MODE_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
@@ -83,6 +84,29 @@ class ExchangeAppBatchMixin(object):
                 TRADE_MODE_PREMIUM,
                 TRADE_MODE_LADDER,
             }
+        )
+
+    @staticmethod
+    def _batch_market_stagger_wait_required(
+        *,
+        enabled: bool,
+        batch_position: int,
+        account_count: int,
+        max_threads: int,
+        trade_account_type: str,
+        trade_mode: str,
+        spot_rounds: int,
+        market_stop_mode: str,
+    ) -> bool:
+        market_has_rounds = int(spot_rounds) > 0 or market_stop_mode == MARKET_STOP_MODE_BNB
+        return bool(
+            enabled
+            and int(account_count) > 1
+            and int(max_threads) > 1
+            and trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
+            and trade_mode == TRADE_MODE_MARKET
+            and market_has_rounds
+            and int(batch_position) % 2 == 1
         )
 
     @staticmethod
@@ -1055,6 +1079,59 @@ class ExchangeAppBatchMixin(object):
             return "--"
         items.sort(key=lambda item: (-item[1], item[0]))
         return " | ".join(f"{asset} {cls._format_amount(float(amount_dec))}" for asset, amount_dec in items)
+
+    @staticmethod
+    def _merge_monthly_trade_volume_summaries(summaries: list[dict[str, object]]) -> dict[str, object]:
+        quote_volumes: dict[str, Decimal] = {}
+        commissions: dict[str, Decimal] = {}
+        unvalued_quote_volumes: dict[str, Decimal] = {}
+        unvalued_commissions: dict[str, Decimal] = {}
+        result: dict[str, object] = {
+            "quoteVolumes": quote_volumes,
+            "commissionByAsset": commissions,
+            "unvaluedQuoteVolumeByAsset": unvalued_quote_volumes,
+            "unvaluedCommissionByAsset": unvalued_commissions,
+            "usdtQuoteVolume": Decimal("0"),
+            "usdtBuyQuoteVolume": Decimal("0"),
+            "usdtSellQuoteVolume": Decimal("0"),
+            "usdtCommission": Decimal("0"),
+            "tradeCount": 0,
+            "orderCount": 0,
+            "symbolCount": len(summaries),
+        }
+
+        def merge_breakdown(target: dict[str, Decimal], source) -> None:
+            for asset, amount in dict(source or {}).items():
+                asset_u = str(asset or "").strip().upper()
+                if asset_u:
+                    target[asset_u] = target.get(asset_u, Decimal("0")) + Decimal(str(amount or "0"))
+
+        for summary in summaries:
+            quote_asset = str(summary.get("quoteAsset") or "").strip().upper()
+            if quote_asset:
+                quote_volumes[quote_asset] = quote_volumes.get(quote_asset, Decimal("0")) + Decimal(
+                    str(summary.get("quoteVolume") or "0")
+                )
+            merge_breakdown(commissions, summary.get("commissionByAsset"))
+            merge_breakdown(unvalued_quote_volumes, summary.get("unvaluedQuoteVolumeByAsset"))
+            merge_breakdown(unvalued_commissions, summary.get("unvaluedCommissionByAsset"))
+            for key in (
+                "usdtQuoteVolume",
+                "usdtBuyQuoteVolume",
+                "usdtSellQuoteVolume",
+                "usdtCommission",
+            ):
+                result[key] = Decimal(str(result[key])) + Decimal(str(summary.get(key) or "0"))
+            result["tradeCount"] = int(result["tradeCount"]) + int(summary.get("tradeCount") or 0)
+            result["orderCount"] = int(result["orderCount"]) + int(summary.get("orderCount") or 0)
+
+        result["usdtOrderPnl"] = Decimal(str(result["usdtSellQuoteVolume"])) - Decimal(
+            str(result["usdtBuyQuoteVolume"])
+        )
+        result["usdtNetResult"] = Decimal(str(result["usdtOrderPnl"])) - Decimal(
+            str(result["usdtCommission"])
+        )
+        return result
     @staticmethod
     def _exchange_success_status_text(text: str, *, fallback: str = "成功") -> str:
         body = str(text or "").strip() or str(fallback or "成功").strip() or "成功"
@@ -1585,6 +1662,7 @@ class ExchangeAppBatchMixin(object):
         spot_symbol: str,
         spot_rounds: int,
         market_stop_mode: str = MARKET_STOP_MODE_DEFAULT,
+        market_stagger_enabled: bool = MARKET_STAGGER_ENABLED_DEFAULT,
         bnb_fee_stop_value: Decimal | str | None = None,
         futures_symbol: str,
         futures_rounds: int,
@@ -1625,6 +1703,8 @@ class ExchangeAppBatchMixin(object):
                 )
             else:
                 lines.append(f"轮次：{int(spot_rounds)}")
+            if trade_mode == TRADE_MODE_MARKET:
+                lines.append(f"市价交错执行：{'开启' if market_stagger_enabled else '关闭'}")
             if trade_mode == TRADE_MODE_LADDER:
                 lines.append(f"档位模式：{ladder_layout}")
                 lines.append(
@@ -1655,6 +1735,7 @@ class ExchangeAppBatchMixin(object):
         spot_symbol: str,
         spot_rounds: int,
         market_stop_mode: str = MARKET_STOP_MODE_DEFAULT,
+        market_stagger_enabled: bool = MARKET_STAGGER_ENABLED_DEFAULT,
         bnb_fee_stop_value: Decimal | str | None = None,
         futures_symbol: str,
         futures_rounds: int,
@@ -1703,6 +1784,7 @@ class ExchangeAppBatchMixin(object):
             spot_symbol=spot_symbol,
             spot_rounds=spot_rounds,
             market_stop_mode=market_stop_mode,
+            market_stagger_enabled=market_stagger_enabled,
             bnb_fee_stop_value=bnb_fee_stop_value,
             futures_symbol=futures_symbol,
             futures_rounds=futures_rounds,
@@ -1847,10 +1929,12 @@ class ExchangeAppBatchMixin(object):
             messagebox.showerror("错误", "现货交易对不能为空")
             return
         try:
-            quote_asset = BinanceClient.get_spot_quote_asset(symbol)
+            base_asset = BinanceClient.get_spot_base_asset(symbol)
             max_threads = max(1, int(self.max_threads_var.get()))
+            min_delay = self._delay_var_value(self.min_delay_var, 1000, "最小")
+            max_delay = self._delay_var_value(self.max_delay_var, 3000, "最大")
         except Exception as exc:
-            messagebox.showerror("错误", str(exc) or "交易对或线程数格式不正确")
+            messagebox.showerror("错误", str(exc) or "交易对、线程数或随机延迟格式不正确")
             return
 
         end_time_ms = int(time.time() * 1000)
@@ -1870,7 +1954,7 @@ class ExchangeAppBatchMixin(object):
         self.btn_withdraw.config(state="disabled")
         self._set_account_manage_buttons_state("disabled")
         self._set_combo_states_for_run(True)
-        self.status_var.set(f"状态：查询 {symbol} 近30天成交额...")
+        self.status_var.set(f"状态：查询 {base_asset} 全部现货交易对近30天成交额...")
         self.progress["value"] = 0
         self.progress["maximum"] = len(selected)
 
@@ -1880,10 +1964,9 @@ class ExchangeAppBatchMixin(object):
 
         result_lock = threading.Lock()
         completed_count = 0
-        success_count = 0
-        total_quote_volume = Decimal("0")
-        total_order_pnl = Decimal("0")
-        total_commissions: dict[str, Decimal] = {}
+        account_results = []
+        spot_symbol_infos: list[dict[str, str]] = []
+        hourly_usdt_rates: dict[str, dict[int, Decimal]] = {}
 
         def format_pnl(value: Decimal) -> str:
             text = BinanceClient._format_decimal(value)
@@ -1896,8 +1979,100 @@ class ExchangeAppBatchMixin(object):
                 current = completed_count
             self._dispatch_ui(lambda: self.progress.config(value=current))
 
+        def valuation_price_lookup(asset: str, timestamp_ms: int) -> Decimal | None:
+            return BinanceClient.historical_usdt_price_lookup(hourly_usdt_rates, asset, timestamp_ms)
+
+        def needs_valuation(summary) -> bool:
+            return bool(summary["unvaluedQuoteVolumeByAsset"] or summary["unvaluedCommissionByAsset"])
+
+        def compact_summary_text(summary, *, integer: bool, include_total: bool = True) -> str:
+            def amount(key, *, signed=False):
+                value = Decimal(str(summary[key]))
+                if integer:
+                    return f"+{int(value)}" if signed and value > 0 else str(int(value))
+                return format_pnl(value) if signed else BinanceClient._format_decimal(value)
+
+            missing_volume = bool(summary["unvaluedQuoteVolumeByAsset"])
+            missing_fee = bool(summary["unvaluedCommissionByAsset"])
+            volume_mark = "≥" if missing_volume else "≈"
+            fields = [
+                f"{volume_mark}{amount('usdtQuoteVolume')} USDT",
+                "净待折算" if missing_volume else f"净≈{amount('usdtOrderPnl', signed=True)}",
+                "费待折算" if missing_fee else f"费≈{amount('usdtCommission')}",
+            ]
+            if include_total:
+                fields.append(
+                    "总盈亏待折算" if missing_volume or missing_fee
+                    else f"总盈亏≈{amount('usdtNetResult', signed=True)}"
+                )
+            return "｜".join(fields)
+
+        def detailed_summary_text(
+            *,
+            title: str,
+            summary: dict[str, object],
+            symbols_text: str,
+        ) -> str:
+            volume_text = BinanceClient._format_decimal(Decimal(str(summary["usdtQuoteVolume"])))
+            buy_text = BinanceClient._format_decimal(Decimal(str(summary["usdtBuyQuoteVolume"])))
+            sell_text = BinanceClient._format_decimal(Decimal(str(summary["usdtSellQuoteVolume"])))
+            pnl_text = format_pnl(Decimal(str(summary["usdtOrderPnl"])))
+            fee_text = BinanceClient._format_decimal(Decimal(str(summary["usdtCommission"])))
+            net_text = format_pnl(Decimal(str(summary["usdtNetResult"])))
+            native_volume_text = self._format_asset_breakdown_text(dict(summary["quoteVolumes"]))
+            native_fee_text = self._format_asset_breakdown_text(dict(summary["commissionByAsset"]))
+            missing_volume = bool(summary["unvaluedQuoteVolumeByAsset"])
+            missing_fee = bool(summary["unvaluedCommissionByAsset"])
+            volume_label = "已折算部分成交额" if missing_volume else "折合成交额"
+            fee_label = "已折算部分" if missing_fee else "折合"
+            lines = [
+                title,
+                f"交易对：{symbols_text}",
+                f"原币种成交额：{native_volume_text}",
+                f"{volume_label}≈{volume_text} USDT（买入≈{buy_text} / 卖出≈{sell_text}）",
+                "交易净额：待折算" if missing_volume else f"交易净额≈{pnl_text} USDT",
+                f"手续费：{native_fee_text}（{fee_label}≈{fee_text} USDT）",
+                "总盈亏：待折算" if missing_volume or missing_fee else f"总盈亏≈{net_text} USDT",
+                f"订单/成交明细：{int(summary['orderCount'])}单/{int(summary['tradeCount'])}笔",
+            ]
+            unvalued_volume = self._format_asset_breakdown_text(dict(summary["unvaluedQuoteVolumeByAsset"]))
+            unvalued_fee = self._format_asset_breakdown_text(dict(summary["unvaluedCommissionByAsset"]))
+            if unvalued_volume != "--":
+                lines.append(f"未折算成交额：{unvalued_volume}")
+            if unvalued_fee != "--":
+                lines.append(f"未折算手续费：{unvalued_fee}")
+            return "\n".join(lines)
+
+        def publish_account_result(result):
+            idx, acc = result["idx"], result["account"]
+            summaries = result["summaries"]
+            stopped = result["stopped"]
+            if not summaries:
+                status = "已停止" if stopped else "月成交额查询失败（无完整交易对数据）"
+                self._schedule_account_status(acc, status if stopped else self._exchange_failed_status_text(status))
+                logger.info("账号 #%d %s：%s", idx, base_asset, status)
+            else:
+                summary = self._merge_monthly_trade_volume_summaries(summaries)
+                partial = len(summaries) < len(spot_symbol_infos) or stopped
+                label = f"部分{len(summaries)}/{len(spot_symbol_infos)}" if partial else f"{len(spot_symbol_infos)}对"
+                if stopped:
+                    label = "已停止 " + label
+                body = f"{base_asset} {label}｜{compact_summary_text(summary, integer=True)}"
+                self._schedule_account_status(
+                    acc, body if partial or needs_valuation(summary) else self._exchange_success_status_text(body),
+                )
+                title = f"账号 #{idx} {base_asset} 近30天成交汇总"
+                if partial:
+                    title += f"（{label}，仅含已查部分）"
+                logger.info("%s", detailed_summary_text(
+                    title=title, summary=summary,
+                    symbols_text="、".join(item["symbol"] for item in summaries),
+                ))
+            result["reported"] = True
+            self._set_account_batch_active(acc, False)
+
         def query_worker(thread_id):
-            nonlocal success_count, total_quote_volume, total_order_pnl
+            first_account = True
             while not self.stop_event.is_set():
                 try:
                     idx, acc = task_queue.get(timeout=1)
@@ -1907,74 +2082,127 @@ class ExchangeAppBatchMixin(object):
                 set_exchange_account_log_index(idx)
                 client = None
                 combined_stop = CombinedStopEvent(self.stop_event, self._get_account_stop_event(acc))
+                result = {"idx": idx, "account": acc, "summaries": [], "stopped": False, "reported": False}
                 try:
-                    self._schedule_account_status(acc, f"查询 {symbol} 近30天成交额...")
+                    if not first_account:
+                        self._schedule_account_status(acc, f"{base_asset} 查询前随机等待...")
+                        if not self._wait_batch_random_delay(
+                            combined_stop, min_delay, max_delay,
+                            log_prefix=f"线程 {thread_id} 切换账号 #{idx} 月成交额查询前 ",
+                        ):
+                            raise InterruptedError("成交额查询已停止")
+                    self._schedule_account_status(acc, f"查询 {base_asset} 全部交易对...")
                     client = self._create_binance_client(
                         acc["api_key"],
                         acc["api_secret"],
                         request_gate=request_gate,
                         request_stop_event=combined_stop,
                     )
-                    summary = client.spot_trade_volume_summary(
-                        symbol,
-                        start_time_ms=start_time_ms,
-                        end_time_ms=end_time_ms,
-                        stop_event=combined_stop,
-                    )
-                    quote_volume = Decimal(str(summary["quoteVolume"]))
-                    order_pnl = Decimal(str(summary["orderPnl"]))
-                    commissions = dict(summary.get("commissionByAsset") or {})
-                    trade_count = int(summary["tradeCount"])
-                    order_count = int(summary["orderCount"])
-                    volume_text = BinanceClient._format_decimal(quote_volume)
-                    pnl_text = format_pnl(order_pnl)
-                    commission_text = self._format_asset_breakdown_text(commissions)
-                    self._schedule_account_status(
-                        acc,
-                        self._exchange_success_status_text(
-                            f"{symbol}近30天成交额 {volume_text} {quote_asset}，"
-                            f"订单盈亏 {pnl_text} {quote_asset}，手续费 {commission_text}"
-                            f"（{order_count}单/{trade_count}笔）"
-                        ),
-                    )
-                    with result_lock:
-                        success_count += 1
-                        total_quote_volume += quote_volume
-                        total_order_pnl += order_pnl
-                        for asset, amount in commissions.items():
-                            asset_u = str(asset or "").strip().upper()
-                            if asset_u:
-                                total_commissions[asset_u] = (
-                                    total_commissions.get(asset_u, Decimal("0")) + Decimal(str(amount or "0"))
+                    for symbol_pos, info in enumerate(spot_symbol_infos, start=1):
+                        if combined_stop.is_set():
+                            raise InterruptedError("成交额查询已停止")
+                        query_symbol = info["symbol"]
+                        self._schedule_account_status(
+                            acc,
+                            f"查询 {base_asset} {symbol_pos}/{len(spot_symbol_infos)}...",
+                        )
+                        try:
+                            result["summaries"].append(
+                                client.spot_trade_volume_summary(
+                                    query_symbol,
+                                    start_time_ms=start_time_ms,
+                                    end_time_ms=end_time_ms,
+                                    stop_event=combined_stop,
+                                    valuation_price_lookup=valuation_price_lookup,
+                                    quote_asset=info["quoteAsset"],
                                 )
-                    logger.info(
-                        "账号 #%d %s 近30天成交额：%s %s，订单盈亏=%s %s，手续费=%s，订单=%d，成交明细=%d",
-                        idx,
-                        symbol,
-                        volume_text,
-                        quote_asset,
-                        pnl_text,
-                        quote_asset,
-                        commission_text,
-                        order_count,
-                        trade_count,
-                    )
+                            )
+                        except InterruptedError:
+                            raise
+                        except Exception as exc:
+                            if combined_stop.is_set():
+                                raise InterruptedError("成交额查询已停止") from exc
+                            logger.error("账号 #%d 查询 %s 近30天成交额失败（其他交易对继续）: %s", idx, query_symbol, exc)
                 except InterruptedError:
-                    self._schedule_account_status(acc, "已停止")
+                    result["stopped"] = True
                 except Exception as exc:
-                    logger.error("账号 #%d 查询 %s 近30天成交额失败: %s", idx, symbol, exc)
-                    self._schedule_account_status(
-                        acc,
-                        self._exchange_error_status_text("月成交额查询失败", exc, fallback="查询失败"),
-                    )
+                    result["stopped"] = combined_stop.is_set()
+                    if not result["stopped"]:
+                        logger.error("账号 #%d 查询 %s 近30天成交额失败: %s", idx, symbol, exc)
                 finally:
+                    first_account = False
+                    result["stopped"] = result["stopped"] or combined_stop.is_set()
+                    with result_lock:
+                        account_results.append(result)
+                    if not result["stopped"] and any(needs_valuation(item) for item in result["summaries"]):
+                        self._schedule_account_status(acc, f"{base_asset} 成交已查，等待补价...")
+                    else:
+                        publish_account_result(result)
                     self._close_binance_client_instance(client)
-                    self._set_account_batch_active(acc, False)
+                    self._set_account_batch_active(acc, not result["reported"])
                     task_queue.task_done()
                     finish_one()
                     clear_exchange_account_log_index()
 
         def controller():
+            nonlocal base_asset, spot_symbol_infos, hourly_usdt_rates
+            bootstrap_client = None
+            try:
+                first_account = selected[0]
+                bootstrap_client = self._create_binance_client(
+                    first_account["api_key"],
+                    first_account["api_secret"],
+                    request_gate=request_gate,
+                    request_stop_event=self.stop_event,
+                )
+                catalog = bootstrap_client.get_spot_symbol_catalog()
+                base_asset, spot_symbol_infos = bootstrap_client.get_spot_symbols_for_base_asset(
+                    symbol,
+                    spot_symbols=catalog,
+                )
+                valuation_assets = {base_asset, "BNB"}
+                valuation_assets.update(item["quoteAsset"] for item in spot_symbol_infos)
+                hourly_usdt_rates = bootstrap_client.get_historical_usdt_hourly_rates(
+                    valuation_assets,
+                    start_time_ms=start_time_ms,
+                    end_time_ms=end_time_ms,
+                    spot_symbols=catalog,
+                    stop_event=self.stop_event,
+                )
+                logger.info(
+                    "%s 月成交额查询范围：%d个现货交易对：%s",
+                    base_asset,
+                    len(spot_symbol_infos),
+                    "、".join(item["symbol"] for item in spot_symbol_infos),
+                )
+            except InterruptedError:
+                for acc in selected:
+                    self._schedule_account_status(acc, "已停止")
+                    self._set_account_batch_active(acc, False)
+                self._dispatch_ui(
+                    lambda: self._restore_batch_ui_to_idle(status_text="状态：月成交额查询已停止", finish_summary=False)
+                )
+                return
+            except Exception as exc:
+                if not self.stop_event.is_set():
+                    logger.error("月成交额查询初始化失败: %s", exc)
+                error_text = (
+                    "月成交额查询已停止" if self.stop_event.is_set()
+                    else self._exchange_error_status_text("月成交额查询失败", exc, fallback="查询失败")
+                )
+                for acc in selected:
+                    self._schedule_account_status(acc, error_text)
+                    self._set_account_batch_active(acc, False)
+                self._dispatch_ui(
+                    lambda text=error_text: self._restore_batch_ui_to_idle(
+                        status_text=f"状态：{text}",
+                        finish_summary=False,
+                    )
+                )
+                return
+            finally:
+                self._close_binance_client_instance(bootstrap_client)
+
             threads = []
             for thread_id in range(min(max_threads, len(selected))):
                 thread = threading.Thread(target=query_worker, args=(thread_id + 1,), daemon=True)
@@ -1983,29 +2211,98 @@ class ExchangeAppBatchMixin(object):
             for thread in threads:
                 thread.join()
 
-            with result_lock:
-                success = success_count
-                total = total_quote_volume
-                pnl = total_order_pnl
-                commissions = dict(total_commissions)
-            total_text = BinanceClient._format_decimal(total)
-            pnl_text = format_pnl(pnl)
-            commission_text = self._format_asset_breakdown_text(commissions)
+            # 只补查实际成交缺失的小时价格；同币种所有账号合并为一次区间请求。
+            missing_hours: dict[str, set[int]] = {}
+            for result in account_results:
+                if result["reported"]:
+                    continue
+                result["stopped"] = result["stopped"] or self._get_account_stop_event(result["account"]).is_set()
+                if result["stopped"]:
+                    continue
+                for item in result["summaries"]:
+                    for asset, hour in item.get("unvaluedHourlyAmounts", {}):
+                        missing_hours.setdefault(asset, set()).add(hour)
+            repair_client = None
+            if missing_hours and not self.stop_event.is_set():
+                self._dispatch_ui(lambda: self.status_var.set("状态：成交查询结束，补查缺失历史价格..."))
+                try:
+                    repair_client = self._create_binance_client(
+                        selected[0]["api_key"], selected[0]["api_secret"],
+                        request_gate=request_gate, request_stop_event=self.stop_event,
+                    )
+                    for asset, hours in sorted(missing_hours.items()):
+                        if self.stop_event.is_set():
+                            break
+                        repaired = repair_client.get_historical_usdt_hourly_rates(
+                            {asset}, start_time_ms=min(hours),
+                            end_time_ms=min(end_time_ms, max(hours) + 3_600_000 - 1),
+                            spot_symbols=catalog, stop_event=self.stop_event, max_retries=1,
+                        )
+                        for hour, price in repaired.get(asset, {}).items():
+                            if hour in hours:
+                                hourly_usdt_rates.setdefault(asset, {}).setdefault(hour, price)
+                except InterruptedError:
+                    pass
+                except Exception as exc:
+                    if not self.stop_event.is_set():
+                        logger.warning("补查历史价格失败，保留已查询成交数据: %s", exc)
+                finally:
+                    self._close_binance_client_instance(repair_client)
+
+            completed_summaries = []
+            success = 0
+            for result in account_results:
+                if not result["reported"]:
+                    for item in result["summaries"]:
+                        BinanceClient.revalue_spot_trade_summary(item, hourly_usdt_rates)
+                    result["stopped"] = (
+                        result["stopped"] or self.stop_event.is_set()
+                        or self._get_account_stop_event(result["account"]).is_set()
+                    )
+                    publish_account_result(result)
+                complete = (
+                    not result["stopped"] and len(result["summaries"]) == len(spot_symbol_infos)
+                    and not any(needs_valuation(item) for item in result["summaries"])
+                )
+                success += int(complete)
+                completed_summaries.extend(result["summaries"])
+
+            # 尚未开始的账号也要结束运行状态，不能在停止后一直显示“等待”。
+            while not task_queue.empty():
+                _idx, acc = task_queue.get_nowait()
+                self._schedule_account_status(acc, "已停止")
+                self._set_account_batch_active(acc, False)
+                task_queue.task_done()
+
+            if not completed_summaries:
+                status_text = "月成交额查询已停止" if self.stop_event.is_set() or any(
+                    result["stopped"] for result in account_results
+                ) else "月成交额查询失败（无完整交易对数据）"
+                logger.info("%s %s", base_asset, status_text)
+                self._dispatch_ui(lambda: self._restore_batch_ui_to_idle(
+                    status_text=f"状态：{status_text}", finish_summary=False,
+                ))
+                return
+
+            summary = self._merge_monthly_trade_volume_summaries(completed_summaries)
+            partial = success < len(selected) or self.stop_event.is_set()
+            label = "已停止，部分汇总" if self.stop_event.is_set() else "部分汇总"
+            title = (
+                f"{base_asset} 近30天{label}（完整账号{success}/{len(selected)}，仅含已查部分）" if partial
+                else f"{base_asset} 近30天全部账号成交汇总（成功{success}/{len(selected)}）"
+            )
             logger.info(
-                "%s 近30天成交额查询完成：成功账号=%d/%d，合计=%s %s，订单盈亏=%s %s，手续费=%s",
-                symbol,
-                success,
-                len(selected),
-                total_text,
-                quote_asset,
-                pnl_text,
-                quote_asset,
-                commission_text,
+                "%s",
+                detailed_summary_text(
+                    title=title,
+                    summary=summary,
+                    symbols_text="、".join(dict.fromkeys(item["symbol"] for item in completed_summaries)),
+                ),
             )
             status_text = (
-                f"状态：{symbol}近30天成交额 {total_text} {quote_asset}，"
-                f"订单盈亏 {pnl_text} {quote_asset}，手续费 {commission_text}"
-                f"（成功{success}/{len(selected)}）"
+                f"状态：{base_asset}月成交 {label if partial else str(len(spot_symbol_infos)) + '对'}｜"
+                f"{compact_summary_text(summary, integer=False, include_total=False)}｜"
+                f"{success}/{len(selected)}（详情见日志）"
             )
             self._dispatch_ui(
                 lambda: self._restore_batch_ui_to_idle(status_text=status_text, finish_summary=False)
@@ -2376,6 +2673,7 @@ class ExchangeAppBatchMixin(object):
             spot_rounds = int(trade_settings["spot_rounds"])
             trade_mode = str(trade_settings["trade_mode"])
             market_stop_mode = str(trade_settings.get("market_stop_mode", MARKET_STOP_MODE_DEFAULT))
+            market_stagger_enabled = bool(trade_settings.get("market_stagger_enabled", MARKET_STAGGER_ENABLED_DEFAULT))
             premium_delta_value = trade_settings["premium_delta_value"]
             premium_order_count = int(trade_settings["premium_order_count"])
             premium_append_threshold_value = trade_settings["premium_append_threshold_value"]
@@ -2403,6 +2701,7 @@ class ExchangeAppBatchMixin(object):
             spot_rounds = max(1, int(self.spot_rounds_var.get() or SPOT_ROUNDS_DEFAULT))
             trade_mode = TRADE_MODE_MARKET
             market_stop_mode = MARKET_STOP_MODE_DEFAULT
+            market_stagger_enabled = MARKET_STAGGER_ENABLED_DEFAULT
             premium_delta_value = None
             premium_order_count = PREMIUM_ORDER_COUNT_DEFAULT
             premium_append_threshold_value = Decimal(PREMIUM_APPEND_THRESHOLD_DEFAULT)
@@ -2474,6 +2773,7 @@ class ExchangeAppBatchMixin(object):
                 spot_symbol=spot_symbol,
                 spot_rounds=spot_rounds,
                 market_stop_mode=market_stop_mode,
+                market_stagger_enabled=market_stagger_enabled,
                 bnb_fee_stop_value=bnb_fee_stop_value,
                 futures_symbol=futures_symbol,
                 futures_rounds=futures_rounds,
@@ -2623,7 +2923,7 @@ class ExchangeAppBatchMixin(object):
 
         task_queue = queue.Queue()
         for batch_pos, acc in enumerate(selected, start=1):
-            task_queue.put((self._account_display_index(acc, batch_pos), acc))
+            task_queue.put((batch_pos, self._account_display_index(acc, batch_pos), acc))
 
         completed_count = 0
         count_lock = threading.Lock()
@@ -2642,7 +2942,7 @@ class ExchangeAppBatchMixin(object):
         def worker_loop(thread_id):
             while not self.stop_event.is_set():
                 try:
-                    idx, acc = task_queue.get(timeout=1)
+                    batch_position, idx, acc = task_queue.get(timeout=1)
                 except queue.Empty:
                     clear_exchange_account_log_index()
                     return
@@ -3214,6 +3514,16 @@ class ExchangeAppBatchMixin(object):
                             trade_account_type=trade_account_type,
                             trade_mode=trade_mode,
                             market_stop_mode=market_stop_mode,
+                            market_initial_stagger=self._batch_market_stagger_wait_required(
+                                enabled=market_stagger_enabled,
+                                batch_position=batch_position,
+                                account_count=total_accounts,
+                                max_threads=max_threads,
+                                trade_account_type=trade_account_type,
+                                trade_mode=trade_mode,
+                                spot_rounds=spot_rounds,
+                                market_stop_mode=market_stop_mode,
+                            ),
                             premium_delta=premium_delta_value,
                             premium_order_count=premium_order_count,
                             premium_append_threshold=premium_append_threshold_value,

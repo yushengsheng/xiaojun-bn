@@ -63,6 +63,7 @@ from exchange_constants import (
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
     LADDER_SELL_PREMIUM_DEFAULT,
     LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
+    MARKET_STAGGER_ENABLED_DEFAULT,
     MARKET_STOP_MODE_BNB,
     MARKET_STOP_MODE_DEFAULT,
     MARKET_STOP_MODE_OPTIONS,
@@ -374,6 +375,7 @@ class ExchangeAppBase(tk.Tk):
         self.trade_account_type_var = tk.StringVar(value=TRADE_ACCOUNT_TYPE_DEFAULT)
         self.spot_rounds_var = tk.IntVar(value=SPOT_ROUNDS_DEFAULT)
         self.market_stop_mode_var = tk.StringVar(value=MARKET_STOP_MODE_DEFAULT)
+        self.market_stagger_enabled_var = tk.BooleanVar(value=MARKET_STAGGER_ENABLED_DEFAULT)
         self.trade_mode_var = tk.StringVar(value=TRADE_MODE_DEFAULT)
         self.premium_delta_var = tk.StringVar(value=PREMIUM_DELTA_DEFAULT)
         self.premium_order_count_var = tk.IntVar(value=PREMIUM_ORDER_COUNT_DEFAULT)
@@ -1065,6 +1067,7 @@ class ExchangeAppBase(tk.Tk):
         market_stop_mode = self._normalize_market_stop_mode(
             stop_mode_var.get() if stop_mode_var is not None else MARKET_STOP_MODE_DEFAULT
         )
+        market_stagger_enabled = bool(self.market_stagger_enabled_var.get())
         spot_symbol_raw = str(self.spot_symbol_var.get() or "")
         spot_symbol = BinanceClient.normalize_trade_symbol(spot_symbol_raw)
         if spot_symbol_raw.strip() and spot_symbol_raw != spot_symbol:
@@ -1247,6 +1250,7 @@ class ExchangeAppBase(tk.Tk):
             "trade_account_type": trade_account_type,
             "trade_mode": mode,
             "market_stop_mode": market_stop_mode,
+            "market_stagger_enabled": market_stagger_enabled,
             "spot_rounds": runtime_rounds,
             "stored_spot_rounds": stored_rounds,
             "spot_symbol": spot_symbol,
@@ -1521,7 +1525,13 @@ class ExchangeAppBase(tk.Tk):
         row3_withdraw_pad = (4, 4)
 
         if current_trade_account_type == TRADE_ACCOUNT_TYPE_SPOT:
-            if current_trade_mode == TRADE_MODE_LIMIT:
+            if current_trade_mode == TRADE_MODE_MARKET:
+                ttk.Checkbutton(
+                    row3_left,
+                    text="市价交错执行",
+                    variable=self.market_stagger_enabled_var,
+                ).pack(side="left", padx=(0, 8))
+            elif current_trade_mode == TRADE_MODE_LIMIT:
                 ttk.Label(row3_left, text="剩余bnb手续费:").pack(side="left")
                 ttk.Entry(row3_left, textvariable=self.bnb_fee_stop_var, width=row3_entry_width).pack(side="left", padx=row3_item_pad)
                 ttk.Label(row3_left, text=self._reprice_threshold_label_text()).pack(side="left")

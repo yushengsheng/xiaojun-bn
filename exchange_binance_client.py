@@ -35,6 +35,7 @@ SUPPORTED_QUOTE_ASSET_SUFFIXES = (
     "EUR",
     "U",
 )
+MONTHLY_VOLUME_QUOTE_ASSETS = frozenset({"USDT", "USDC", "ETH", "BNB", "BTC"})
 
 logger = logging.getLogger("bot")
 
@@ -675,8 +676,11 @@ class BinanceClient:
         start_time_ms: int,
         end_time_ms: int,
         stop_event=None,
+        valuation_price_lookup=None,
+        quote_asset: str | None = None,
     ) -> dict[str, object]:
         symbol_u = self.normalize_trade_symbol(symbol)
+        quote_asset_u = str(quote_asset or "").strip().upper() or self.get_spot_quote_asset(symbol_u)
         start_ms = int(start_time_ms)
         end_ms = int(end_time_ms)
         if not symbol_u:
@@ -696,8 +700,34 @@ class BinanceClient:
         buy_quote_volume = Decimal("0")
         sell_quote_volume = Decimal("0")
         commission_by_asset: dict[str, Decimal] = {}
+        usdt_quote_volume = Decimal("0")
+        usdt_buy_quote_volume = Decimal("0")
+        usdt_sell_quote_volume = Decimal("0")
+        usdt_commission = Decimal("0")
+        unvalued_quote_volume_by_asset: dict[str, Decimal] = {}
+        unvalued_commission_by_asset: dict[str, Decimal] = {}
+        unvalued_hourly_amounts: dict[tuple[str, int], dict[str, Decimal]] = {}
         trade_count = 0
         last_trade_id: int | None = None
+
+        def remember_unvalued(asset: str, timestamp: int, kind: str, amount: Decimal) -> None:
+            if amount <= 0:
+                return
+            hour = timestamp - timestamp % 3_600_000
+            amounts = unvalued_hourly_amounts.setdefault((asset, hour), {})
+            amounts[kind] = amounts.get(kind, Decimal("0")) + amount
+
+        def usdt_price(asset: str, trade_time: int) -> Decimal | None:
+            asset_u = str(asset or "").strip().upper()
+            if asset_u == "USDT":
+                return Decimal("1")
+            if valuation_price_lookup is None:
+                return None
+            try:
+                price = Decimal(str(valuation_price_lookup(asset_u, trade_time) or "0"))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            return price if price.is_finite() and price > 0 else None
 
         while True:
             if stop_event is not None and stop_event.is_set():
@@ -738,12 +768,37 @@ class BinanceClient:
                     buy_quote_volume += quote_qty
                 else:
                     sell_quote_volume += quote_qty
+                quote_usdt_price = usdt_price(quote_asset_u, trade_time)
+                if quote_usdt_price is None:
+                    if quote_qty > 0:
+                        unvalued_quote_volume_by_asset[quote_asset_u] = (
+                            unvalued_quote_volume_by_asset.get(quote_asset_u, Decimal("0")) + quote_qty
+                        )
+                    remember_unvalued(
+                        quote_asset_u, trade_time,
+                        "buy" if self._bool_from_value(item.get("isBuyer")) else "sell", quote_qty,
+                    )
+                else:
+                    quote_usdt_value = quote_qty * quote_usdt_price
+                    usdt_quote_volume += quote_usdt_value
+                    if self._bool_from_value(item.get("isBuyer")):
+                        usdt_buy_quote_volume += quote_usdt_value
+                    else:
+                        usdt_sell_quote_volume += quote_usdt_value
                 commission_asset = str(item.get("commissionAsset") or "").strip().upper()
                 commission = max(Decimal("0"), self._decimal_from_str(item.get("commission"), "0"))
                 if commission_asset and commission > 0:
                     commission_by_asset[commission_asset] = (
                         commission_by_asset.get(commission_asset, Decimal("0")) + commission
                     )
+                    commission_usdt_price = usdt_price(commission_asset, trade_time)
+                    if commission_usdt_price is None:
+                        unvalued_commission_by_asset[commission_asset] = (
+                            unvalued_commission_by_asset.get(commission_asset, Decimal("0")) + commission
+                        )
+                        remember_unvalued(commission_asset, trade_time, "commission", commission)
+                    else:
+                        usdt_commission += commission * commission_usdt_price
                 trade_count += 1
                 raw_order_id = item.get("orderId")
                 if raw_order_id not in (None, ""):
@@ -766,7 +821,7 @@ class BinanceClient:
 
         return {
             "symbol": symbol_u,
-            "quoteAsset": self.get_spot_quote_asset(symbol_u),
+            "quoteAsset": quote_asset_u,
             "startTime": start_ms,
             "endTime": end_ms,
             "quoteVolume": quote_volume,
@@ -774,9 +829,45 @@ class BinanceClient:
             "sellQuoteVolume": sell_quote_volume,
             "orderPnl": sell_quote_volume - buy_quote_volume,
             "commissionByAsset": commission_by_asset,
+            "usdtQuoteVolume": usdt_quote_volume,
+            "usdtBuyQuoteVolume": usdt_buy_quote_volume,
+            "usdtSellQuoteVolume": usdt_sell_quote_volume,
+            "usdtOrderPnl": usdt_sell_quote_volume - usdt_buy_quote_volume,
+            "usdtCommission": usdt_commission,
+            "unvaluedQuoteVolumeByAsset": unvalued_quote_volume_by_asset,
+            "unvaluedCommissionByAsset": unvalued_commission_by_asset,
+            "unvaluedHourlyAmounts": unvalued_hourly_amounts,
             "tradeCount": trade_count,
             "orderCount": len(order_ids),
         }
+
+    @staticmethod
+    def revalue_spot_trade_summary(summary: dict[str, object], hourly_rates) -> None:
+        """补算缺价桶并移除已处理桶；重复调用不会重复累计，不改变原币种明细。"""
+        pending = summary.get("unvaluedHourlyAmounts", {})
+        for (asset, hour), amounts in list(pending.items()):
+            price = BinanceClient.historical_usdt_price_lookup(hourly_rates, asset, hour)
+            if price is None or not price.is_finite() or price <= 0:
+                continue
+            buy = amounts.get("buy", Decimal("0"))
+            sell = amounts.get("sell", Decimal("0"))
+            fee = amounts.get("commission", Decimal("0"))
+            for key, amount in (
+                ("usdtBuyQuoteVolume", buy), ("usdtSellQuoteVolume", sell),
+                ("usdtQuoteVolume", buy + sell), ("usdtCommission", fee),
+            ):
+                summary[key] += amount * price
+            for key, amount in (
+                ("unvaluedQuoteVolumeByAsset", buy + sell),
+                ("unvaluedCommissionByAsset", fee),
+            ):
+                remaining = summary[key]
+                if amount > 0:
+                    remaining[asset] -= amount
+                    if remaining[asset] == 0:
+                        del remaining[asset]
+            del pending[(asset, hour)]
+        summary["usdtOrderPnl"] = summary["usdtSellQuoteVolume"] - summary["usdtBuyQuoteVolume"]
 
     def query_total_wallet_balance(self, quote_asset="USDT", *, fast: bool = False):
         requester = self.request_query if fast else self.request
@@ -1224,6 +1315,151 @@ class BinanceClient:
         raise RuntimeError(f"找不到支持市价0轮兑换的方向：{direction_key}")
 
     # -------- 公共行情 / 交易规则 --------
+    def get_spot_symbol_catalog(self) -> list[dict[str, str]]:
+        data = self.public_get(
+            self.spot,
+            "/api/v3/exchangeInfo",
+            {"permissions": "SPOT", "showPermissionSets": "false"},
+        )
+        symbols = data.get("symbols", []) if isinstance(data, dict) else []
+        normalized: list[dict[str, str]] = []
+        for item in symbols:
+            if not isinstance(item, dict) or item.get("isSpotTradingAllowed") is False:
+                continue
+            item_symbol = self.normalize_trade_symbol(item.get("symbol"))
+            base_asset = str(item.get("baseAsset") or "").strip().upper()
+            quote_asset = str(item.get("quoteAsset") or "").strip().upper()
+            if not item_symbol or not base_asset or not quote_asset:
+                continue
+            info = {
+                "symbol": item_symbol,
+                "baseAsset": base_asset,
+                "quoteAsset": quote_asset,
+                "status": str(item.get("status") or "").strip().upper(),
+            }
+            normalized.append(info)
+        return normalized
+
+    def get_spot_symbols_for_base_asset(
+        self,
+        symbol: str,
+        *,
+        spot_symbols: list[dict[str, str]] | None = None,
+    ) -> tuple[str, list[dict[str, str]]]:
+        symbol_u = self.normalize_trade_symbol(symbol)
+        if not symbol_u:
+            raise RuntimeError("现货交易对不能为空")
+        catalog = spot_symbols if spot_symbols is not None else self.get_spot_symbol_catalog()
+        selected_info = next(
+            (item for item in catalog if str(item.get("symbol") or "").strip().upper() == symbol_u),
+            None,
+        )
+        if selected_info is None:
+            raise RuntimeError(f"找不到现货交易对：{symbol_u}")
+
+        base_asset = selected_info["baseAsset"]
+        matched = [
+            item
+            for item in catalog
+            if item["baseAsset"] == base_asset
+            and item["quoteAsset"] in MONTHLY_VOLUME_QUOTE_ASSETS
+        ]
+        matched.sort(key=lambda item: (item["symbol"] != symbol_u, item["symbol"]))
+        return base_asset, matched
+
+    def get_historical_usdt_hourly_rates(
+        self,
+        assets: set[str] | list[str] | tuple[str, ...],
+        *,
+        start_time_ms: int,
+        end_time_ms: int,
+        spot_symbols: list[dict[str, str]],
+        stop_event=None,
+        max_retries: int | None = None,
+    ) -> dict[str, dict[int, Decimal]]:
+        start_ms = int(start_time_ms)
+        end_ms = int(end_time_ms)
+        if start_ms < 0 or end_ms < start_ms:
+            raise RuntimeError("历史价格查询时间范围无效")
+
+        hour_ms = 60 * 60 * 1000
+        first_hour_ms = start_ms - (start_ms % hour_ms)
+        symbol_map = {
+            str(item.get("symbol") or "").strip().upper(): item
+            for item in spot_symbols
+            if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+        }
+        rates: dict[str, dict[int, Decimal]] = {}
+        for raw_asset in assets:
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError("成交额查询已停止")
+            asset = str(raw_asset or "").strip().upper()
+            if not asset:
+                continue
+            if asset == "USDT":
+                rates[asset] = {}
+                continue
+
+            route_symbol = asset + "USDT"
+            inverse = False
+            if route_symbol not in symbol_map:
+                route_symbol = "USDT" + asset
+                inverse = True
+            if route_symbol not in symbol_map:
+                continue
+            try:
+                requester = self.public_get if max_retries is None else self.public_get_query
+                rows = requester(
+                    self.spot,
+                    "/api/v3/klines",
+                    {
+                        "symbol": route_symbol,
+                        "interval": "1h",
+                        "startTime": first_hour_ms,
+                        "endTime": end_ms,
+                        "limit": 1000,
+                    },
+                    **({"timeout": 15, "max_retries": max_retries} if max_retries is not None else {}),
+                )
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("成交额查询已停止") from exc
+                logger.warning("查询 %s 历史USDT价格失败，保留原币种明细: %s", asset, exc)
+                continue
+
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError("成交额查询已停止")
+            asset_rates: dict[int, Decimal] = {}
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, (list, tuple)) or len(row) < 5:
+                    continue
+                try:
+                    open_time = int(row[0])
+                    close_price = Decimal(str(row[4]))
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                if not close_price.is_finite() or close_price <= 0:
+                    continue
+                asset_rates[open_time] = (Decimal("1") / close_price) if inverse else close_price
+            if asset_rates:
+                rates[asset] = asset_rates
+        return rates
+
+    @staticmethod
+    def historical_usdt_price_lookup(
+        hourly_rates: dict[str, dict[int, Decimal]],
+        asset: str,
+        timestamp_ms: int,
+    ) -> Decimal | None:
+        asset_u = str(asset or "").strip().upper()
+        if asset_u == "USDT":
+            return Decimal("1")
+        hour_ms = 60 * 60 * 1000
+        bucket = int(timestamp_ms) - (int(timestamp_ms) % hour_ms)
+        return hourly_rates.get(asset_u, {}).get(bucket)
+
     def get_exchange_info(self, symbol: str):
         symbol = self.normalize_trade_symbol(symbol)
         if symbol in self._exchange_info_cache:

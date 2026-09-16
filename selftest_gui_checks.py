@@ -210,6 +210,19 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 ):
                     raise RuntimeError(f"GUI 自检失败：市价剩余BNB停止参数未生效（{market_bnb_settings}）")
                 app.market_stop_mode_var.set("现货轮次")
+                app.market_stagger_enabled_var.set(True)
+                app._refresh_strategy_panel_layout()
+                pump_tk_events(app, timeout=2.0)
+                market_controls = [
+                    str(widget.cget("text") or "")
+                    for widget in app._strategy_row3_left.pack_slaves()
+                    if "text" in widget.keys()
+                ]
+                if "市价交错执行" not in market_controls:
+                    raise RuntimeError(f"GUI 自检失败：市价交错执行控件缺失（{market_controls}）")
+                if app._collect_trade_mode_settings().get("market_stagger_enabled") is not True:
+                    raise RuntimeError("GUI 自检失败：市价交错执行参数未生效")
+                app.market_stagger_enabled_var.set(False)
                 checks.append("exchange-market-stop-mode-gui=ok")
                 app.trade_account_type_var.set("现货")
                 app.trade_mode_var.set("分仓挂单")

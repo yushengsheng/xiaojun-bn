@@ -868,13 +868,24 @@ def _wait_for_receipt_success(owner, params: WithdrawRuntimeParams, txid: str, *
     if not tx_hash:
         raise RuntimeError(f"{label}失败：未拿到 txid")
     interval = _receipt_poll_interval_seconds(params)
-    attempts = _receipt_retry_count(params)
+    started_at = time.monotonic()
+    deadline = started_at + _confirm_timeout_seconds(params)
+    next_progress_at = started_at + 15.0
+    attempt = 0
     last_detail = "未查询到 receipt"
-    for attempt in range(1, attempts + 1):
+    # 确认时间包含 RPC 请求耗时；提交重试次数不能延长确认期限。
+    while True:
         if owner.stop_requested.is_set():
             raise RuntimeError("任务已停止")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempt += 1
         try:
-            receipt = owner.client.get_transaction_receipt(params.network, tx_hash)
+            receipt = owner.client.get_transaction_receipt(
+                params.network, tx_hash, timeout_seconds=min(15.0, remaining),
+                stop_event=owner.stop_requested,
+            )
             state = _receipt_state(receipt)
             if state == "success":
                 return receipt or {}
@@ -883,12 +894,27 @@ def _wait_for_receipt_success(owner, params: WithdrawRuntimeParams, txid: str, *
             last_detail = "receipt 未返回"
         except Exception as exc:
             last_detail = str(exc)
+            if owner.stop_requested.is_set():
+                raise RuntimeError("任务已停止") from exc
             if "receipt status=0" in last_detail:
                 raise
-        if attempt < attempts:
-            if owner.stop_requested.wait(interval):
-                raise RuntimeError("任务已停止")
-    raise RuntimeError(f"{label}超时：查询 receipt {attempts} 次仍未确认，txid={tx_hash}，最后结果：{last_detail}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        now = time.monotonic()
+        if now >= next_progress_at:
+            owner._dispatch_ui(
+                lambda m=(f"{label}等待链上确认：已等待 {now - started_at:.1f} 秒，"
+                          f"剩余 {remaining:.1f} 秒，查询 {attempt} 次，txid={tx_hash}，{last_detail}"): owner.log(m)
+            )
+            next_progress_at = now + 15.0
+        if owner.stop_requested.wait(min(interval, remaining)):
+            raise RuntimeError("任务已停止")
+    elapsed = time.monotonic() - started_at
+    raise RuntimeError(
+        f"{label}确认超时：等待 {elapsed:.1f} 秒，查询 receipt {attempt} 次仍未确认，"
+        f"txid={tx_hash}，最后结果：{last_detail}。链上结果尚未确认，请保留原交易记录续查"
+    )
 
 
 def _update_relay_record(owner, record, *, status: str, **changes: object):
@@ -1041,7 +1067,16 @@ def _pick_or_create_relay_records(
         if candidates:
             candidate = candidates.pop()
             reuse_key = _relay_reuse_key(owner, params.network, source_addr, target)
-            if str(candidate.status or "").strip() == "completed":
+            candidate_status = str(candidate.status or "").strip()
+            reset_unsubmitted_1m_native = bool(
+                params.token_is_native
+                and hasattr(owner, "_is_mode_1m")
+                and owner._is_mode_1m()
+                and candidate_status in {"", "created", "failed"}
+                and not str(candidate.token_funded_txid or "").strip()
+                and not str(candidate.token_funded_nonce or "").strip()
+            )
+            if candidate_status == "completed":
                 candidate = owner.relay_wallet_store.update_record(
                     candidate.relay_address,
                     batch_id=candidate.batch_id,
@@ -1065,6 +1100,15 @@ def _pick_or_create_relay_records(
                     sweep_resolution="",
                     last_error="",
                     completed_at="",
+                )
+            elif reset_unsubmitted_1m_native:
+                candidate = owner.relay_wallet_store.update_record(
+                    candidate.relay_address,
+                    batch_id=candidate.batch_id,
+                    reuse_key=reuse_key,
+                    transfer_amount="",
+                    transfer_units="",
+                    last_error="",
                 )
             relay_records_by_row_key[row_key] = candidate
             resumed_count += 1
@@ -1267,7 +1311,8 @@ def _relay_resolve_source_token_transfer(owner, params: WithdrawRuntimeParams, i
 def _relay_resolve_1m_native_transfer(owner, params: WithdrawRuntimeParams, item: "_RelayBatchItem") -> None:
     if item.value_units <= 0:
         raise RuntimeError(f"{item.prefix} 转账数量必须大于 0")
-    gas_price = int(item.source_token_gas_price or owner.client.get_gas_price_wei(params.network))
+    # 预检查报价可能已过期；签名前刷新，并按当前手续费重新检查余额。
+    gas_price = owner.client.get_gas_price_wei(params.network)
     gas_limit = int(item.source_token_gas_limit or owner.client.NATIVE_GAS_LIMIT)
     balance_units = owner.client.get_balance_wei(params.network, item.source_addr)
     total_send_units = item.value_units + item.reserve_units
@@ -2787,6 +2832,19 @@ def _relay_preflight_1m_native_source(
         if balance_units < required_units:
             current_text = owner._gas_fee_amount_text(params.network, balance_units)
             required_text = owner._gas_fee_amount_text(params.network, required_units)
+            with _relay_defer_record_writes(owner):
+                for item in source_items:
+                    item.relay_record = owner.relay_wallet_store.update_record(
+                        item.relay_addr,
+                        batch_id=item.relay_record.batch_id,
+                        status="created",
+                        transfer_amount="",
+                        transfer_units="",
+                        last_error="",
+                    )
+                    item.amount_text = ""
+                    item.value_units = 0
+                _relay_flush_record_writes(owner)
             raise RuntimeError(
                 f"一对多中转整批余额不足：当前 {current_text}，本批 {len(source_items)} 笔至少需要 {required_text}"
             )

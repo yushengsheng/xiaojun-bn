@@ -28,6 +28,7 @@ from exchange_constants import (
     LADDER_MIN_POOL_NOTIONAL_DEFAULT,
     LADDER_SELL_PREMIUM_DEFAULT,
     LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
+    MARKET_STAGGER_ENABLED_DEFAULT,
     MARKET_STOP_MODE_BNB,
     MARKET_STOP_MODE_DEFAULT,
     MARKET_STOP_MODE_OPTIONS,
@@ -82,6 +83,7 @@ class Strategy:
         trade_account_type: str = TRADE_ACCOUNT_TYPE_DEFAULT,
         trade_mode: str = TRADE_MODE_DEFAULT,
         market_stop_mode: str = MARKET_STOP_MODE_DEFAULT,
+        market_initial_stagger: bool = MARKET_STAGGER_ENABLED_DEFAULT,
         premium_delta: Decimal | None = None,
         premium_order_count: int = PREMIUM_ORDER_COUNT_DEFAULT,
         premium_append_threshold: Decimal | None = None,
@@ -115,6 +117,7 @@ class Strategy:
         self.trade_account_type = str(trade_account_type or TRADE_ACCOUNT_TYPE_DEFAULT)
         self.trade_mode = str(trade_mode or TRADE_MODE_DEFAULT)
         self.market_stop_mode = str(market_stop_mode or MARKET_STOP_MODE_DEFAULT)
+        self.market_initial_stagger = bool(market_initial_stagger)
         self.premium_delta = Decimal(str(premium_delta if premium_delta is not None else "0"))
         self.premium_order_count = max(0, int(premium_order_count or 0))
         self.premium_append_threshold = Decimal(
@@ -2250,6 +2253,14 @@ class Strategy:
                 logger.info("检测到停止信号，停止后续执行（现货阶段）")
                 return
             logger.error("现货轮开始前归集 %s 到现货失败：%s；后续轮次将仅使用现货账户已有余额", quote_asset, e)
+
+        if self.market_initial_stagger:
+            logger.info("市价交错执行：首次买入前等待一个随机延迟周期")
+            self._emit_progress(progress_cb, 0, total_steps, "市价交错等待首次买入")
+            self.sleep_fn()
+            if stop_event and stop_event.is_set():
+                logger.info("市价交错等待被停止，停止后续执行（现货阶段）")
+                return
 
         i = 0
         while bnb_stop_mode or i < self.spot_rounds:

@@ -138,6 +138,91 @@ class _MarketBnbStopClient:
 
 
 class ExchangeMarketRoundFailureTests(unittest.TestCase):
+    def test_batch_market_stagger_waits_odd_selected_positions_only(self):
+        waits = [
+            ExchangeAppBatchMixin._batch_market_stagger_wait_required(
+                enabled=True,
+                batch_position=position,
+                account_count=5,
+                max_threads=5,
+                trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+                trade_mode=TRADE_MODE_MARKET,
+                spot_rounds=3,
+                market_stop_mode=MARKET_STOP_MODE_DEFAULT,
+            )
+            for position in range(1, 6)
+        ]
+
+        self.assertEqual(waits, [True, False, True, False, True])
+
+    def test_batch_market_stagger_is_disabled_outside_multi_thread_market_rounds(self):
+        common = {
+            "enabled": True,
+            "batch_position": 1,
+            "account_count": 2,
+            "max_threads": 2,
+            "trade_account_type": TRADE_ACCOUNT_TYPE_SPOT,
+            "trade_mode": TRADE_MODE_MARKET,
+            "spot_rounds": 1,
+            "market_stop_mode": MARKET_STOP_MODE_DEFAULT,
+        }
+        for override in (
+            {"enabled": False},
+            {"account_count": 1},
+            {"max_threads": 1},
+            {"trade_mode": TRADE_MODE_LIMIT},
+            {"spot_rounds": 0},
+        ):
+            with self.subTest(override=override):
+                self.assertFalse(
+                    ExchangeAppBatchMixin._batch_market_stagger_wait_required(**(common | override))
+                )
+
+    def test_market_initial_stagger_adds_one_wait_before_first_buy(self):
+        client = _MarketRoundTransientFailureClient()
+        strategy = Strategy(
+            client=client,
+            spot_rounds=1,
+            withdraw_coin="USDT",
+            withdraw_address="",
+            withdraw_network="BSC",
+            withdraw_fee_buffer=0,
+            spot_symbol="BTCUSDT",
+            sleep_fn=lambda: client.calls.append(("sleep", "")),
+            enable_withdraw=False,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            trade_mode=TRADE_MODE_MARKET,
+            market_initial_stagger=True,
+        )
+
+        strategy.run(stop_event=_NoDelayStop())
+
+        first_sleep = client.calls.index(("sleep", ""))
+        first_buy = client.calls.index(("buy", "BTCUSDT"))
+        self.assertLess(first_sleep, first_buy)
+        self.assertEqual(client.calls.count(("sleep", "")), 3)
+
+    def test_market_default_keeps_first_buy_before_random_wait(self):
+        client = _MarketRoundTransientFailureClient()
+        strategy = Strategy(
+            client=client,
+            spot_rounds=1,
+            withdraw_coin="USDT",
+            withdraw_address="",
+            withdraw_network="BSC",
+            withdraw_fee_buffer=0,
+            spot_symbol="BTCUSDT",
+            sleep_fn=lambda: client.calls.append(("sleep", "")),
+            enable_withdraw=False,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
+            trade_mode=TRADE_MODE_MARKET,
+        )
+
+        strategy.run(stop_event=_NoDelayStop())
+
+        self.assertLess(client.calls.index(("buy", "BTCUSDT")), client.calls.index(("sleep", "")))
+        self.assertEqual(client.calls.count(("sleep", "")), 2)
+
     def test_account_bnb_topup_selection_controls_only_that_account(self):
         enabled_account = {"api_key": "enabled-key"}
         recreated_enabled_account = {"api_key": "enabled-key"}

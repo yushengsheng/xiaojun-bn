@@ -2042,6 +2042,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             mode=TRADE_MODE_MARKET,
             spot_rounds=0,
             market_stop_mode=MARKET_STOP_MODE_DEFAULT,
+            market_stagger_enabled=False,
             bnb_fee_stop="",
             earn_asset="USDT",
             earn_amount="12.5",
@@ -2055,6 +2056,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
             self.trade_account_type_var = _SimpleVar(account_type)
             self.trade_mode_var = _SimpleVar(mode)
             self.market_stop_mode_var = _SimpleVar(market_stop_mode)
+            self.market_stagger_enabled_var = _SimpleVar(market_stagger_enabled)
             self.spot_symbol_var = _SimpleVar("BTCUSDT")
             self.spot_rounds_var = _SimpleVar(spot_rounds)
             self.futures_rounds_var = _SimpleVar(20)
@@ -2086,8 +2088,16 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     if (
         market_zero_settings.get("spot_rounds") != 0
         or market_zero_settings.get("market_stop_mode") != MARKET_STOP_MODE_DEFAULT
+        or market_zero_settings.get("market_stagger_enabled") is not False
     ):
         raise RuntimeError(f"0轮市价参数自检失败：轮次未保留为0（{market_zero_settings}）")
+    market_stagger_settings = _SelftestTradeSettingsProbe(
+        mode=TRADE_MODE_MARKET,
+        spot_rounds=1,
+        market_stagger_enabled=True,
+    )._collect_trade_mode_settings()
+    if market_stagger_settings.get("market_stagger_enabled") is not True:
+        raise RuntimeError(f"市价交错执行参数自检失败（{market_stagger_settings}）")
     market_bnb_stop_settings = _SelftestTradeSettingsProbe(
         mode=TRADE_MODE_MARKET,
         spot_rounds=0,

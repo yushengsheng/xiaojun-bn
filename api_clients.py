@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import importlib
 import json
+import logging
 import os
 import re
 import sys
@@ -15,6 +16,7 @@ import time
 from typing import Callable
 
 import requests
+from urllib3.util import Timeout
 
 from core_models import EvmToken, GeneratedWalletEntry
 from system_proxy import configure_requests_session_for_proxy, resolve_proxy_route
@@ -47,6 +49,9 @@ class EvmClient:
     ERC20_DEFAULT_GAS_LIMIT = 70000
     RPC_CONNECT_TIMEOUT = 5
     RPC_READ_TIMEOUT = 20
+    GAS_PRICE_CACHE_SECONDS = 3.0
+    GAS_PRICE_HISTORY_BLOCKS = 20
+    GAS_PRICE_HISTORY_TIMEOUT = 8.0
     NETWORKS = {
         "ETH": {
             "chain_id": 1,
@@ -100,6 +105,10 @@ class EvmClient:
         self._rpc_sessions: dict[int, requests.Session] = {}
         self._preferred_rpc_urls_lock = threading.Lock()
         self._preferred_rpc_urls: dict[str, str] = {}
+        self._preferred_receipt_rpc_urls: dict[str, str] = {}
+        self._receipt_rpc_cooldowns: dict[tuple[str, str], float] = {}
+        self._gas_price_locks = {network: threading.Lock() for network in self.NETWORKS}
+        self._gas_price_cache: dict[str, tuple[float, int]] = {}
 
     def _allow_system_proxy_now(self) -> bool:
         if self._allow_system_proxy_provider is None:
@@ -418,9 +427,13 @@ class EvmClient:
         params: list,
         *,
         require_positive_hex_result: bool = False,
+        try_next_on_null_result: bool = False,
+        timeout_seconds: float | None = None,
+        stop_event: threading.Event | None = None,
     ) -> object:
         info = self._network_info(network)
-        max_attempts = 2
+        deadline = None if timeout_seconds is None else time.monotonic() + max(0.0, float(timeout_seconds))
+        max_attempts = 1 if deadline is not None or try_next_on_null_result else 2
         payload = {
             "jsonrpc": "2.0",
             "id": int(time.time() * 1000),
@@ -430,9 +443,30 @@ class EvmClient:
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
         last_err = ""
+        saw_null_result = False
         rpc_urls = self._ordered_rpc_urls(network, list(info["rpc_urls"]))
-        for url in rpc_urls:
+        if try_next_on_null_result:
+            with self._preferred_rpc_urls_lock:
+                receipt_preferred = self._preferred_receipt_rpc_urls.get(network, "")
+                cooldowns = dict(self._receipt_rpc_cooldowns)
+            now = time.monotonic()
+            rpc_urls.sort(key=lambda url: (cooldowns.get((network, url), 0.0) > now, url != receipt_preferred))
+        for url_index, url in enumerate(rpc_urls):
             for attempt in range(1, max_attempts + 1):
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("任务已停止")
+                request_timeout = (self.RPC_CONNECT_TIMEOUT, self.RPC_READ_TIMEOUT)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError(f"{network} RPC 查询超时：{method}")
+                    # 为备用节点留出时间，避免一个慢节点耗尽整轮回执查询。
+                    node_budget = remaining / (len(rpc_urls) - url_index)
+                    request_timeout = Timeout(
+                        total=node_budget,
+                        connect=min(self.RPC_CONNECT_TIMEOUT, node_budget),
+                        read=min(self.RPC_READ_TIMEOUT, node_budget),
+                    )
                 session = None
                 proxy_url = ""
                 try:
@@ -441,7 +475,7 @@ class EvmClient:
                         url,
                         data=body,
                         headers={"Content-Type": "application/json"},
-                        timeout=(self.RPC_CONNECT_TIMEOUT, self.RPC_READ_TIMEOUT),
+                        timeout=request_timeout,
                     )
                     text = resp.text
                     if resp.status_code >= 400:
@@ -456,9 +490,17 @@ class EvmClient:
                         msg = err.get("message")
                         raise RuntimeError(f"RPC({url}) code={code} msg={msg}")
                     result = j.get("result")
+                    if try_next_on_null_result and result is None:
+                        # 节点可能尚未同步到交易；空回执不能锁定为首选节点。
+                        saw_null_result = True
+                        break
                     if require_positive_hex_result and self._int_from_hex(result) <= 0:
                         raise RuntimeError(f"RPC({url}) {method} 返回无效结果：{result}")
                     self._remember_preferred_rpc_url(network, url)
+                    if try_next_on_null_result:
+                        with self._preferred_rpc_urls_lock:
+                            self._preferred_receipt_rpc_urls[network] = url
+                            self._receipt_rpc_cooldowns.pop((network, url), None)
                     return result
                 except Exception as exc:
                     err_text = str(exc)
@@ -467,10 +509,15 @@ class EvmClient:
                     if proxy_url and "Missing dependencies for SOCKS support" in err_text:
                         err_text = f"当前代理为 SOCKS，但运行环境缺少 PySocks：{proxy_url}"
                     last_err = err_text
+                    if try_next_on_null_result:
+                        with self._preferred_rpc_urls_lock:
+                            self._receipt_rpc_cooldowns[(network, url)] = time.monotonic() + 30.0
                     if attempt < max_attempts:
                         time.sleep(2.0)
                         continue
                     break
+        if saw_null_result:
+            return None
         raise RuntimeError(f"{network} RPC 请求失败：{last_err}")
 
     @staticmethod
@@ -605,28 +652,86 @@ class EvmClient:
         result = self._rpc_call(network, "eth_getTransactionCount", [address, "latest"])
         return self._int_from_hex(result)
 
-    def get_transaction_receipt(self, network: str, tx_hash: str) -> dict | None:
+    def get_transaction_receipt(
+        self, network: str, tx_hash: str, *,
+        timeout_seconds: float | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> dict | None:
         txid = self._ensure_hex_prefixed(str(tx_hash or "").strip())
         if not re.fullmatch(r"0x[a-fA-F0-9]{64}", txid):
             raise RuntimeError(f"交易哈希格式错误：{tx_hash}")
-        result = self._rpc_call(network, "eth_getTransactionReceipt", [txid])
+        result = self._rpc_call(
+            network, "eth_getTransactionReceipt", [txid], try_next_on_null_result=True,
+            timeout_seconds=15.0 if timeout_seconds is None else timeout_seconds, stop_event=stop_event,
+        )
         if result is None:
             return None
         if not isinstance(result, dict):
             raise RuntimeError(f"交易回执格式异常：{result}")
         return dict(result)
 
+    @classmethod
+    def _gas_price_from_fee_history(cls, history: object) -> int:
+        if not isinstance(history, dict):
+            raise ValueError("近期区块费用格式异常")
+        rewards = history.get("reward")
+        base_fees = history.get("baseFeePerGas")
+        if (
+            not isinstance(rewards, list)
+            or not 3 <= len(rewards) <= cls.GAS_PRICE_HISTORY_BLOCKS
+            or not isinstance(base_fees, list)
+            or len(base_fees) != len(rewards) + 1
+        ):
+            raise ValueError("近期区块费用样本不足或格式异常")
+
+        def quantity(value: object) -> int:
+            if not isinstance(value, str) or not re.fullmatch(r"0x[0-9a-fA-F]+", value):
+                raise ValueError("近期区块费用数值异常")
+            return int(value, 16)
+
+        bases = [quantity(value) for value in base_fees]
+        tips = []
+        for row in rewards:
+            if not isinstance(row, list) or len(row) != 1:
+                raise ValueError("近期区块费用分位数异常")
+            tip = quantity(row[0])
+            if tip > 0:
+                tips.append(tip)
+        if len(tips) < 3:
+            raise ValueError("近期区块有效费用样本不足")
+        tips.sort()
+        middle = len(tips) // 2
+        # 各区块按 gas 用量加权的 P50，再取跨区块中位数，避免个别高价交易拉高报价。
+        median_tip = tips[middle] if len(tips) % 2 else (tips[middle - 1] + tips[middle] + 1) // 2
+        # 最后一项是下一块基础费；全程整数计算并向上取整，兼容 BSC 的零基础费。
+        return ((bases[-1] + median_tip) * 110 + 99) // 100
+
     def get_gas_price_wei(self, network: str) -> int:
-        result = self._rpc_call(
-            network,
-            "eth_gasPrice",
-            [],
-            require_positive_hex_result=True,
-        )
-        val = self._int_from_hex(result)
-        if val <= 0:
-            raise RuntimeError("读取 gasPrice 失败")
-        return val
+        net = network.strip().upper()
+        self._network_info(net)
+        # 同网络并发钱包共用短期报价，不让每笔交易都查询一遍历史区块。
+        with self._gas_price_locks[net]:
+            cached = self._gas_price_cache.get(net)
+            if cached is not None and time.monotonic() - cached[0] < self.GAS_PRICE_CACHE_SECONDS:
+                return cached[1]
+            result = self._rpc_call(net, "eth_gasPrice", [], require_positive_hex_result=True)
+            node_price = self._int_from_hex(result)
+            if node_price <= 0:
+                raise RuntimeError("读取 gasPrice 失败")
+            price = node_price
+            logger = logging.getLogger("bot")
+            try:
+                history = self._rpc_call(
+                    net, "eth_feeHistory", [hex(self.GAS_PRICE_HISTORY_BLOCKS), "latest", [50]],
+                    timeout_seconds=self.GAS_PRICE_HISTORY_TIMEOUT,
+                )
+                price = max(node_price, self._gas_price_from_fee_history(history))
+            except Exception as exc:
+                logger.warning("%s 近期区块估费不可用（%s），回退节点建议价 %s wei", net, type(exc).__name__, node_price)
+            else:
+                logger.info("%s 动态估费：节点建议 %s wei，采用 %s wei", net, node_price, price)
+            self._gas_price_cache[net] = (time.monotonic(), price)
+            return price
 
     def estimate_erc20_transfer_gas(self, network: str, from_address: str, contract: str, to_address: str, amount_units: int) -> int:
         data = "0xa9059cbb" + self._abi_encode_address(to_address) + self._abi_encode_uint(amount_units)
