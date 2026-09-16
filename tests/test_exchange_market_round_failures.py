@@ -138,11 +138,10 @@ class _MarketBnbStopClient:
 
 
 class ExchangeMarketRoundFailureTests(unittest.TestCase):
-    def test_batch_market_stagger_waits_odd_selected_positions_only(self):
-        waits = [
-            ExchangeAppBatchMixin._batch_market_stagger_wait_required(
+    def test_batch_market_stagger_enables_strict_coordination_for_multiple_workers(self):
+        self.assertTrue(
+            ExchangeAppBatchMixin._batch_market_stagger_enabled(
                 enabled=True,
-                batch_position=position,
                 account_count=5,
                 max_threads=5,
                 trade_account_type=TRADE_ACCOUNT_TYPE_SPOT,
@@ -150,15 +149,11 @@ class ExchangeMarketRoundFailureTests(unittest.TestCase):
                 spot_rounds=3,
                 market_stop_mode=MARKET_STOP_MODE_DEFAULT,
             )
-            for position in range(1, 6)
-        ]
-
-        self.assertEqual(waits, [True, False, True, False, True])
+        )
 
     def test_batch_market_stagger_is_disabled_outside_multi_thread_market_rounds(self):
         common = {
             "enabled": True,
-            "batch_position": 1,
             "account_count": 2,
             "max_threads": 2,
             "trade_account_type": TRADE_ACCOUNT_TYPE_SPOT,
@@ -175,7 +170,7 @@ class ExchangeMarketRoundFailureTests(unittest.TestCase):
         ):
             with self.subTest(override=override):
                 self.assertFalse(
-                    ExchangeAppBatchMixin._batch_market_stagger_wait_required(**(common | override))
+                    ExchangeAppBatchMixin._batch_market_stagger_enabled(**(common | override))
                 )
 
     def test_market_initial_stagger_adds_one_wait_before_first_buy(self):

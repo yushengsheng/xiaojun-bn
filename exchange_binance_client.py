@@ -2538,6 +2538,24 @@ class BinanceClient:
                 raise RuntimeError(f"订单未成交，状态={status}")
             time.sleep(max(0.2, float(poll_interval)))
 
+    def _confirm_spot_market_order_filled(self, symbol: str, order_data: dict):
+        if not isinstance(order_data, dict):
+            raise RuntimeError("市价订单返回格式异常，无法确认成交")
+        status = str(order_data.get("status") or "").strip().upper()
+        if status == "FILLED":
+            return order_data
+        if status in {"CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+            raise RuntimeError(f"市价订单未成交，状态={status}")
+        order_id = order_data.get("orderId")
+        if order_id in (None, ""):
+            raise RuntimeError("市价订单返回缺少 orderId，无法确认成交")
+        return self.wait_order_filled(
+            symbol,
+            order_id,
+            stop_event=self._request_stop_event,
+            poll_interval=0.2,
+        )
+
     def get_order_average_price(self, order_data: dict) -> Decimal | None:
         if not isinstance(order_data, dict):
             return None
@@ -2689,7 +2707,7 @@ class BinanceClient:
                 f"{symbol_u} 买入金额过小：{self._format_decimal(amount)} < 最小下单额 {self._format_decimal(rules['minNotional'])}"
             )
 
-        self.request(
+        order = self.request(
             self.spot,
             "POST",
             "/api/v3/order",
@@ -2698,8 +2716,10 @@ class BinanceClient:
                 "side": "BUY",
                 "type": "MARKET",
                 "quoteOrderQty": self._format_decimal(amount),
+                "newOrderRespType": "RESULT",
             },
         )
+        self._confirm_spot_market_order_filled(symbol_u, order)
         logger.info("现货市价买入 %s，使用 %s 金额 %s", symbol_u, quote_asset, self._format_decimal(amount))
         return True
 
@@ -2861,7 +2881,7 @@ class BinanceClient:
                 )
                 return False
 
-        self.request(
+        order = self.request(
             self.spot,
             "POST",
             "/api/v3/order",
@@ -2870,8 +2890,10 @@ class BinanceClient:
                 "side": "SELL",
                 "type": "MARKET",
                 "quantity": format(qty.normalize(), "f"),
+                "newOrderRespType": "RESULT",
             },
         )
+        self._confirm_spot_market_order_filled(symbol, order)
         logger.info("现货市价卖出 %s，数量 %s", symbol, format(qty.normalize(), "f"))
         return True
 

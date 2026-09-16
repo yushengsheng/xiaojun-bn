@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import unittest
 from decimal import Decimal
+from unittest.mock import patch
 
 from exchange_app_config import ExchangeAppConfigMixin
 from exchange_binance_client import BinanceClient
@@ -152,6 +153,30 @@ class ExchangeSymbolNormalizationTests(unittest.TestCase):
         self.assertEqual(client.orders[3]["symbol"], "ALPHAXYZ")
         self.assertEqual(client.orders[3]["side"], "SELL")
         self.assertEqual(client.orders[3]["quantity"], "7")
+        self.assertTrue(all(order["newOrderRespType"] == "RESULT" for order in client.orders))
+
+    def test_market_order_waits_until_exchange_reports_filled(self) -> None:
+        client = BinanceClient("test-key", "test-secret")
+        try:
+            with patch.object(
+                client,
+                "wait_order_filled",
+                return_value={"orderId": 7, "status": "FILLED"},
+            ) as wait_filled:
+                result = client._confirm_spot_market_order_filled(
+                    "BTCUSDT",
+                    {"orderId": 7, "status": "NEW"},
+                )
+        finally:
+            client.close()
+
+        self.assertEqual(result["status"], "FILLED")
+        wait_filled.assert_called_once_with(
+            "BTCUSDT",
+            7,
+            stop_event=None,
+            poll_interval=0.2,
+        )
 
     def test_reverse_resolution_is_limited_to_market_zero_round(self) -> None:
         client = _DirectionalMarketClient()

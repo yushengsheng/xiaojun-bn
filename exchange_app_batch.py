@@ -16,6 +16,7 @@ from exchange_app_base import (
     LADDER_SELL_PREMIUM_DEFAULT,
     LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
     MARKET_STAGGER_ENABLED_DEFAULT,
+    MarketStaggerCoordinator,
     MARKET_STOP_MODE_BNB,
     MARKET_STOP_MODE_DEFAULT,
     PREMIUM_APPEND_THRESHOLD_DEFAULT,
@@ -87,10 +88,9 @@ class ExchangeAppBatchMixin(object):
         )
 
     @staticmethod
-    def _batch_market_stagger_wait_required(
+    def _batch_market_stagger_enabled(
         *,
         enabled: bool,
-        batch_position: int,
         account_count: int,
         max_threads: int,
         trade_account_type: str,
@@ -106,7 +106,6 @@ class ExchangeAppBatchMixin(object):
             and trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
             and trade_mode == TRADE_MODE_MARKET
             and market_has_rounds
-            and int(batch_position) % 2 == 1
         )
 
     @staticmethod
@@ -2901,6 +2900,8 @@ class ExchangeAppBatchMixin(object):
         self.btn_withdraw.config(state="disabled")
         self._set_account_manage_buttons_state("disabled")
         self._set_combo_states_for_run(True)
+        total_accounts = len(selected)
+        worker_count = min(max_threads, total_accounts)
 
         if preflight_required:
             if trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
@@ -2908,22 +2909,41 @@ class ExchangeAppBatchMixin(object):
             else:
                 self.status_var.set("状态：初始化连接/校验交易对中...")
         elif batch_total_asset_only:
-            self.status_var.set(f"状态：查询全部总资产中 (并发 {max_threads} 线程)...")
+            self.status_var.set(f"状态：查询全部总资产中 (并发 {worker_count} 线程)...")
         elif batch_collect_bnb_mode:
-            self.status_var.set(f"状态：归集BNB并提现中 (并发 {max_threads} 线程)...")
+            self.status_var.set(f"状态：归集BNB并提现中 (并发 {worker_count} 线程)...")
         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
             action_text = "开启自动申购" if earn_auto_subscribe_only else "理财存入"
-            self.status_var.set(f"状态：{action_text}中 (并发 {max_threads} 线程)...")
+            self.status_var.set(f"状态：{action_text}中 (并发 {worker_count} 线程)...")
         else:
-            self.status_var.set(f"状态：批量执行中 (并发 {max_threads} 线程)...")
+            self.status_var.set(f"状态：批量执行中 (并发 {worker_count} 线程)...")
 
         self.progress["value"] = 0
-        total_accounts = len(selected)
         self.progress["maximum"] = total_accounts
+
+        strict_market_stagger = self._batch_market_stagger_enabled(
+            enabled=market_stagger_enabled,
+            account_count=total_accounts,
+            max_threads=worker_count,
+            trade_account_type=trade_account_type,
+            trade_mode=trade_mode,
+            spot_rounds=spot_rounds,
+            market_stop_mode=market_stop_mode,
+        )
+        market_stagger_coordinator = (
+            MarketStaggerCoordinator(range(1, worker_count + 1))
+            if strict_market_stagger
+            else None
+        )
+        if market_stagger_coordinator is not None:
+            logger.info(
+                "市价严格交错已启用：%d 个工作线程，奇数线程与偶数线程反相执行",
+                worker_count,
+            )
 
         task_queue = queue.Queue()
         for batch_pos, acc in enumerate(selected, start=1):
-            task_queue.put((batch_pos, self._account_display_index(acc, batch_pos), acc))
+            task_queue.put((self._account_display_index(acc, batch_pos), acc))
 
         completed_count = 0
         count_lock = threading.Lock()
@@ -2942,8 +2962,10 @@ class ExchangeAppBatchMixin(object):
         def worker_loop(thread_id):
             while not self.stop_event.is_set():
                 try:
-                    batch_position, idx, acc = task_queue.get(timeout=1)
+                    idx, acc = task_queue.get(timeout=1)
                 except queue.Empty:
+                    if market_stagger_coordinator is not None:
+                        market_stagger_coordinator.unregister(thread_id)
                     clear_exchange_account_log_index()
                     return
                 set_exchange_account_log_index(idx)
@@ -3514,16 +3536,8 @@ class ExchangeAppBatchMixin(object):
                             trade_account_type=trade_account_type,
                             trade_mode=trade_mode,
                             market_stop_mode=market_stop_mode,
-                            market_initial_stagger=self._batch_market_stagger_wait_required(
-                                enabled=market_stagger_enabled,
-                                batch_position=batch_position,
-                                account_count=total_accounts,
-                                max_threads=max_threads,
-                                trade_account_type=trade_account_type,
-                                trade_mode=trade_mode,
-                                spot_rounds=spot_rounds,
-                                market_stop_mode=market_stop_mode,
-                            ),
+                            market_stagger_coordinator=market_stagger_coordinator,
+                            market_stagger_lane_id=thread_id,
                             premium_delta=premium_delta_value,
                             premium_order_count=premium_order_count,
                             premium_append_threshold=premium_append_threshold_value,
@@ -3641,6 +3655,9 @@ class ExchangeAppBatchMixin(object):
                         logger.info(f"[线程 {thread_id}] 账号 #{idx} 处理完毕")
                     clear_exchange_account_log_index()
 
+            if market_stagger_coordinator is not None:
+                market_stagger_coordinator.unregister(thread_id)
+
         def controller():
             nonlocal validated_quote_asset, validated_earn_product_id
             if preflight_required:
@@ -3710,14 +3727,14 @@ class ExchangeAppBatchMixin(object):
                     def _set_running_status():
                         self._set_retry_failed_button_state()
                         if batch_total_asset_only:
-                            self.status_var.set(f"状态：查询全部总资产中 (并发 {max_threads} 线程)...")
+                            self.status_var.set(f"状态：查询全部总资产中 (并发 {worker_count} 线程)...")
                         elif batch_collect_bnb_mode:
-                            self.status_var.set(f"状态：归集BNB并提现中 (并发 {max_threads} 线程)...")
+                            self.status_var.set(f"状态：归集BNB并提现中 (并发 {worker_count} 线程)...")
                         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
                             action_text = "开启自动申购" if earn_auto_subscribe_only else "理财存入"
-                            self.status_var.set(f"状态：{action_text}中 (并发 {max_threads} 线程)...")
+                            self.status_var.set(f"状态：{action_text}中 (并发 {worker_count} 线程)...")
                         else:
-                            self.status_var.set(f"状态：批量执行中 (并发 {max_threads} 线程)...")
+                            self.status_var.set(f"状态：批量执行中 (并发 {worker_count} 线程)...")
 
                     self._dispatch_ui(_set_running_status)
                 except Exception as e:
@@ -3732,8 +3749,8 @@ class ExchangeAppBatchMixin(object):
                 finally:
                     self._close_binance_client_instance(validate_client)
             threads = []
-            logger.info(f"启动 {max_threads} 个工作线程处理 {total_accounts} 个账号")
-            for i in range(max_threads):
+            logger.info(f"启动 {worker_count} 个工作线程处理 {total_accounts} 个账号")
+            for i in range(worker_count):
                 t = threading.Thread(target=worker_loop, args=(i + 1,), daemon=True)
                 t.start()
                 threads.append(t)

@@ -104,7 +104,7 @@ from exchange_logging import (
     set_exchange_account_log_index,
 )
 from exchange_proxy_runtime import ExchangeProxyRuntime, http_get_via_proxy
-from exchange_strategy import CombinedStopEvent, Strategy
+from exchange_strategy import CombinedStopEvent, MarketStaggerCoordinator, Strategy
 from operation_journal import OperationJournal
 from secret_box import SECRET_BOX
 from shared_utils import (

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from contextlib import nullcontext
 from decimal import Decimal
@@ -60,6 +61,165 @@ def _normalize_futures_margin_type(value) -> str:
     return FUTURES_MARGIN_TYPE_LABEL_TO_VALUE.get(text, FUTURES_MARGIN_TYPE_DEFAULT)
 
 
+class MarketStaggerCoordinator:
+    """Keep market-order worker lanes in two strictly alternating phase groups."""
+
+    def __init__(self, lane_ids):
+        self._condition = threading.Condition()
+        self._known_lanes = {max(1, int(lane_id)) for lane_id in lane_ids}
+        self._active_lanes = set(self._known_lanes)
+        self._phase = 0
+        self._phase_open = False
+        self._phase_tokens: dict[int, dict[str, object]] = {}
+        self._pending: dict[int, dict[str, object]] = {}
+
+    @staticmethod
+    def _side_for_phase(lane_id: int, phase: int) -> str | None:
+        odd_lane = int(lane_id) % 2 == 1
+        if phase == 0:
+            return "BUY" if odd_lane else None
+        if phase % 2 == 1:
+            return "SELL" if odd_lane else "BUY"
+        return "BUY" if odd_lane else "SELL"
+
+    def _expected_lanes_locked(self) -> dict[int, str]:
+        while self._known_lanes:
+            for lane_id, token in tuple(self._pending.items()):
+                if (
+                    lane_id in self._known_lanes
+                    and lane_id not in self._active_lanes
+                    and self._side_for_phase(lane_id, self._phase) == token["side"]
+                ):
+                    self._active_lanes.add(lane_id)
+            expected = {
+                lane_id: side
+                for lane_id in self._active_lanes
+                if (side := self._side_for_phase(lane_id, self._phase)) is not None
+            }
+            if expected:
+                return expected
+            if not self._active_lanes and not any(
+                lane_id in self._known_lanes for lane_id in self._pending
+            ):
+                return {}
+            self._phase += 1
+        return {}
+
+    def _try_open_phase_locked(self) -> None:
+        if self._phase_open:
+            return
+        expected = self._expected_lanes_locked()
+        if not expected:
+            self._condition.notify_all()
+            return
+        for lane_id, side in expected.items():
+            token = self._pending.get(lane_id)
+            if token is None or token["side"] != side:
+                return
+        self._phase_open = True
+        self._phase_tokens = {lane_id: self._pending[lane_id] for lane_id in expected}
+        for token in self._phase_tokens.values():
+            token["released"] = True
+        self._condition.notify_all()
+
+    def _try_finish_phase_locked(self) -> None:
+        if not self._phase_open:
+            self._try_open_phase_locked()
+            return
+        if any(not bool(token["finished"]) for token in self._phase_tokens.values()):
+            return
+        completed_tokens = tuple(self._phase_tokens.items())
+        for lane_id, token in completed_tokens:
+            if self._pending.get(lane_id) is token:
+                self._pending.pop(lane_id, None)
+            token["phase_done"] = True
+        self._phase_tokens = {}
+        self._phase_open = False
+        self._phase += 1
+        self._condition.notify_all()
+        self._try_open_phase_locked()
+
+    def _suspend_locked(self, lane: int) -> None:
+        self._active_lanes.discard(lane)
+        pending = self._pending.pop(lane, None)
+        if pending is not None:
+            pending["cancelled"] = True
+            pending["phase_done"] = True
+        phase_token = self._phase_tokens.pop(lane, None)
+        if phase_token is not None:
+            phase_token["cancelled"] = True
+            phase_token["finished"] = True
+            phase_token["phase_done"] = True
+        self._try_finish_phase_locked()
+        self._try_open_phase_locked()
+        self._condition.notify_all()
+
+    def suspend(self, lane_id: int) -> None:
+        lane = max(1, int(lane_id))
+        with self._condition:
+            if lane in self._known_lanes:
+                self._suspend_locked(lane)
+
+    def unregister(self, lane_id: int) -> None:
+        lane = max(1, int(lane_id))
+        with self._condition:
+            self._known_lanes.discard(lane)
+            self._suspend_locked(lane)
+
+    def execute(self, lane_id: int, side: str, action, stop_event=None):
+        lane = max(1, int(lane_id))
+        side_u = str(side or "").strip().upper()
+        if side_u not in {"BUY", "SELL"}:
+            raise ValueError(f"不支持的市价交错方向：{side}")
+
+        token: dict[str, object] = {
+            "side": side_u,
+            "released": False,
+            "finished": False,
+            "phase_done": False,
+            "cancelled": False,
+        }
+        bypass_coordination = False
+        with self._condition:
+            if lane not in self._known_lanes:
+                bypass_coordination = True
+            else:
+                if lane in self._pending:
+                    raise RuntimeError(f"市价交错线程 {lane} 存在未完成动作")
+                self._pending[lane] = token
+                self._try_open_phase_locked()
+            while not bypass_coordination and not bool(token["released"]):
+                if bool(token["cancelled"]):
+                    raise RetryAborted("市价交错等待已取消")
+                if stop_event is not None and stop_event.is_set():
+                    self._suspend_locked(lane)
+                    raise RetryAborted("检测到停止信号")
+                self._condition.wait(timeout=0.1)
+
+        if bypass_coordination:
+            return action()
+
+        result = None
+        action_error = None
+        try:
+            result = action()
+        except BaseException as exc:
+            action_error = exc
+        finally:
+            with self._condition:
+                token["finished"] = True
+                self._try_finish_phase_locked()
+                while not bool(token["phase_done"]):
+                    if stop_event is not None and stop_event.is_set():
+                        self._suspend_locked(lane)
+                        break
+                    self._condition.wait(timeout=0.1)
+
+        if action_error is not None:
+            raise action_error
+        return result
+
+
 class Strategy:
     TRADE_OPERATION_RETRY_POLICY = RetryPolicy(attempts=10, delay_seconds=1)
     LADDER_POLL_INTERVAL_SECONDS = 1.5
@@ -84,6 +244,8 @@ class Strategy:
         trade_mode: str = TRADE_MODE_DEFAULT,
         market_stop_mode: str = MARKET_STOP_MODE_DEFAULT,
         market_initial_stagger: bool = MARKET_STAGGER_ENABLED_DEFAULT,
+        market_stagger_coordinator: MarketStaggerCoordinator | None = None,
+        market_stagger_lane_id: int = 0,
         premium_delta: Decimal | None = None,
         premium_order_count: int = PREMIUM_ORDER_COUNT_DEFAULT,
         premium_append_threshold: Decimal | None = None,
@@ -118,6 +280,8 @@ class Strategy:
         self.trade_mode = str(trade_mode or TRADE_MODE_DEFAULT)
         self.market_stop_mode = str(market_stop_mode or MARKET_STOP_MODE_DEFAULT)
         self.market_initial_stagger = bool(market_initial_stagger)
+        self.market_stagger_coordinator = market_stagger_coordinator
+        self.market_stagger_lane_id = max(0, int(market_stagger_lane_id or 0))
         self.premium_delta = Decimal(str(premium_delta if premium_delta is not None else "0"))
         self.premium_order_count = max(0, int(premium_order_count or 0))
         self.premium_append_threshold = Decimal(
@@ -2240,6 +2404,29 @@ class Strategy:
         total_steps = 1 if bnb_stop_mode else (self.spot_rounds if self.spot_rounds > 0 else 1)
         step = 0
         base_asset, quote_asset = self._spot_pair_assets()
+        stagger_coordinator = self.market_stagger_coordinator
+        stagger_lane_id = self.market_stagger_lane_id
+
+        def run_market_action(side: str, context: str, action):
+            run_with_retry = lambda: self._run_trade_action_with_retry(stop_event, context, action)
+            if stagger_coordinator is None or stagger_lane_id <= 0:
+                return run_with_retry()
+            return stagger_coordinator.execute(
+                stagger_lane_id,
+                side,
+                run_with_retry,
+                stop_event=stop_event,
+            )
+
+        def complete_stagger_side_without_order(side: str) -> None:
+            if stagger_coordinator is None or stagger_lane_id <= 0:
+                return
+            stagger_coordinator.execute(
+                stagger_lane_id,
+                side,
+                lambda: False,
+                stop_event=stop_event,
+            )
 
         self.ensure_base_sold()
         try:
@@ -2254,7 +2441,7 @@ class Strategy:
                 return
             logger.error("现货轮开始前归集 %s 到现货失败：%s；后续轮次将仅使用现货账户已有余额", quote_asset, e)
 
-        if self.market_initial_stagger:
+        if self.market_initial_stagger and stagger_coordinator is None:
             logger.info("市价交错执行：首次买入前等待一个随机延迟周期")
             self._emit_progress(progress_cb, 0, total_steps, "市价交错等待首次买入")
             self.sleep_fn()
@@ -2276,6 +2463,7 @@ class Strategy:
             round_label = str(round_number) if bnb_stop_mode else "%d/%d" % (round_number, self.spot_rounds)
             total_steps = round_number if bnb_stop_mode else total_steps
             stop_after_round = False
+            round_stage = "BUY"
             logger.info("--- 现货轮 %s 开始 ---", round_label)
 
             try:
@@ -2285,8 +2473,8 @@ class Strategy:
                     total_steps,
                     "现货轮 %s 买入 %s" % (round_label, base_asset),
                 )
-                buy_success = self._run_trade_action_with_retry(
-                    stop_event,
+                buy_success = run_market_action(
+                    "BUY",
                     "现货轮 %s 买入 %s" % (round_label, base_asset),
                     lambda: self.c.spot_buy_all_usdt(symbol=self.spot_symbol, assume_spot_funds_ready=True),
                 )
@@ -2304,13 +2492,15 @@ class Strategy:
                         total_steps,
                         "现货轮 %s 卖出 %s" % (round_label, base_asset),
                     )
-                    self._run_trade_action_with_retry(
-                        stop_event,
+                    round_stage = "SELL"
+                    run_market_action(
+                        "SELL",
                         "现货轮 %s 卖出 %s" % (round_label, base_asset),
                         lambda: self.c.spot_sell_all_base(symbol=self.spot_symbol),
                     )
                 else:
                     logger.info("买入未执行（可能余额不足），跳过本轮卖出")
+                    complete_stagger_side_without_order("SELL")
                     stop_after_round = bnb_stop_mode
 
                 logger.info("--- 现货轮 %d 完成 ---", round_number)
@@ -2321,6 +2511,14 @@ class Strategy:
                     return
                 self._record_market_round_failure(round_number, e)
                 logger.error(f"现货轮 %d 执行异常: {e}", round_number)
+                if round_stage == "BUY":
+                    try:
+                        complete_stagger_side_without_order("SELL")
+                    except Exception as stagger_exc:
+                        if isinstance(stagger_exc, RetryAborted) or (stop_event and stop_event.is_set()):
+                            logger.info("检测到停止信号，停止后续执行（现货阶段）")
+                            return
+                        logger.error("现货轮 %d 交错卖出占位异常: %s", round_number, stagger_exc)
                 stop_after_round = bnb_stop_mode
 
             step += 1
@@ -2780,7 +2978,11 @@ class Strategy:
             elif self._is_convert_mode():
                 self._run_convert_mode(stop_event, progress_cb=progress_cb)
             elif self._mode_name() == TRADE_MODE_MARKET:
-                self._run_market_mode(stop_event, progress_cb=progress_cb)
+                try:
+                    self._run_market_mode(stop_event, progress_cb=progress_cb)
+                finally:
+                    if self.market_stagger_coordinator is not None and self.market_stagger_lane_id > 0:
+                        self.market_stagger_coordinator.suspend(self.market_stagger_lane_id)
             else:
                 self._run_limit_like_mode(stop_event, progress_cb=progress_cb)
 
