@@ -1222,6 +1222,33 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     )
     if withdraw_success is not False or "提现失败" not in str(withdraw_status):
         raise RuntimeError("批量策略状态栏自检失败：开启自动提现时未保持提现结果状态")
+    run_stats_text = ExchangeAppBatchMixin._format_spot_run_trade_statistics(
+        "BTCUSDT",
+        {
+            "quoteAsset": "USDT",
+            "quoteVolume": Decimal("12.345678"),
+            "orderPnl": Decimal("0.123456"),
+        },
+    )
+    run_completion_text = ExchangeAppBatchMixin._spot_strategy_completion_text(
+        TRADE_MODE_MARKET,
+        2,
+        market_round_result,
+    )
+    run_status, run_status_success = ExchangeAppBatchMixin._format_batch_strategy_completion_status(
+        0.0,
+        "USDT",
+        enable_withdraw=False,
+        strategy_result=market_round_result,
+        completion_text=run_completion_text,
+        trade_stats_text=run_stats_text,
+    )
+    if (
+        not run_status_success
+        or "市价2轮结束" not in str(run_status)
+        or "BTCUSDT 交易量≈12.34568 USDT｜盈亏≈+0.12346 USDT" not in str(run_status)
+    ):
+        raise RuntimeError(f"现货完成状态统计自检失败：{run_status}")
     checks.append("spot-market-rounds=ok")
 
     class _SelftestPremiumPartialFillClient:

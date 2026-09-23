@@ -8,14 +8,16 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from exchange_app_accounts import ExchangeAppAccountsMixin
 from exchange_app_batch import ExchangeAppBatchMixin
+from exchange_binance_client import BinanceClient
 from exchange_constants import (
     MARKET_STOP_MODE_BNB,
     MARKET_STOP_MODE_DEFAULT,
     TRADE_ACCOUNT_TYPE_SPOT,
+    TRADE_ACCOUNT_TYPE_FUTURES,
     TRADE_MODE_CONVERT,
     TRADE_MODE_LADDER,
     TRADE_MODE_LIMIT,
@@ -561,11 +563,155 @@ class ExchangeMarketRoundFailureTests(unittest.TestCase):
             0,
             "USDT",
             enable_withdraw=False,
-            completion_text="分仓挂单已结束",
+            completion_text="分仓挂单结束",
         )
 
         self.assertTrue(success)
-        self.assertIn("分仓挂单已结束", status)
+        self.assertIn("分仓挂单结束", status)
+
+    def test_spot_completion_status_appends_current_pair_volume_and_pnl(self):
+        summary = {
+            "quoteAsset": "USDT",
+            "quoteVolume": Decimal("123.456789"),
+            "orderPnl": Decimal("0.123456"),
+        }
+        stats = ExchangeAppBatchMixin._format_spot_run_trade_statistics("btcusdt", summary)
+        self.assertEqual(stats, "BTCUSDT 交易量≈123.45679 USDT｜盈亏≈+0.12346 USDT")
+        completion = ExchangeAppBatchMixin._spot_strategy_completion_text(
+            TRADE_MODE_MARKET,
+            3,
+            {"market_round_completed": 3},
+        )
+        status, success = ExchangeAppBatchMixin._format_batch_strategy_completion_status(
+            0,
+            "USDT",
+            enable_withdraw=False,
+            completion_text=completion,
+            trade_stats_text=stats,
+        )
+        self.assertTrue(success)
+        self.assertEqual(status, f"✔市价3轮结束｜{stats}")
+
+        withdraw_status, withdraw_success = ExchangeAppBatchMixin._format_batch_strategy_completion_status(
+            9.876543,
+            "USDT",
+            enable_withdraw=True,
+            completion_text=completion,
+            trade_stats_text=stats,
+        )
+        self.assertTrue(withdraw_success)
+        self.assertEqual(withdraw_status, f"✔提现9.87654 USDT｜{stats}")
+
+    def test_spot_completion_labels_cover_limit_modes(self):
+        self.assertEqual(
+            ExchangeAppBatchMixin._spot_strategy_completion_text(TRADE_MODE_LIMIT, 0),
+            "挂单结束",
+        )
+        self.assertEqual(
+            ExchangeAppBatchMixin._spot_strategy_completion_text(TRADE_MODE_PREMIUM, 0),
+            "溢价挂单结束",
+        )
+        self.assertEqual(
+            ExchangeAppBatchMixin._spot_strategy_completion_text(TRADE_MODE_LADDER, 0),
+            "分仓挂单结束",
+        )
+
+    def test_run_statistics_use_current_pair_and_exchange_time_window(self):
+        app = ExchangeAppBatchMixin()
+        client = Mock()
+        client.current_server_time_ms.side_effect = [1000, 2000]
+        client.spot_trade_volume_summary.return_value = {
+            "quoteAsset": "USDT", "quoteVolume": "20.123456", "orderPnl": "-0.123456",
+        }
+        strategy = Mock()
+        strategy.run.return_value = {"withdraw_amount": 9.5}
+        stop = threading.Event()
+        progress = Mock()
+        result, stats = app._run_strategy_with_spot_statistics(
+            strategy, client, stop, progress,
+            trade_account_type=TRADE_ACCOUNT_TYPE_SPOT, trade_mode=TRADE_MODE_LADDER,
+            zero_round_spot_conversion=False, spot_symbol="BTCUSDT", quote_asset="USDT",
+        )
+        strategy.run.assert_called_once_with(stop, progress_cb=progress)
+        self.assertIs(result, strategy.run.return_value)
+        client.spot_trade_volume_summary.assert_called_once_with(
+            "BTCUSDT", start_time_ms=1000, end_time_ms=2000, stop_event=stop, quote_asset="USDT",
+        )
+        self.assertEqual(stats, "BTCUSDT 交易量≈20.12346 USDT｜盈亏≈-0.12346 USDT")
+
+    def test_statistics_failure_preserves_completed_trade_and_withdrawal(self):
+        app = ExchangeAppBatchMixin()
+        for error in (RuntimeError("network unavailable"), InterruptedError("stopped")):
+            with self.subTest(error=type(error).__name__):
+                client = Mock()
+                client.spot_trade_volume_summary.side_effect = error
+                strategy = Mock()
+                strategy.run.return_value = {"withdraw_amount": 9.5}
+                result, stats = app._run_strategy_with_spot_statistics(
+                    strategy, client, threading.Event(), None,
+                    trade_account_type=TRADE_ACCOUNT_TYPE_SPOT, trade_mode=TRADE_MODE_MARKET,
+                    zero_round_spot_conversion=False, spot_symbol="BTCUSDT", quote_asset="USDT",
+                )
+                self.assertIs(result, strategy.run.return_value)
+                strategy.run.assert_called_once()
+                status, success = app._format_batch_strategy_completion_status(
+                    result["withdraw_amount"], "USDT", enable_withdraw=True, trade_stats_text=stats,
+                )
+                self.assertTrue(success)
+                self.assertEqual(status, "✔提现9.5 USDT｜BTCUSDT 交易统计暂不可用")
+
+    def test_statistics_skip_other_modes_failed_and_stopped_runs(self):
+        for account_type, mode, zero_round, failed, stopped in (
+            (TRADE_ACCOUNT_TYPE_FUTURES, TRADE_MODE_MARKET, False, False, False),
+            (TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_CONVERT, False, False, False),
+            (TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_MARKET, True, False, False),
+            (TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_MARKET, False, True, False),
+            (TRADE_ACCOUNT_TYPE_SPOT, TRADE_MODE_LADDER, False, False, True),
+        ):
+            with self.subTest(account_type=account_type, mode=mode, zero_round=zero_round, failed=failed, stopped=stopped):
+                client, strategy = Mock(), Mock()
+                strategy.run.return_value = {"trade_error": "order failed"} if failed else {}
+                stop = threading.Event()
+                if stopped:
+                    stop.set()
+                result, stats = ExchangeAppBatchMixin()._run_strategy_with_spot_statistics(
+                    strategy, client, stop, None,
+                    trade_account_type=account_type, trade_mode=mode,
+                    zero_round_spot_conversion=zero_round, spot_symbol="BTCUSDT", quote_asset="USDT",
+                )
+                self.assertIs(result, strategy.run.return_value)
+                self.assertEqual(stats, "")
+                client.spot_trade_volume_summary.assert_not_called()
+                if account_type == TRADE_ACCOUNT_TYPE_FUTURES or mode == TRADE_MODE_CONVERT or zero_round:
+                    client.current_server_time_ms.assert_not_called()
+
+    def test_invalid_statistics_are_not_reported_as_zero(self):
+        for summary in ({}, {"quoteVolume": "NaN", "orderPnl": "0"}, {"quoteVolume": "1", "orderPnl": "bad"}):
+            self.assertEqual(
+                ExchangeAppBatchMixin._format_spot_run_trade_statistics("BTCUSDT", summary),
+                "BTCUSDT 交易统计暂不可用",
+            )
+
+    def test_single_account_completion_survives_ui_reset_and_failure_takes_priority(self):
+        app = ExchangeAppBatchMixin()
+        app._restore_batch_ui_to_idle = Mock()
+        app.api_key_var = Mock()
+        app.api_key_var.get.return_value = ""
+        app._on_worker_finished(completion_status="✔市价3轮结束｜BTCUSDT 交易量≈20 USDT｜盈亏≈0 USDT")
+        self.assertIn("市价3轮结束", app._restore_batch_ui_to_idle.call_args.kwargs["status_text"])
+        app._on_worker_finished("停止清理失败", "✔市价3轮结束")
+        self.assertEqual(app._restore_batch_ui_to_idle.call_args.kwargs["status_text"], "状态：失败：停止清理失败")
+
+    def test_trade_window_timestamp_uses_exchange_offset_and_cached_fallback(self):
+        client = object.__new__(BinanceClient)
+        client.spot = "https://clock-test.invalid"
+        with patch.object(client, "_local_timestamp_ms", return_value=1000), \
+             patch.object(client, "_sync_server_time_offset", return_value=5000):
+            self.assertEqual(client.current_server_time_ms(), 6000)
+        with patch.object(client, "_local_timestamp_ms", return_value=1000), \
+             patch.object(client, "_sync_server_time_offset", side_effect=RuntimeError("offline")), \
+             patch.dict(BinanceClient._shared_server_time_offset_ms, {client.spot: -500}):
+            self.assertEqual(client.current_server_time_ms(), 500)
 
 
 if __name__ == "__main__":

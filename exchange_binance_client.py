@@ -374,6 +374,19 @@ class BinanceClient:
             type(self)._shared_server_time_synced_at[base_n] = time.monotonic()
         return int(offset_ms)
 
+    def current_server_time_ms(self, base: str | None = None) -> int:
+        """Return an exchange-aligned timestamp for exact trade-history windows."""
+        base_n = self._normalize_base_url(base or self.spot)
+        offset_ms = 0
+        try:
+            offset_ms = self._sync_server_time_offset(base_n)
+        except Exception:
+            with type(self)._shared_server_time_lock:
+                cached_offset = type(self)._shared_server_time_offset_ms.get(base_n)
+            if cached_offset is not None:
+                offset_ms = int(cached_offset)
+        return self._local_timestamp_ms() + int(offset_ms)
+
     def _signed_params(self, base: str, params=None, *, force_time_sync: bool = False) -> dict[str, Any]:
         signed_params = dict(params or {})
         offset_ms = 0
