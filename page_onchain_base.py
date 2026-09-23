@@ -44,6 +44,7 @@ from shared_utils import (
     append_log_row,
     bind_paste_shortcuts,
     clear_ui_batch_size,
+    decimal_to_stat_text,
     decimal_to_text,
     dispatch_ui_callback,
     flush_queued_log_rows,
@@ -857,6 +858,9 @@ class OnchainTransferPageBase:
     @classmethod
     def _decimal_to_text(cls, v: Decimal) -> str:
         return decimal_to_text(v)
+    @classmethod
+    def _stat_decimal_to_text(cls, v: Decimal) -> str:
+        return decimal_to_stat_text(v)
     @staticmethod
     def _factor_by_decimals(decimals: int) -> Decimal:
         if decimals < 0 or decimals > OnchainTransferPageBase.MAX_TOKEN_DECIMALS:
@@ -882,13 +886,13 @@ class OnchainTransferPageBase:
             symbol = ""
         return symbol or network.strip().upper() or "-"
     def _gas_fee_amount_text(self, network: str, fee_wei: int) -> str:
-        fee_text = self._decimal_to_text(self._units_to_amount(int(fee_wei), 18))
+        fee_text = self._stat_decimal_to_text(self._units_to_amount(int(fee_wei), 18))
         symbol = self._network_fee_symbol(network)
         return f"{fee_text} {symbol}"
     def _estimated_gas_fee_text(self, network: str, fee_wei: int) -> str:
         return f"预估 {self._gas_fee_amount_text(network, fee_wei)}"
     def _token_amount_text(self, symbol: str, amount: Decimal) -> str:
-        return f"{self._decimal_to_text(amount)} {symbol.strip().upper()}"
+        return f"{self._stat_decimal_to_text(amount)} {symbol.strip().upper()}"
     def _runtime_worker_threads(self) -> int:
         raw = self._runtime_state_snapshot().get("threads_raw", ONCHAIN_WORKER_THREADS_DEFAULT)
         return parse_worker_threads(raw, default=ONCHAIN_WORKER_THREADS_DEFAULT)
@@ -1149,9 +1153,14 @@ class OnchainTransferPageBase:
         if status == "incomplete":
             return "st_incomplete"
         return ""
-    @staticmethod
-    def _success_status_text(coin: str, amount_text: str) -> str:
+    @classmethod
+    def _success_status_text(cls, coin: str, amount_text: str) -> str:
         amount = str(amount_text or "").strip()
+        if amount:
+            try:
+                amount = cls._stat_decimal_to_text(Decimal(amount))
+            except Exception:
+                pass
         coin_text = str(coin or "").strip().lower()
         if not amount:
             return "✅"
@@ -1186,13 +1195,13 @@ class OnchainTransferPageBase:
         if v is None:
             return "-"
         symbol = self.symbol_var.get().strip() or "-"
-        return f"{symbol}:{self._decimal_to_text(v)}"
+        return f"{symbol}:{self._stat_decimal_to_text(v)}"
     def _balance_text_for_target(self, target: str) -> str:
         v = self.target_balance_cache.get(target)
         if v is None:
             return "-"
         symbol = self.symbol_var.get().strip() or "-"
-        return f"{symbol}:{self._decimal_to_text(v)}"
+        return f"{symbol}:{self._stat_decimal_to_text(v)}"
     def _onchain_source_address_for_search(self, source: str) -> str:
         source_key = str(source or "").strip()
         if not source_key:
@@ -1757,6 +1766,7 @@ class OnchainTransferPageBase:
             except Exception:
                 logger.exception("链上后台线程异常：%s", name)
             finally:
+                self.client.release_current_thread_rpc_session()
                 current = threading.current_thread()
                 with self._managed_threads_lock:
                     self._managed_threads.discard(current)
@@ -1764,6 +1774,16 @@ class OnchainTransferPageBase:
         thread = threading.Thread(target=runner, daemon=daemon, name=name)
         with self._managed_threads_lock:
             self._managed_threads.add(thread)
+        thread.start()
+        return thread
+    def _start_rpc_worker_thread(self, target, *, name: str = "onchain-rpc-worker") -> threading.Thread:
+        def runner():
+            try:
+                target()
+            finally:
+                self.client.release_current_thread_rpc_session()
+
+        thread = threading.Thread(target=runner, daemon=True, name=name)
         thread.start()
         return thread
     def _confirmation_worker_limit(self) -> int:

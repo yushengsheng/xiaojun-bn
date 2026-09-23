@@ -34,6 +34,15 @@ RELAY_BNB_DUST_THRESHOLD = Decimal("0.000005")
 _RELAY_SWEEP_LOG_LOCK = threading.Lock()
 
 
+def _start_relay_rpc_worker(owner, target, *, name: str) -> threading.Thread:
+    starter = getattr(owner, "_start_rpc_worker_thread", None)
+    if callable(starter):
+        return starter(target, name=name)
+    thread = threading.Thread(target=target, daemon=True, name=name)
+    thread.start()
+    return thread
+
+
 class RelayAutoForwardPending(RuntimeError):
     def __init__(self, message: str, *, txid: str = ""):
         super().__init__(message)
@@ -74,6 +83,12 @@ def _append_relay_sweep_log(event: str, **fields: object) -> None:
 
 def _relay_success_status_text(owner, params: WithdrawRuntimeParams, amount_text: str) -> str:
     amount = str(amount_text or "").strip()
+    if amount:
+        try:
+            formatter = getattr(owner, "_stat_decimal_to_text", owner._decimal_to_text)
+            amount = formatter(Decimal(amount))
+        except Exception:
+            pass
     coin_text = str(getattr(params, "coin", "") or "").strip().lower()
     if amount and coin_text:
         return f"✅{amount}{coin_text}"
@@ -223,7 +238,9 @@ def _relay_recovery_row_status_text(outcome: str, status_text: str) -> str:
 def _relay_recovery_amount_status_text(owner, network: str, amount_wei: int, *, kept_margin: bool = False) -> str:
     amount = owner._units_to_amount(max(0, int(amount_wei)), 18)
     symbol = str(owner._network_fee_symbol(network) or "").strip().lower()
-    text = f"✅{owner._decimal_to_text(amount)}{symbol}" if symbol else f"✅{owner._decimal_to_text(amount)}"
+    formatter = getattr(owner, "_stat_decimal_to_text", owner._decimal_to_text)
+    amount_text = formatter(amount)
+    text = f"✅{amount_text}{symbol}" if symbol else f"✅{amount_text}"
     if kept_margin:
         text = f"{text}(留边际)"
     return text
@@ -505,7 +522,7 @@ def _relay_manual_token_summary_text(
             continue
         total_wallets += max(0, int(wallet_counts.get(key) or 0))
         amount = owner._units_to_amount(total_units, decimals)
-        parts.append(f"{owner._decimal_to_text(amount)} {token_symbol}({network})")
+        parts.append(f"{owner._token_amount_text(token_symbol, amount)}({network})")
     if not parts:
         return "无"
     return f"{total_wallets} 个钱包，合计 {' / '.join(parts)}"
@@ -1763,8 +1780,17 @@ def run_relay_fee_recovery(
                     current_status = str(record.status or "").strip()
                     sweep_resolution = str(record.sweep_resolution or "").strip().lower()
                     auto_forward_gas_fee = 0
+                    forward_state = _transaction_receipt_state(owner, network, record.token_forward_txid)
+                    state_text = {
+                        "missing": "缺少第二跳交易记录",
+                        "pending": "第二跳交易仍在确认中",
+                        "failed": "第二跳交易失败",
+                    }.get(forward_state, f"状态 {forward_state}")
 
-                    if _relay_terminal_snapshot_can_be_ignored(owner, network, record, snapshot):
+                    if (
+                        forward_state == "success"
+                        and _relay_terminal_snapshot_can_be_ignored(owner, network, record, snapshot)
+                    ):
                         finish_job(
                             progress_key,
                             display_row_key,
@@ -1776,6 +1802,41 @@ def run_relay_fee_recovery(
                         continue
 
                     if not has_positive_balance:
+                        if forward_state != "success":
+                            if dry_run:
+                                finish_job(
+                                    progress_key,
+                                    display_row_key,
+                                    outcome=("pending" if forward_state == "pending" else "skipped"),
+                                    msg=f"{prefix} 模拟跳过：主转账未完成（{state_text}），中转钱包为空不能作为成功依据",
+                                    status_text=("确认中" if forward_state == "pending" else "归集未完成"),
+                                )
+                                continue
+                            if forward_state == "pending":
+                                finish_job(
+                                    progress_key,
+                                    display_row_key,
+                                    outcome="pending",
+                                    msg=f"{prefix} 等待确认：{state_text}，暂不判定为无需回收",
+                                    status_text="确认中",
+                                )
+                                continue
+                            failure_reason = f"主转账未完成：{state_text}；中转钱包为空不能作为转账成功依据"
+                            record = owner.relay_wallet_store.update_record(
+                                relay_addr,
+                                batch_id=record.batch_id,
+                                status="failed",
+                                last_error=failure_reason,
+                            )
+                            finish_job(
+                                progress_key,
+                                display_row_key,
+                                outcome="failed",
+                                msg=f"{prefix} 归集失败：{failure_reason}",
+                                status_text="归集未完成",
+                                retry_record=record,
+                            )
+                            continue
                         if dry_run:
                             finish_job(
                                 progress_key,
@@ -1821,13 +1882,6 @@ def run_relay_fee_recovery(
                             cleanup_record=record,
                         )
                         continue
-
-                    forward_state = _transaction_receipt_state(owner, network, record.token_forward_txid)
-                    state_text = {
-                        "missing": "缺少第二跳交易记录",
-                        "pending": "第二跳交易仍在确认中",
-                        "failed": "第二跳交易失败",
-                    }.get(forward_state, f"状态 {forward_state}")
 
                     if (
                         _relay_token_dust_requires_native_recovery(owner, network, snapshot)
@@ -2019,43 +2073,27 @@ def run_relay_fee_recovery(
                                     progress_key,
                                     display_row_key,
                                     outcome="skipped",
-                                    msg=f"{prefix} 模拟跳过：{state_text}，但中转钱包已无 USDT/USDC，正式运行会清理陈旧状态",
+                                    msg=f"{prefix} 模拟跳过：{state_text}，未检测到代币余额也不能证明第二跳成功",
                                     status_text="已跳过",
                                 )
                                 continue
-                            record = _update_relay_record(
-                                owner,
-                                record,
-                                status="forwarded",
+                            failure_reason = f"主转账未完成：{state_text}；未检测到代币余额，不能据此判定第二跳成功"
+                            record = owner.relay_wallet_store.update_record(
+                                relay_addr,
+                                batch_id=record.batch_id,
+                                status="failed",
                                 sweep_target=sweep_target,
-                                last_error="",
+                                last_error=failure_reason,
                             )
-                            forward_state = "success"
-                            if native_balance > 0:
-                                dispatch_ui(
-                                    lambda m=(
-                                        f"{prefix} 已清理陈旧第二跳状态：中转钱包无 USDT/USDC，"
-                                        f"继续处理剩余 {owner._gas_fee_amount_text(network, native_balance)}"
-                                    ): owner.log(m)
-                                )
-                            else:
-                                _update_relay_record(
-                                    owner,
-                                    record,
-                                    status="completed",
-                                    sweep_target=sweep_target,
-                                    sweep_resolution="manual_empty",
-                                    last_error="",
-                                )
-                                finish_job(
-                                    progress_key,
-                                    display_row_key,
-                                    outcome="already_empty",
-                                    msg=f"{prefix} 已清理陈旧状态：中转钱包已无 USDT/USDC 余额",
-                                    status_text="已清空",
-                                    cleanup_record=record,
-                                )
-                                continue
+                            finish_job(
+                                progress_key,
+                                display_row_key,
+                                outcome="failed",
+                                msg=f"{prefix} 归集失败：{failure_reason}",
+                                status_text="归集未完成",
+                                retry_record=record,
+                            )
+                            continue
                         else:
                             if dry_run:
                                 finish_job(
@@ -2523,8 +2561,7 @@ def run_relay_fee_recovery(
         def run_workers(count: int) -> None:
             workers: list[threading.Thread] = []
             for _ in range(max(1, int(count))):
-                t = threading.Thread(target=worker, daemon=True)
-                t.start()
+                t = _start_relay_rpc_worker(owner, worker, name="onchain-relay-recovery-worker")
                 workers.append(t)
             for t in workers:
                 t.join()
@@ -2890,8 +2927,7 @@ def _relay_run_parallel(owner, units: list, worker_count: int, func) -> None:
     workers: list[threading.Thread] = []
     count = max(1, min(int(worker_count or 1), len(units)))
     for _ in range(count):
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
+        t = _start_relay_rpc_worker(owner, worker, name="onchain-relay-worker")
         workers.append(t)
     for t in workers:
         t.join()
@@ -3079,7 +3115,9 @@ def _relay_simple_stage(
     status_text: str,
     confirm_receipt: bool = True,
 ) -> None:
-    stage_items = [item for item in items if not item.failed and _relay_record_status(item) not in done_statuses]
+    # 已标记完成的历史记录也必须重新核验第二跳回执。仅凭本地 status 跳过会让
+    # “中转钱包为空”等错误恢复状态被当成真实转账成功。
+    stage_items = [item for item in items if not item.failed]
     if not stage_items:
         return
 
@@ -3107,7 +3145,7 @@ def _relay_simple_stage(
             _relay_fail_item(owner, item, exc, log_prefix=f"{stage_label}提交失败")
 
     def confirm_item(item: _RelayBatchItem) -> None:
-        if item.failed or _relay_record_status(item) in done_statuses:
+        if item.failed:
             return
         txid = _relay_record_txid(item, tx_attr)
         if not txid:

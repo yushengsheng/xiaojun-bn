@@ -936,8 +936,7 @@ class OnchainTransferRunnerMixin(object):
             worker_limit = params.one_to_many_source_threads if self._is_mode_1m() else params.threads
             worker_count = max(1, min(int(worker_limit or 1), len(jobs_data)))
             for _ in range(worker_count):
-                t = threading.Thread(target=worker, daemon=True)
-                t.start()
+                t = self._start_rpc_worker_thread(worker, name="onchain-transfer-worker")
                 workers.append(t)
             for t in workers:
                 t.join()

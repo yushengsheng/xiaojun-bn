@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from exchange_app_accounts import ExchangeAppAccountsMixin
 from exchange_app_batch import ExchangeAppBatchMixin
@@ -138,6 +142,46 @@ class _MarketBnbStopClient:
 
 
 class ExchangeMarketRoundFailureTests(unittest.TestCase):
+    def test_exchange_statistics_use_five_decimal_places(self):
+        self.assertEqual(ExchangeAppBatchMixin._format_amount(Decimal("1.234565")), "1.23457")
+        self.assertEqual(
+            ExchangeAppBatchMixin._format_batch_metric_totals(
+                {
+                    "a": (Decimal("1.111114"), "USDT"),
+                    "b": (Decimal("2.222225"), "USDT"),
+                }
+            ),
+            "3.33334 USDT",
+        )
+
+    def test_exchange_asset_breakdown_uses_five_decimal_places(self):
+        self.assertEqual(
+            ExchangeAppBatchMixin._format_asset_breakdown_text(
+                {"USDT": Decimal("10.123456"), "BNB": Decimal("0.000006")}
+            ),
+            "USDT 10.12346 | BNB 0.00001",
+        )
+
+    def test_exchange_result_files_use_fixed_five_decimal_places(self):
+        recorder = object.__new__(ExchangeAppAccountsMixin)
+        recorder._result_file_lock = threading.Lock()
+        recorder.total_asset_results = {}
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            withdraw_path = root / "withdraw.txt"
+            asset_path = root / "assets.txt"
+            csv_path = root / "assets.csv"
+            with patch("exchange_app_accounts.WITHDRAW_SUCCESS_FILE", withdraw_path), \
+                    patch("exchange_app_accounts.TOTAL_ASSET_RESULT_FILE", asset_path), \
+                    patch("exchange_app_accounts.filedialog.asksaveasfilename", return_value=str(csv_path)), \
+                    patch("exchange_app_accounts.messagebox.showinfo"):
+                recorder.record_withdraw(1, "example-key", "0xabc", Decimal("1.234565"))
+                recorder.record_total_asset(1, "example-key", "0xabc", "BSC", Decimal("9.8"))
+                recorder.export_total_asset_csv()
+            self.assertTrue(withdraw_path.read_text(encoding="utf-8").rstrip().endswith("+1.23457"))
+            self.assertTrue(asset_path.read_text(encoding="utf-8").rstrip().endswith("+9.80000"))
+            self.assertIn("9.80000", csv_path.read_text(encoding="utf-8-sig"))
+
     def test_batch_market_stagger_enables_strict_coordination_for_multiple_workers(self):
         self.assertTrue(
             ExchangeAppBatchMixin._batch_market_stagger_enabled(

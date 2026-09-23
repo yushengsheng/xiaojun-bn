@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from datetime import datetime
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, localcontext
 import tkinter as tk
 from tkinter import END, Scrollbar
 
@@ -845,6 +845,24 @@ def random_decimal_between(low: Decimal, high: Decimal, unit: Decimal = Decimal(
 def decimal_to_text(value: Decimal) -> str:
     text = format(value.normalize(), "f")
     if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def decimal_to_stat_text(value, *, precision: int = 5, fixed: bool = False) -> str:
+    """Format a displayed statistic without changing the underlying calculation value."""
+    digits = max(0, int(precision))
+    amount = value if isinstance(value, Decimal) else Decimal(str(value or "0"))
+    if not amount.is_finite():
+        return decimal_to_text(amount)
+    quantum = Decimal(1).scaleb(-digits)
+    with localcontext() as context:
+        context.prec = max(28, amount.adjusted() + digits + 3, len(amount.as_tuple().digits) + digits + 2)
+        rounded = amount.quantize(quantum, rounding=ROUND_HALF_UP)
+    if rounded == 0:
+        rounded = rounded.copy_abs()
+    text = format(rounded, "f")
+    if not fixed and "." in text:
         text = text.rstrip("0").rstrip(".")
     return text or "0"
 

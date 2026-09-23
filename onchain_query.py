@@ -531,7 +531,7 @@ class OnchainQueryMixin(object):
                             ok += 1
                             done_row_keys.update(row_keys)
                             balance_total_text = self._token_amount_text(symbol, total)
-                        msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
+                        msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._stat_decimal_to_text(amount)}"
                         dispatch_ui(lambda m=msg: self.log(m))
                         dispatch_ui(lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
                         dispatch_ui(lambda keys=row_keys: self._set_query_statuses(keys, "success"))
@@ -547,8 +547,7 @@ class OnchainQueryMixin(object):
             workers: list[threading.Thread] = []
             worker_count = max(1, min(self._runtime_worker_threads(), len(sources)))
             for _ in range(worker_count):
-                t = threading.Thread(target=worker, daemon=True)
-                t.start()
+                t = self._start_rpc_worker_thread(worker, name="onchain-query-multi-to-multi-worker")
                 workers.append(t)
             for t in workers:
                 t.join()
@@ -557,7 +556,7 @@ class OnchainQueryMixin(object):
                 failed += len(pending_keys)
                 dispatch_ui(lambda keys=pending_keys: self._set_query_statuses(keys, "failed"))
                 dispatch_ui(lambda: self.log("余额查询已停止"))
-            summary = f"余额查询结束：成功 {ok}，失败 {failed}，{symbol} 合计={self._decimal_to_text(total)}"
+            summary = f"余额查询结束：成功 {ok}，失败 {failed}，{symbol} 合计={self._stat_decimal_to_text(total)}"
             dispatch_ui(lambda: self._refresh_tree())
             dispatch_ui(lambda: self.log(summary))
             dispatch_ui(lambda s=ok, f=failed: self._finish_progress("query", s, f))
@@ -598,9 +597,9 @@ class OnchainQueryMixin(object):
                         src_units = self.client.get_erc20_balance(network, token.contract, source_addr)
                     src_amount = self._units_to_amount(src_units, token.decimals)
                     self.source_balance_cache[source] = src_amount
-                    src_text = f"{symbol}:{self._decimal_to_text(src_amount)}"
+                    src_text = f"{symbol}:{self._stat_decimal_to_text(src_amount)}"
                     dispatch_ui(lambda c=context_sig, t=src_text: self._apply_source_balance_summary(c, t))
-                    dispatch_ui(lambda m=f"[SRC][{self._mask(source_addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(src_amount)}": self.log(m))
+                    dispatch_ui(lambda m=f"[SRC][{self._mask(source_addr, head=8, tail=6)}] 余额={symbol} {self._stat_decimal_to_text(src_amount)}": self.log(m))
                     source_query_state = "ok"
                 except Exception as exc:
                     dispatch_ui(lambda c=context_sig: self._clear_source_balance_summary(c))
@@ -648,7 +647,7 @@ class OnchainQueryMixin(object):
                             if row_key:
                                 done_row_keys.add(row_key)
                             balance_total_text = self._token_amount_text(symbol, total)
-                        msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
+                        msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._stat_decimal_to_text(amount)}"
                         dispatch_ui(lambda m=msg: self.log(m))
                         dispatch_ui(lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
                         if row_key:
@@ -669,8 +668,7 @@ class OnchainQueryMixin(object):
             workers: list[threading.Thread] = []
             worker_count = min(self._runtime_worker_threads(), len(targets))
             for _ in range(worker_count):
-                t = threading.Thread(target=worker, daemon=True)
-                t.start()
+                t = self._start_rpc_worker_thread(worker, name="onchain-query-one-to-many-worker")
                 workers.append(t)
             for t in workers:
                 t.join()
@@ -683,7 +681,7 @@ class OnchainQueryMixin(object):
             src_status_text = {"ok": "成功", "failed": "失败", "skip": "跳过"}.get(source_query_state, source_query_state)
             summary = (
                 f"余额查询结束：源钱包查询={src_status_text}，目标地址成功 {ok}，失败 {failed}，"
-                f"目标地址{symbol}合计={self._decimal_to_text(total)}"
+                f"目标地址{symbol}合计={self._stat_decimal_to_text(total)}"
             )
             dispatch_ui(lambda: self._refresh_tree())
             dispatch_ui(lambda: self.log(summary))
@@ -721,9 +719,9 @@ class OnchainQueryMixin(object):
                         target_units = self.client.get_erc20_balance(network, token.contract, target)
                     target_amount = self._units_to_amount(target_units, token.decimals)
                     self.target_balance_cache[target] = target_amount
-                    target_text = f"{symbol}:{self._decimal_to_text(target_amount)}"
+                    target_text = f"{symbol}:{self._stat_decimal_to_text(target_amount)}"
                     dispatch_ui(lambda c=context_sig, t=target_text: self._apply_target_balance_summary(c, t))
-                    dispatch_ui(lambda m=f"[DST][{self._mask(target, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(target_amount)}": self.log(m))
+                    dispatch_ui(lambda m=f"[DST][{self._mask(target, head=8, tail=6)}] 余额={symbol} {self._stat_decimal_to_text(target_amount)}": self.log(m))
                     target_query_state = "ok"
                 except Exception as exc:
                     dispatch_ui(lambda c=context_sig: self._clear_target_balance_summary(c))
@@ -772,7 +770,7 @@ class OnchainQueryMixin(object):
                             if row_key:
                                 done_row_keys.add(row_key)
                             balance_total_text = self._token_amount_text(symbol, total)
-                        msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
+                        msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._stat_decimal_to_text(amount)}"
                         dispatch_ui(lambda m=msg: self.log(m))
                         dispatch_ui(lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
                         if row_key:
@@ -793,8 +791,7 @@ class OnchainQueryMixin(object):
             workers: list[threading.Thread] = []
             worker_count = min(self._runtime_worker_threads(), len(sources))
             for _ in range(worker_count):
-                t = threading.Thread(target=worker, daemon=True)
-                t.start()
+                t = self._start_rpc_worker_thread(worker, name="onchain-query-many-to-one-worker")
                 workers.append(t)
             for t in workers:
                 t.join()
@@ -807,7 +804,7 @@ class OnchainQueryMixin(object):
             dst_status_text = {"ok": "成功", "failed": "失败", "skip": "跳过"}.get(target_query_state, target_query_state)
             summary = (
                 f"余额查询结束：收款地址查询={dst_status_text}，源钱包成功 {ok}，失败 {failed}，"
-                f"源钱包{symbol}合计={self._decimal_to_text(total)}"
+                f"源钱包{symbol}合计={self._stat_decimal_to_text(total)}"
             )
             dispatch_ui(lambda: self._refresh_tree())
             dispatch_ui(lambda: self.log(summary))

@@ -440,6 +440,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             private_key="relay-private-key",
             status="forwarded",
             batch_id="batch-retry",
+            token_forward_txid="0x" + "f" * 64,
         )
         _RECORDS[(relay_addr, record.batch_id)] = record
         owner.client.native_balance_responses = [RuntimeError("temporary RPC failure"), 0]
@@ -468,6 +469,48 @@ class OnchainRelayPipelineTests(unittest.TestCase):
         self.assertIn("已清空 1", str(result["detail_text"]))
         self.assertEqual(result["action_buttons"][0][0], "复制待人工账号")
         self.assertFalse(result["action_buttons"][0][2])
+
+    def test_manual_recovery_does_not_treat_empty_relay_as_completed_transfer(self) -> None:
+        owner = _FakeOwner()
+        relay_addr = "0x00000000000000000000000000000000000000d0"
+        record = RelayWalletRecord(
+            created_at="",
+            expires_at="",
+            network="BSC",
+            source="0x00000000000000000000000000000000000000aa",
+            target="0x00000000000000000000000000000000000000bb",
+            relay_address=relay_addr,
+            private_key="relay-private-key",
+            status="forwarded",
+            batch_id="batch-empty-without-forward",
+        )
+        _RECORDS[(relay_addr, record.batch_id)] = record
+        owner.client.native_balance_wei = 0
+        owner.client.erc20_balance_units = 0
+
+        with TemporaryDirectory() as tmp_dir:
+            with (
+                patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
+                patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+            ):
+                run_relay_fee_recovery(
+                    owner,
+                    False,
+                    batch_ids={record.batch_id},
+                    show_dialog=True,
+                    use_progress=False,
+                    manage_running_state=False,
+                    run_label="batch-empty-without-forward",
+                )
+
+        self.assertIn((relay_addr, record.batch_id), _RECORDS)
+        saved = _RECORDS[(relay_addr, record.batch_id)]
+        self.assertEqual(saved.status, "failed")
+        self.assertIn("缺少第二跳交易记录", saved.last_error)
+        self.assertFalse(any("无需回收" in message for message in owner.logs))
+        result = owner.result_dialogs[0]
+        self.assertEqual(result["success"], 0)
+        self.assertEqual(result["failed"], 1)
 
     def test_manual_recovery_counts_persistent_rpc_failure_once(self) -> None:
         owner = _FakeOwner()
@@ -781,14 +824,44 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             self.assertEqual(item.relay_record.token_forward_txid, f"0x{item.index:064x}")
             self.assertIn("尚未确认", item.relay_record.last_error)
 
-        # 模拟重新载入保存记录，已提交的第二跳只确认，不再次转账。
+        # 模拟重新载入保存记录：全部记录都复核第二跳回执，已提交交易不再次转账。
         resumed = [replace(item, failed=False, failure_reason="") for item in items]
         owner.client.get_transaction_receipt = Mock(return_value={"status": "0x1"})
         submit.reset_mock()
         _relay_simple_stage(owner, params, resumed, **stage_args)
         submit.assert_not_called()
-        self.assertEqual(owner.client.get_transaction_receipt.call_count, 2)
+        self.assertEqual(owner.client.get_transaction_receipt.call_count, 8)
         self.assertTrue(all(item.relay_record.status == "forwarded" for item in resumed))
+
+    def test_second_hop_forwarded_status_without_txid_is_failed(self) -> None:
+        owner = _FakeOwner(mode_m1=True)
+        item = _item(1)
+        item.relay_record = owner.relay_wallet_store.update_record(
+            item.relay_addr,
+            batch_id="batch",
+            status="forwarded",
+            token_forward_txid="",
+        )
+        submit = Mock(side_effect=AssertionError("不得凭本地 forwarded 状态跳过回执核验"))
+
+        _relay_simple_stage(
+            owner,
+            _params(),
+            [item],
+            stage_label="中转第二跳",
+            tx_attr="token_forward_txid",
+            nonce_attr="token_forward_nonce",
+            submitted_status="token_forward_submitted",
+            done_status="forwarded",
+            done_statuses={"forwarded", "completed"},
+            submit_one=submit,
+            status_text="第二跳",
+        )
+
+        submit.assert_not_called()
+        self.assertTrue(item.failed)
+        self.assertEqual(item.relay_record.status, "failed")
+        self.assertIn("未拿到 txid", item.relay_record.last_error)
 
     def test_second_hop_stop_retains_transaction_for_resume(self) -> None:
         owner = _FakeOwner(mode_1m=True)

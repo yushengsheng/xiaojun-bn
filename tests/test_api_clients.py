@@ -46,6 +46,65 @@ class EvmClientWalletGenerationTests(unittest.TestCase):
             client.create_wallets(10000, worker_threads=1)
 
 
+class EvmClientSessionLifecycleTests(unittest.TestCase):
+    class _Session:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    def test_short_lived_workers_release_every_rpc_session(self) -> None:
+        client = EvmClient(allow_system_proxy=False)
+        sessions = []
+        sessions_lock = threading.Lock()
+
+        def build_session(*_args, **_kwargs):
+            session = self._Session()
+            with sessions_lock:
+                sessions.append(session)
+            return session
+
+        def worker():
+            try:
+                client._rpc_session("https://rpc.example")
+            finally:
+                client.release_current_thread_rpc_session()
+
+        with patch.object(client, "_build_rpc_session", side_effect=build_session):
+            for _round in range(20):
+                threads = [threading.Thread(target=worker) for _ in range(20)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+        self.assertEqual(len(sessions), 400)
+        self.assertTrue(all(session.closed for session in sessions))
+        self.assertEqual(client._rpc_sessions, {})
+
+    def test_next_rpc_prunes_sessions_left_by_dead_threads(self) -> None:
+        client = EvmClient(allow_system_proxy=False)
+        sessions = []
+
+        def build_session(*_args, **_kwargs):
+            session = self._Session()
+            sessions.append(session)
+            return session
+
+        with patch.object(client, "_build_rpc_session", side_effect=build_session):
+            worker = threading.Thread(target=lambda: client._rpc_session("https://old.example"))
+            worker.start()
+            worker.join()
+            self.assertEqual(len(client._rpc_sessions), 1)
+            client._rpc_session("https://new.example")
+
+        self.assertTrue(sessions[0].closed)
+        client.release_current_thread_rpc_session()
+        self.assertTrue(sessions[1].closed)
+        self.assertEqual(client._rpc_sessions, {})
+
+
 class EvmClientGasPriceTests(unittest.TestCase):
     @staticmethod
     def _history(tips: list[int], next_base: int = 0) -> dict:
@@ -218,7 +277,7 @@ class EvmClientGasPriceTests(unittest.TestCase):
             gas_price = client.get_gas_price_wei("BSC")
 
         self.assertEqual(gas_price, 50_000_000)
-        self.assertEqual([call.args[0] for call in session.post.call_args_list], [bad_url, bad_url, good_url, good_url])
+        self.assertEqual([call.args[0] for call in session.post.call_args_list], [bad_url, good_url, good_url])
         self.assertEqual(client._preferred_rpc_urls["BSC"], good_url)
 
 

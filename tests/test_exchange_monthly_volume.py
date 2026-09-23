@@ -712,7 +712,7 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
             self.assertEqual(params["endTime"], _END)
             self.assertEqual(kwargs["max_retries"], 1)
         for status in app.statuses.values():
-            self.assertEqual(status, "✔XPL 2对｜≈99 USDT｜净≈-99｜费≈3｜总盈亏≈-102")
+            self.assertEqual(status, "✔XPL 2对｜≈99.9 USDT｜净≈-99.9｜费≈3｜总盈亏≈-102.9")
         self.assertIn("≈299.7 USDT｜净≈-299.7｜费≈9｜3/3", app.final_status)
         self.assertIn("总盈亏≈-308.7 USDT", app.logs)
         self.assertNotIn("待折算", app.logs)
@@ -760,7 +760,7 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         app.pages[("0", "XPLUSDC")] = [[_fill(1, "100", fee="0.01")]]
         app.query()
         self.assertEqual(len(app.repair_requests), 2)
-        self.assertIn("≈99 USDT｜净≈-99｜费待折算｜总盈亏待折算", app.statuses["0"])
+        self.assertIn("≈99.9 USDT｜净≈-99.9｜费待折算｜总盈亏待折算", app.statuses["0"])
         self.assertIn("折合成交额≈99.9 USDT", app.logs)
         self.assertNotIn("未折算成交额", app.logs)
 
@@ -842,8 +842,20 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         for acc in app.accounts:
             app.pages[(acc["api_key"], "XPLUSDT")] = [[_fill(1, "0.6")]]
         app.query()
-        self.assertTrue(all("≈0 USDT" in status for status in app.statuses.values()))
+        self.assertTrue(all("≈0.6 USDT" in status for status in app.statuses.values()))
         self.assertIn("≈1.2 USDT｜净≈-1.2", app.final_status)
+
+    def test_monthly_statistics_round_to_five_decimal_places(self):
+        app = _MonthlyApp()
+        app.pages[("0", "XPLUSDT")] = [[
+            _fill(1, "1.2345678", fee="0.000006", fee_asset="USDT")
+        ]]
+        app.query()
+        self.assertEqual(
+            app.statuses["0"],
+            "✔XPL 2对｜≈1.23457 USDT｜净≈-1.23457｜费≈0.00001｜总盈亏≈-1.23457",
+        )
+        self.assertIn("折合成交额≈1.23457 USDT", app.logs)
 
 
 if __name__ == "__main__":

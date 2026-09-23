@@ -50,6 +50,7 @@ from exchange_app_base import (
     ttk,
 )
 from exchange_order_recovery import exchange_operation_scope, reconcile_exchange_orders
+from shared_utils import decimal_to_stat_text
 
 
 class ExchangeAppBatchMixin(object):
@@ -134,7 +135,7 @@ class ExchangeAppBatchMixin(object):
             logger.info(
                 "理财全部存入：现货 %s 可用余额=%s",
                 asset_u,
-                BinanceClient._format_decimal(amount_dec),
+                self._format_amount(amount_dec),
             )
             return amount_dec
         amount_dec = Decimal(str(configured_amount or "0"))
@@ -275,19 +276,19 @@ class ExchangeAppBatchMixin(object):
                     if required_amount > 0:
                         log_progress_throttled(
                             "futures-balance-required",
-                            "%s 到账检测中，当前 U本位可用 %s = %.8f，目标至少 %.8f",
+                            "%s 到账检测中，当前 U本位可用 %s = %s，目标至少 %s",
                             quote_asset,
                             quote_asset,
-                            quote_balance,
-                            float(required_amount),
+                            self._format_amount(quote_balance_dec),
+                            self._format_amount(required_amount),
                         )
                     else:
                         log_progress_throttled(
                             "futures-balance",
-                            "%s 到账检测中，当前 U本位可用 %s = %.8f",
+                            "%s 到账检测中，当前 U本位可用 %s = %s",
                             quote_asset,
                             quote_asset,
-                            quote_balance,
+                            self._format_amount(quote_balance_dec),
                         )
                 else:
                     collect_trade_asset_to_spot(quote_asset)
@@ -299,29 +300,29 @@ class ExchangeAppBatchMixin(object):
                     if spot_base_to_quote_only:
                         log_progress_throttled(
                             "spot-balance-zero-round",
-                            "0轮兑换余额检测中，当前现货 %s = %.8f，%s = %.8f",
+                            "0轮兑换余额检测中，当前现货 %s = %s，%s = %s",
                             quote_asset,
-                            quote_balance,
+                            self._format_amount(quote_balance_dec),
                             base_asset,
-                            float(base_balance_dec),
+                            self._format_amount(base_balance_dec),
                         )
                     elif spot_pair_balance_wait:
                         log_progress_throttled(
                             "spot-pair-balance",
-                            "%s模式余额检测中，当前现货 %s = %.8f，%s = %.8f",
+                            "%s模式余额检测中，当前现货 %s = %s，%s = %s",
                             mode_name,
                             quote_asset,
-                            quote_balance,
+                            self._format_amount(quote_balance_dec),
                             base_asset,
-                            float(base_balance_dec),
+                            self._format_amount(base_balance_dec),
                         )
                     else:
                         log_progress_throttled(
                             "spot-balance",
-                            "%s 到账检测中，当前现货 %s = %.8f",
+                            "%s 到账检测中，当前现货 %s = %s",
                             quote_asset,
                             quote_asset,
-                            quote_balance,
+                            self._format_amount(quote_balance_dec),
                         )
             except Exception as e:
                 log_error_throttled(
@@ -561,7 +562,7 @@ class ExchangeAppBatchMixin(object):
                             source_account="SPOT",
                             auto_subscribe=earn_auto_subscribe,
                         )
-                        amount_text = BinanceClient._format_decimal(amount_dec)
+                        amount_text = self._format_amount(amount_dec)
                         purchase_id = str((result or {}).get("purchaseId") or "").strip() if isinstance(result, dict) else ""
                         logger.info(
                             "单账号活期理财存入已提交：资产=%s，数量=%s，自动申购=%s，productId=%s，purchaseId=%s",
@@ -1055,11 +1056,8 @@ class ExchangeAppBatchMixin(object):
             return
         self.run_batch_collect_bnb_with_confirm(accounts_to_run=[acc])
     @staticmethod
-    def _format_amount(value: float, precision: int = 8) -> str:
-        text = f"{float(value):.{precision}f}" if value is not None else "0"
-        if "." in text:
-            text = text.rstrip("0").rstrip(".")
-        return text if text else "0"
+    def _format_amount(value, precision: int = 5) -> str:
+        return decimal_to_stat_text(value, precision=precision)
     @classmethod
     def _query_account_asset_balances_text(cls, client, *, fast: bool = True) -> str:
         asset_breakdown = client.query_asset_balances_breakdown(fast=fast)
@@ -1077,7 +1075,7 @@ class ExchangeAppBatchMixin(object):
         if not items:
             return "--"
         items.sort(key=lambda item: (-item[1], item[0]))
-        return " | ".join(f"{asset} {cls._format_amount(float(amount_dec))}" for asset, amount_dec in items)
+        return " | ".join(f"{asset} {cls._format_amount(amount_dec)}" for asset, amount_dec in items)
 
     @staticmethod
     def _merge_monthly_trade_volume_summaries(summaries: list[dict[str, object]]) -> dict[str, object]:
@@ -1398,7 +1396,7 @@ class ExchangeAppBatchMixin(object):
         parts = []
         for asset in sorted(totals.keys()):
             amount = totals.get(asset, Decimal("0"))
-            amount_text = cls._format_amount(float(amount))
+            amount_text = cls._format_amount(amount)
             parts.append(f"{amount_text} {asset}" if asset else amount_text)
         return " / ".join(parts)
     def _build_batch_summary_text(self, summary: dict | None = None, *, pending_as_failed: bool = False) -> str:
@@ -1968,7 +1966,7 @@ class ExchangeAppBatchMixin(object):
         hourly_usdt_rates: dict[str, dict[int, Decimal]] = {}
 
         def format_pnl(value: Decimal) -> str:
-            text = BinanceClient._format_decimal(value)
+            text = self._format_amount(value)
             return f"+{text}" if value > 0 else text
 
         def finish_one():
@@ -1984,12 +1982,10 @@ class ExchangeAppBatchMixin(object):
         def needs_valuation(summary) -> bool:
             return bool(summary["unvaluedQuoteVolumeByAsset"] or summary["unvaluedCommissionByAsset"])
 
-        def compact_summary_text(summary, *, integer: bool, include_total: bool = True) -> str:
+        def compact_summary_text(summary, *, include_total: bool = True) -> str:
             def amount(key, *, signed=False):
                 value = Decimal(str(summary[key]))
-                if integer:
-                    return f"+{int(value)}" if signed and value > 0 else str(int(value))
-                return format_pnl(value) if signed else BinanceClient._format_decimal(value)
+                return format_pnl(value) if signed else self._format_amount(value)
 
             missing_volume = bool(summary["unvaluedQuoteVolumeByAsset"])
             missing_fee = bool(summary["unvaluedCommissionByAsset"])
@@ -2012,11 +2008,11 @@ class ExchangeAppBatchMixin(object):
             summary: dict[str, object],
             symbols_text: str,
         ) -> str:
-            volume_text = BinanceClient._format_decimal(Decimal(str(summary["usdtQuoteVolume"])))
-            buy_text = BinanceClient._format_decimal(Decimal(str(summary["usdtBuyQuoteVolume"])))
-            sell_text = BinanceClient._format_decimal(Decimal(str(summary["usdtSellQuoteVolume"])))
+            volume_text = self._format_amount(Decimal(str(summary["usdtQuoteVolume"])))
+            buy_text = self._format_amount(Decimal(str(summary["usdtBuyQuoteVolume"])))
+            sell_text = self._format_amount(Decimal(str(summary["usdtSellQuoteVolume"])))
             pnl_text = format_pnl(Decimal(str(summary["usdtOrderPnl"])))
-            fee_text = BinanceClient._format_decimal(Decimal(str(summary["usdtCommission"])))
+            fee_text = self._format_amount(Decimal(str(summary["usdtCommission"])))
             net_text = format_pnl(Decimal(str(summary["usdtNetResult"])))
             native_volume_text = self._format_asset_breakdown_text(dict(summary["quoteVolumes"]))
             native_fee_text = self._format_asset_breakdown_text(dict(summary["commissionByAsset"]))
@@ -2056,7 +2052,7 @@ class ExchangeAppBatchMixin(object):
                 label = f"部分{len(summaries)}/{len(spot_symbol_infos)}" if partial else f"{len(spot_symbol_infos)}对"
                 if stopped:
                     label = "已停止 " + label
-                body = f"{base_asset} {label}｜{compact_summary_text(summary, integer=True)}"
+                body = f"{base_asset} {label}｜{compact_summary_text(summary)}"
                 self._schedule_account_status(
                     acc, body if partial or needs_valuation(summary) else self._exchange_success_status_text(body),
                 )
@@ -2300,7 +2296,7 @@ class ExchangeAppBatchMixin(object):
             )
             status_text = (
                 f"状态：{base_asset}月成交 {label if partial else str(len(spot_symbol_infos)) + '对'}｜"
-                f"{compact_summary_text(summary, integer=False, include_total=False)}｜"
+                f"{compact_summary_text(summary, include_total=False)}｜"
                 f"{success}/{len(selected)}（详情见日志）"
             )
             self._dispatch_ui(
@@ -2536,7 +2532,7 @@ class ExchangeAppBatchMixin(object):
                                         "账号 #%d 活期理财赎回已提交：资产=%s，金额=%s，redeemId=%s",
                                         idx,
                                         asset,
-                                        BinanceClient._format_decimal(amount),
+                                        self._format_amount(amount),
                                         redeem_id or "--",
                                     )
                                     redeemed_assets.append(asset)
@@ -3043,19 +3039,19 @@ class ExchangeAppBatchMixin(object):
                         )
 
                         detail_text = " | ".join(
-                            [f'{r["walletName"]}:{r["balance"]:.4f}' for r in rows if r["balance"] > 0]
+                            [f'{r["walletName"]}:{self._format_amount(r["balance"])}' for r in rows if r["balance"] > 0]
                         )
                         logger.info(
                             "账号 #%d 总资产约 %s USDT；钱包=%s；币种=%s",
                             idx,
-                            f"{total_usdt:.8f}",
+                            self._format_amount(total_usdt),
                             detail_text if detail_text else "无非零钱包余额",
                             asset_text if asset_text != "--" else "无币种资产",
                         )
 
                         set_status(
                             self._exchange_success_status_text(
-                                asset_text if asset_text != "--" else f"总资产 {Decimal(str(total_usdt)):.4f} USDT"
+                                asset_text if asset_text != "--" else f"总资产 {self._format_amount(total_usdt)} USDT"
                             )
                         )
                         op_success = True
@@ -3169,7 +3165,7 @@ class ExchangeAppBatchMixin(object):
                                     logger.info(
                                         "账号 #%d 残留现货资产总额约 %s USDT，小于 0.1 USDT，忽略残留：%s",
                                         idx,
-                                        BinanceClient._format_decimal(residual_total_usdt),
+                                        self._format_amount(residual_total_usdt),
                                         residual_assets,
                                     )
                                     residual_assets.clear()
@@ -3189,7 +3185,7 @@ class ExchangeAppBatchMixin(object):
                             "账号 #%d 当前现货 %s = %s",
                             idx,
                             collect_withdraw_coin,
-                            BinanceClient._format_decimal(bnb_balance),
+                            self._format_amount(bnb_balance),
                         )
                         if not str(acc.get("address") or "").strip():
                             logger.info("账号 #%d 未填写提现地址，跳过 %s 提现", idx, collect_withdraw_coin)
@@ -3202,8 +3198,8 @@ class ExchangeAppBatchMixin(object):
                                 idx,
                                 earn_assets,
                                 collect_withdraw_coin,
-                                BinanceClient._format_decimal(bnb_balance),
-                                BinanceClient._format_decimal(Decimal(str(withdraw_buffer or "0"))),
+                                self._format_amount(bnb_balance),
+                                self._format_amount(Decimal(str(withdraw_buffer or "0"))),
                             )
                             status_text, batch_complete = self._format_collect_bnb_earn_status(
                                 0.0,
@@ -3297,7 +3293,7 @@ class ExchangeAppBatchMixin(object):
                                 source_account="SPOT",
                                 auto_subscribe=earn_auto_subscribe,
                             )
-                            amount_text = BinanceClient._format_decimal(amount_dec)
+                            amount_text = self._format_amount(amount_dec)
                             purchase_id = str((result or {}).get("purchaseId") or "").strip() if isinstance(result, dict) else ""
                             self._record_batch_amount_metric(acc, "earn_subscribe_by_account", amount_dec, asset_u)
                             logger.info(

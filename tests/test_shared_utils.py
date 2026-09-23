@@ -4,8 +4,23 @@
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
 
-from shared_utils import _shift_text_view_state_after_trim, log_amount_value_spans
+from shared_utils import _shift_text_view_state_after_trim, decimal_to_stat_text, decimal_to_text, log_amount_value_spans
+
+
+class StatisticDecimalFormatTests(unittest.TestCase):
+    def test_rounds_statistics_to_five_decimal_places(self) -> None:
+        self.assertEqual(decimal_to_stat_text(Decimal("12.345675")), "12.34568")
+        self.assertEqual(decimal_to_stat_text(Decimal("-0.000006")), "-0.00001")
+        self.assertEqual(decimal_to_stat_text(Decimal("0.000004")), "0")
+
+    def test_supports_fixed_five_decimal_result_files(self) -> None:
+        self.assertEqual(decimal_to_stat_text(Decimal("12.3"), fixed=True), "12.30000")
+        self.assertEqual(decimal_to_stat_text(Decimal("1E+100")), "1" + ("0" * 100))
+
+    def test_full_precision_formatter_is_unchanged_for_transaction_values(self) -> None:
+        self.assertEqual(decimal_to_text(Decimal("12.34567891")), "12.34567891")
 
 
 class LogAmountHighlightTests(unittest.TestCase):

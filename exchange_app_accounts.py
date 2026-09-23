@@ -33,6 +33,7 @@ from exchange_account_destruction import (
 )
 from sensitive_data import mask_api_key
 from secret_box import atomic_write_private_text
+from shared_utils import decimal_to_stat_text
 
 
 class ExchangeAppAccountsMixin(object):
@@ -486,7 +487,7 @@ class ExchangeAppAccountsMixin(object):
         return len(deduped_accounts)
     def record_withdraw(self, index, api_key, address, amount):
         api_key_masked = mask_api_key(api_key)
-        line = f"{index}+{api_key_masked}+{address}+{amount:.8f}\n"
+        line = f"{index}+{api_key_masked}+{address}+{decimal_to_stat_text(amount, fixed=True)}\n"
         try:
             WITHDRAW_SUCCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
             with self._result_file_lock:
@@ -498,7 +499,7 @@ class ExchangeAppAccountsMixin(object):
     def record_total_asset(self, index, api_key, address, network, total_usdt):
         total_dec = Decimal(str(total_usdt))
         api_key_masked = mask_api_key(api_key)
-        line = f"{index}+{api_key_masked}+{total_dec:.8f}\n"
+        line = f"{index}+{api_key_masked}+{decimal_to_stat_text(total_dec, fixed=True)}\n"
 
         try:
             TOTAL_ASSET_RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -541,7 +542,7 @@ class ExchangeAppAccountsMixin(object):
                         row["api_key"],
                         row["address"],
                         row["network"],
-                        f'{row["total_usdt"]:.8f}',
+                        decimal_to_stat_text(row["total_usdt"], fixed=True),
                     ])
 
             logger.info("总资产 CSV 已导出到：%s", path)
