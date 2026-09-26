@@ -10,9 +10,10 @@ import logging
 import re
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -159,6 +160,13 @@ class BinanceAPIError(Exception):
         if not explanation:
             return base_text
         return f"{base_text} | 中文说明: {explanation}"
+
+
+class UnconfirmedOrderError(RuntimeError):
+    def __init__(self, symbol: str, client_order_id: str):
+        self.symbol = symbol
+        self.client_order_id = client_order_id
+        super().__init__(f"{symbol} 订单 {client_order_id} 的交易所执行状态未确认，已停止自动挂单；请核对交易所订单")
 
 
 class SharedRateLimitGate:
@@ -2414,8 +2422,7 @@ class BinanceClient:
         close_orders = self.close_all_um_futures_positions_market(symbol)
         return close_orders[0] if close_orders else None
 
-    def get_closed_minute_klines(self, symbol: str, count: int) -> list[dict[str, object]]:
-        """Fetch closed, contiguous one-minute trade candles for auto ladder decisions."""
+    def _get_recent_minute_klines(self, symbol: str, count: int) -> tuple[str, int, list[dict[str, object]]]:
         count = int(count)
         if count < 1 or count > 70:
             raise ValueError("自动分仓分钟K线窗口必须在1至70分钟之间")
@@ -2423,7 +2430,7 @@ class BinanceClient:
         rows = self.public_get_query(
             self.spot, "/api/v3/klines",
             {"symbol": symbol_u, "interval": "1m", "limit": count + 1},
-            timeout=4, max_retries=2,
+            timeout=4, max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
         )
         if not isinstance(rows, list):
             raise RuntimeError(f"{symbol_u} 分钟K线返回格式无效")
@@ -2432,32 +2439,136 @@ class BinanceClient:
         for row in rows:
             if not isinstance(row, list) or len(row) < 8:
                 raise RuntimeError(f"{symbol_u} 分钟K线字段不完整")
-            if int(row[6]) != int(row[0]) + 59999:
+            open_ms = int(row[0])
+            close_ms = int(row[6])
+            if open_ms % 60000 or close_ms != open_ms + 59999:
                 raise RuntimeError(f"{symbol_u} 分钟K线时间格式无效")
-            if int(row[6]) >= now_ms:
-                continue  # 最后一根还没有收盘
             high, low, volume = (Decimal(str(row[2])), Decimal(str(row[3])), Decimal(str(row[7])))
             if not all(value.is_finite() for value in (high, low, volume)) or low <= 0 or high < low or volume < 0:
                 raise RuntimeError(f"{symbol_u} 分钟K线价格或成交额无效")
-            result.append({"open_time": int(row[0]), "high": high, "low": low, "quote_volume": volume})
-        if len(result) < count:
+            result.append({"open_time": open_ms, "high": high, "low": low, "quote_volume": volume})
+        return symbol_u, now_ms, result
+
+    @staticmethod
+    def _validate_recent_closed_klines(symbol_u: str, rows: list[dict[str, object]], count: int, now_ms: int) -> list[dict[str, object]]:
+        if len(rows) < count:
             raise RuntimeError(f"{symbol_u} 已收盘分钟K线不足 {count} 根")
-        result = result[-count:]
+        result = rows[-count:]
+        if any(result[i]["open_time"] - result[i - 1]["open_time"] != 60000 for i in range(1, len(result))):
+            raise RuntimeError(f"{symbol_u} 分钟K线不连续")
         if now_ms - (int(result[-1]["open_time"]) + 60000) > 75000:
             raise RuntimeError(f"{symbol_u} 分钟K线已过期")
         return result
 
+    def get_closed_minute_klines(self, symbol: str, count: int) -> list[dict[str, object]]:
+        """Fetch closed, contiguous one-minute trade candles for auto ladder decisions."""
+        symbol_u, now_ms, rows = self._get_recent_minute_klines(symbol, count)
+        closed = [row for row in rows if row["open_time"] + 60000 <= now_ms]
+        return self._validate_recent_closed_klines(symbol_u, closed, count, now_ms)
+
+    def get_minute_klines_with_live(self, symbol: str, closed_count: int) -> tuple[list[dict[str, object]], dict[str, object]]:
+        """Return recent closed minutes and the still-open current minute from one response."""
+        symbol_u, now_ms, rows = self._get_recent_minute_klines(symbol, closed_count)
+        current_open = (now_ms // 60000) * 60000
+        live = next((row for row in reversed(rows) if row["open_time"] == current_open), None)
+        if live is None:
+            raise RuntimeError(f"{symbol_u} 当前分钟K线不可用")
+        closed = [row for row in rows if row["open_time"] < current_open]
+        recent_closed = self._validate_recent_closed_klines(symbol_u, closed, closed_count, now_ms)
+        if live["open_time"] - recent_closed[-1]["open_time"] != 60000:
+            raise RuntimeError(f"{symbol_u} 当前分钟K线与历史不连续")
+        return recent_closed, live
+
+    def get_last_spot_trade_time_ms(self, symbol: str) -> int:
+        """avgPrice.closeTime is the latest trade time, independent of candle closure."""
+        symbol_u = self.normalize_trade_symbol(symbol)
+        data = self.public_get_query(
+            self.spot, "/api/v3/avgPrice", {"symbol": symbol_u},
+            timeout=4, max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
+        )
+        if not isinstance(data, dict):
+            raise RuntimeError(f"{symbol_u} 最近成交时间返回格式无效")
+        try:
+            trade_ms = int(data["closeTime"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"{symbol_u} 最近成交时间无效") from exc
+        if trade_ms <= 0:
+            raise RuntimeError(f"{symbol_u} 最近成交时间无效")
+        return trade_ms
+
     def get_book_ticker(self, symbol: str) -> dict[str, Decimal]:
         symbol_u = self.normalize_trade_symbol(symbol)
         data = self.public_get(self.spot, "/api/v3/ticker/bookTicker", {"symbol": symbol_u})
+        return self._parse_book_ticker(symbol_u, data)
+
+    def get_observation_book_ticker(self, symbol: str) -> dict[str, Decimal]:
+        """Read the shared book with the same retry count as other market requests."""
+        symbol_u = self.normalize_trade_symbol(symbol)
+        data = self.public_get_query(
+            self.spot, "/api/v3/ticker/bookTicker", {"symbol": symbol_u},
+            timeout=4, max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
+        )
+        return self._parse_book_ticker(symbol_u, data)
+
+    def _parse_book_ticker(self, symbol_u: str, data) -> dict[str, Decimal]:
+        if not isinstance(data, dict):
+            raise RuntimeError(f"读取盘口失败：{symbol_u} 返回格式无效")
         bid_price = self._decimal_from_str(data.get("bidPrice"), "0")
         ask_price = self._decimal_from_str(data.get("askPrice"), "0")
-        if bid_price <= 0 or ask_price <= 0:
+        if not bid_price.is_finite() or not ask_price.is_finite() or bid_price <= 0 or ask_price < bid_price:
             raise RuntimeError(f"读取盘口失败：{symbol_u} bid/ask 无效")
         return {
             "bidPrice": bid_price,
             "askPrice": ask_price,
         }
+
+    def get_order_by_client_id(self, symbol: str, client_order_id: str):
+        return self.request_query(
+            self.spot, "GET", "/api/v3/order",
+            {"symbol": self.normalize_trade_symbol(symbol), "origClientOrderId": client_order_id},
+            timeout=6, max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
+        )
+
+    def _place_limit_order_with_recovery(
+        self, symbol: str, params: dict, retry_guard: Callable[[], bool] | None,
+    ):
+        """Resolve an uncertain submit by client ID, never repeating its POST."""
+        client_order_id = "xja" + uuid.uuid4().hex
+        params = {**params, "newClientOrderId": client_order_id}
+        if retry_guard is not None and not retry_guard():
+            raise RuntimeError("自动分仓提交前行情不再达标")
+        try:
+            response = self.request_query(
+                self.spot, "POST", "/api/v3/order", params,
+                timeout=15, max_retries=1,
+            )
+            if isinstance(response, dict) and response.get("orderId"):
+                return response
+        except BinanceAPIError as exc:
+            uncertain = exc.code in {-1001, -1006, -1007, -1008} or (exc.status_code or 0) >= 500
+            if not uncertain:
+                raise
+        except Exception:
+            # A network error may occur after the matching engine accepted the order.
+            pass
+        logger.warning("限价挂单回复未确认，按订单标识查询交易所状态：%s", client_order_id)
+        for lookup in range(self.DEFAULT_REQUEST_RETRY_COUNT):
+            try:
+                found = self.get_order_by_client_id(symbol, client_order_id)
+            except BinanceAPIError as exc:
+                if exc.code != -2013:
+                    raise UnconfirmedOrderError(symbol, client_order_id) from exc
+            except Exception as exc:
+                raise UnconfirmedOrderError(symbol, client_order_id) from exc
+            else:
+                if isinstance(found, dict) and found.get("orderId"):
+                    return found
+                raise UnconfirmedOrderError(symbol, client_order_id)
+            if lookup + 1 < self.DEFAULT_REQUEST_RETRY_COUNT:
+                time.sleep(self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS)
+        # Binance permits reusing a client ID after the original order fills.
+        # A temporary -2013 cannot prove the first POST was rejected.
+        raise UnconfirmedOrderError(symbol, client_order_id)
 
     def place_limit_order(
         self,
@@ -2467,6 +2578,8 @@ class BinanceClient:
         price: Decimal,
         *,
         maker_only: bool = False,
+        safe_retry: bool = False,
+        retry_guard: Callable[[], bool] | None = None,
     ):
         symbol_u = self.normalize_trade_symbol(symbol)
         side_u = side.upper()
@@ -2509,7 +2622,10 @@ class BinanceClient:
         }
         if not maker_only:
             params["timeInForce"] = "GTC"
-        data = self.request(self.spot, "POST", "/api/v3/order", params)
+        data = (
+            self._place_limit_order_with_recovery(symbol_u, params, retry_guard)
+            if safe_retry else self.request(self.spot, "POST", "/api/v3/order", params)
+        )
         logger.info(
             "限价挂单 %s %s：数量=%s 价格=%s",
             symbol_u,
@@ -2655,6 +2771,8 @@ class BinanceClient:
         quote_amount: Decimal | str | float | int,
         *,
         maker_only: bool = False,
+        safe_retry: bool = False,
+        retry_guard: Callable[[], bool] | None = None,
     ):
         rules = self.get_symbol_trade_rules(symbol)
         if not rules:
@@ -2674,7 +2792,10 @@ class BinanceClient:
             return None
 
         qty = self._floor_to_step(amount_quote / price_dec, rules["stepSize"])
-        return self.place_limit_order(symbol, "BUY", qty, price_dec, maker_only=maker_only)
+        return self.place_limit_order(
+            symbol, "BUY", qty, price_dec, maker_only=maker_only,
+            safe_retry=safe_retry, retry_guard=retry_guard,
+        )
 
     def spot_limit_sell_quantity(
         self,
@@ -2683,6 +2804,8 @@ class BinanceClient:
         quantity: Decimal | str | float | int,
         *,
         maker_only: bool = False,
+        safe_retry: bool = False,
+        retry_guard: Callable[[], bool] | None = None,
     ):
         rules = self.get_symbol_trade_rules(symbol)
         if not rules:
@@ -2702,7 +2825,10 @@ class BinanceClient:
             return None
 
         qty = self._floor_to_step(qty, rules["stepSize"])
-        return self.place_limit_order(symbol, "SELL", qty, price_dec, maker_only=maker_only)
+        return self.place_limit_order(
+            symbol, "SELL", qty, price_dec, maker_only=maker_only,
+            safe_retry=safe_retry, retry_guard=retry_guard,
+        )
 
     def spot_buy_quote_amount(
         self,

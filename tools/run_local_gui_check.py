@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +20,7 @@ PERSISTENT_REGRESSION_PYTHON = ROOT / ".venv-regression" / ("Scripts/python.exe"
 VERIFIED_SING_BOX_PATH = ROOT / "data" / "proxy_runtimes" / "sing-box" / "v1.13.5" / "sing-box"
 VERIFIED_SING_BOX_SHA256 = "44c9311a332c66a9785ffecc318fc2bddda9dbd61be23b462b526cbc4ad4f207"
 VERIFIED_HYSTERIA_PATH = ROOT / "data" / "proxy_runtimes" / "hysteria" / "app_v2.9.2" / "hysteria"
+VERIFIED_HYSTERIA_SHA256 = "16a978d3c1db6658cb2fb086f580a63ebbca57110be62cc06ff7258c204ec24f"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -66,6 +69,34 @@ def _apply_verified_runtime_defaults(env: MutableMapping[str, str]) -> None:
 
     if not str(env.get("HYSTERIA_PATH", "") or "").strip() and VERIFIED_HYSTERIA_PATH.exists():
         env["HYSTERIA_PATH"] = str(VERIFIED_HYSTERIA_PATH)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(262144), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stage_verified_proxy_runtimes(env: MutableMapping[str, str], stage_dir: Path) -> None:
+    """Run the local selftest from verified copies, never touching app cache manifests."""
+    for backend, source, expected in (
+        ("SING_BOX", VERIFIED_SING_BOX_PATH, VERIFIED_SING_BOX_SHA256),
+        ("HYSTERIA", VERIFIED_HYSTERIA_PATH, VERIFIED_HYSTERIA_SHA256),
+    ):
+        if not source.is_file():
+            raise RuntimeError(f"本地 GUI 自检缺少已验证的 {backend} 运行时：{source}")
+        actual = _sha256_file(source)
+        if actual != expected:
+            raise RuntimeError(f"本地 GUI 自检的 {backend} 运行时哈希不匹配：{source}")
+        staged = stage_dir / backend.lower() / source.name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, staged)
+        if _sha256_file(staged) != expected:
+            raise RuntimeError(f"本地 GUI 自检的 {backend} 运行时复制校验失败")
+        env[f"{backend}_PATH"] = str(staged)
+        env[f"{backend}_EXECUTABLE_SHA256"] = expected
 
 
 def _run_gui_smoke() -> int:
@@ -127,14 +158,17 @@ def _run_child(args: argparse.Namespace) -> int:
     env = os.environ.copy()
     env.setdefault("XIAOJUN_APP_LOCK_BYPASS", "1")
     _apply_verified_runtime_defaults(env)
-    os.environ.update(env)
-    if args.full_selftest:
-        cmd = [sys.executable, "小军bn.py", "--selftest", "--selftest-gui"]
-    elif args.regression:
-        cmd = [sys.executable, "tools/run_regression.py", "--gui", "--strict-pip-check"]
-    else:
-        return _run_gui_smoke()
-    return subprocess.run(cmd, cwd=ROOT, env=env, check=False).returncode
+    with tempfile.TemporaryDirectory(prefix=".regression-proxy-", dir=ROOT) as tmpdir:
+        if sys.platform == "darwin":
+            _stage_verified_proxy_runtimes(env, Path(tmpdir))
+        os.environ.update(env)
+        if args.full_selftest:
+            cmd = [sys.executable, "小军bn.py", "--selftest", "--selftest-gui"]
+        elif args.regression:
+            cmd = [sys.executable, "tools/run_regression.py", "--gui", "--strict-pip-check"]
+        else:
+            return _run_gui_smoke()
+        return subprocess.run(cmd, cwd=ROOT, env=env, check=False).returncode
 
 
 def main(argv: list[str] | None = None) -> int:

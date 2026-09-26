@@ -24,15 +24,30 @@ if [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ]; then
   UV_BIN="$HOME/.local/bin/uv"
 fi
 if [ ! -x "$PYTHON_BIN" ]; then
-  [ -n "$UV_BIN" ] || fail "缺少项目 Python 环境及 uv，无法自动恢复。"
-  "$UV_BIN" venv --python 3.11 "$PROJECT_DIR/.venv" >>"$LOG_FILE" 2>&1 || fail "创建 Python 3.11 环境失败。"
+  BASE_PYTHON=""
+  for candidate in /opt/homebrew/bin/python3.11 /usr/local/bin/python3.11 "$(command -v python3.11 2>/dev/null || true)"; do
+    if [ -x "$candidate" ]; then
+      BASE_PYTHON="$candidate"
+      break
+    fi
+  done
+  if [ -n "$BASE_PYTHON" ]; then
+    "$BASE_PYTHON" -m venv "$PROJECT_DIR/.venv" >>"$LOG_FILE" 2>&1 || fail "创建 Python 3.11 环境失败。"
+  elif [ -n "$UV_BIN" ]; then
+    "$UV_BIN" venv --python 3.11 "$PROJECT_DIR/.venv" >>"$LOG_FILE" 2>&1 || fail "创建 Python 3.11 环境失败。"
+  else
+    fail "缺少项目 Python 环境及 Python 3.11，无法自动恢复。"
+  fi
 fi
 "$PYTHON_BIN" -c 'import sys; assert sys.version_info[:2] == (3, 11)' >>"$LOG_FILE" 2>&1 || fail "项目 Python 必须为 3.11。"
 
 cd "$PROJECT_DIR"
 if ! "$PYTHON_BIN" -c 'import tkinter, requests, eth_account, eth_utils, socks, cryptography' >>"$LOG_FILE" 2>&1; then
-  [ -n "$UV_BIN" ] || fail "运行依赖缺失，且未找到 uv。"
-  "$UV_BIN" pip install --python "$PYTHON_BIN" --require-hashes -r "$PROJECT_DIR/requirements.lock" >>"$LOG_FILE" 2>&1 || fail "安装运行依赖失败。"
+  if [ -n "$UV_BIN" ]; then
+    "$UV_BIN" pip install --python "$PYTHON_BIN" --require-hashes -r "$PROJECT_DIR/requirements.lock" >>"$LOG_FILE" 2>&1 || fail "安装运行依赖失败。"
+  else
+    "$PYTHON_BIN" -m pip install --require-hashes -r "$PROJECT_DIR/requirements.lock" >>"$LOG_FILE" 2>&1 || fail "安装运行依赖失败。"
+  fi
   "$PYTHON_BIN" -c 'import tkinter, requests, eth_account, eth_utils, socks, cryptography' >>"$LOG_FILE" 2>&1 || fail "运行依赖校验失败。"
 fi
 

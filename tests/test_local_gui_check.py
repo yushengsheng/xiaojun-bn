@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import argparse
 import unittest
 import tempfile
 from pathlib import Path
@@ -58,6 +60,45 @@ class LocalGuiCheckTests(unittest.TestCase):
 
         self.assertEqual(env["SING_BOX_PATH"], "/custom/sing-box")
         self.assertEqual(env["SING_BOX_EXECUTABLE_SHA256"], "0" * 64)
+
+    def test_regression_uses_verified_copies_without_changing_live_runtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_box = root / "live" / "sing-box"
+            source_hysteria = root / "live" / "hysteria"
+            source_box.parent.mkdir()
+            source_box.write_bytes(b"verified sing-box")
+            source_hysteria.write_bytes(b"verified hysteria")
+            box_hash = hashlib.sha256(source_box.read_bytes()).hexdigest()
+            hysteria_hash = hashlib.sha256(source_hysteria.read_bytes()).hexdigest()
+            env = {"SING_BOX_PATH": str(source_box), "HYSTERIA_PATH": str(source_hysteria)}
+            with patch.object(run_local_gui_check, "VERIFIED_SING_BOX_PATH", source_box), \
+                 patch.object(run_local_gui_check, "VERIFIED_HYSTERIA_PATH", source_hysteria), \
+                 patch.object(run_local_gui_check, "VERIFIED_SING_BOX_SHA256", box_hash), \
+                 patch.object(run_local_gui_check, "VERIFIED_HYSTERIA_SHA256", hysteria_hash):
+                run_local_gui_check._stage_verified_proxy_runtimes(env, root / "stage")
+                self.assertEqual(Path(env["SING_BOX_PATH"]).read_bytes(), source_box.read_bytes())
+                self.assertEqual(Path(env["HYSTERIA_PATH"]).read_bytes(), source_hysteria.read_bytes())
+                self.assertNotEqual(Path(env["SING_BOX_PATH"]), source_box)
+                self.assertNotEqual(Path(env["HYSTERIA_PATH"]), source_hysteria)
+                self.assertEqual(env["SING_BOX_EXECUTABLE_SHA256"], box_hash)
+                self.assertEqual(env["HYSTERIA_EXECUTABLE_SHA256"], hysteria_hash)
+
+            with patch.object(run_local_gui_check, "VERIFIED_SING_BOX_PATH", source_box), \
+                 patch.object(run_local_gui_check, "VERIFIED_SING_BOX_SHA256", "0" * 64):
+                with self.assertRaisesRegex(RuntimeError, "哈希不匹配"):
+                    run_local_gui_check._stage_verified_proxy_runtimes({}, root / "bad-stage")
+
+    def test_regression_child_stages_proxy_before_selftest(self):
+        args = argparse.Namespace(full_selftest=False, regression=True)
+        with patch.dict(run_local_gui_check.os.environ, {}, clear=False), \
+             patch.object(run_local_gui_check.sys, "platform", "darwin"), \
+             patch.object(run_local_gui_check, "_stage_verified_proxy_runtimes") as stage, \
+             patch.object(run_local_gui_check.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            self.assertEqual(run_local_gui_check._run_child(args), 0)
+        stage.assert_called_once()
+        self.assertEqual(run.call_args.args[0][1:], ["tools/run_regression.py", "--gui", "--strict-pip-check"])
 
 
 if __name__ == "__main__":

@@ -576,7 +576,7 @@ class ExchangeMarketRoundFailureTests(unittest.TestCase):
             "orderPnl": Decimal("0.123456"),
         }
         stats = ExchangeAppBatchMixin._format_spot_run_trade_statistics("btcusdt", summary)
-        self.assertEqual(stats, "BTCUSDT 交易量≈123.45679 USDT｜盈亏≈+0.12346 USDT")
+        self.assertEqual(stats, "BTCUSDT 交易量≈123.45679 USDT｜买卖收支差≈+0.12346 USDT")
         completion = ExchangeAppBatchMixin._spot_strategy_completion_text(
             TRADE_MODE_MARKET,
             3,
@@ -637,7 +637,7 @@ class ExchangeMarketRoundFailureTests(unittest.TestCase):
         client.spot_trade_volume_summary.assert_called_once_with(
             "BTCUSDT", start_time_ms=1000, end_time_ms=2000, stop_event=stop, quote_asset="USDT",
         )
-        self.assertEqual(stats, "BTCUSDT 交易量≈20.12346 USDT｜盈亏≈-0.12346 USDT")
+        self.assertEqual(stats, "BTCUSDT 交易量≈20.12346 USDT｜买卖收支差≈-0.12346 USDT")
 
     def test_statistics_failure_preserves_completed_trade_and_withdrawal(self):
         app = ExchangeAppBatchMixin()
@@ -697,7 +697,7 @@ class ExchangeMarketRoundFailureTests(unittest.TestCase):
         app._restore_batch_ui_to_idle = Mock()
         app.api_key_var = Mock()
         app.api_key_var.get.return_value = ""
-        app._on_worker_finished(completion_status="✔市价3轮结束｜BTCUSDT 交易量≈20 USDT｜盈亏≈0 USDT")
+        app._on_worker_finished(completion_status="✔市价3轮结束｜BTCUSDT 交易量≈20 USDT｜买卖收支差≈0 USDT")
         self.assertIn("市价3轮结束", app._restore_batch_ui_to_idle.call_args.kwargs["status_text"])
         app._on_worker_finished("停止清理失败", "✔市价3轮结束")
         self.assertEqual(app._restore_batch_ui_to_idle.call_args.kwargs["status_text"], "状态：失败：停止清理失败")

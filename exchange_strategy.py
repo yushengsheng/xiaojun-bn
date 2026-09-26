@@ -7,9 +7,11 @@ import threading
 import time
 from contextlib import nullcontext
 from decimal import Decimal
+from typing import Callable
 
-from exchange_auto_ladder import AutoLadderSettingsStore, reversal_count, volume_and_price_signal
-from exchange_binance_client import BinanceAPIError, BinanceClient
+from exchange_auto_ladder import AutoLadderSettingsStore, price_risk_reason, trade_is_recent
+from exchange_auto_ladder_observer import AutoLadderMarketObserver
+from exchange_binance_client import BinanceAPIError, BinanceClient, UnconfirmedOrderError
 from retry_utils import RetryAborted, RetryPolicy, run_with_retries
 from exchange_constants import (
     FUTURES_LEVERAGE_DEFAULT,
@@ -51,6 +53,10 @@ from exchange_constants import (
     TRADE_MODE_PREMIUM,
 )
 from exchange_logging import logger
+
+
+class _AutoLadderMarketPause(RuntimeError):
+    """The newest book is outside the configured price safety band."""
 
 
 def _normalize_futures_margin_type(value) -> str:
@@ -260,6 +266,7 @@ class Strategy:
         ladder_sell_premium_enabled: bool = LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
         ladder_sell_premium: Decimal | None = None,
         auto_ladder_settings: AutoLadderSettingsStore | None = None,
+        auto_ladder_observer: AutoLadderMarketObserver | None = None,
         futures_symbol: str = FUTURES_SYMBOL_DEFAULT,
         futures_rounds: int = FUTURES_ROUNDS_DEFAULT,
         futures_amount: Decimal | None = None,
@@ -311,6 +318,7 @@ class Strategy:
             str(ladder_sell_premium if ladder_sell_premium is not None else LADDER_SELL_PREMIUM_DEFAULT)
         )
         self.auto_ladder_settings = auto_ladder_settings
+        self.auto_ladder_observer = auto_ladder_observer
         self.futures_symbol = BinanceClient.normalize_trade_symbol(futures_symbol or FUTURES_SYMBOL_DEFAULT)
         self.futures_rounds = max(1, int(futures_rounds or FUTURES_ROUNDS_DEFAULT))
         self.futures_amount = Decimal(str(futures_amount if futures_amount is not None else "0"))
@@ -1916,6 +1924,7 @@ class Strategy:
         target_prices: dict[str, list[Decimal]],
         *,
         sell_from_bid: bool = False,
+        market_guard: Callable[[Decimal, Decimal], bool] | None = None,
     ) -> dict[str, Decimal]:
         if not pending_allocations:
             return {}
@@ -1937,17 +1946,40 @@ class Strategy:
         ):
             return {}
         latest_book = self.c.get_book_ticker(self.spot_symbol)
+        latest_bid = Decimal(str(latest_book["bidPrice"]))
+        latest_ask = Decimal(str(latest_book["askPrice"]))
+        if market_guard is not None and not market_guard(latest_bid, latest_ask):
+            raise _AutoLadderMarketPause("提交前盘口价格超出安全范围")
         live_target_prices = self._ladder_target_prices(
-            Decimal(str(latest_book["bidPrice"])),
-            Decimal(str(latest_book["askPrice"])),
-            sell_bid_anchor=(Decimal(str(latest_book["bidPrice"])) if sell_from_bid else None),
+            latest_bid,
+            latest_ask,
+            sell_bid_anchor=(latest_bid if sell_from_bid else None),
         )
         ordered_allocations = sorted(
             pending_allocations,
             key=lambda item: 0 if item.get("source") == "reprice" else 1,
         )
         submitted_anchors: dict[str, Decimal] = {}
-        for allocation in ordered_allocations:
+        order_kwargs = {"maker_only": True}
+        if market_guard is not None and isinstance(self.c, BinanceClient):
+            def retry_guard() -> bool:
+                retry_book = self.c.get_book_ticker(self.spot_symbol)
+                return market_guard(
+                    Decimal(str(retry_book["bidPrice"])), Decimal(str(retry_book["askPrice"])),
+                )
+            order_kwargs.update(safe_retry=True, retry_guard=retry_guard)
+        for index, allocation in enumerate(ordered_allocations):
+            if market_guard is not None:
+                if index:
+                    latest_book = self.c.get_book_ticker(self.spot_symbol)
+                    latest_bid = Decimal(str(latest_book["bidPrice"]))
+                    latest_ask = Decimal(str(latest_book["askPrice"]))
+                    live_target_prices = self._ladder_target_prices(
+                        latest_bid, latest_ask,
+                        sell_bid_anchor=(latest_bid if sell_from_bid else None),
+                    )
+                if not market_guard(latest_bid, latest_ask):
+                    raise _AutoLadderMarketPause("提交子订单前公共行情已变化")
             side_u = str(allocation.get("side") or "").strip().upper()
             amount = Decimal(str(allocation.get("amount", "0") or "0"))
             prices = list(live_target_prices.get(side_u) or target_prices.get(side_u) or [])
@@ -1964,14 +1996,14 @@ class Strategy:
                         self.spot_symbol,
                         order_price,
                         amount,
-                        maker_only=True,
+                        **order_kwargs,
                     )
                 else:
                     order = self.c.spot_limit_sell_quantity(
                         self.spot_symbol,
                         order_price,
                         amount,
-                        maker_only=True,
+                        **order_kwargs,
                     )
             except BinanceAPIError as exc:
                 if exc.code == -2010 and "immediately match and take" in str(exc.msg or "").lower():
@@ -2242,18 +2274,13 @@ class Strategy:
         loop_count = 0
         automatic = mode_name == TRADE_MODE_AUTO_LADDER
         auto_store = (self.auto_ladder_settings or AutoLadderSettingsStore()) if automatic else None
+        observer = (
+            self.auto_ladder_observer or AutoLadderMarketObserver(self.c, self.spot_symbol, auto_store)
+        ) if automatic else None
+        local_observer = automatic and self.auto_ladder_observer is None
         auto_state = "OBSERVE" if automatic else "ACTIVE"
         paused_reason = ""
         stable_since: float | None = None
-        last_kline_at = -float("inf")
-        last_settings_version = -1
-        market_ready = False
-        market_dry = False
-        market_available = False
-        mid_samples: list[tuple[float, Decimal]] = []
-        tick = Decimal(str(self.c.get_symbol_tick_size(self.spot_symbol) or "0")) if automatic else Decimal("0")
-        if automatic and tick <= 0:
-            raise RuntimeError("自动分仓无法读取交易对价格精度")
 
         self.c.collect_asset_to_spot(quote_asset, context="交易前")
         sell_price_text = "卖1"
@@ -2280,31 +2307,35 @@ class Strategy:
 
             try:
                 loop_count += 1
-                book_ticker = self.c.get_book_ticker(self.spot_symbol)
-                current_bid = Decimal(str(book_ticker["bidPrice"]))
-                current_ask = Decimal(str(book_ticker["askPrice"]))
-
+                if automatic:
+                    if local_observer:
+                        observer.poll_once()
+                    market = observer.snapshot()
+                    settings, version = auto_store.snapshot()
+                    market_available = market is not None and market.settings_version == version
+                    current_bid = market.bid if market_available else Decimal("0")
+                    current_ask = market.ask if market_available else Decimal("0")
+                else:
+                    book_ticker = self.c.get_book_ticker(self.spot_symbol)
+                    current_bid = Decimal(str(book_ticker["bidPrice"]))
+                    current_ask = Decimal(str(book_ticker["askPrice"]))
                 now = time.monotonic()
                 if automatic:
-                    settings, version = auto_store.snapshot()
-                    mid_samples.append((now, (current_bid + current_ask) / Decimal("2")))
-                    mid_samples = [(t, p) for t, p in mid_samples if now - t <= 600]
-                    turns = reversal_count(mid_samples, now, settings.turn_seconds, tick * settings.turn_ticks)
-                    choppy = turns >= settings.turn_count
-                    if version != last_settings_version or now - last_kline_at >= 10:
-                        last_settings_version = version
-                        last_kline_at = now
-                        try:
-                            rows = self.c.get_closed_minute_klines(self.spot_symbol, settings.required_minutes)
-                            market_ready, market_dry = volume_and_price_signal(rows, settings, tick)
-                            market_available = True
-                        except Exception as market_exc:
-                            market_ready = False
-                            market_dry = False
-                            market_available = False
-                            logger.warning("自动分仓行情不可用，禁止新挂单：%s", market_exc)
-                    if auto_state == "ACTIVE" and (not market_available or market_dry or choppy):
-                        paused_reason = "行情不可用" if not market_available else "快速反复波动" if choppy else "成交额缩量"
+                    market_ready = market_available and market.market_ready
+                    market_dry = market_available and market.market_dry
+                    price_safe = market_available and market.price_safe
+                    choppy = market_available and market.choppy
+                    no_trade = market_available and not trade_is_recent(
+                        market.last_trade_ms, int(time.time() * 1000), settings.no_trade_seconds,
+                    )
+                    turns = market.turns if market_available else 0
+                    if auto_state == "ACTIVE" and (not market_available or no_trade or market_dry or choppy or not price_safe):
+                        paused_reason = (
+                            "行情不可用" if not market_available else
+                            "超过无成交暂停时间" if no_trade else
+                            "快速反复波动" if choppy else
+                            "价格超出安全范围" if not price_safe else "成交额缩量"
+                        )
                         auto_state = "PAUSED"
                         stable_since = None
                         pending_allocations.clear()
@@ -2316,11 +2347,14 @@ class Strategy:
                             self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS)
                             continue
                     if auto_state != "ACTIVE":
-                        eligible = market_available and market_ready and not choppy
+                        eligible = market_available and market_ready and price_safe and not choppy and not no_trade
                         if eligible:
                             if stable_since is None:
                                 stable_since = now
-                            if auto_state == "OBSERVE" or now - stable_since >= settings.stable_seconds:
+                            if (
+                                (auto_state == "OBSERVE" and market.entry_ready)
+                                or (auto_state == "PAUSED" and now - stable_since >= settings.stable_seconds)
+                            ):
                                 initial_entry = auto_state == "OBSERVE"
                                 auto_state = "ACTIVE"
                                 bid_anchor = current_bid
@@ -2452,11 +2486,31 @@ class Strategy:
                         sell_levels,
                     )
 
+                def auto_market_guard(bid: Decimal, ask: Decimal) -> bool:
+                    latest = observer.snapshot()
+                    if latest is None:
+                        raise _AutoLadderMarketPause("提交前公共行情已过期")
+                    if latest.settings_version != version or auto_store.snapshot()[1] != version:
+                        raise _AutoLadderMarketPause("提交前设置已更新，等待重新观察")
+                    if latest.choppy:
+                        raise _AutoLadderMarketPause("提交前价格反复折返")
+                    if latest.market_dry:
+                        raise _AutoLadderMarketPause("提交前成交额已缩量")
+                    if not trade_is_recent(latest.last_trade_ms, int(time.time() * 1000), settings.no_trade_seconds):
+                        raise _AutoLadderMarketPause("提交前已达到无成交暂停时间")
+                    if not latest.price_safe:
+                        raise _AutoLadderMarketPause("提交前公共行情价格尚未恢复稳定")
+                    reason = price_risk_reason(latest.rows, settings, latest.tick, bid, ask)
+                    if reason:
+                        raise _AutoLadderMarketPause(f"提交前盘口价格超出安全范围：{reason}")
+                    return True
+
                 submitted_anchors = self._ladder_submit_pending_allocations(
                     pending_allocations,
                     active_orders,
                     target_prices,
                     sell_from_bid=premium_sell_pricing,
+                    market_guard=auto_market_guard if automatic else None,
                 )
                 submitted_bid = submitted_anchors.get("BUY")
                 if submitted_bid is not None:
@@ -2480,18 +2534,31 @@ class Strategy:
                     )
                     return
             except Exception as exc:
+                if isinstance(exc, UnconfirmedOrderError):
+                    if self.operation_journal is not None:
+                        entry_id = self.operation_journal.begin(
+                            "exchange-order", self.operation_scope,
+                            {"symbol": exc.symbol, "client_order_id": exc.client_order_id},
+                        )
+                        self.operation_journal.update(entry_id, "open")
+                    self.trade_error = str(exc)
+                    self.trade_error_stage = "自动分仓订单状态"
+                    logger.error("自动分仓停止：%s", exc)
+                    self._auto_ladder_cancel_orders(active_orders, reason="unconfirmed-order")
+                    return
                 if isinstance(exc, RetryAborted) or (stop_event and stop_event.is_set()):
                     self._ladder_cleanup_after_manual_stop(active_orders, base_asset)
                     logger.info("检测到停止信号，已停止后续执行（%s模式）", mode_name)
                     return
-                logger.error("分仓挂单轮询异常: %s", exc)
+                if isinstance(exc, _AutoLadderMarketPause):
+                    logger.warning("自动分仓暂停挂单：%s", exc)
+                else:
+                    logger.error("分仓挂单轮询异常: %s", exc)
                 if automatic:
                     auto_state = "PAUSED"
-                    paused_reason = "轮询异常"
+                    paused_reason = str(exc) if isinstance(exc, _AutoLadderMarketPause) else "轮询异常"
                     stable_since = None
-                    market_available = False
                     pending_allocations.clear()
-                    last_kline_at = -float("inf")
                     if not self._auto_ladder_cancel_orders(active_orders, reason="auto-error"):
                         logger.error("自动分仓仍有未确认订单，保持暂停并重试撤单")
 

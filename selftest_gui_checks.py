@@ -262,6 +262,16 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 window = app.auto_ladder_window
                 if not window.winfo_exists():
                     raise RuntimeError("GUI 自检失败：自动分仓设置弹窗未显示")
+                field_names = {name for name, _label in exchange_app_auto_ladder.FIELDS}
+                if set(exchange_app_auto_ladder.FIELD_HELP) != field_names:
+                    raise RuntimeError("GUI 自检失败：自动分仓参数说明不完整")
+                help_bubbles = window._auto_ladder_help_bubbles
+                if len(help_bubbles) != len(field_names):
+                    raise RuntimeError("GUI 自检失败：自动分仓悬浮说明未绑定到全部参数")
+                help_bubbles[0]._show()
+                if help_bubbles[0]._bubble is None or not help_bubbles[0]._bubble.winfo_exists():
+                    raise RuntimeError("GUI 自检失败：自动分仓悬浮说明未显示")
+                help_bubbles[0]._hide()
                 buttons = [widget for widget in window.winfo_children()[0].winfo_children()
                            if widget.winfo_class() == "TButton" and widget.cget("text") == "保存并运行"]
                 if len(buttons) != 1:

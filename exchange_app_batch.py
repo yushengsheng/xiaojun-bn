@@ -51,6 +51,7 @@ from exchange_app_base import (
     ttk,
 )
 from exchange_order_recovery import exchange_operation_scope, reconcile_exchange_orders
+from exchange_auto_ladder_observer import AutoLadderMarketObserver
 from shared_utils import decimal_to_stat_text
 
 
@@ -1210,7 +1211,7 @@ class ExchangeAppBatchMixin(object):
         symbol_prefix = f"{symbol_u} " if symbol_u else ""
         return (
             f"{symbol_prefix}交易量≈{cls._format_amount(volume)}{asset_suffix}｜"
-            f"盈亏≈{pnl_text}{asset_suffix}"
+            f"买卖收支差≈{pnl_text}{asset_suffix}"
         )
     def _run_strategy_with_spot_statistics(
         self, strategy, client, stop_event, progress_cb, *,
@@ -2131,13 +2132,13 @@ class ExchangeAppBatchMixin(object):
             volume_mark = "≥" if missing_volume else "≈"
             fields = [
                 f"{volume_mark}{amount('usdtQuoteVolume')} USDT",
-                "净待折算" if missing_volume else f"净≈{amount('usdtOrderPnl', signed=True)}",
+                "买卖差待折算" if missing_volume else f"买卖差≈{amount('usdtOrderPnl', signed=True)}",
                 "费待折算" if missing_fee else f"费≈{amount('usdtCommission')}",
             ]
             if include_total:
                 fields.append(
-                    "总盈亏待折算" if missing_volume or missing_fee
-                    else f"总盈亏≈{amount('usdtNetResult', signed=True)}"
+                    "含费收支差待折算" if missing_volume or missing_fee
+                    else f"含费收支差≈{amount('usdtNetResult', signed=True)}"
                 )
             return "｜".join(fields)
 
@@ -2164,9 +2165,10 @@ class ExchangeAppBatchMixin(object):
                 f"交易对：{symbols_text}",
                 f"原币种成交额：{native_volume_text}",
                 f"{volume_label}≈{volume_text} USDT（买入≈{buy_text} / 卖出≈{sell_text}）",
-                "交易净额：待折算" if missing_volume else f"交易净额≈{pnl_text} USDT",
+                "买卖收支差：待折算" if missing_volume else f"买卖收支差≈{pnl_text} USDT",
                 f"手续费：{native_fee_text}（{fee_label}≈{fee_text} USDT）",
-                "总盈亏：待折算" if missing_volume or missing_fee else f"总盈亏≈{net_text} USDT",
+                "含费收支差：待折算" if missing_volume or missing_fee else f"含费收支差≈{net_text} USDT",
+                "说明：这里是近30天卖出收入减买入支出及手续费，未计入期初/期末持币价值和闪兑，不等于实际盈亏。",
                 f"订单/成交明细：{int(summary['orderCount'])}单/{int(summary['tradeCount'])}笔",
             ]
             unvalued_volume = self._format_asset_breakdown_text(dict(summary["unvaluedQuoteVolumeByAsset"]))
@@ -3075,6 +3077,8 @@ class ExchangeAppBatchMixin(object):
                 "市价严格交错已启用：%d 个工作线程，奇数线程与偶数线程反相执行",
                 worker_count,
             )
+        auto_ladder_observer = None
+        auto_ladder_observer_client = None
 
         task_queue = queue.Queue()
         for batch_pos, acc in enumerate(selected, start=1):
@@ -3685,6 +3689,7 @@ class ExchangeAppBatchMixin(object):
                             ladder_sell_premium_enabled=ladder_sell_premium_enabled,
                             ladder_sell_premium=ladder_sell_premium_value,
                             auto_ladder_settings=self.auto_ladder_settings_store if trade_mode == TRADE_MODE_AUTO_LADDER else None,
+                            auto_ladder_observer=auto_ladder_observer if trade_mode == TRADE_MODE_AUTO_LADDER else None,
                             futures_symbol=futures_symbol,
                             futures_rounds=futures_rounds,
                             futures_amount=futures_amount_value,
@@ -3817,7 +3822,7 @@ class ExchangeAppBatchMixin(object):
                 market_stagger_coordinator.unregister(thread_id)
 
         def controller():
-            nonlocal validated_quote_asset, validated_earn_product_id
+            nonlocal validated_quote_asset, validated_earn_product_id, auto_ladder_observer, auto_ladder_observer_client
             if preflight_required:
                 validate_client = None
                 try:
@@ -3906,15 +3911,40 @@ class ExchangeAppBatchMixin(object):
                     return
                 finally:
                     self._close_binance_client_instance(validate_client)
-            threads = []
-            logger.info(f"启动 {worker_count} 个工作线程处理 {total_accounts} 个账号")
-            for i in range(worker_count):
-                t = threading.Thread(target=worker_loop, args=(i + 1,), daemon=True)
-                t.start()
-                threads.append(t)
+            if trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and trade_mode == TRADE_MODE_AUTO_LADDER:
+                try:
+                    sample_acc = selected[0]
+                    auto_ladder_observer_client = self._create_binance_client(
+                        sample_acc["api_key"], sample_acc["api_secret"],
+                        request_gate=batch_request_gate, request_stop_event=self.stop_event,
+                    )
+                    auto_ladder_observer = AutoLadderMarketObserver(
+                        auto_ladder_observer_client, spot_symbol, self.auto_ladder_settings_store,
+                        close_client_on_exit=True,
+                    )
+                    auto_ladder_observer.start(self.stop_event)
+                    logger.info("自动分仓公共行情由单独观察线程读取，%d 个账号共享信号", worker_count)
+                except Exception as exc:
+                    logger.error("自动分仓公共行情观察启动失败：%s", exc)
+                    self._close_binance_client_instance(auto_ladder_observer_client)
+                    self._dispatch_ui(lambda err=exc: self._restore_batch_ui_to_idle(
+                        status_text=f"状态：公共行情观察启动失败：{err}", finish_summary=False,
+                    ))
+                    return
+            try:
+                threads = []
+                logger.info(f"启动 {worker_count} 个工作线程处理 {total_accounts} 个账号")
+                for i in range(worker_count):
+                    t = threading.Thread(target=worker_loop, args=(i + 1,), daemon=True)
+                    t.start()
+                    threads.append(t)
 
-            for t in threads:
-                t.join()
+                for t in threads:
+                    t.join()
+            finally:
+                if auto_ladder_observer is not None:
+                    if not auto_ladder_observer.close():
+                        logger.warning("自动分仓公共行情观察线程尚未退出；连接将在后台请求结束后释放")
 
             logger.info("批量任务全部结束")
             self._dispatch_ui(self._on_worker_finished)

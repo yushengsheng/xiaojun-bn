@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import unittest
+import time
 from decimal import Decimal
 
 from exchange_binance_client import BinanceAPIError, BinanceClient
@@ -106,6 +107,10 @@ class _RunningLadderClient(_PriceRulesClient):
     @staticmethod
     def get_book_ticker(_symbol: str) -> dict[str, Decimal]:
         return {"bidPrice": Decimal("10.111"), "askPrice": Decimal("10.112")}
+
+    @staticmethod
+    def get_last_spot_trade_time_ms(_symbol: str) -> int:
+        return int(time.time() * 1000)
 
     def spot_balance_snapshot(self, _assets) -> dict[str, dict[str, Decimal]]:
         return {

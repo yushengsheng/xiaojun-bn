@@ -27,6 +27,9 @@ class _Client:
     def get_order(self, _symbol, _order_id):
         return {"status": self.status}
 
+    def get_order_by_client_id(self, _symbol, _client_order_id):
+        return {"status": self.status}
+
 
 class ExchangeOrderRecoveryTests(unittest.TestCase):
     def _entry(self):
@@ -45,6 +48,14 @@ class ExchangeOrderRecoveryTests(unittest.TestCase):
     def test_open_order_blocks_new_execution(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "未完成交易所挂单"):
             reconcile_exchange_orders(_Journal([self._entry()]), _Client("NEW"), "api-key")
+
+    def test_unconfirmed_client_order_id_blocks_until_exchange_confirms_terminal_state(self) -> None:
+        entry = {"id": "entry-2", "payload": {"symbol": "BTCUSDT", "client_order_id": "xja123"}}
+        with self.assertRaisesRegex(RuntimeError, "未完成交易所挂单"):
+            reconcile_exchange_orders(_Journal([entry]), _Client("NEW"), "api-key")
+        journal = _Journal([entry])
+        reconcile_exchange_orders(journal, _Client("FILLED"), "api-key")
+        self.assertEqual(journal.updates, [("entry-2", "completed", {"exchange_status": "FILLED"})])
 
 
 if __name__ == "__main__":

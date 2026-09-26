@@ -1246,7 +1246,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
     if (
         not run_status_success
         or "市价2轮结束" not in str(run_status)
-        or "BTCUSDT 交易量≈12.34568 USDT｜盈亏≈+0.12346 USDT" not in str(run_status)
+        or "BTCUSDT 交易量≈12.34568 USDT｜买卖收支差≈+0.12346 USDT" not in str(run_status)
     ):
         raise RuntimeError(f"现货完成状态统计自检失败：{run_status}")
     checks.append("spot-market-rounds=ok")

@@ -1,6 +1,7 @@
 __pycache__/
 .venv/
 .venv-regression/
+.regression-proxy-*/
 *.pyc
 *.pyo
 *.pyd

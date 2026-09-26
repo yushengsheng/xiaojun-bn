@@ -514,8 +514,8 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
             _fill(3, "9990", buy=False, fee="2", fee_asset="USDT", order_id=101),
         ]]
         app.query()
-        self.assertEqual(app.statuses["0"], "✔XPL 2对｜≈19990 USDT｜净≈-10｜费≈10｜总盈亏≈-20")
-        self.assertEqual(app.final_status, "状态：XPL月成交 2对｜≈19990 USDT｜净≈-10｜费≈10｜1/1（详情见日志）")
+        self.assertEqual(app.statuses["0"], "✔XPL 2对｜≈19990 USDT｜买卖差≈-10｜费≈10｜含费收支差≈-20")
+        self.assertEqual(app.final_status, "状态：XPL月成交 2对｜≈19990 USDT｜买卖差≈-10｜费≈10｜1/1（详情见日志）")
         self.assertIn("订单/成交明细：2单/3笔", app.logs)
         self.assertIn("全部账号成交汇总（成功1/1）", app.logs)
         self.assertEqual(app.repair_requests, [])
@@ -537,7 +537,7 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
                 patch("exchange_binance_client.time.sleep", side_effect=AssertionError("unexpected request delay")):
             for _ in range(5):
                 self.assertTrue(gate.wait())
-        self.assertIn("≈200 USDT｜净≈-200｜费≈6｜2/2", app.final_status)
+        self.assertIn("≈200 USDT｜买卖差≈-200｜费≈6｜2/2", app.final_status)
 
     def test_five_workers_start_immediately_and_only_finished_worker_delays_next_account(self):
         app = _MonthlyApp(account_count=6, threads=5)
@@ -613,7 +613,7 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         wait.assert_not_called()
         self.assertEqual(len(app.trade_requests), 3)
         self.assertEqual(len(app.repair_requests), 1)
-        self.assertIn("≈1001 USDT｜净≈-1001｜费≈300", app.final_status)
+        self.assertIn("≈1001 USDT｜买卖差≈-1001｜费≈300", app.final_status)
 
     def test_zero_config_does_not_wait_between_accounts(self):
         app = _MonthlyApp(account_count=3)
@@ -682,10 +682,10 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         self.assertIn("查询失败", app.statuses["0"])
         self.assertIn("查询失败", app.final_status)
         self.assertNotIn("≈0", app.final_status)
-        self.assertNotIn("总盈亏≈0", app.logs)
+        self.assertNotIn("含费收支差≈0", app.logs)
         empty = _MonthlyApp()
         empty.query()
-        self.assertEqual(empty.statuses["0"], "✔XPL 2对｜≈0 USDT｜净≈0｜费≈0｜总盈亏≈0")
+        self.assertEqual(empty.statuses["0"], "✔XPL 2对｜≈0 USDT｜买卖差≈0｜费≈0｜含费收支差≈0")
         self.assertIn("成功1/1", empty.logs)
 
     def test_partial_account_and_complete_account_both_enter_global_sum(self):
@@ -712,9 +712,9 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
             self.assertEqual(params["endTime"], _END)
             self.assertEqual(kwargs["max_retries"], 1)
         for status in app.statuses.values():
-            self.assertEqual(status, "✔XPL 2对｜≈99.9 USDT｜净≈-99.9｜费≈3｜总盈亏≈-102.9")
-        self.assertIn("≈299.7 USDT｜净≈-299.7｜费≈9｜3/3", app.final_status)
-        self.assertIn("总盈亏≈-308.7 USDT", app.logs)
+            self.assertEqual(status, "✔XPL 2对｜≈99.9 USDT｜买卖差≈-99.9｜费≈3｜含费收支差≈-102.9")
+        self.assertIn("≈299.7 USDT｜买卖差≈-299.7｜费≈9｜3/3", app.final_status)
+        self.assertIn("含费收支差≈-308.7 USDT", app.logs)
         self.assertNotIn("待折算", app.logs)
         self.assertFalse(any(app.active.values()))
 
@@ -736,10 +736,10 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         app.repair_rates["BNB"] = TimeoutError("price offline")
         app.pages[("0", "XPLUSDT")] = [[_fill(1, "100", fee="0.01")]]
         app.query()
-        self.assertEqual(app.statuses["0"], "XPL 2对｜≈100 USDT｜净≈-100｜费待折算｜总盈亏待折算")
+        self.assertEqual(app.statuses["0"], "XPL 2对｜≈100 USDT｜买卖差≈-100｜费待折算｜含费收支差待折算")
         self.assertIn("手续费：BNB 0.01", app.logs)
-        self.assertIn("总盈亏：待折算", app.logs)
-        self.assertNotIn("总盈亏≈", app.logs)
+        self.assertIn("含费收支差：待折算", app.logs)
+        self.assertNotIn("含费收支差≈", app.logs)
         self.assertEqual(len(app.repair_requests), 1)
 
     def test_missing_quote_price_never_displays_complete_pnl(self):
@@ -748,9 +748,9 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         app.pages[("0", "XPLUSDT")] = [[_fill(1, "100", buy=False)]]
         app.pages[("0", "XPLUSDC")] = [[_fill(1, "101")]]
         app.query()
-        self.assertIn("≥100 USDT｜净待折算｜费≈0｜总盈亏待折算", app.statuses["0"])
-        self.assertIn("交易净额：待折算", app.logs)
-        self.assertNotIn("总盈亏≈", app.logs)
+        self.assertIn("≥100 USDT｜买卖差待折算｜费≈0｜含费收支差待折算", app.statuses["0"])
+        self.assertIn("买卖收支差：待折算", app.logs)
+        self.assertNotIn("含费收支差≈", app.logs)
         self.assertIn("未折算成交额：USDC 101", app.logs)
 
     def test_failed_price_asset_does_not_block_other_price_repair(self):
@@ -760,7 +760,7 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         app.pages[("0", "XPLUSDC")] = [[_fill(1, "100", fee="0.01")]]
         app.query()
         self.assertEqual(len(app.repair_requests), 2)
-        self.assertIn("≈99.9 USDT｜净≈-99.9｜费待折算｜总盈亏待折算", app.statuses["0"])
+        self.assertIn("≈99.9 USDT｜买卖差≈-99.9｜费待折算｜含费收支差待折算", app.statuses["0"])
         self.assertIn("折合成交额≈99.9 USDT", app.logs)
         self.assertNotIn("未折算成交额", app.logs)
 
@@ -773,7 +773,7 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         self.assertEqual(app.btn_stop["state"], "disabled")
         app.pages = {("0", "XPLUSDT"): [[_fill(1, "20")]]}
         app.query()
-        self.assertEqual(app.statuses["0"], "✔XPL 2对｜≈20 USDT｜净≈-20｜费≈0｜总盈亏≈-20")
+        self.assertEqual(app.statuses["0"], "✔XPL 2对｜≈20 USDT｜买卖差≈-20｜费≈0｜含费收支差≈-20")
         self.assertEqual(app.progress["value"], 0)
         self.assertFalse(any(app.active.values()))
 
@@ -816,7 +816,7 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         app.repair_hook = lambda: app.stop_event.set()
         app.query()
         self.assertIn("已停止", app.statuses["0"])
-        self.assertIn("总盈亏待折算", app.statuses["0"])
+        self.assertIn("含费收支差待折算", app.statuses["0"])
         self.assertIn("已停止", app.final_status)
         self.assertEqual(len(app.repair_requests), 1)
         self.assertEqual(len(app.closed), 3)
@@ -843,7 +843,7 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
             app.pages[(acc["api_key"], "XPLUSDT")] = [[_fill(1, "0.6")]]
         app.query()
         self.assertTrue(all("≈0.6 USDT" in status for status in app.statuses.values()))
-        self.assertIn("≈1.2 USDT｜净≈-1.2", app.final_status)
+        self.assertIn("≈1.2 USDT｜买卖差≈-1.2", app.final_status)
 
     def test_monthly_statistics_round_to_five_decimal_places(self):
         app = _MonthlyApp()
@@ -853,7 +853,7 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         app.query()
         self.assertEqual(
             app.statuses["0"],
-            "✔XPL 2对｜≈1.23457 USDT｜净≈-1.23457｜费≈0.00001｜总盈亏≈-1.23457",
+            "✔XPL 2对｜≈1.23457 USDT｜买卖差≈-1.23457｜费≈0.00001｜含费收支差≈-1.23457",
         )
         self.assertIn("折合成交额≈1.23457 USDT", app.logs)
 
