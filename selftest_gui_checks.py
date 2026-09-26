@@ -65,6 +65,7 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
     from tkinter import messagebox
 
     import exchange_app_accounts
+    import exchange_app_auto_ladder
     import exchange_app_base
     import exchange_app_config
     import onchain_imports
@@ -84,6 +85,7 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
         accounts_path = tmp_root / "accounts.json"
         exchange_journal_path = tmp_root / "exchange_operations.json"
         strategy_path = tmp_root / "exchange_strategy_settings.json"
+        auto_ladder_path = tmp_root / "auto_ladder_settings.json"
         proxy_path = tmp_root / "exchange_proxy_settings.json"
         onchain_path = tmp_root / "onchain.json"
         withdraw_result_path = tmp_root / "withdraw_success.txt"
@@ -93,6 +95,7 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
             (exchange_app_base, "DATA_FILE", accounts_path),
             (exchange_app_base, "EXCHANGE_OPERATION_JOURNAL_FILE", exchange_journal_path),
             (exchange_app_base, "STRATEGY_CONFIG_FILE", strategy_path),
+            (exchange_app_auto_ladder, "AUTO_LADDER_CONFIG_FILE", auto_ladder_path),
             (exchange_app_base, "EXCHANGE_PROXY_CONFIG_FILE", proxy_path),
             (exchange_app_accounts, "DATA_FILE", accounts_path),
             (exchange_app_accounts, "EXCHANGE_OPERATION_JOURNAL_FILE", exchange_journal_path),
@@ -246,6 +249,39 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 ):
                     raise RuntimeError(f"GUI 自检失败：分仓挂单参数未生效（{ladder_settings}）")
                 checks.append("exchange-ladder-control-gui=ok")
+                app.trade_mode_var.set("自动分仓挂单")
+                app._refresh_strategy_panel_layout()
+                pump_tk_events(app, timeout=2.0)
+                row2_widgets = list(app._strategy_row2_left.pack_slaves())
+                if app.btn_auto_ladder_settings not in row2_widgets or str(app.btn_auto_ladder_settings.cget("state")) != "normal":
+                    raise RuntimeError("GUI 自检失败：自动分仓弹窗按钮缺失或不可用")
+                auto_settings = app._collect_trade_mode_settings()
+                if auto_settings.get("ladder_layout") != "买2卖1":
+                    raise RuntimeError("GUI 自检失败：自动分仓未复用主界面的档位")
+                app.open_auto_ladder_settings()
+                window = app.auto_ladder_window
+                if not window.winfo_exists():
+                    raise RuntimeError("GUI 自检失败：自动分仓设置弹窗未显示")
+                buttons = [widget for widget in window.winfo_children()[0].winfo_children()
+                           if widget.winfo_class() == "TButton" and widget.cget("text") == "保存并运行"]
+                if len(buttons) != 1:
+                    raise RuntimeError("GUI 自检失败：自动分仓设置保存按钮缺失")
+                buttons[0].invoke()
+                if not auto_ladder_path.exists() or app.auto_ladder_settings_store.snapshot()[1] != 1:
+                    raise RuntimeError("GUI 自检失败：自动分仓设置未原子保存并更新")
+                app._set_combo_states_for_run(True)
+                try:
+                    if str(app.trade_mode_combo.cget("state")) != "disabled":
+                        raise RuntimeError("GUI 自检失败：运行中主界面模式未锁定")
+                    if str(app.btn_auto_ladder_settings.cget("state")) != "normal":
+                        raise RuntimeError("GUI 自检失败：运行中自动分仓设置按钮不可用")
+                    app.btn_auto_ladder_settings.invoke()
+                    if not app.auto_ladder_window.winfo_exists():
+                        raise RuntimeError("GUI 自检失败：运行中无法打开自动分仓设置")
+                    app.auto_ladder_window.destroy()
+                finally:
+                    app._set_combo_states_for_run(False)
+                checks.append("exchange-auto-ladder-control-gui=ok")
                 app.trade_account_type_var.set("理财")
                 app._refresh_strategy_panel_layout()
                 pump_tk_events(app, timeout=2.0)

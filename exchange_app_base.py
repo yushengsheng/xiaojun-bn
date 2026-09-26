@@ -33,6 +33,7 @@ from app_paths import (
     WITHDRAW_SUCCESS_FILE,
 )
 from core_models import AccountEntry
+from exchange_auto_ladder import AutoLadderSettingsStore
 from exchange_binance_client import BinanceClient, SharedRateLimitGate, summarize_exchange_exception
 from exchange_constants import (
     API_KEY_DEFAULT,
@@ -83,6 +84,7 @@ from exchange_constants import (
     TRADE_MODE_CONVERT,
     TRADE_MODE_DEFAULT,
     TRADE_MODE_LADDER,
+    TRADE_MODE_AUTO_LADDER,
     TRADE_MODE_LIMIT,
     TRADE_MODE_MARKET,
     TRADE_MODE_OPTIONS,
@@ -219,6 +221,7 @@ class ExchangeAppBase(tk.Tk):
         self.onchain_proxy_runtime.cleanup_stale_runtime()
         self.account_store = AccountStore(DATA_FILE)
         self.exchange_operation_journal = OperationJournal(EXCHANGE_OPERATION_JOURNAL_FILE)
+        self.auto_ladder_settings_store = AutoLadderSettingsStore()
 
         self.accounts = []
         self.total_asset_results = {}
@@ -228,6 +231,7 @@ class ExchangeAppBase(tk.Tk):
         self._sync_exchange_proxy_state()
         start_ui_bridge(self, root=self)
         self._load_strategy_config()
+        self._load_auto_ladder_settings()
         self._load_exchange_proxy_config()
         self._load_accounts()
         self._log_poll_after_token = self.after(100, self._poll_log_queue)
@@ -1148,7 +1152,7 @@ class ExchangeAppBase(tk.Tk):
                 reprice_threshold_text = REPRICE_THRESHOLD_DEFAULT
             bnb_topup_value = self._decimal_field_value(bnb_topup_text, "预买BNB金额", min_value=0)
             reprice_threshold_value = self._decimal_field_value(reprice_threshold_text, "重挂阈值", min_value=0)
-            if mode == TRADE_MODE_LADDER:
+            if mode in {TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}:
                 ladder_min_pool_notional_value = self._decimal_field_value(
                     ladder_min_pool_notional_text,
                     "最小分仓成交额",
@@ -1182,9 +1186,11 @@ class ExchangeAppBase(tk.Tk):
                         raise RuntimeError("剩余bnb手续费必须大于 0")
             else:
                 runtime_rounds = stored_rounds if stored_rounds >= 0 else SPOT_ROUNDS_DEFAULT
+                if mode == TRADE_MODE_AUTO_LADDER and runtime_rounds == 0:
+                    raise RuntimeError("自动分仓挂单模式不支持0轮兑换，请将现货轮次设为1或更大")
                 if runtime_rounds != 0:
                     effective_fee_stop_text = fee_stop_text
-                    if mode == TRADE_MODE_LADDER and not effective_fee_stop_text:
+                    if mode in {TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER} and not effective_fee_stop_text:
                         effective_fee_stop_text = "0"
                     fee_stop_value = self._decimal_field_value(
                         effective_fee_stop_text,
@@ -1443,7 +1449,7 @@ class ExchangeAppBase(tk.Tk):
                 row2_left,
                 textvariable=self.trade_mode_var,
                 values=TRADE_MODE_OPTIONS,
-                width=8,
+                width=12,
                 state="readonly",
             )
             self.trade_mode_combo.pack(side="left", padx=(4, 12))
@@ -1471,6 +1477,9 @@ class ExchangeAppBase(tk.Tk):
                 ttk.Spinbox(row2_left, from_=0, to=100, textvariable=self.spot_rounds_var, width=6).pack(side="left", padx=(4, 12))
             ttk.Label(row2_left, text="预购买BNB金额:").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.bnb_topup_amount_var, width=10).pack(side="left", padx=(4, 12))
+            if current_trade_mode == TRADE_MODE_AUTO_LADDER:
+                self.btn_auto_ladder_settings = ttk.Button(row2_left, text="策略设置", command=self.open_auto_ladder_settings)
+                self.btn_auto_ladder_settings.pack(side="left", padx=(0, 8))
         elif current_trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
             ttk.Label(row2_left, text="合约交易对:", style="ExchangeAccent.TLabel").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.futures_symbol_var, width=14).pack(side="left", padx=(4, 12))
@@ -1548,7 +1557,7 @@ class ExchangeAppBase(tk.Tk):
                 ttk.Label(row3_left, text=self._reprice_threshold_label_text()).pack(side="left")
                 ttk.Entry(row3_left, textvariable=self.reprice_threshold_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
                 ttk.Checkbutton(row3_left, text="部分成交循环", variable=self.premium_partial_fill_var).pack(side="left", padx=(0, 8))
-            elif current_trade_mode == TRADE_MODE_LADDER:
+            elif current_trade_mode in {TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}:
                 ttk.Label(row3_left, text="剩余bnb手续费:").pack(side="left")
                 ttk.Entry(row3_left, textvariable=self.bnb_fee_stop_var, width=row3_compact_entry_width).pack(side="left", padx=row3_item_pad)
                 ttk.Label(row3_left, text="档位模式:").pack(side="left")

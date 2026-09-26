@@ -2414,6 +2414,39 @@ class BinanceClient:
         close_orders = self.close_all_um_futures_positions_market(symbol)
         return close_orders[0] if close_orders else None
 
+    def get_closed_minute_klines(self, symbol: str, count: int) -> list[dict[str, object]]:
+        """Fetch closed, contiguous one-minute trade candles for auto ladder decisions."""
+        count = int(count)
+        if count < 1 or count > 70:
+            raise ValueError("自动分仓分钟K线窗口必须在1至70分钟之间")
+        symbol_u = self.normalize_trade_symbol(symbol)
+        rows = self.public_get_query(
+            self.spot, "/api/v3/klines",
+            {"symbol": symbol_u, "interval": "1m", "limit": count + 1},
+            timeout=4, max_retries=2,
+        )
+        if not isinstance(rows, list):
+            raise RuntimeError(f"{symbol_u} 分钟K线返回格式无效")
+        now_ms = int(time.time() * 1000)
+        result: list[dict[str, object]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 8:
+                raise RuntimeError(f"{symbol_u} 分钟K线字段不完整")
+            if int(row[6]) != int(row[0]) + 59999:
+                raise RuntimeError(f"{symbol_u} 分钟K线时间格式无效")
+            if int(row[6]) >= now_ms:
+                continue  # 最后一根还没有收盘
+            high, low, volume = (Decimal(str(row[2])), Decimal(str(row[3])), Decimal(str(row[7])))
+            if not all(value.is_finite() for value in (high, low, volume)) or low <= 0 or high < low or volume < 0:
+                raise RuntimeError(f"{symbol_u} 分钟K线价格或成交额无效")
+            result.append({"open_time": int(row[0]), "high": high, "low": low, "quote_volume": volume})
+        if len(result) < count:
+            raise RuntimeError(f"{symbol_u} 已收盘分钟K线不足 {count} 根")
+        result = result[-count:]
+        if now_ms - (int(result[-1]["open_time"]) + 60000) > 75000:
+            raise RuntimeError(f"{symbol_u} 分钟K线已过期")
+        return result
+
     def get_book_ticker(self, symbol: str) -> dict[str, Decimal]:
         symbol_u = self.normalize_trade_symbol(symbol)
         data = self.public_get(self.spot, "/api/v3/ticker/bookTicker", {"symbol": symbol_u})

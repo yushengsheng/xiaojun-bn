@@ -31,6 +31,7 @@ from exchange_app_base import (
     TRADE_MODE_CONVERT,
     TRADE_MODE_DEFAULT,
     TRADE_MODE_LADDER,
+    TRADE_MODE_AUTO_LADDER,
     TRADE_MODE_LIMIT,
     TRADE_MODE_MARKET,
     TRADE_MODE_PREMIUM,
@@ -85,6 +86,7 @@ class ExchangeAppBatchMixin(object):
                 TRADE_MODE_LIMIT,
                 TRADE_MODE_PREMIUM,
                 TRADE_MODE_LADDER,
+                TRADE_MODE_AUTO_LADDER,
             }
         )
 
@@ -462,6 +464,7 @@ class ExchangeAppBatchMixin(object):
                 TRADE_MODE_LIMIT,
                 TRADE_MODE_PREMIUM,
                 TRADE_MODE_LADDER,
+                TRADE_MODE_AUTO_LADDER,
             }:
                 premium_append_mode_enabled = (
                     trade_mode == TRADE_MODE_PREMIUM
@@ -614,6 +617,7 @@ class ExchangeAppBatchMixin(object):
             ladder_min_pool_notional=ladder_min_pool_notional_value,
             ladder_sell_premium_enabled=ladder_sell_premium_enabled,
             ladder_sell_premium=ladder_sell_premium_value,
+            auto_ladder_settings=self.auto_ladder_settings_store if trade_mode == TRADE_MODE_AUTO_LADDER else None,
             futures_symbol=futures_symbol,
             futures_rounds=futures_rounds,
             futures_amount=futures_amount_value,
@@ -693,7 +697,7 @@ class ExchangeAppBatchMixin(object):
                         BinanceClient._format_decimal(effective_reprice_threshold or Decimal("0")),
                         quote_asset,
                     )
-                elif trade_mode == TRADE_MODE_LADDER:
+                elif trade_mode in {TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}:
                     logger.info(
                         "开始执行策略：分仓挂单，档位模式=%s，最小分仓成交额=%s %s，预买BNB金额=%s，剩余bnb手续费=%s，重挂阈值=%s %s",
                         ladder_layout,
@@ -1216,7 +1220,7 @@ class ExchangeAppBatchMixin(object):
         collect_stats = (
             trade_account_type == TRADE_ACCOUNT_TYPE_SPOT
             and not zero_round_spot_conversion
-            and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER}
+            and trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}
         )
         started_at_ms = client.current_server_time_ms() if collect_stats else None
         result = strategy.run(stop_event, progress_cb=progress_cb)
@@ -1247,7 +1251,7 @@ class ExchangeAppBatchMixin(object):
         strategy_result: dict | None = None,
     ) -> str:
         mode = str(trade_mode or "").strip()
-        if mode == TRADE_MODE_LADDER:
+        if mode in {TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}:
             return "分仓挂单结束"
         if mode == TRADE_MODE_LIMIT:
             return "挂单结束"
@@ -1837,13 +1841,13 @@ class ExchangeAppBatchMixin(object):
                 lines.append(f"轮次：{int(spot_rounds)}")
             if trade_mode == TRADE_MODE_MARKET:
                 lines.append(f"市价交错执行：{'开启' if market_stagger_enabled else '关闭'}")
-            if trade_mode == TRADE_MODE_LADDER:
+            if trade_mode in {TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}:
                 lines.append(f"档位模式：{ladder_layout}")
                 lines.append(
                     "最小分仓成交额：%s"
                     % BinanceClient._format_decimal(Decimal(str(ladder_min_pool_notional or "0")))
                 )
-            if trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER}:
+            if trade_mode in {TRADE_MODE_MARKET, TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}:
                 lines.append(
                     "预购买BNB金额：%s" % BinanceClient._format_decimal(Decimal(str(bnb_topup_amount or "0")))
                 )
@@ -3538,7 +3542,7 @@ class ExchangeAppBatchMixin(object):
                                 BinanceClient._format_decimal(effective_reprice_threshold),
                                 quote_asset,
                             )
-                        elif trade_mode == TRADE_MODE_LADDER:
+                        elif trade_mode in {TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}:
                             if reprice_threshold_value > 0:
                                 effective_reprice_threshold = client.normalize_price_delta(
                                     spot_symbol,
@@ -3680,6 +3684,7 @@ class ExchangeAppBatchMixin(object):
                             ladder_min_pool_notional=ladder_min_pool_notional_value,
                             ladder_sell_premium_enabled=ladder_sell_premium_enabled,
                             ladder_sell_premium=ladder_sell_premium_value,
+                            auto_ladder_settings=self.auto_ladder_settings_store if trade_mode == TRADE_MODE_AUTO_LADDER else None,
                             futures_symbol=futures_symbol,
                             futures_rounds=futures_rounds,
                             futures_amount=futures_amount_value,
@@ -3784,7 +3789,7 @@ class ExchangeAppBatchMixin(object):
                             )
                             if cleanup_error:
                                 set_status(self._exchange_failed_status_text(f"停止清理失败：{cleanup_error}"))
-                            elif trade_mode == TRADE_MODE_LADDER and cleanup_confirmed:
+                            elif trade_mode in {TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER} and cleanup_confirmed:
                                 set_status("已停止（已确认撤单清仓）")
                             else:
                                 set_status("已停止")

@@ -8,6 +8,7 @@ import time
 from contextlib import nullcontext
 from decimal import Decimal
 
+from exchange_auto_ladder import AutoLadderSettingsStore, reversal_count, volume_and_price_signal
 from exchange_binance_client import BinanceAPIError, BinanceClient
 from retry_utils import RetryAborted, RetryPolicy, run_with_retries
 from exchange_constants import (
@@ -44,6 +45,7 @@ from exchange_constants import (
     TRADE_MODE_DEFAULT,
     TRADE_MODE_LIMIT,
     TRADE_MODE_LADDER,
+    TRADE_MODE_AUTO_LADDER,
     TRADE_MODE_MARKET,
     TRADE_MODE_OPTIONS,
     TRADE_MODE_PREMIUM,
@@ -257,6 +259,7 @@ class Strategy:
         ladder_min_pool_notional: Decimal | None = None,
         ladder_sell_premium_enabled: bool = LADDER_SELL_PREMIUM_ENABLED_DEFAULT,
         ladder_sell_premium: Decimal | None = None,
+        auto_ladder_settings: AutoLadderSettingsStore | None = None,
         futures_symbol: str = FUTURES_SYMBOL_DEFAULT,
         futures_rounds: int = FUTURES_ROUNDS_DEFAULT,
         futures_amount: Decimal | None = None,
@@ -307,6 +310,7 @@ class Strategy:
         self.ladder_sell_premium = Decimal(
             str(ladder_sell_premium if ladder_sell_premium is not None else LADDER_SELL_PREMIUM_DEFAULT)
         )
+        self.auto_ladder_settings = auto_ladder_settings
         self.futures_symbol = BinanceClient.normalize_trade_symbol(futures_symbol or FUTURES_SYMBOL_DEFAULT)
         self.futures_rounds = max(1, int(futures_rounds or FUTURES_ROUNDS_DEFAULT))
         self.futures_amount = Decimal(str(futures_amount if futures_amount is not None else "0"))
@@ -491,7 +495,7 @@ class Strategy:
         return (not self._is_futures_mode()) and self._mode_name() == TRADE_MODE_CONVERT
 
     def _limit_like_mode(self) -> bool:
-        return self._mode_name() in {TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER}
+        return self._mode_name() in {TRADE_MODE_LIMIT, TRADE_MODE_PREMIUM, TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}
 
     def _premium_split_order_count(self) -> int:
         return max(0, int(self.premium_order_count or 0))
@@ -2200,6 +2204,28 @@ class Strategy:
                 )
             time.sleep(max(0.0, float(self.LADDER_CLEANUP_CONFIRM_POLL_INTERVAL_SECONDS)))
 
+    def _auto_ladder_cancel_orders(self, active_orders: dict[str, dict[str, object]], *, reason: str) -> bool:
+        """Unlike legacy cleanup, never assume a cancel succeeded without a final query."""
+        confirmed = True
+        for key, state in list(active_orders.items()):
+            order_id = state["order_id"]
+            side = str(state["side"])
+            try:
+                self._cancel_limit_order_with_fill_guard(order_id, side)
+                final = self.c.get_order(self.spot_symbol, order_id)
+                status = str(final.get("status") or "").upper()
+                if not self._order_terminal_status(status):
+                    raise RuntimeError(f"订单#{order_id}撤销未确认：{status}")
+                self._journal_order_state(
+                    order_id, side, "completed" if status == "FILLED" else "cancelled",
+                    reason=reason, exchange_status=status,
+                )
+                active_orders.pop(key, None)
+            except Exception as exc:
+                confirmed = False
+                logger.error("自动分仓撤单未确认 %s #%s：%s", side, order_id, exc)
+        return confirmed
+
     def _run_ladder_mode(self, stop_event, progress_cb=None):
         mode_name = self._mode_name()
         base_asset, quote_asset = self._spot_pair_assets()
@@ -2214,6 +2240,20 @@ class Strategy:
         sell_reprice_pending = False
         last_reconcile_at = time.monotonic()
         loop_count = 0
+        automatic = mode_name == TRADE_MODE_AUTO_LADDER
+        auto_store = (self.auto_ladder_settings or AutoLadderSettingsStore()) if automatic else None
+        auto_state = "OBSERVE" if automatic else "ACTIVE"
+        paused_reason = ""
+        stable_since: float | None = None
+        last_kline_at = -float("inf")
+        last_settings_version = -1
+        market_ready = False
+        market_dry = False
+        market_available = False
+        mid_samples: list[tuple[float, Decimal]] = []
+        tick = Decimal(str(self.c.get_symbol_tick_size(self.spot_symbol) or "0")) if automatic else Decimal("0")
+        if automatic and tick <= 0:
+            raise RuntimeError("自动分仓无法读取交易对价格精度")
 
         self.c.collect_asset_to_spot(quote_asset, context="交易前")
         sell_price_text = "卖1"
@@ -2245,6 +2285,57 @@ class Strategy:
                 current_ask = Decimal(str(book_ticker["askPrice"]))
 
                 now = time.monotonic()
+                if automatic:
+                    settings, version = auto_store.snapshot()
+                    mid_samples.append((now, (current_bid + current_ask) / Decimal("2")))
+                    mid_samples = [(t, p) for t, p in mid_samples if now - t <= 600]
+                    turns = reversal_count(mid_samples, now, settings.turn_seconds, tick * settings.turn_ticks)
+                    choppy = turns >= settings.turn_count
+                    if version != last_settings_version or now - last_kline_at >= 10:
+                        last_settings_version = version
+                        last_kline_at = now
+                        try:
+                            rows = self.c.get_closed_minute_klines(self.spot_symbol, settings.required_minutes)
+                            market_ready, market_dry = volume_and_price_signal(rows, settings, tick)
+                            market_available = True
+                        except Exception as market_exc:
+                            market_ready = False
+                            market_dry = False
+                            market_available = False
+                            logger.warning("自动分仓行情不可用，禁止新挂单：%s", market_exc)
+                    if auto_state == "ACTIVE" and (not market_available or market_dry or choppy):
+                        paused_reason = "行情不可用" if not market_available else "快速反复波动" if choppy else "成交额缩量"
+                        auto_state = "PAUSED"
+                        stable_since = None
+                        pending_allocations.clear()
+                        bid_anchor = ask_anchor = None
+                        buy_reprice_pending = sell_reprice_pending = False
+                        logger.warning("自动分仓暂停挂单：%s（折返=%d）", paused_reason, turns)
+                    if auto_state == "PAUSED" and active_orders:
+                        if not self._auto_ladder_cancel_orders(active_orders, reason="auto-pause"):
+                            self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS)
+                            continue
+                    if auto_state != "ACTIVE":
+                        eligible = market_available and market_ready and not choppy
+                        if eligible:
+                            if stable_since is None:
+                                stable_since = now
+                            if auto_state == "OBSERVE" or now - stable_since >= settings.stable_seconds:
+                                initial_entry = auto_state == "OBSERVE"
+                                auto_state = "ACTIVE"
+                                bid_anchor = current_bid
+                                ask_anchor = current_ask
+                                if initial_entry:
+                                    loop_count = 0  # 首次入场仍按旧分仓的初始持仓卖价
+                                logger.info("自动分仓行情达标，开始按当前盘口挂单")
+                        else:
+                            stable_since = None
+                        if auto_state != "ACTIVE":
+                            if progress_cb and loop_count % 7 == 0:
+                                progress_cb(0, 1, f"自动分仓观察中：{paused_reason or '等待行情达标'}")
+                            self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS)
+                            continue
+
                 if (now - last_reconcile_at) >= self.LADDER_ORDER_RECONCILE_INTERVAL_SECONDS:
                     self._ladder_reconcile_order_states(active_orders)
                     last_reconcile_at = now
@@ -2381,7 +2472,7 @@ class Strategy:
                         f"分仓挂单 活动订单{len(active_orders)} 待提交{len(pending_allocations)}",
                     )
 
-                if not active_orders and not pending_allocations:
+                if not active_orders and not pending_allocations and not automatic:
                     logger.info(
                         "分仓挂单无活动订单，且可用余额均未达到最小分仓成交额 %s %s，结束本次运行",
                         BinanceClient._format_decimal(min_pool),
@@ -2394,6 +2485,15 @@ class Strategy:
                     logger.info("检测到停止信号，已停止后续执行（%s模式）", mode_name)
                     return
                 logger.error("分仓挂单轮询异常: %s", exc)
+                if automatic:
+                    auto_state = "PAUSED"
+                    paused_reason = "轮询异常"
+                    stable_since = None
+                    market_available = False
+                    pending_allocations.clear()
+                    last_kline_at = -float("inf")
+                    if not self._auto_ladder_cancel_orders(active_orders, reason="auto-error"):
+                        logger.error("自动分仓仍有未确认订单，保持暂停并重试撤单")
 
             if self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS):
                 continue
@@ -2755,7 +2855,7 @@ class Strategy:
         if self._mode_name() == TRADE_MODE_LIMIT:
             self._run_limit_mode(stop_event, progress_cb=progress_cb)
             return
-        if self._mode_name() == TRADE_MODE_LADDER:
+        if self._mode_name() in {TRADE_MODE_LADDER, TRADE_MODE_AUTO_LADDER}:
             self._run_ladder_mode(stop_event, progress_cb=progress_cb)
             return
         self._run_premium_mode(stop_event, progress_cb=progress_cb)
@@ -2985,6 +3085,10 @@ class Strategy:
                         self.market_stagger_coordinator.suspend(self.market_stagger_lane_id)
             else:
                 self._run_limit_like_mode(stop_event, progress_cb=progress_cb)
+
+        if self._mode_name() == TRADE_MODE_AUTO_LADDER and self.trade_error:
+            logger.error("自动分仓策略失败，跳过最终提现：%s", self.trade_error)
+            return result_payload()
 
         if stop_event and stop_event.is_set():
             logger.info("检测到停止信号，跳过最终提现")
