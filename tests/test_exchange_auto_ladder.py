@@ -356,6 +356,240 @@ class AutoLadderTests(unittest.TestCase):
             observer.poll_once()
             self.assertTrue(observer.snapshot().entry_ready)
 
+    def test_auto_mode_keeps_orders_through_brief_market_gap(self):
+        stop = _StopAfterOrders()
+        client = _BnbStopLadderClient(stop)
+        strategy = _strategy(client)
+        strategy.trade_mode = TRADE_MODE_AUTO_LADDER
+        strategy.auto_ladder_settings = AutoLadderSettingsStore(
+            AutoLadderSettings.parse({"entry_confirm_seconds": "0"})
+        )
+        clock = [100.0]
+        reads = [0]
+
+        def read_candles(*_args):
+            reads[0] += 1
+            if reads[0] == 2:
+                raise ConnectionError("短暂行情中断")
+            return candles([100000] * 6)
+
+        client.get_closed_minute_klines = read_candles
+        before_recovery = []
+
+        def wait(_seconds):
+            stop.wait_count += 1
+            if stop.wait_count == 1:
+                clock[0] = 102.0
+                before_recovery.append((len(client.placements), len(client.events)))
+            elif stop.wait_count == 2:
+                clock[0] = 104.0
+                before_recovery.append((len(client.placements), len(client.events)))
+            elif stop.wait_count == 3:
+                before_recovery.append((len(client.placements), len(client.events)))
+                stop.stopped = True
+            return stop.stopped
+
+        stop.wait_count = 0
+        stop.wait = wait
+        with patch.object(AutoLadderMarketObserver, "KLINE_REFRESH_SECONDS", 0), \
+             patch("exchange_auto_ladder_observer.time.monotonic", side_effect=lambda: clock[0]):
+            strategy._run_ladder_mode(stop)
+        self.assertGreater(before_recovery[0][0], 0)
+        self.assertEqual(before_recovery[0], before_recovery[1])
+        self.assertEqual(before_recovery[1][1], before_recovery[2][1])
+        self.assertTrue(any(event.startswith("cancel-") for event in client.events))  # 人工停止清理
+
+    def test_auto_mode_cancels_orders_after_ten_second_market_gap(self):
+        stop = _StopAfterOrders()
+        client = _BnbStopLadderClient(stop)
+        strategy = _strategy(client)
+        strategy.trade_mode = TRADE_MODE_AUTO_LADDER
+        strategy.auto_ladder_settings = AutoLadderSettingsStore(
+            AutoLadderSettings.parse({"entry_confirm_seconds": "0"})
+        )
+        clock = [100.0]
+        reads = [0]
+
+        def read_candles(*_args):
+            reads[0] += 1
+            if reads[0] > 1:
+                raise ConnectionError("持续行情中断")
+            return candles([100000] * 6)
+
+        client.get_closed_minute_klines = read_candles
+        events_at_wait = []
+
+        def wait(_seconds):
+            stop.wait_count += 1
+            events_at_wait.append(list(client.events))
+            if stop.wait_count == 1:
+                clock[0] = 102.0
+            elif stop.wait_count == 2:
+                clock[0] = 109.0
+            elif stop.wait_count == 3:
+                clock[0] = 112.0
+            elif stop.wait_count == 4:
+                stop.stopped = True
+            return stop.stopped
+
+        stop.wait_count = 0
+        stop.wait = wait
+        with patch.object(AutoLadderMarketObserver, "KLINE_REFRESH_SECONDS", 0), \
+             patch("exchange_auto_ladder_observer.time.monotonic", side_effect=lambda: clock[0]):
+            strategy._run_ladder_mode(stop)
+        self.assertFalse(any(event.startswith("cancel-") for event in events_at_wait[1]))
+        self.assertFalse(any(event.startswith("cancel-") for event in events_at_wait[2]))
+        self.assertTrue(any(event.startswith("cancel-") for event in events_at_wait[3]))
+        self.assertFalse(any(event.startswith("market-sell-") for event in events_at_wait[3]))
+
+    def test_settings_change_still_pauses_orders_without_market_grace(self):
+        stop = _StopAfterOrders()
+        client = _BnbStopLadderClient(stop)
+        strategy = _strategy(client)
+        strategy.trade_mode = TRADE_MODE_AUTO_LADDER
+        store = AutoLadderSettingsStore(AutoLadderSettings.parse({"entry_confirm_seconds": "0"}))
+        strategy.auto_ladder_settings = store
+        events_at_wait = []
+        reads = [0]
+
+        def read_candles(*_args):
+            reads[0] += 1
+            if reads[0] > 1:
+                raise ConnectionError("设置刷新时行情暂不可用")
+            return candles([100000] * 6)
+
+        client.get_closed_minute_klines = read_candles
+
+        def wait(_seconds):
+            events_at_wait.append(list(client.events))
+            if len(events_at_wait) == 1:
+                store.replace(store.snapshot()[0])
+            else:
+                stop.stopped = True
+            return stop.stopped
+
+        stop.wait = wait
+        with patch.object(AutoLadderMarketObserver, "KLINE_REFRESH_SECONDS", 0):
+            strategy._run_ladder_mode(stop)
+        self.assertFalse(any(event.startswith("cancel-") for event in events_at_wait[0]))
+        self.assertTrue(any(event.startswith("cancel-") for event in events_at_wait[1]))
+
+    def test_paused_recovery_timer_survives_brief_market_gap(self):
+        stop = _StopAfterOrders()
+        client = _BnbStopLadderClient(stop)
+        strategy = _strategy(client)
+        strategy.trade_mode = TRADE_MODE_AUTO_LADDER
+        strategy.auto_ladder_settings = AutoLadderSettingsStore(AutoLadderSettings.parse({
+            "entry_confirm_seconds": "0", "stable_seconds": "10",
+            "dry_minutes": "1", "dry_confirm_minutes": "1",
+        }))
+        clock = [100.0]
+        next_times = [102.0, 103.0, 107.0, 109.0, 111.0, 115.0]
+        reads = [0]
+        placements_at_wait = []
+
+        def read_candles(*_args):
+            reads[0] += 1
+            if reads[0] == 2:
+                return candles([0] * 6)
+            if reads[0] == 5:
+                raise ConnectionError("恢复观察短暂中断")
+            return candles([100000] * 6)
+
+        def wait(_seconds):
+            placements_at_wait.append(len(client.placements))
+            if len(placements_at_wait) <= len(next_times):
+                clock[0] = next_times[len(placements_at_wait) - 1]
+            else:
+                stop.stopped = True
+            return stop.stopped
+
+        client.get_closed_minute_klines = read_candles
+        stop.wait = wait
+        with patch.object(AutoLadderMarketObserver, "KLINE_REFRESH_SECONDS", 0), \
+             patch("exchange_auto_ladder_observer.time.monotonic", side_effect=lambda: clock[0]):
+            strategy._run_ladder_mode(stop)
+        self.assertEqual(placements_at_wait[3], placements_at_wait[4])  # 数据缺口不补挂
+        self.assertEqual(placements_at_wait[4], placements_at_wait[5])
+        self.assertGreater(placements_at_wait[6], placements_at_wait[5])  # 原稳定期结束后恢复
+
+    def test_auto_mode_retries_when_market_gap_starts_before_order_submission(self):
+        stop = _StopAfterOrders()
+        client = _BnbStopLadderClient(stop)
+        store = AutoLadderSettingsStore(AutoLadderSettings.parse({"entry_confirm_seconds": "0"}))
+        observer = AutoLadderMarketObserver(_ObserverClient(), "BTCUSDT", store)
+        observer.poll_once()
+        fresh = observer.snapshot()
+        reads = [0]
+
+        def snapshot():
+            reads[0] += 1
+            return None if reads[0] == 2 else fresh
+
+        observer.snapshot = snapshot
+        strategy = _strategy(client)
+        strategy.trade_mode = TRADE_MODE_AUTO_LADDER
+        strategy.auto_ladder_settings = store
+        strategy.auto_ladder_observer = observer
+        orders_at_wait = []
+        events_at_wait = []
+
+        def wait(_seconds):
+            stop.wait_count += 1
+            orders_at_wait.append(len(client.placements))
+            events_at_wait.append(list(client.events))
+            if stop.wait_count == 2:
+                stop.stopped = True
+            return stop.stopped
+
+        stop.wait_count = 0
+        stop.wait = wait
+        strategy._run_ladder_mode(stop)
+        self.assertEqual(orders_at_wait[0], 0)
+        self.assertGreater(orders_at_wait[1], 0)
+        self.assertFalse(any(event.startswith("cancel-") for event in events_at_wait[1]))
+
+    def test_repeated_submit_guard_failures_hit_ten_second_limit(self):
+        stop = _StopAfterOrders()
+        client = _BnbStopLadderClient(stop)
+        store = AutoLadderSettingsStore(AutoLadderSettings.parse({"entry_confirm_seconds": "0"}))
+        observer = AutoLadderMarketObserver(_ObserverClient(), "BTCUSDT", store)
+        observer.poll_once()
+        fresh = observer.snapshot()
+        reads = [0]
+
+        def snapshot():
+            reads[0] += 1
+            return fresh if reads[0] % 2 else None
+
+        observer.snapshot = snapshot
+        strategy = _strategy(client)
+        strategy.trade_mode = TRADE_MODE_AUTO_LADDER
+        strategy.auto_ladder_settings = store
+        strategy.auto_ladder_observer = observer
+        clock = [100.0]
+        cancel_times = []
+        original_cancel = strategy._auto_ladder_cancel_orders
+
+        def cancel(orders, *, reason):
+            cancel_times.append((clock[0], reason))
+            return original_cancel(orders, reason=reason)
+
+        def wait(_seconds):
+            stop.wait_count += 1
+            clock[0] = 100.0 + 5 * stop.wait_count
+            if stop.wait_count == 3:
+                stop.stopped = True
+            return stop.stopped
+
+        strategy._auto_ladder_cancel_orders = cancel
+        stop.wait_count = 0
+        stop.wait = wait
+        with patch("exchange_auto_ladder_observer.time.monotonic", side_effect=lambda: clock[0]):
+            strategy._run_ladder_mode(stop)
+        self.assertEqual(cancel_times, [(110.0, "auto-error")])
+        self.assertEqual(client.placements, [])
+
     def test_five_account_workers_do_not_fetch_public_data_while_observing(self):
         observer_client = _ObserverClient()
         settings = AutoLadderSettingsStore()

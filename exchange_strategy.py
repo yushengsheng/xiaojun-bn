@@ -59,6 +59,10 @@ class _AutoLadderMarketPause(RuntimeError):
     """The newest book is outside the configured price safety band."""
 
 
+class _AutoLadderMarketRetry(RuntimeError):
+    """A short public-market gap freezes new orders while existing orders remain."""
+
+
 def _normalize_futures_margin_type(value) -> str:
     text = str(value or '').strip()
     if not text:
@@ -232,6 +236,7 @@ class Strategy:
     TRADE_OPERATION_RETRY_POLICY = RetryPolicy(attempts=10, delay_seconds=1)
     LADDER_POLL_INTERVAL_SECONDS = 1.5
     LADDER_ORDER_RECONCILE_INTERVAL_SECONDS = 5.0
+    AUTO_LADDER_DATA_GRACE_SECONDS = 10.0
     LADDER_CLEANUP_CONFIRM_TIMEOUT_SECONDS = 12.0
     LADDER_CLEANUP_CONFIRM_POLL_INTERVAL_SECONDS = 0.5
     LADDER_MAX_ACTIVE_CHILD_ORDERS_PER_SIDE = 20
@@ -812,6 +817,7 @@ class Strategy:
         side: str,
         *,
         cleanup_after_stop: bool = False,
+        strict_confirmation: bool = False,
     ) -> dict:
         symbol_u = self.spot_symbol.upper()
         get_order = self.c.get_order
@@ -851,7 +857,7 @@ class Strategy:
             )
             if cancel_status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
                 return dict(cancel_result)
-            if cleanup_after_stop:
+            if cleanup_after_stop or strict_confirmation:
                 raise RuntimeError(f"订单 #{order_id} 撤销后状态未确认")
             if latest_order is None:
                 latest_order = {
@@ -2083,6 +2089,7 @@ class Strategy:
             order_id,
             side_u,
             cleanup_after_stop=reason == "stop",
+            strict_confirmation=True,
         )
         latest_status = str(latest_order.get("status") or "").strip().upper()
         if not self._order_terminal_status(latest_status):
@@ -2243,7 +2250,7 @@ class Strategy:
             order_id = state["order_id"]
             side = str(state["side"])
             try:
-                self._cancel_limit_order_with_fill_guard(order_id, side)
+                self._cancel_limit_order_with_fill_guard(order_id, side, strict_confirmation=True)
                 final = self.c.get_order(self.spot_symbol, order_id)
                 status = str(final.get("status") or "").upper()
                 if not self._order_terminal_status(status):
@@ -2279,8 +2286,12 @@ class Strategy:
         ) if automatic else None
         local_observer = automatic and self.auto_ladder_observer is None
         auto_state = "OBSERVE" if automatic else "ACTIVE"
+        last_settings_version = auto_store.snapshot()[1] if automatic else None
         paused_reason = ""
         stable_since: float | None = None
+        stable_gap_started: float | None = None
+        market_retrying = False
+        market_gap_started: float | None = None
 
         self.c.collect_asset_to_spot(quote_asset, context="交易前")
         sell_price_text = "卖1"
@@ -2312,6 +2323,8 @@ class Strategy:
                         observer.poll_once()
                     market = observer.snapshot()
                     settings, version = auto_store.snapshot()
+                    settings_changed = version != last_settings_version
+                    last_settings_version = version
                     market_available = market is not None and market.settings_version == version
                     current_bid = market.bid if market_available else Decimal("0")
                     current_ask = market.ask if market_available else Decimal("0")
@@ -2321,6 +2334,16 @@ class Strategy:
                     current_ask = Decimal(str(book_ticker["askPrice"]))
                 now = time.monotonic()
                 if automatic:
+                    if market_available:
+                        if auto_state != "ACTIVE":
+                            market_gap_started = None
+                    elif market_gap_started is None:
+                        market_gap_started = now
+                    data_grace_active = (
+                        not market_available
+                        and not settings_changed
+                        and now - market_gap_started < self.AUTO_LADDER_DATA_GRACE_SECONDS
+                    )
                     market_ready = market_available and market.market_ready
                     market_dry = market_available and market.market_dry
                     price_safe = market_available and market.price_safe
@@ -2329,15 +2352,26 @@ class Strategy:
                         market.last_trade_ms, int(time.time() * 1000), settings.no_trade_seconds,
                     )
                     turns = market.turns if market_available else 0
+                    if auto_state == "ACTIVE" and data_grace_active:
+                        if not market_retrying:
+                            logger.warning("自动分仓公共行情暂不可用：冻结新增及重挂，保留现有挂单并持续重试")
+                            market_retrying = True
+                        if progress_cb and loop_count % 7 == 0:
+                            progress_cb(0, 1, "自动分仓行情重试中：保留现有挂单，冻结新挂单")
+                        self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS)
+                        continue
                     if auto_state == "ACTIVE" and (not market_available or no_trade or market_dry or choppy or not price_safe):
                         paused_reason = (
-                            "行情不可用" if not market_available else
+                            "设置已更新，等待重新观察" if settings_changed else
+                            "行情连续不可用达到10秒" if not market_available else
                             "超过无成交暂停时间" if no_trade else
                             "快速反复波动" if choppy else
                             "价格超出安全范围" if not price_safe else "成交额缩量"
                         )
                         auto_state = "PAUSED"
+                        market_retrying = False
                         stable_since = None
+                        stable_gap_started = None
                         pending_allocations.clear()
                         bid_anchor = ask_anchor = None
                         buy_reprice_pending = sell_reprice_pending = False
@@ -2347,6 +2381,20 @@ class Strategy:
                             self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS)
                             continue
                     if auto_state != "ACTIVE":
+                        if (
+                            auto_state == "PAUSED" and stable_since is not None
+                            and data_grace_active
+                        ):
+                            if stable_gap_started is None:
+                                stable_gap_started = now
+                            if progress_cb and loop_count % 7 == 0:
+                                progress_cb(0, 1, "自动分仓行情重试中：恢复计时暂时冻结")
+                            self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS)
+                            continue
+                        if stable_gap_started is not None:
+                            if market_available and stable_since is not None:
+                                stable_since += now - stable_gap_started
+                            stable_gap_started = None
                         eligible = market_available and market_ready and price_safe and not choppy and not no_trade
                         if eligible:
                             if stable_since is None:
@@ -2487,10 +2535,12 @@ class Strategy:
                     )
 
                 def auto_market_guard(bid: Decimal, ask: Decimal) -> bool:
+                    if auto_store.snapshot()[1] != version:
+                        raise _AutoLadderMarketPause("提交前设置已更新，等待重新观察")
                     latest = observer.snapshot()
                     if latest is None:
-                        raise _AutoLadderMarketPause("提交前公共行情已过期")
-                    if latest.settings_version != version or auto_store.snapshot()[1] != version:
+                        raise _AutoLadderMarketRetry("提交前公共行情不可用，等待重试")
+                    if latest.settings_version != version:
                         raise _AutoLadderMarketPause("提交前设置已更新，等待重新观察")
                     if latest.choppy:
                         raise _AutoLadderMarketPause("提交前价格反复折返")
@@ -2533,6 +2583,11 @@ class Strategy:
                         quote_asset,
                     )
                     return
+                if automatic:
+                    market_gap_started = None
+                    if market_retrying:
+                        logger.info("自动分仓公共行情已恢复，继续按最新行情运行")
+                        market_retrying = False
             except Exception as exc:
                 if isinstance(exc, UnconfirmedOrderError):
                     if self.operation_journal is not None:
@@ -2550,14 +2605,27 @@ class Strategy:
                     self._ladder_cleanup_after_manual_stop(active_orders, base_asset)
                     logger.info("检测到停止信号，已停止后续执行（%s模式）", mode_name)
                     return
+                if isinstance(exc, _AutoLadderMarketRetry):
+                    retry_now = time.monotonic()
+                    if market_gap_started is None:
+                        market_gap_started = retry_now
+                    if retry_now - market_gap_started < self.AUTO_LADDER_DATA_GRACE_SECONDS:
+                        if not market_retrying:
+                            logger.warning("自动分仓提交前公共行情暂不可用：冻结新挂单并持续重试")
+                            market_retrying = True
+                        self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS)
+                        continue
+                    exc = _AutoLadderMarketPause("提交前公共行情连续不可用达到10秒")
                 if isinstance(exc, _AutoLadderMarketPause):
                     logger.warning("自动分仓暂停挂单：%s", exc)
                 else:
                     logger.error("分仓挂单轮询异常: %s", exc)
                 if automatic:
                     auto_state = "PAUSED"
+                    market_retrying = False
                     paused_reason = str(exc) if isinstance(exc, _AutoLadderMarketPause) else "轮询异常"
                     stable_since = None
+                    stable_gap_started = None
                     pending_allocations.clear()
                     if not self._auto_ladder_cancel_orders(active_orders, reason="auto-error"):
                         logger.error("自动分仓仍有未确认订单，保持暂停并重试撤单")

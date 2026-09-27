@@ -550,6 +550,34 @@ class ExchangeLadderStrategyTests(unittest.TestCase):
             "source": "reprice",
         }])
 
+    def test_reprice_keeps_order_when_cancel_status_cannot_be_confirmed(self) -> None:
+        class UnclearCancelClient(_CancelClient):
+            reads = 0
+
+            def get_order(self, symbol, order_id):
+                self.reads += 1
+                if self.reads > 1:
+                    raise ConnectionError("查询撤单状态失败")
+                return super().get_order(symbol, order_id)
+
+            def cancel_order(self, _symbol, order_id):
+                return {"orderId": order_id}  # 回复未提供终态
+
+        client = UnclearCancelClient()
+        strategy = _strategy(client)
+        active_orders = {
+            "2": {"order_id": "2", "side": "BUY", "price": Decimal("10.110"), "level_index": 1},
+        }
+        pending_allocations = []
+
+        with self.assertRaisesRegex(RuntimeError, "撤销后状态未确认"):
+            strategy._ladder_cancel_orders_outside_targets(
+                active_orders, pending_allocations, "BUY",
+                [Decimal("10.112"), Decimal("10.111")], reason="reprice",
+            )
+        self.assertIn("2", active_orders)
+        self.assertEqual(pending_allocations, [])
+
     def test_small_cancelled_remainder_returns_to_balance_pool(self) -> None:
         client = _CancelClient()
         client.orders["2"]["origQty"] = "1"
