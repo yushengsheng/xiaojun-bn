@@ -355,6 +355,23 @@ class OnchainRelayPipelineTests(unittest.TestCase):
         self.assertEqual(_receipt_state({"status": "0x0"}), "failed")
         self.assertEqual(_receipt_state(None), "pending")
 
+    def test_relay_amount_branch_uses_started_mode_even_after_ui_mode_changes(self) -> None:
+        owner = _FakeOwner(mode_m1=True)
+        owner._is_mode_m1 = Mock(side_effect=AssertionError("worker must use its mode snapshot"))
+        owner._is_mode_1m = Mock(side_effect=AssertionError("worker must use its mode snapshot"))
+        item = _item(1)
+        params = replace(_params(coin="BNB", token_is_native=True), mode="1对多")
+        items = _relay_prepare_items(owner, [(item.row_key, "source-key", item.target)], params,
+                                     {item.row_key: 1}, {item.row_key: item.relay_record},
+                                     {item.row_key: ("source-key", item.source_addr)})
+        self.assertEqual(items[0].value_units, 10**18)
+        self.assertEqual(items[0].amount_text, "1")
+        params = replace(params, mode="多对1")
+        items = _relay_prepare_items(owner, [(item.row_key, "source-key", item.target)], params,
+                                     {item.row_key: 1}, {item.row_key: item.relay_record},
+                                     {item.row_key: ("source-key", item.source_addr)})
+        self.assertEqual(items[0].value_units, 0)  # The many-to-one amount is resolved from balance later.
+
     def test_relay_dust_thresholds_match_cleanup_policy(self) -> None:
         owner = _FakeOwner()
         bnb_threshold_units = 5_000_000_000_000

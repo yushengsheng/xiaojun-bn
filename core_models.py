@@ -62,6 +62,7 @@ class WithdrawRuntimeParams:
     relay_fee_reserve: Decimal | None = None
     relay_sweep_enabled: bool = False
     relay_sweep_target: str = ""
+    mode: str = ""
 
 
 @dataclass

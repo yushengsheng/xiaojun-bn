@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from dataclasses import asdict
@@ -263,12 +264,14 @@ class AccountStore:
         self.one_to_many_source_api_key = SECRET_BOX.decrypt(str(one_to_many_raw.get("api_key", "") or "").strip()).strip()
         self.one_to_many_source_api_secret = SECRET_BOX.decrypt(str(one_to_many_raw.get("api_secret", "") or "").strip()).strip()
         try:
-            worker_threads = max(1, int(settings_raw.get("worker_threads", EXCHANGE_WORKER_THREADS_DEFAULT)))
+            worker_threads = int(settings_raw.get("worker_threads", EXCHANGE_WORKER_THREADS_DEFAULT))
+            if not 1 <= worker_threads <= 128:
+                worker_threads = EXCHANGE_WORKER_THREADS_DEFAULT
         except Exception:
             worker_threads = EXCHANGE_WORKER_THREADS_DEFAULT
         try:
             delay_seconds = float(settings_raw.get("delay_seconds", ONCHAIN_DELAY_SECONDS_DEFAULT))
-            if delay_seconds < 0:
+            if not math.isfinite(delay_seconds) or delay_seconds < 0 or delay_seconds > 86400:
                 delay_seconds = 0.0
         except Exception:
             delay_seconds = ONCHAIN_DELAY_SECONDS_DEFAULT
@@ -441,7 +444,7 @@ class OnchainStore:
 
         try:
             delay = float(settings_raw.get("delay_seconds", ONCHAIN_DELAY_SECONDS_DEFAULT))
-            if delay < 0:
+            if not math.isfinite(delay) or delay < 0 or delay > 86400:
                 delay = 0.0
         except Exception:
             delay = ONCHAIN_DELAY_SECONDS_DEFAULT
@@ -449,19 +452,21 @@ class OnchainStore:
             one_to_many_source_threads = int(
                 settings_raw.get("one_to_many_source_threads", ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT)
             )
-            if one_to_many_source_threads <= 0:
+            if not 1 <= one_to_many_source_threads <= 128:
                 one_to_many_source_threads = ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT
         except Exception:
             one_to_many_source_threads = ONCHAIN_ONE_TO_MANY_SOURCE_THREADS_DEFAULT
         try:
-            threads = max(1, int(settings_raw.get("worker_threads", ONCHAIN_WORKER_THREADS_DEFAULT)))
+            threads = int(settings_raw.get("worker_threads", ONCHAIN_WORKER_THREADS_DEFAULT))
+            if not 1 <= threads <= 128:
+                threads = ONCHAIN_WORKER_THREADS_DEFAULT
         except Exception:
             threads = ONCHAIN_WORKER_THREADS_DEFAULT
         try:
             confirm_timeout_seconds = float(
                 settings_raw.get("confirm_timeout_seconds", ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)
             )
-            if confirm_timeout_seconds <= 0:
+            if not math.isfinite(confirm_timeout_seconds) or not 0 < confirm_timeout_seconds <= 86400:
                 confirm_timeout_seconds = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
         except Exception:
             confirm_timeout_seconds = ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT
@@ -469,19 +474,19 @@ class OnchainStore:
             receipt_poll_interval_seconds = float(
                 settings_raw.get("receipt_poll_interval_seconds", ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT)
             )
-            if receipt_poll_interval_seconds <= 0:
+            if not math.isfinite(receipt_poll_interval_seconds) or not 0 < receipt_poll_interval_seconds <= 86400:
                 receipt_poll_interval_seconds = ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT
         except Exception:
             receipt_poll_interval_seconds = ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT
         try:
             receipt_retry_count = int(settings_raw.get("receipt_retry_count", ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT))
-            if receipt_retry_count <= 0:
+            if not 1 <= receipt_retry_count <= 1000:
                 receipt_retry_count = ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT
         except Exception:
             receipt_retry_count = ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT
         try:
             nonce_window = int(settings_raw.get("nonce_window", ONCHAIN_NONCE_WINDOW_DEFAULT))
-            if nonce_window <= 0:
+            if not 1 <= nonce_window <= 128:
                 nonce_window = ONCHAIN_NONCE_WINDOW_DEFAULT
         except Exception:
             nonce_window = ONCHAIN_NONCE_WINDOW_DEFAULT

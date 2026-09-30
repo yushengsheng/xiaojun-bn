@@ -3,9 +3,14 @@
 """自动分仓的可热更新判断参数及纯行情信号；不持有订单或账号状态。"""
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+
+
+AUTO_LADDER_SHARE_FORMAT = "xiaojun-auto-ladder-settings"
+AUTO_LADDER_SHARE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,35 @@ class AutoLadderSettings:
     def required_minutes(self) -> int:
         return max(self.volume_minutes, self.price_minutes,
                    self.dry_minutes + self.dry_confirm_minutes - 1)
+
+
+def export_auto_ladder_settings(settings: AutoLadderSettings) -> str:
+    return json.dumps({
+        "format": AUTO_LADDER_SHARE_FORMAT,
+        "version": AUTO_LADDER_SHARE_VERSION,
+        "settings": settings.as_dict(),
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def import_auto_ladder_settings(text: str) -> AutoLadderSettings:
+    if not isinstance(text, str) or len(text) > 8192:
+        raise ValueError("分享内容无效或过长")
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("分享内容不是有效的策略设置") from exc
+    if not isinstance(payload, dict) or payload.get("format") != AUTO_LADDER_SHARE_FORMAT:
+        raise ValueError("分享内容不是自动分仓策略设置")
+    if set(payload) != {"format", "version", "settings"}:
+        raise ValueError("分享策略结构无效")
+    if type(payload.get("version")) is not int or payload["version"] != AUTO_LADDER_SHARE_VERSION:
+        raise ValueError("分享策略版本不受支持，请升级程序后重试")
+    raw = payload.get("settings")
+    if not isinstance(raw, dict) or set(raw) != set(AutoLadderSettings.__dataclass_fields__):
+        raise ValueError("分享策略参数不完整或版本不兼容")
+    if any(not isinstance(value, str) for value in raw.values()):
+        raise ValueError("分享策略参数格式无效")
+    return AutoLadderSettings.parse(raw)
 
 
 class AutoLadderSettingsStore:

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from input_validation import bounded_int, finite_decimal, finite_float, MAX_RETRY_COUNT
+
 import tkinter as tk
 from tkinter import ttk
 
@@ -56,7 +58,7 @@ class OnchainTransferRunnerMixin(object):
                 return None
             try:
                 if amount_mode == self.AMOUNT_MODE_FIXED:
-                    v = Decimal(amount_raw)
+                    v = finite_decimal(amount_raw, "固定数量")
                     if v <= 0:
                         raise InvalidOperation
                     amount = self._decimal_to_text(v)
@@ -72,8 +74,8 @@ class OnchainTransferRunnerMixin(object):
             min_raw = self.random_min_var.get().strip()
             max_raw = self.random_max_var.get().strip()
             try:
-                random_min = Decimal(min_raw)
-                random_max = Decimal(max_raw)
+                random_min = finite_decimal(min_raw, "随机金额最小值")
+                random_max = finite_decimal(max_raw, "随机金额最大值")
             except Exception:
                 messagebox.showerror("参数错误", "随机金额最小值/最大值格式错误")
                 return None
@@ -90,53 +92,39 @@ class OnchainTransferRunnerMixin(object):
                 return None
 
         try:
-            delay = max(0.0, float(self.delay_var.get()))
-        except Exception:
-            messagebox.showerror("参数错误", "执行间隔格式错误")
+            delay = finite_float(self.delay_var.get(), "执行间隔")
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc) or "执行间隔格式错误")
             return None
         try:
-            one_to_many_source_threads = int(str(self.one_to_many_source_threads_var.get()).strip())
-            if one_to_many_source_threads <= 0:
-                raise ValueError
-        except Exception:
-            messagebox.showerror("参数错误", "1对多单钱包线程数必须是大于 0 的整数")
+            one_to_many_source_threads = bounded_int(self.one_to_many_source_threads_var.get(), "1对多单钱包线程数")
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc) or "1对多单钱包线程数必须是大于 0 的整数")
             return None
         try:
-            threads = max(1, int(str(self.threads_var.get()).strip()))
-        except Exception:
-            messagebox.showerror("参数错误", "执行线程数格式错误")
+            threads = bounded_int(self.threads_var.get(), "执行线程数")
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc) or "执行线程数格式错误")
             return None
         try:
-            confirm_timeout_seconds = float(str(self.confirm_timeout_var.get()).strip())
-        except Exception:
-            messagebox.showerror("参数错误", "确认超时格式错误")
-            return None
-        if confirm_timeout_seconds <= 0:
-            messagebox.showerror("参数错误", "确认超时必须大于 0")
+            confirm_timeout_seconds = finite_float(self.confirm_timeout_var.get(), "确认超时", positive=True)
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc) or "确认超时格式错误")
             return None
         try:
-            receipt_poll_interval_seconds = float(str(self.receipt_poll_interval_var.get()).strip())
-        except Exception:
-            messagebox.showerror("参数错误", "receipt轮询间隔格式错误")
-            return None
-        if receipt_poll_interval_seconds <= 0:
-            messagebox.showerror("参数错误", "receipt轮询间隔必须大于 0")
+            receipt_poll_interval_seconds = finite_float(self.receipt_poll_interval_var.get(), "receipt轮询间隔", positive=True)
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc) or "receipt轮询间隔格式错误")
             return None
         try:
-            receipt_retry_count = int(str(self.receipt_retry_count_var.get()).strip())
-        except Exception:
-            messagebox.showerror("参数错误", "receipt重试次数格式错误")
-            return None
-        if receipt_retry_count <= 0:
-            messagebox.showerror("参数错误", "receipt重试次数必须大于 0")
+            receipt_retry_count = bounded_int(self.receipt_retry_count_var.get(), "receipt重试次数", maximum=MAX_RETRY_COUNT)
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc) or "receipt重试次数格式错误")
             return None
         try:
-            nonce_window = int(str(self.nonce_window_var.get()).strip())
-        except Exception:
-            messagebox.showerror("参数错误", "单钱包nonce并发格式错误")
-            return None
-        if nonce_window <= 0:
-            messagebox.showerror("参数错误", "单钱包nonce并发必须大于 0")
+            nonce_window = bounded_int(self.nonce_window_var.get(), "单钱包nonce并发")
+        except Exception as exc:
+            messagebox.showerror("参数错误", str(exc) or "单钱包nonce并发格式错误")
             return None
 
         if hasattr(self, "mode_var") and self._is_mode_m1():
@@ -164,12 +152,9 @@ class OnchainTransferRunnerMixin(object):
                 messagebox.showerror("参数错误", "启用中转后必须填写预留原生币手续费")
                 return None
             try:
-                relay_fee_reserve = Decimal(reserve_raw)
+                relay_fee_reserve = finite_decimal(reserve_raw, "预留原生币手续费")
             except Exception:
                 messagebox.showerror("参数错误", "预留原生币手续费格式错误")
-                return None
-            if relay_fee_reserve < 0:
-                messagebox.showerror("参数错误", "预留原生币手续费不能小于 0")
                 return None
             if relay_fee_reserve == 0 and not self._is_mode_m1():
                 messagebox.showerror("参数错误", "预留原生币手续费必须大于 0")
@@ -196,6 +181,7 @@ class OnchainTransferRunnerMixin(object):
             relay_fee_reserve=relay_fee_reserve,
             relay_sweep_enabled=False,
             relay_sweep_target="",
+            mode=self._mode(),
         )
     def _resolve_wallet(self, source: str) -> tuple[str, str]:
         source_key = source.strip()
@@ -745,7 +731,7 @@ class OnchainTransferRunnerMixin(object):
             )
             dispatch_ui(
                 lambda: self.log(
-                    f"开始批量链上转账：mode={self._mode()}，任务={len(jobs_data)}，network={params.network}，"
+                    f"开始批量链上转账：mode={params.mode or self._mode()}，任务={len(jobs_data)}，network={params.network}，"
                     f"coin={token_desc}，amount={amount_view}，delay={params.delay}，"
                     f"1m_source_threads={params.one_to_many_source_threads}，threads={params.threads}，dry_run={dry_run}"
                 ),
@@ -933,7 +919,8 @@ class OnchainTransferRunnerMixin(object):
                             return
 
             workers: list[threading.Thread] = []
-            worker_limit = params.one_to_many_source_threads if self._is_mode_1m() else params.threads
+            is_one_to_many = params.mode == self.MODE_1M if params.mode else self._is_mode_1m()
+            worker_limit = params.one_to_many_source_threads if is_one_to_many else params.threads
             worker_count = max(1, min(int(worker_limit or 1), len(jobs_data)))
             for _ in range(worker_count):
                 t = self._start_rpc_worker_thread(worker, name="onchain-transfer-worker")

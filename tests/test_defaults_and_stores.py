@@ -135,6 +135,25 @@ class StoreDefaultTests(unittest.TestCase):
             saved_payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(saved_payload.get("format"), "xiaojun-authenticated-config-v1")
 
+    def test_stores_repair_nonfinite_and_excessive_runtime_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for store_type in (AccountStore, OnchainStore):
+                for value in ("NaN", "Infinity", "9999999999999"):
+                    with self.subTest(store=store_type.__name__, value=value):
+                        path = Path(tmpdir) / (store_type.__name__ + value + ".json")
+                        path.write_text(json.dumps({"settings": {"delay_seconds": value, "worker_threads": value,
+                            "one_to_many_source_threads": value, "confirm_timeout_seconds": value,
+                            "receipt_poll_interval_seconds": value, "receipt_retry_count": value, "nonce_window": value}}), encoding="utf-8")
+                        store = store_type(path)
+                        store.load()
+                        self.assertEqual(store.settings.delay_seconds, 0)
+                        self.assertEqual(store.settings.worker_threads, EXCHANGE_WORKER_THREADS_DEFAULT if store_type is AccountStore else ONCHAIN_WORKER_THREADS_DEFAULT)
+                        if store_type is OnchainStore:
+                            self.assertEqual(store.settings.confirm_timeout_seconds, ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT)
+                            self.assertEqual(store.settings.receipt_poll_interval_seconds, ONCHAIN_RECEIPT_POLL_INTERVAL_SECONDS_DEFAULT)
+                            self.assertEqual(store.settings.receipt_retry_count, ONCHAIN_RECEIPT_RETRY_COUNT_DEFAULT)
+                            self.assertEqual(store.settings.nonce_window, ONCHAIN_NONCE_WINDOW_DEFAULT)
+
     def test_onchain_store_does_not_persist_ephemeral_one_to_many_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "onchain.json"

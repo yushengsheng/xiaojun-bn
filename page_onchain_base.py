@@ -187,6 +187,7 @@ class OnchainTransferPageBase:
         self._confirmation_futures: set[Future] = set()
 
         self.mode_var = StringVar(value=self.MODE_M2M)
+        self._ui_mode_snapshot = self.MODE_M2M
         self.network_var = StringVar(value="")
         self.coin_var = StringVar(value="")
         self.symbol_var = StringVar(value="-")
@@ -539,10 +540,13 @@ class OnchainTransferPageBase:
     def _make_scrollbar(parent, orient, command):
         return make_scrollbar(parent, orient, command)
     def _mode(self) -> str:
+        if threading.current_thread() is not threading.main_thread():
+            return self._ui_mode_snapshot
         m = self.mode_var.get().strip()
         if m not in {self.MODE_M2M, self.MODE_1M, self.MODE_M1}:
             m = self.MODE_M2M
             self.mode_var.set(m)
+        self._ui_mode_snapshot = m
         return m
     def _is_mode_m2m(self) -> bool:
         return self._mode() == self.MODE_M2M
@@ -895,7 +899,7 @@ class OnchainTransferPageBase:
         return f"{self._stat_decimal_to_text(amount)} {symbol.strip().upper()}"
     def _runtime_worker_threads(self) -> int:
         raw = self._runtime_state_snapshot().get("threads_raw", ONCHAIN_WORKER_THREADS_DEFAULT)
-        return parse_worker_threads(raw, default=ONCHAIN_WORKER_THREADS_DEFAULT)
+        return min(128, parse_worker_threads(raw, default=ONCHAIN_WORKER_THREADS_DEFAULT))
     def _sync_runtime_state(self) -> None:
         threads_var = getattr(self, "threads_var", None)
         threads_raw = str(threads_var.get() if threads_var is not None else ONCHAIN_WORKER_THREADS_DEFAULT)
@@ -1777,15 +1781,7 @@ class OnchainTransferPageBase:
         thread.start()
         return thread
     def _start_rpc_worker_thread(self, target, *, name: str = "onchain-rpc-worker") -> threading.Thread:
-        def runner():
-            try:
-                target()
-            finally:
-                self.client.release_current_thread_rpc_session()
-
-        thread = threading.Thread(target=runner, daemon=True, name=name)
-        thread.start()
-        return thread
+        return self._start_managed_thread(target, name=name)
     def _confirmation_worker_limit(self) -> int:
         return min(max(1, self._runtime_worker_threads()), ONCHAIN_CONFIRM_WORKER_LIMIT_MAX)
     def _confirmation_executor_for_current_settings(self) -> ThreadPoolExecutor:
@@ -1855,15 +1851,23 @@ class OnchainTransferPageBase:
                 thread.join(per_thread)
     def _schedule_tree_refresh(self) -> None:
         schedule_ui_callback(self, "tree_refresh", self._refresh_tree, root=getattr(self, "root", None))
-    def shutdown(self) -> None:
-        if self._closing:
-            return
+    def request_shutdown(self) -> None:
         self._closing = True
         self.stop_requested.set()
         try:
             self._close_wallet_generator()
         except Exception:
             pass
+
+    def shutdown_pending(self) -> bool:
+        with self._confirmation_executor_lock:
+            pending_confirmations = any(not future.done() for future in self._confirmation_futures)
+        return bool(self.is_running or self._managed_threads_snapshot() or pending_confirmations)
+
+    def shutdown(self) -> None:
+        self.request_shutdown()
+        if self.shutdown_pending():
+            return
         self._clear_source_private_key_cache()
         self._shutdown_confirmation_executor()
         self._join_managed_threads(timeout_total=1.0)

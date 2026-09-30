@@ -15,6 +15,7 @@ class PyInstallerArgsTests(unittest.TestCase):
     def test_hidden_imports_include_split_selftest_modules(self) -> None:
         required = {
             "app_defaults",
+            "input_validation",
             "secure_config",
             "operation_journal",
             "exchange_order_recovery",

@@ -264,6 +264,7 @@ class ExchangeAppConfigMixin(object):
             proxy_url=self._get_exchange_proxy_url(),
             request_gate=request_gate,
             request_stop_event=request_stop_event,
+            operation_journal=getattr(self, "exchange_operation_journal", None),
         )
     @staticmethod
     def _ensure_trade_symbol_supported(

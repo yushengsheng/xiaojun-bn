@@ -20,6 +20,7 @@ HIDDEN_IMPORTS = (
     "app_version",
     "core_models",
     "shared_utils",
+    "input_validation",
     "stores",
     "secret_box",
     "secure_config",

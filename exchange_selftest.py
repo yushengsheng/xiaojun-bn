@@ -849,6 +849,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         def __init__(self, events=None):
             self.calls: list[tuple[str, str]] = []
             self.events = events
+            self.base_balance = Decimal("1")
 
         def _record_event(self, name: str) -> None:
             if self.events is not None:
@@ -870,6 +871,7 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         def spot_sell_all_base(self, symbol: str, small_qty_log_text=None):
             self.calls.append(("sell", str(symbol or "").strip().upper()))
             self._record_event("sell")
+            self.base_balance = Decimal("0")
             return {"status": "ok"}
 
         def resolve_spot_market_conversion(self, symbol: str):
@@ -882,6 +884,9 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
 
         def spot_market_convert_base_to_quote_all(self, symbol: str):
             return self.spot_sell_all_base(symbol)
+
+        def spot_market_conversion_sellable_source_amount(self, symbol: str):
+            return self.base_balance
 
         def withdraw_all_coin(self, *, coin, address, network, fee_buffer, enable_withdraw, auto_collect_to_spot=False):
             self.calls.append(("withdraw", str(coin or "").strip().upper()))
@@ -949,6 +954,8 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         stop_withdraw_sleep_calls["count"] += 1
         stop_withdraw_events.append("sleep")
         if stop_withdraw_sleep_calls["count"] == 2:
+            # A residual base balance must be cleared even when stopping before withdrawal.
+            stop_withdraw_client.base_balance = Decimal("1")
             stop_withdraw_event.set()
 
     stop_withdraw_strategy = Strategy(
@@ -970,8 +977,10 @@ def _run_offline_business_selftest_checks(checks: list[str]) -> None:
         raise RuntimeError(f"最终提现停止自检失败：停止后仍执行提现（{stop_withdraw_client.calls}）")
     if stop_withdraw_result.get("withdraw_attempted") is not False:
         raise RuntimeError(f"最终提现停止自检失败：停止后提现状态异常（{stop_withdraw_result}）")
-    if stop_withdraw_events != ["sleep", "sell", "sleep"]:
+    if stop_withdraw_events != ["sleep", "sell", "sleep", "sell"]:
         raise RuntimeError(f"最终提现停止自检失败：随机延迟和停止顺序异常（{stop_withdraw_events}）")
+    if not stop_withdraw_result.get("cleanup_confirmed") or stop_withdraw_client.base_balance != 0:
+        raise RuntimeError(f"最终提现停止自检失败：停止后清仓未确认（{stop_withdraw_result}）")
     checks.append("final-withdraw-delay-stop=ok")
 
     missing_address_events: list[str] = []

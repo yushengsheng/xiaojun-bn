@@ -11,7 +11,7 @@ from typing import Callable
 
 from exchange_auto_ladder import AutoLadderSettingsStore, price_risk_reason, trade_is_recent
 from exchange_auto_ladder_observer import AutoLadderMarketObserver
-from exchange_binance_client import BinanceAPIError, BinanceClient, UnconfirmedOrderError
+from exchange_binance_client import BinanceAPIError, BinanceClient, RequestStoppedError, UnconfirmedOperationError, UnconfirmedOrderError
 from retry_utils import RetryAborted, RetryPolicy, run_with_retries
 from exchange_constants import (
     FUTURES_LEVERAGE_DEFAULT,
@@ -236,7 +236,7 @@ class Strategy:
     TRADE_OPERATION_RETRY_POLICY = RetryPolicy(attempts=10, delay_seconds=1)
     LADDER_POLL_INTERVAL_SECONDS = 1.5
     LADDER_ORDER_RECONCILE_INTERVAL_SECONDS = 5.0
-    AUTO_LADDER_DATA_GRACE_SECONDS = 10.0
+    AUTO_LADDER_DATA_GRACE_SECONDS = 30.0
     LADDER_CLEANUP_CONFIRM_TIMEOUT_SECONDS = 12.0
     LADDER_CLEANUP_CONFIRM_POLL_INTERVAL_SECONDS = 0.5
     LADDER_MAX_ACTIVE_CHILD_ORDERS_PER_SIDE = 20
@@ -280,6 +280,7 @@ class Strategy:
         futures_side: str = FUTURES_SIDE_DEFAULT,
         operation_journal=None,
         operation_scope: str = "",
+        cleanup_callback=None,
     ):
         self.c = client
         self.spot_rounds = spot_rounds
@@ -333,6 +334,18 @@ class Strategy:
         self.operation_journal = operation_journal
         self.operation_scope = str(operation_scope or "").strip()
         self._journal_order_entries: dict[str, str] = {}
+        self._active_spot_orders: dict[str, str] = {}
+        self.cleanup_callback = cleanup_callback
+        self.cleanup_confirmed = False
+        self.cleanup_error = ""
+        self.stop_cleanup_requested = False
+        self._recovery_stop_event = threading.Event()
+        self._recovery_bnb_checked_at = float("-inf")
+        self._recovery_bnb_enabled = False
+        self._running_stop_event = None
+        if isinstance(client, BinanceClient) and operation_journal is not None:
+            client.operation_journal = operation_journal
+            client.operation_scope = self.operation_scope
         if self.futures_margin_type not in FUTURES_MARGIN_TYPE_OPTIONS:
             self.futures_margin_type = FUTURES_MARGIN_TYPE_DEFAULT
         if self.futures_side not in FUTURES_SIDE_OPTIONS:
@@ -364,8 +377,12 @@ class Strategy:
 
     def _journal_open_order(self, order_id: int | str, side: str) -> str:
         key = str(order_id or "").strip()
+        if key:
+            self._active_spot_orders[key] = str(side or "").upper()
         if not key or self.operation_journal is None:
             return ""
+        if isinstance(self.c, BinanceClient):
+            return getattr(self.c, "_order_journal_entries", {}).get(("spot", self.spot_symbol, key), "")
         entry_id = self._journal_order_entries.get(key)
         if entry_id:
             return entry_id
@@ -379,9 +396,138 @@ class Strategy:
         return entry_id
 
     def _journal_order_state(self, order_id: int | str, side: str, state: str, **changes: object) -> None:
+        if isinstance(self.c, BinanceClient):
+            self.c.record_order_state("/api/v3/order", {"symbol": self.spot_symbol, "orderId": order_id, "status": changes.get("exchange_status") or ("FILLED" if state == "completed" else "CANCELED")})
+            if state in {"completed", "cancelled", "failed"}:
+                self._active_spot_orders.pop(str(order_id), None)
+            return
+        if state in {"completed", "cancelled", "failed"} and str(order_id) not in self._active_spot_orders and str(order_id) not in self._journal_order_entries:
+            return
         entry_id = self._journal_open_order(order_id, side)
         if entry_id:
             self.operation_journal.update(entry_id, state, **changes)
+        if state in {"completed", "cancelled", "failed"}:
+            self._journal_order_entries.pop(str(order_id), None)
+            self._active_spot_orders.pop(str(order_id), None)
+
+    def _remember_spot_order(self, order: dict | None, side: str) -> None:
+        if order and order.get("orderId"):
+            self._journal_open_order(order["orderId"], side)
+            status = str(order.get("status") or "").upper()
+            if self._order_terminal_status(status):
+                self._journal_order_state(order["orderId"], side, "completed" if status == "FILLED" else "cancelled", exchange_status=status)
+
+    def _get_spot_order(self, symbol: str, order_id):
+        order = self._run_trade_action_with_retry(
+            self._running_stop_event, f"查询 {symbol} 原订单 #{order_id}",
+            lambda: self.c.get_order(symbol, order_id),
+        )
+        order = {**order, "orderId": order.get("orderId") or order_id}
+        self._remember_spot_order(order, str(order.get("side") or self._active_spot_orders.get(str(order_id), "")))
+        return order
+
+    def _cleanup_after_stop(self, *, notify: bool = True) -> None:
+        """Finish the current task's orders and tradable exposure before reporting stopped."""
+        self.cleanup_confirmed = False
+        self.stop_cleanup_requested = True
+        self.cleanup_error = ""
+        self.ladder_cleanup_confirmed = False
+        self.ladder_cleanup_error = ""
+        context_factory = getattr(self.c, "cleanup_requests_after_stop", None)
+        context = context_factory() if callable(context_factory) else nullcontext()
+        try:
+            with context:
+                pending_reader = getattr(self.c, "pending_order_requests", None)
+                for payload in pending_reader() if callable(pending_reader) else []:
+                    market = payload.get("market", "spot")
+                    symbol = str(payload["symbol"])
+                    path = "/fapi/v1/order" if market == "um_futures" else "/api/v3/order"
+                    base = self.c.um_futures if market == "um_futures" else self.c.spot
+                    cleanup_reader = getattr(self.c, "get_pending_order_for_cleanup", None)
+                    order = (cleanup_reader(payload) if callable(cleanup_reader) else
+                             self.c.get_order_by_client_id(symbol, payload["client_order_id"], **({"market": market} if market != "spot" else {})))
+                    if order is None:
+                        continue
+                    self.c.record_order_state(path, order, entry_id=payload.get("entry_id", ""), request_params=payload)
+                    if not self._order_terminal_status(str(order.get("status") or "").upper()):
+                        order_id = order.get("orderId")
+                        if not order_id:
+                            raise RuntimeError(f"{symbol} 未确认订单号")
+                        if market == "spot" and symbol == self.spot_symbol:
+                            self._cancel_limit_order_with_fill_guard(order_id, payload.get("side", ""), cleanup_after_stop=True)
+                        else:
+                            self.c.request(base, "DELETE", path, {"symbol": symbol, "orderId": order_id})
+                            final = self.c.request(base, "GET", path, {"symbol": symbol, "orderId": order_id})
+                            if not self._order_terminal_status(str(final.get("status") or "").upper()):
+                                raise RuntimeError(f"{symbol} 订单撤销未确认")
+                for order_id, side in list(self._active_spot_orders.items()):
+                    self._cancel_limit_order_with_fill_guard(order_id, side, cleanup_after_stop=True)
+                if self._is_futures_mode():
+                    self.ensure_futures_position_closed(strict=True)
+                else:
+                    if self._is_zero_round_spot_conversion() and self._mode_name() == TRADE_MODE_MARKET:
+                        # Preserve the user's input direction for inverse 0-round routes.
+                        remaining_reader = getattr(self.c, "spot_market_conversion_sellable_source_amount", None)
+                        if not callable(remaining_reader) or remaining_reader(self.spot_symbol) > 0:
+                            self.c.spot_market_convert_base_to_quote_all(self.spot_symbol)
+                        if callable(remaining_reader):
+                            deadline = time.monotonic() + self.LADDER_CLEANUP_CONFIRM_TIMEOUT_SECONDS
+                            while remaining_reader(self.spot_symbol) > 0:
+                                if time.monotonic() >= deadline:
+                                    raise RuntimeError(f"{self.spot_symbol} 0轮兑换清理后仍有可交易的前置币")
+                                time.sleep(self.LADDER_CLEANUP_CONFIRM_POLL_INTERVAL_SECONDS)
+                    elif self._is_convert_mode():
+                        self.c.convert_base_to_quote_all(self.spot_symbol)
+                    else:
+                        base_asset, _quote_asset = self._spot_pair_assets()
+                        self._ladder_sell_all_base_and_confirm(base_asset, reason="停止现货任务后")
+            self.cleanup_confirmed = True
+            self.ladder_cleanup_confirmed = True
+            if self.trade_error_stage == "停止清理":
+                self.trade_error = ""
+                self.trade_error_stage = ""
+            logger.info("已确认当前任务订单与仓位清理完成")
+        except Exception as exc:
+            self.cleanup_error = str(exc)
+            self.ladder_cleanup_error = self.cleanup_error
+            if not self.trade_error or self.trade_error_stage == "停止清理":
+                self.trade_error = self.cleanup_error
+                self.trade_error_stage = "停止清理"
+            if notify:
+                logger.error("停止清理尚未完成，保留恢复状态：%s", exc)
+        finally:
+            if notify and callable(self.cleanup_callback):
+                self.cleanup_callback(self)
+
+    def retry_stop_cleanup(self) -> bool:
+        if isinstance(self.c, BinanceClient) and getattr(self.c, "session", None) is None:
+            self.c._reset_session_after_transport_error()
+        self._cleanup_after_stop()
+        return self.cleanup_confirmed
+
+    def _has_timed_out_submissions(self) -> bool:
+        return isinstance(self.c, BinanceClient) and any(
+            payload.get("confirmation_timed_out") for payload in self.c.pending_order_requests()
+        )
+
+    def _wait_for_completion_cleanup(self, stop_event, progress_cb=None) -> bool:
+        """Keep the original task and withdrawal step until cleanup succeeds or stops."""
+        failed_attempts = 0
+        while not (stop_event and stop_event.is_set()):
+            # The running task owns these retries; the stop scheduler takes over
+            # only after run() returns, avoiding duplicate scheduled retry loops.
+            self._cleanup_after_stop(notify=False)
+            if self.cleanup_confirmed:
+                if callable(self.cleanup_callback):
+                    self.cleanup_callback(self)
+                return True
+            failed_attempts += 1
+            if failed_attempts == 1 or failed_attempts % 10 == 0:
+                logger.warning("结束清理暂未确认（第 %d 次），保留最终提现步骤并继续重试：%s", failed_attempts, self.cleanup_error)
+                self._emit_progress(progress_cb, 0, 1, "等待订单与仓位清理，暂缓提现")
+            if self._pause_with_stop(stop_event, self.TRADE_OPERATION_RETRY_POLICY.delay_seconds):
+                return False
+        return False
 
     def ensure_base_sold(self):
         try:
@@ -394,6 +540,8 @@ class Strategy:
             if sold:
                 logger.info("【补救措施】检测到残留基础币，已执行补充卖出。")
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning(f"补救卖出时发生错误（可忽略）: {e}")
 
     def _trade_account_type_name(self) -> str:
@@ -459,6 +607,8 @@ class Strategy:
                 minimum_text = "市价最小下单额" if market_mode else "最小闪兑金额"
                 logger.info("0 轮现货兑换未执行：可能 %s 余额不足或不满足%s", base_asset, minimum_text)
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                 logger.info("检测到停止信号，跳过 0 轮现货兑换")
                 return
@@ -474,7 +624,7 @@ class Strategy:
     def _futures_margin_asset(self) -> str:
         return self.c.get_um_futures_margin_asset(self.futures_symbol)
 
-    def ensure_futures_position_closed(self):
+    def ensure_futures_position_closed(self, *, strict: bool = False):
         try:
             close_orders = self.c.close_all_um_futures_positions_market(self.futures_symbol)
             if close_orders:
@@ -489,8 +639,16 @@ class Strategy:
                     if not remaining_positions:
                         return
                     time.sleep(0.3)
+                if strict:
+                    raise RuntimeError("合约持仓平仓后仍未完全归零")
                 logger.warning("残留合约持仓平仓后仍未完全归零，后续设置可能被交易所拒绝")
+            elif strict and any(Decimal(str(position.get("positionAmt", "0"))) != 0 for position in self.c.get_um_futures_positions(self.futures_symbol)):
+                raise RuntimeError("合约仍有未清理持仓")
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
+            if strict:
+                raise
             logger.warning(f"补救平仓时发生错误（可忽略）: {e}")
 
     def _mode_name(self) -> str:
@@ -547,6 +705,31 @@ class Strategy:
             )
             return True
         return False
+
+    def _check_recovery_stop(self, *, timeout: float = 6.0) -> None:
+        """A balance probe must not recurse into the request it is recovering."""
+        if not self._recovery_bnb_enabled or (not self._limit_like_mode() and not self._is_market_bnb_stop_mode()):
+            return
+        now = time.monotonic()
+        if now - self._recovery_bnb_checked_at < 5.0:
+            return
+        self._recovery_bnb_checked_at = now
+        try:
+            if isinstance(self.c, BinanceClient):
+                with self.c.bounded_requests():
+                    data = self.c.request_query(self.c.spot, "GET", "/api/v3/account", timeout=timeout, max_retries=1)
+                balance = next((item["free"] for item in data["balances"] if item["asset"] == "BNB"), "0")
+                current = Decimal(str(balance))
+                threshold = max(Decimal(0), self.bnb_fee_stop_value)
+                should_stop = current.is_finite() and current < threshold
+            else:
+                should_stop = self._should_stop_for_bnb_fee()
+        except Exception:
+            # Unavailable balances are not proof the stop threshold was reached.
+            return
+        if should_stop:
+            logger.info("恢复期间 BNB 余额触发停止条件，结束后续交易并清理订单和仓位")
+            self._recovery_stop_event.set()
 
     def _premium_sell_price(self, buy_price: Decimal) -> Decimal:
         premium_delta = self.c.normalize_price_delta(
@@ -636,6 +819,10 @@ class Strategy:
         policy = self.TRADE_OPERATION_RETRY_POLICY
 
         def should_retry(_exc: Exception) -> bool:
+            if isinstance(_exc, UnconfirmedOperationError):
+                return False
+            if isinstance(_exc, BinanceAPIError):
+                return _exc.code in {-1001, -1003} and not bool(stop_event and stop_event.is_set())
             return not bool(stop_event and stop_event.is_set())
 
         def on_retry(failed_attempt: int, total: int, exc: Exception) -> None:
@@ -652,17 +839,44 @@ class Strategy:
             logger.error("%s执行异常，重试 %d 次后仍失败: %s", context_text, total, exc)
 
         def retry_sleep(seconds: float) -> None:
+            self._check_recovery_stop()
             if self._pause_with_stop(stop_event, seconds):
                 raise RetryAborted("检测到停止信号")
 
-        return run_with_retries(
-            action,
-            policy=policy,
-            should_retry=should_retry,
-            on_retry=on_retry,
-            on_give_up=on_give_up,
-            sleep_fn=retry_sleep,
-        )
+        def guarded_action():
+            submission_serial = getattr(self.c, "_order_submission_serial", 0)
+            try:
+                return action()
+            except Exception as exc:
+                if isinstance(exc, (RequestStoppedError, RetryAborted)):
+                    raise
+                if isinstance(exc, UnconfirmedOperationError):
+                    raise
+                if getattr(self.c, "_order_submission_serial", 0) != submission_serial:
+                    raise UnconfirmedOperationError(f"{context_text}已下单，后续状态处理失败，停止重复执行：{exc}") from exc
+                raise
+
+        while True:
+            if stop_event and stop_event.is_set():
+                raise RetryAborted("检测到停止信号")
+            try:
+                return run_with_retries(
+                    guarded_action, policy=policy, should_retry=should_retry,
+                    on_retry=on_retry, on_give_up=on_give_up, sleep_fn=retry_sleep,
+                )
+            except Exception as exc:
+                if isinstance(exc, UnconfirmedOperationError) or not BinanceClient.is_temporary_request_error(exc):
+                    raise
+                # Keep this action's call frame; do not restart its containing round.
+                retry_sleep(policy.delay_seconds)
+
+    def _stop_on_permanent_trade_error(self, error: Exception, stage: str) -> bool:
+        if not isinstance(error, BinanceAPIError) or error.code in {-1001, -1003}:
+            return False
+        self.trade_error = str(error)
+        self.trade_error_stage = stage
+        logger.error("%s收到明确拒绝，停止当前任务：%s", stage, error)
+        return True
 
     @staticmethod
     def _order_price_decimal(order_data: dict, fallback_price: Decimal) -> Decimal:
@@ -706,14 +920,14 @@ class Strategy:
         while True:
             if stop_event and stop_event.is_set():
                 try:
-                    self.c.cancel_order(symbol_u, order_id)
-                    self._journal_order_state(order_id, side_u, "cancelled", reason="stop")
-                    logger.info("停止时已尝试撤销未完成订单 %s #%s", symbol_u, order_id)
+                    self._cancel_limit_order_with_fill_guard(order_id, side_u, cleanup_after_stop=True)
+                    logger.info("停止时已确认未完成订单结束 %s #%s", symbol_u, order_id)
                 except Exception as cancel_exc:
-                    logger.warning("停止时撤销订单失败 %s #%s: %s", symbol_u, order_id, cancel_exc)
+                    self.ladder_cleanup_error = f"订单#{order_id}撤销未确认：{cancel_exc}"
+                    logger.error("停止时撤销订单失败 %s #%s: %s", symbol_u, order_id, cancel_exc)
                 raise RuntimeError("收到停止信号，已停止等待挂单成交")
 
-            order = self.c.get_order(symbol_u, order_id)
+            order = self._get_spot_order(symbol_u, order_id)
             status = str(order.get("status") or "").upper()
             if status == "FILLED":
                 self._journal_order_state(order_id, side_u, "completed", exchange_status=status)
@@ -727,8 +941,9 @@ class Strategy:
                 should_reprice, current_ref = self._should_reprice_open_order(side_u, order_price, book_ticker)
                 if should_reprice:
                     try:
-                        self.c.cancel_order(symbol_u, order_id)
-                        self._journal_order_state(order_id, side_u, "cancelled", reason="reprice")
+                        latest_order = self._cancel_limit_order_with_fill_guard(order_id, side_u)
+                        if str(latest_order.get("status") or "").upper() == "FILLED":
+                            return "filled", latest_order
                         logger.info(
                             "%s模式%s单价格偏离超过 %s，已撤单重挂：旧价=%s，当前参考价=%s",
                             mode_name,
@@ -740,7 +955,7 @@ class Strategy:
                         return "reprice", book_ticker
                     except Exception as cancel_exc:
                         logger.warning("撤单重挂时撤单失败 %s #%s: %s", symbol_u, order_id, cancel_exc)
-                        latest_order = self.c.get_order(symbol_u, order_id)
+                        latest_order = self._get_spot_order(symbol_u, order_id)
                         latest_status = str(latest_order.get("status") or "").upper()
                         if latest_status == "FILLED":
                             self._journal_order_state(order_id, side_u, "completed", exchange_status=latest_status)
@@ -748,13 +963,7 @@ class Strategy:
                         raise
 
             if stop_event and stop_event.wait(max(0.2, float(poll_interval))):
-                try:
-                    self.c.cancel_order(symbol_u, order_id)
-                    self._journal_order_state(order_id, side_u, "cancelled", reason="stop")
-                    logger.info("停止时已尝试撤销未完成订单 %s #%s", symbol_u, order_id)
-                except Exception:
-                    pass
-                raise RuntimeError("收到停止信号，已停止等待挂单成交")
+                continue
             if not stop_event:
                 time.sleep(max(0.2, float(poll_interval)))
 
@@ -817,7 +1026,6 @@ class Strategy:
         side: str,
         *,
         cleanup_after_stop: bool = False,
-        strict_confirmation: bool = False,
     ) -> dict:
         symbol_u = self.spot_symbol.upper()
         get_order = self.c.get_order
@@ -834,6 +1042,7 @@ class Strategy:
         if latest_order is not None:
             latest_status = str(latest_order.get("status") or "").upper()
             if latest_status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+                self._journal_order_state(order_id, side, "completed" if latest_status == "FILLED" else "cancelled", exchange_status=latest_status)
                 return latest_order
 
         try:
@@ -843,7 +1052,9 @@ class Strategy:
                 latest_order = get_order(symbol_u, order_id)
             except Exception:
                 latest_order = None
-            if latest_order is not None and str(latest_order.get("status") or "").upper() == "FILLED":
+            latest_status = str((latest_order or {}).get("status") or "").upper()
+            if latest_order is not None and self._order_terminal_status(latest_status):
+                self._journal_order_state(order_id, side, "completed" if latest_status == "FILLED" else "cancelled", exchange_status=latest_status)
                 return latest_order
             raise cancel_exc
 
@@ -856,18 +1067,14 @@ class Strategy:
                 else ""
             )
             if cancel_status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
+                self._journal_order_state(order_id, side, "completed" if cancel_status == "FILLED" else "cancelled", exchange_status=cancel_status)
                 return dict(cancel_result)
-            if cleanup_after_stop or strict_confirmation:
-                raise RuntimeError(f"订单 #{order_id} 撤销后状态未确认")
-            if latest_order is None:
-                latest_order = {
-                    "orderId": order_id,
-                    "side": side,
-                    "status": "CANCELED",
-                }
-            else:
-                latest_order = dict(latest_order)
-                latest_order["status"] = str(latest_order.get("status") or "CANCELED").upper()
+            raise RuntimeError(f"订单 #{order_id} 撤销后状态未确认")
+        final_status = str(latest_order.get("status") or "").upper()
+        if not self._order_terminal_status(final_status):
+            raise RuntimeError(f"订单 #{order_id} 撤销后状态未确认：{final_status}")
+        if self._order_terminal_status(final_status):
+            self._journal_order_state(order_id, side, "completed" if final_status == "FILLED" else "cancelled", exchange_status=final_status)
         return latest_order
 
     def _limit_order_plan(self, book_ticker: dict[str, Decimal]) -> dict[str, Decimal | str]:
@@ -930,8 +1137,20 @@ class Strategy:
             )
         if quote_balance > 0:
             buy_order = self.c.spot_limit_buy_quote_amount(self.spot_symbol, bid_price, quote_balance)
+            self._remember_spot_order(buy_order, "BUY")
         if base_balance > 0:
-            sell_order = self.c.spot_limit_sell_quantity(self.spot_symbol, ask_price, base_balance)
+            try:
+                sell_order = self._run_trade_action_with_retry(
+                    self._running_stop_event, f"{mode_name}挂卖单",
+                    lambda: self.c.spot_limit_sell_quantity(self.spot_symbol, ask_price, base_balance),
+                )
+            except Exception as exc:
+                if isinstance(exc, (RequestStoppedError, RetryAborted)):
+                    raise
+                if buy_order:
+                    raise UnconfirmedOperationError(f"买单已提交，卖单失败，停止重放双边挂单：{exc}") from exc
+                raise
+            self._remember_spot_order(sell_order, "SELL")
 
         buy_text = "未挂出"
         if buy_order:
@@ -990,9 +1209,10 @@ class Strategy:
             if stop_event and stop_event.is_set():
                 for side_u, state in list(active_orders.items()):
                     try:
-                        self._cancel_limit_order_with_fill_guard(state["order_id"], side_u)
-                    except Exception:
-                        pass
+                        self._cancel_limit_order_with_fill_guard(state["order_id"], side_u, cleanup_after_stop=True)
+                    except Exception as exc:
+                        self.ladder_cleanup_error = f"订单#{state['order_id']}撤销未确认：{exc}"
+                        logger.error("%s", self.ladder_cleanup_error)
                 raise RuntimeError("收到停止信号，已停止等待挂单成交")
 
             book_ticker = self.c.get_book_ticker(symbol_u)
@@ -1000,7 +1220,7 @@ class Strategy:
             reprice_triggered = False
 
             for side_u, state in list(active_orders.items()):
-                order = self.c.get_order(symbol_u, state["order_id"])
+                order = self._get_spot_order(symbol_u, state["order_id"])
                 status = str(order.get("status") or "").upper()
                 if status == "FILLED":
                     filled_orders.append((side_u, order))
@@ -1113,6 +1333,7 @@ class Strategy:
             return None
 
         buy_order = self.c.spot_limit_buy_quote_amount(self.spot_symbol, price, amount)
+        self._remember_spot_order(buy_order, "BUY")
         if not buy_order:
             return None
 
@@ -1141,6 +1362,7 @@ class Strategy:
 
         sell_price = self._premium_sell_price(buy_fill_price)
         sell_order = self.c.spot_limit_sell_quantity(self.spot_symbol, sell_price, qty)
+        self._remember_spot_order(sell_order, "SELL")
         if not sell_order:
             return None
 
@@ -1173,10 +1395,12 @@ class Strategy:
                     orders.pop(order_key, None)
                     continue
                 try:
-                    self._cancel_limit_order_with_fill_guard(order_id, side_u)
+                    self._cancel_limit_order_with_fill_guard(order_id, side_u, cleanup_after_stop=True)
                 except Exception as exc:
                     logger.warning("停止时撤销溢价单模式未完成订单失败 %s #%s: %s", side_u, order_id, exc)
-                orders.pop(order_key, None)
+                    self.ladder_cleanup_error = f"溢价订单#{order_id}撤销未确认：{exc}"
+                else:
+                    orders.pop(order_key, None)
 
     def _run_premium_partial_fill_mode(self, stop_event, progress_cb=None):
         mode_name = self._mode_name()
@@ -1528,7 +1752,7 @@ class Strategy:
                 for order_key, state in list(active_buy_orders.items()):
                     order = retry(
                         f"{mode_name}部分成交 查询买单#{state['order_id']}",
-                        lambda order_id=state["order_id"]: self.c.get_order(self.spot_symbol, order_id),
+                        lambda order_id=state["order_id"]: self._get_spot_order(self.spot_symbol, order_id),
                     )
                     status = str(order.get("status") or "").upper()
                     _delta_qty, _delta_quote, order_price = _record_buy_delta(order, state)
@@ -1542,7 +1766,7 @@ class Strategy:
                 for order_key, state in list(active_sell_orders.items()):
                     order = retry(
                         f"{mode_name}部分成交 查询卖单#{state['order_id']}",
-                        lambda order_id=state["order_id"]: self.c.get_order(self.spot_symbol, order_id),
+                        lambda order_id=state["order_id"]: self._get_spot_order(self.spot_symbol, order_id),
                     )
                     status = str(order.get("status") or "").upper()
                     delta_qty, delta_quote, order_price = _order_delta(order, state)
@@ -1592,9 +1816,13 @@ class Strategy:
                 if not stop_event:
                     time.sleep(1.0)
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
                     logger.info("检测到停止信号，已停止后续执行（%s部分成交循环）", mode_name)
+                    return
+                if self._stop_on_permanent_trade_error(e, mode_name):
                     return
                 logger.error("%s部分成交循环执行异常: %s", mode_name, e)
 
@@ -1696,7 +1924,7 @@ class Strategy:
                 for order_key, state in list(active_buy_orders.items()):
                     order = retry(
                         f"{mode_name}分笔 查询买单#{state['order_id']}",
-                        lambda order_id=state["order_id"]: self.c.get_order(self.spot_symbol, order_id),
+                        lambda order_id=state["order_id"]: self._get_spot_order(self.spot_symbol, order_id),
                     )
                     status = str(order.get("status") or "").upper()
                     executed_qty = self._order_executed_qty_decimal(order)
@@ -1731,7 +1959,7 @@ class Strategy:
                 for order_key, state in list(active_sell_orders.items()):
                     order = retry(
                         f"{mode_name}分笔 查询卖单#{state['order_id']}",
-                        lambda order_id=state["order_id"]: self.c.get_order(self.spot_symbol, order_id),
+                        lambda order_id=state["order_id"]: self._get_spot_order(self.spot_symbol, order_id),
                     )
                     status = str(order.get("status") or "").upper()
                     if status == "FILLED":
@@ -1800,9 +2028,13 @@ class Strategy:
                 if not stop_event:
                     time.sleep(1.0)
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
                     logger.info("检测到停止信号，已停止后续执行（%s模式）", mode_name)
+                    return
+                if self._stop_on_permanent_trade_error(e, mode_name):
                     return
                 logger.error("%s分笔模式执行异常: %s", mode_name, e)
 
@@ -2065,7 +2297,7 @@ class Strategy:
         for order_key, state in list(active_orders.items()):
             side_u = str(state.get("side") or "").strip().upper()
             order_id = state.get("order_id")
-            order = self.c.get_order(self.spot_symbol, order_id)
+            order = self._get_spot_order(self.spot_symbol, order_id)
             status = str(order.get("status") or "").strip().upper()
             state["price"] = self._order_price_decimal(order, Decimal(str(state.get("price", "0") or "0")))
             if status == "FILLED":
@@ -2089,7 +2321,6 @@ class Strategy:
             order_id,
             side_u,
             cleanup_after_stop=reason == "stop",
-            strict_confirmation=True,
         )
         latest_status = str(latest_order.get("status") or "").strip().upper()
         if not self._order_terminal_status(latest_status):
@@ -2202,10 +2433,11 @@ class Strategy:
         context = cleanup_context() if callable(cleanup_context) else nullcontext()
         with context:
             all_cancelled = self._ladder_cancel_all_orders(active_orders, reason="stop")
-            try:
-                self._ladder_sell_all_base_and_confirm(base_asset, reason="手动停止分仓挂单后")
-            except Exception as exc:
-                self._set_ladder_cleanup_failure(f"市价清仓未确认：{exc}")
+            if all_cancelled:
+                try:
+                    self._ladder_sell_all_base_and_confirm(base_asset, reason="手动停止分仓挂单后")
+                except Exception as exc:
+                    self._set_ladder_cleanup_failure(f"市价清仓未确认：{exc}")
         if not all_cancelled:
             self._set_ladder_cleanup_failure("部分分仓挂单撤销未确认")
         elif not self.ladder_cleanup_error:
@@ -2250,8 +2482,8 @@ class Strategy:
             order_id = state["order_id"]
             side = str(state["side"])
             try:
-                self._cancel_limit_order_with_fill_guard(order_id, side, strict_confirmation=True)
-                final = self.c.get_order(self.spot_symbol, order_id)
+                self._cancel_limit_order_with_fill_guard(order_id, side)
+                final = self._get_spot_order(self.spot_symbol, order_id)
                 status = str(final.get("status") or "").upper()
                 if not self._order_terminal_status(status):
                     raise RuntimeError(f"订单#{order_id}撤销未确认：{status}")
@@ -2363,7 +2595,7 @@ class Strategy:
                     if auto_state == "ACTIVE" and (not market_available or no_trade or market_dry or choppy or not price_safe):
                         paused_reason = (
                             "设置已更新，等待重新观察" if settings_changed else
-                            "行情连续不可用达到10秒" if not market_available else
+                            f"行情连续不可用达到{self.AUTO_LADDER_DATA_GRACE_SECONDS:g}秒" if not market_available else
                             "超过无成交暂停时间" if no_trade else
                             "快速反复波动" if choppy else
                             "价格超出安全范围" if not price_safe else "成交额缩量"
@@ -2590,7 +2822,7 @@ class Strategy:
                         market_retrying = False
             except Exception as exc:
                 if isinstance(exc, UnconfirmedOrderError):
-                    if self.operation_journal is not None:
+                    if self.operation_journal is not None and not exc.journal_entry_id:
                         entry_id = self.operation_journal.begin(
                             "exchange-order", self.operation_scope,
                             {"symbol": exc.symbol, "client_order_id": exc.client_order_id},
@@ -2605,6 +2837,10 @@ class Strategy:
                     self._ladder_cleanup_after_manual_stop(active_orders, base_asset)
                     logger.info("检测到停止信号，已停止后续执行（%s模式）", mode_name)
                     return
+                if isinstance(exc, UnconfirmedOperationError):
+                    raise
+                if self._stop_on_permanent_trade_error(exc, mode_name):
+                    return
                 if isinstance(exc, _AutoLadderMarketRetry):
                     retry_now = time.monotonic()
                     if market_gap_started is None:
@@ -2615,7 +2851,9 @@ class Strategy:
                             market_retrying = True
                         self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS)
                         continue
-                    exc = _AutoLadderMarketPause("提交前公共行情连续不可用达到10秒")
+                    exc = _AutoLadderMarketPause(
+                        f"提交前公共行情连续不可用达到{self.AUTO_LADDER_DATA_GRACE_SECONDS:g}秒"
+                    )
                 if isinstance(exc, _AutoLadderMarketPause):
                     logger.warning("自动分仓暂停挂单：%s", exc)
                 else:
@@ -2671,6 +2909,8 @@ class Strategy:
                 lambda: self.c.collect_asset_to_spot(quote_asset, context="交易前"),
             )
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                 logger.info("检测到停止信号，停止后续执行（现货阶段）")
                 return
@@ -2741,6 +2981,8 @@ class Strategy:
                 logger.info("--- 现货轮 %d 完成 ---", round_number)
 
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（现货阶段）")
                     return
@@ -2837,6 +3079,8 @@ class Strategy:
 
                 logger.info("--- 闪兑轮 %d 完成 ---", i + 1)
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（闪兑阶段）")
                     return
@@ -2859,6 +3103,7 @@ class Strategy:
             if self._should_stop_for_bnb_fee():
                 return
 
+            round_submission_serial = getattr(self.c, "_order_submission_serial", 0)
             try:
                 book_ticker = self._run_trade_action_with_retry(
                     stop_event,
@@ -2902,8 +3147,14 @@ class Strategy:
                 logger.info("%s模式当前无活动挂单，结束本次运行", mode_name)
                 return
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
+                    return
+                if self._active_spot_orders or getattr(self.c, "_order_submission_serial", 0) != round_submission_serial:
+                    raise UnconfirmedOperationError(f"{mode_name}已有订单执行进展，停止重放本轮：{e}") from e
+                if self._stop_on_permanent_trade_error(e, mode_name):
                     return
                 logger.error("%s轮 %d 执行异常: %s", mode_name, step, e)
 
@@ -2928,6 +3179,7 @@ class Strategy:
 
             step += 1
             logger.info("--- %s轮 %d 开始 ---", mode_name, step)
+            round_submission_serial = getattr(self.c, "_order_submission_serial", 0)
             try:
                 self._emit_progress(
                     progress_cb,
@@ -2978,8 +3230,14 @@ class Strategy:
 
                 logger.info("--- %s轮 %d 完成 ---", mode_name, step)
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
+                    return
+                if self._active_spot_orders or getattr(self.c, "_order_submission_serial", 0) != round_submission_serial:
+                    raise UnconfirmedOperationError(f"{mode_name}已有订单执行进展，停止重放本轮：{e}") from e
+                if self._stop_on_permanent_trade_error(e, mode_name):
                     return
                 logger.error("%s轮 %d 执行异常: %s", mode_name, step, e)
 
@@ -3067,6 +3325,8 @@ class Strategy:
         try:
             self._ensure_futures_available_balance()
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             if "合约有问题" in str(e):
                 self.trade_error = str(e)
                 self.trade_error_stage = "合约有问题"
@@ -3145,6 +3405,8 @@ class Strategy:
                     BinanceClient._format_decimal(close_price),
                 )
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（合约阶段）")
                     return
@@ -3172,6 +3434,62 @@ class Strategy:
         self.ensure_futures_position_closed()
 
     def run(self, stop_event, progress_cb=None):
+        stop_event = CombinedStopEvent(stop_event, self._recovery_stop_event)
+        self._running_stop_event = stop_event
+        original_client_state = None
+        if isinstance(self.c, BinanceClient):
+            original_client_state = (self.c._request_stop_event, self.c._continuous_trading, self.c._recovery_check)
+            self.c._request_stop_event = stop_event
+            self.c._continuous_trading = True
+            self.c._recovery_check = self._check_recovery_stop
+        result = None
+        try:
+            result = self._run_steps(stop_event, progress_cb=progress_cb)
+        except (RequestStoppedError, RetryAborted):
+            if not (stop_event and stop_event.is_set()):
+                raise
+            result = self._strategy_result()
+        except UnconfirmedOperationError as exc:
+            self.trade_error = str(exc)
+            self.trade_error_stage = "交易执行状态未确认"
+            result = self._strategy_result()
+        finally:
+            try:
+                # Cleanup has its own retry scheduler and must not remain in a read loop.
+                if isinstance(self.c, BinanceClient):
+                    self.c._continuous_trading = False
+                if (stop_event and stop_event.is_set()) or self._has_timed_out_submissions():
+                    self._cleanup_after_stop()
+                elif self._active_spot_orders or (isinstance(self.c, BinanceClient) and self.c.pending_order_requests()):
+                    self.cleanup_error = "任务结束后仍有未确认订单，需完成清理"
+                    if callable(self.cleanup_callback):
+                        self.cleanup_callback(self)
+                if isinstance(result, dict):
+                    result.update(cleanup_confirmed=self.cleanup_confirmed, cleanup_error=self.cleanup_error,
+                                  ladder_cleanup_confirmed=self.ladder_cleanup_confirmed,
+                                  ladder_cleanup_error=self.ladder_cleanup_error,
+                                  trade_error=self.trade_error, trade_error_stage=self.trade_error_stage,
+                                  trade_failed=bool(self.trade_error))
+            finally:
+                if original_client_state is not None:
+                    self.c._request_stop_event, self.c._continuous_trading, self.c._recovery_check = original_client_state
+                self._running_stop_event = None
+        return result
+
+    def _strategy_result(self, withdraw_amount=0.0, withdraw_error="", withdraw_attempted=False):
+        return {
+            "withdraw_amount": withdraw_amount, "withdraw_error": withdraw_error,
+            "withdraw_attempted": withdraw_attempted, "trade_error": self.trade_error,
+            "trade_error_stage": self.trade_error_stage, "trade_failed": bool(self.trade_error),
+            "market_round_total": self.market_round_total, "market_round_completed": self.market_round_completed,
+            "market_round_failed_count": len(self.market_round_failed_rounds),
+            "market_round_failed_rounds": list(self.market_round_failed_rounds),
+            "market_round_failure_details": list(self.market_round_failure_details),
+            "ladder_cleanup_confirmed": self.ladder_cleanup_confirmed, "ladder_cleanup_error": self.ladder_cleanup_error,
+            "cleanup_confirmed": self.cleanup_confirmed, "cleanup_error": self.cleanup_error,
+        }
+
+    def _run_steps(self, stop_event, progress_cb=None):
         withdraw_amount = 0.0
         withdraw_error = ""
         withdraw_attempted = False
@@ -3181,21 +3499,7 @@ class Strategy:
         self.ladder_cleanup_error = ""
 
         def result_payload():
-            return {
-                "withdraw_amount": withdraw_amount,
-                "withdraw_error": withdraw_error,
-                "withdraw_attempted": withdraw_attempted,
-                "trade_error": self.trade_error,
-                "trade_error_stage": self.trade_error_stage,
-                "trade_failed": bool(self.trade_error),
-                "market_round_total": self.market_round_total,
-                "market_round_completed": self.market_round_completed,
-                "market_round_failed_count": len(self.market_round_failed_rounds),
-                "market_round_failed_rounds": list(self.market_round_failed_rounds),
-                "market_round_failure_details": list(self.market_round_failure_details),
-                "ladder_cleanup_confirmed": self.ladder_cleanup_confirmed,
-                "ladder_cleanup_error": self.ladder_cleanup_error,
-            }
+            return self._strategy_result(withdraw_amount, withdraw_error, withdraw_attempted)
 
         zero_round_spot_conversion = self._is_zero_round_spot_conversion()
 
@@ -3208,21 +3512,33 @@ class Strategy:
             self._run_bnb_topup_if_needed(stop_event)
 
         if not zero_round_spot_conversion:
-            if self._is_futures_mode():
-                self._run_futures_mode(stop_event, progress_cb=progress_cb)
-            elif self._is_convert_mode():
-                self._run_convert_mode(stop_event, progress_cb=progress_cb)
-            elif self._mode_name() == TRADE_MODE_MARKET:
-                try:
-                    self._run_market_mode(stop_event, progress_cb=progress_cb)
-                finally:
-                    if self.market_stagger_coordinator is not None and self.market_stagger_lane_id > 0:
-                        self.market_stagger_coordinator.suspend(self.market_stagger_lane_id)
-            else:
-                self._run_limit_like_mode(stop_event, progress_cb=progress_cb)
+            self._recovery_bnb_enabled = True
+            try:
+                if self._is_futures_mode():
+                    self._run_futures_mode(stop_event, progress_cb=progress_cb)
+                elif self._is_convert_mode():
+                    self._run_convert_mode(stop_event, progress_cb=progress_cb)
+                elif self._mode_name() == TRADE_MODE_MARKET:
+                    try:
+                        self._run_market_mode(stop_event, progress_cb=progress_cb)
+                    finally:
+                        if self.market_stagger_coordinator is not None and self.market_stagger_lane_id > 0:
+                            self.market_stagger_coordinator.suspend(self.market_stagger_lane_id)
+                else:
+                    self._run_limit_like_mode(stop_event, progress_cb=progress_cb)
+            finally:
+                self._recovery_bnb_enabled = False
 
-        if self._mode_name() == TRADE_MODE_AUTO_LADDER and self.trade_error:
-            logger.error("自动分仓策略失败，跳过最终提现：%s", self.trade_error)
+        # Abandoned attempts can still lock funds or fill after the trading step.
+        # Reconcile and clear them before collecting or withdrawing the result.
+        if self._has_timed_out_submissions():
+            if not self._wait_for_completion_cleanup(stop_event, progress_cb):
+                return result_payload()
+
+        # Keep the established futures collection/withdrawal flow for definite failures.
+        # An uncertain submission exits through run() before reaching this point.
+        if self.trade_error and not self._is_futures_mode():
+            logger.error("策略失败，跳过最终提现：%s", self.trade_error)
             return result_payload()
 
         if stop_event and stop_event.is_set():

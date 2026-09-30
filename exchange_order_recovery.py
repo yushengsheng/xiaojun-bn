@@ -22,15 +22,18 @@ def reconcile_exchange_orders(journal, client, api_key: str) -> None:
         symbol = str(payload.get("symbol") or "").strip().upper()
         order_id = payload.get("order_id")
         client_order_id = str(payload.get("client_order_id") or "").strip()
+        market = str(payload.get("market") or "spot")
         entry_id = str(entry.get("id") or "")
         if not symbol or (order_id in (None, "") and not client_order_id):
             pending.append(entry_id)
             continue
         try:
-            order = (
-                client.get_order(symbol, order_id)
-                if order_id not in (None, "") else client.get_order_by_client_id(symbol, client_order_id)
-            )
+            if market == "um_futures":
+                params = {"symbol": symbol}
+                params["orderId" if order_id not in (None, "") else "origClientOrderId"] = order_id if order_id not in (None, "") else client_order_id
+                order = client.request(client.um_futures, "GET", "/fapi/v1/order", params)
+            else:
+                order = client.get_order(symbol, order_id) if order_id not in (None, "") else client.get_order_by_client_id(symbol, client_order_id)
             status = str(order.get("status") or "").upper()
         except Exception:
             pending.append(entry_id)

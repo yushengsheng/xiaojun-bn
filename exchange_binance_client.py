@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import hmac
 import logging
@@ -11,12 +10,13 @@ import re
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, InvalidOperation
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlencode
 
 import requests
+from urllib3.exceptions import NewConnectionError
 
 from system_proxy import configure_requests_session_for_proxy
 
@@ -162,11 +162,25 @@ class BinanceAPIError(Exception):
         return f"{base_text} | 中文说明: {explanation}"
 
 
-class UnconfirmedOrderError(RuntimeError):
-    def __init__(self, symbol: str, client_order_id: str):
+class UnconfirmedOperationError(RuntimeError):
+    """A financial write may have executed; replaying it is unsafe."""
+
+
+class RequestStoppedError(RuntimeError):
+    """Stopped at the request gate, before a request was sent."""
+
+
+class UnconfirmedOrderError(UnconfirmedOperationError):
+    def __init__(self, symbol: str, client_order_id: str, *, market: str = "spot", journal_entry_id: str = ""):
         self.symbol = symbol
         self.client_order_id = client_order_id
-        super().__init__(f"{symbol} 订单 {client_order_id} 的交易所执行状态未确认，已停止自动挂单；请核对交易所订单")
+        self.market = market
+        self.journal_entry_id = journal_entry_id
+        super().__init__(f"{symbol} 订单 {client_order_id} 的交易所执行状态未确认，已停止自动提交；请核对交易所订单")
+
+
+class _OrderConfirmationTimeout(UnconfirmedOrderError):
+    """One submission exhausted its grace period; its original intent remains active."""
 
 
 class SharedRateLimitGate:
@@ -215,43 +229,26 @@ class SharedRateLimitGate:
             time.sleep(remaining)
 
 
-def retry_request(max_retries=3, delay=2):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            for i in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except (requests.exceptions.RequestException, ConnectionError, TimeoutError) as e:
-                    last_exception = e
-                    logger.warning(f"网络请求失败 ({i + 1}/{max_retries}): {e}，将在 {delay} 秒后重试...")
-                    time.sleep(delay)
-                except BinanceAPIError as e:
-                    last_exception = e
-                    if e.code in [-1001, -1003]:
-                        logger.warning(f"Binance 系统繁忙 ({i + 1}/{max_retries}): {e}，重试中...")
-                        time.sleep(delay)
-                    else:
-                        raise e
-            logger.error(f"重试 {max_retries} 次后仍然失败。")
-            if last_exception:
-                raise last_exception
-            raise RuntimeError("未知错误：重试失败")
-        return wrapper
-    return decorator
-
-
 # ====================== Binance 客户端 ======================
 class BinanceClient:
     SERVER_TIME_CACHE_TTL_SECONDS = 30.0
     DEFAULT_RECV_WINDOW_MS = 20000
     DEFAULT_REQUEST_RETRY_COUNT = 10
     DEFAULT_REQUEST_RETRY_DELAY_SECONDS = 1.0
+    ORDER_SUBMISSION_CONFIRMATION_GRACE_SECONDS = 30.0
     INVALID_PERMISSION_RETRY_COUNT = 3
     RETRYABLE_BINANCE_ERROR_CODES = {-1001, -1003, -2015}
     SHARED_RATE_LIMIT_ERROR_CODES = {-1003, -1008, -1015}
     SHARED_RATE_LIMIT_HTTP_STATUS_CODES = {418, 429}
+    # These POST endpoints read data or set an absolute value, rather than move funds.
+    REPLAY_SAFE_POST_PATHS = frozenset({
+        "/sapi/v3/asset/getUserAsset", "/sapi/v1/asset/get-funding-asset",
+        "/sapi/v1/asset/dust-btc", "/sapi/v1/convert/getQuote",
+        "/sapi/v1/simple-earn/flexible/setAutoSubscribe",
+        "/fapi/v1/positionSide/dual", "/fapi/v1/marginType", "/fapi/v1/leverage",
+    })
+    ORDER_PATHS = {"/api/v3/order": "spot", "/fapi/v1/order": "um_futures"}
+    ORDER_TERMINAL_STATUSES = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"})
     _shared_convert_exchange_info_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     _shared_convert_asset_info_cache: dict[str, int] | None = None
     _shared_convert_cache_lock = threading.Lock()
@@ -270,6 +267,7 @@ class BinanceClient:
         *,
         request_gate: SharedRateLimitGate | None = None,
         request_stop_event=None,
+        operation_journal=None,
     ):
         if not key or not secret:
             raise ValueError("API KEY / SECRET 不能为空")
@@ -280,6 +278,14 @@ class BinanceClient:
         self._request_gate = request_gate
         self._request_stop_event = request_stop_event
         self._cleanup_request_depth = 0
+        self.operation_journal = operation_journal
+        self._order_journal_entries: dict[tuple[str, str, str], str] = {}
+        self._pending_order_requests: dict[str, dict] = {}
+        self._uncertain_write_error: UnconfirmedOperationError | None = None
+        self._order_submission_serial = 0
+        self._continuous_trading = False
+        self._recovery_check = None
+        self._bounded_request_depth = 0
         self.spot = "https://api.binance.com"
         self.um_futures = "https://fapi.binance.com"
         self.cm_futures = "https://dapi.binance.com"
@@ -452,13 +458,87 @@ class BinanceClient:
         return status_code in self.SHARED_RATE_LIMIT_HTTP_STATUS_CODES, retry_after
 
     def _wait_for_request_gate(self, *, ignore_stop_event: bool = False) -> None:
-        gate = self._request_gate
+        gate = getattr(self, "_request_gate", None)
         cleanup_active = int(getattr(self, "_cleanup_request_depth", 0) or 0) > 0
+        stop = getattr(self, "_request_stop_event", None)
+        if not (ignore_stop_event or cleanup_active) and stop is not None and stop.is_set():
+            raise RequestStoppedError("检测到停止信号，停止当前请求")
         if gate is not None and not gate.wait(
-            self._request_stop_event,
+            getattr(self, "_request_stop_event", None),
             ignore_stop=bool(ignore_stop_event or cleanup_active),
         ):
-            raise RuntimeError("检测到停止信号，已停止限流等待")
+            raise RequestStoppedError("检测到停止信号，已停止限流等待")
+
+    @contextmanager
+    def bounded_requests(self):
+        """Keep probes and shutdown cleanup bounded; their owner schedules retries."""
+        self._bounded_request_depth = int(getattr(self, "_bounded_request_depth", 0)) + 1
+        try:
+            yield
+        finally:
+            self._bounded_request_depth -= 1
+
+    @staticmethod
+    def is_temporary_request_error(exc: Exception) -> bool:
+        if isinstance(exc, BinanceAPIError):
+            return exc.code in {-1001, -1003, -1006, -1007, -1008} or (exc.status_code or 0) >= 500
+        if isinstance(exc, requests.exceptions.HTTPError):
+            response = exc.response
+            return response is None or response.status_code in {418, 429} or response.status_code >= 500
+        return isinstance(exc, (requests.exceptions.RequestException, ConnectionError, TimeoutError))
+
+    @staticmethod
+    def _order_definitely_not_accepted(exc: Exception, market: str) -> bool:
+        # ReadTimeout, reset-after-send and -2013 are NOT evidence of non-delivery.
+        seen = set()
+        pending = [exc]
+        while pending:
+            error = pending.pop()
+            if id(error) in seen:
+                continue
+            seen.add(id(error))
+            if isinstance(error, (requests.exceptions.ConnectTimeout, NewConnectionError)):
+                return True
+            if market == "um_futures":
+                if isinstance(error, BinanceAPIError) and error.code == -1008:
+                    return True
+                response = getattr(error, "response", None)
+                status = getattr(error, "status_code", None) or getattr(response, "status_code", None)
+                message = getattr(error, "msg", "") or (response.text if response is not None else "")
+                if status == 503 and message.strip() in {
+                    "Service Unavailable.",
+                    "Internal error; unable to process your request. Please try again.",
+                }:
+                    return True
+            pending.extend(value for value in (
+                getattr(error, "__cause__", None),
+                getattr(error, "reason", None), *getattr(error, "args", ()),
+            ) if isinstance(value, BaseException))
+        return False
+
+    def _wait_for_recovery(self, context: str, attempt: int, exc: Exception, *, ignore_stop_event=False, deadline=None) -> None:
+        cleanup = bool(ignore_stop_event or getattr(self, "_cleanup_request_depth", 0))
+        self._wait_for_request_gate(ignore_stop_event=cleanup)
+        check = getattr(self, "_recovery_check", None)
+        if not cleanup and callable(check):
+            if deadline is None:
+                check()
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    check(timeout=min(6.0, remaining))
+        self._wait_for_request_gate(ignore_stop_event=cleanup)
+        delay = max(0.0, float(self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS))
+        if deadline is not None:
+            delay = min(delay, max(0.0, deadline - time.monotonic()))
+        if attempt == 1 or attempt % 10 == 0:
+            logger.warning("%s 暂未恢复（第 %d 次），保留当前步骤，%g 秒后继续：%s", context, attempt, delay, exc)
+        stop = None if cleanup else getattr(self, "_request_stop_event", None)
+        if stop is not None:
+            if stop.wait(delay):
+                raise RequestStoppedError("检测到停止信号，结束恢复等待并清理状态")
+        elif delay:
+            time.sleep(delay)
 
     @contextmanager
     def cleanup_requests_after_stop(self):
@@ -488,6 +568,7 @@ class BinanceClient:
         base: str = "",
         path: str = "",
         ignore_stop_event: bool = False,
+        replay_safe: bool = True,
     ):
         last_exception = None
         retry_count = max(1, int(max_retries or self.DEFAULT_REQUEST_RETRY_COUNT))
@@ -514,6 +595,8 @@ class BinanceClient:
                 if self._request_gate is not None and is_rate_limited:
                     self._pause_for_shared_rate_limit(e, retry_after)
                     continue
+                if not replay_safe:
+                    raise UnconfirmedOperationError(f"{path} 响应未确认，停止自动重发，请核对交易所状态") from e
                 attempt += 1
                 last_exception = e
                 self._reset_session_after_transport_error()
@@ -522,6 +605,8 @@ class BinanceClient:
                 logger.warning(f"网络请求失败 ({attempt}/{retry_count}): {e}，将在 {retry_delay:g} 秒后重试...")
                 sleep_before_retry()
             except (requests.exceptions.RequestException, ConnectionError, TimeoutError) as e:
+                if not replay_safe:
+                    raise UnconfirmedOperationError(f"{path} 响应未确认，停止自动重发，请核对交易所状态") from e
                 attempt += 1
                 last_exception = e
                 self._reset_session_after_transport_error()
@@ -531,6 +616,8 @@ class BinanceClient:
                 sleep_before_retry()
             except BinanceAPIError as e:
                 last_exception = e
+                if not replay_safe and self._is_uncertain_write_error(e):
+                    raise UnconfirmedOperationError(f"{path} 执行状态未确认：{e}；停止自动重发") from e
                 is_rate_limited, retry_after = self._shared_rate_limit_details(e, base=base, path=path)
                 if self._request_gate is not None and is_rate_limited:
                     self._pause_for_shared_rate_limit(e, retry_after)
@@ -549,7 +636,10 @@ class BinanceClient:
                     sleep_before_retry()
                     continue
                 raise e
-        logger.error(f"重试 {final_attempt_limit} 次后仍然失败。")
+        if getattr(self, "_continuous_trading", False):
+            logger.debug("本次请求未恢复，继续保留当前步骤")
+        else:
+            logger.error(f"重试 {final_attempt_limit} 次后仍然失败。")
         if last_exception:
             raise last_exception
         raise RuntimeError("未知错误：重试失败")
@@ -570,6 +660,7 @@ class BinanceClient:
                 data = r.json()
             except Exception:
                 r.raise_for_status()
+                raise
 
             if r.status_code == 200:
                 return data
@@ -595,33 +686,91 @@ class BinanceClient:
         raise RuntimeError("签名请求失败")
 
     def request(self, base, method, path, params=None, *, ignore_stop_event: bool = False):
-        return self._run_request_with_retry(
-            lambda: self._request_impl(base, method, path, params, timeout=15),
-            max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
-            delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
-            base=base,
-            path=path,
-            ignore_stop_event=ignore_stop_event,
+        if method == "POST" and path in self.ORDER_PATHS:
+            return self._submit_order_with_recovery(base, path, params or {}, ignore_stop_event=ignore_stop_event)
+        result = self._run_signed_request(
+            base, method, path, params, timeout=15,
+            max_retries=self.DEFAULT_REQUEST_RETRY_COUNT, ignore_stop_event=ignore_stop_event,
         )
+        if path in self.ORDER_PATHS and isinstance(result, dict):
+            self.record_order_state(path, result, request_params=params)
+        return result
+
+    @staticmethod
+    def _is_uncertain_write_error(exc: Exception) -> bool:
+        if isinstance(exc, BinanceAPIError):
+            return exc.code in {-1001, -1006, -1007, -1008} or (exc.status_code or 0) >= 500
+        return isinstance(exc, (requests.exceptions.RequestException, ConnectionError, TimeoutError, ValueError))
+
+    def _run_signed_request(self, base, method, path, params, *, timeout, max_retries, ignore_stop_event=False):
+        continuous = bool(
+            getattr(self, "_continuous_trading", False)
+            and not getattr(self, "_bounded_request_depth", 0)
+            and not getattr(self, "_cleanup_request_depth", 0)
+            and not ignore_stop_event
+        )
+        attempt = 0
+        while True:
+            try:
+                return self._run_signed_request_once(
+                    base, method, path, params, timeout=timeout,
+                    max_retries=1 if continuous and (method != "POST" or path in self.REPLAY_SAFE_POST_PATHS) else max_retries,
+                    ignore_stop_event=ignore_stop_event,
+                )
+            except Exception as exc:
+                replay_safe = method != "POST" or path in self.REPLAY_SAFE_POST_PATHS
+                missing_order = method == "GET" and path in self.ORDER_PATHS and isinstance(exc, BinanceAPIError) and exc.code == -2013
+                if not continuous or not replay_safe or not (self.is_temporary_request_error(exc) or missing_order or isinstance(exc, ValueError)):
+                    raise
+                attempt += 1
+                self._wait_for_recovery(path, attempt, exc)
+
+    def _run_signed_request_once(self, base, method, path, params, *, timeout, max_retries, ignore_stop_event=False):
+        replay_safe = method != "POST" or path in self.REPLAY_SAFE_POST_PATHS
+        if not replay_safe and getattr(self, "_uncertain_write_error", None) is not None:
+            raise self._uncertain_write_error
+        try:
+            return self._run_request_with_retry(
+                lambda: self._request_impl(base, method, path, params, timeout=timeout),
+                max_retries=max_retries,
+                delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+                base=base,
+                path=path,
+                ignore_stop_event=ignore_stop_event,
+                replay_safe=replay_safe,
+            )
+        except UnconfirmedOperationError as exc:
+            if path not in self.ORDER_PATHS:
+                self._uncertain_write_error = exc
+            raise
+        except Exception as exc:
+            if not replay_safe and self._is_uncertain_write_error(exc):
+                uncertain = UnconfirmedOperationError(f"{path} 响应未确认，停止自动重发，请核对交易所状态")
+                if path not in self.ORDER_PATHS:
+                    self._uncertain_write_error = uncertain
+                raise uncertain from exc
+            raise
 
     def request_query(self, base, method, path, params=None, *, timeout: float = 6, max_retries: int | None = None):
-        return self._run_request_with_retry(
-            lambda: self._request_impl(base, method, path, params, timeout=timeout),
+        return self._run_signed_request(
+            base, method, path, params, timeout=timeout,
             max_retries=self.DEFAULT_REQUEST_RETRY_COUNT if max_retries is None else max_retries,
-            delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
-            base=base,
-            path=path,
         )
 
     def public_get(self, base, path, params=None):
-        return self.public_get_query(
-            base,
-            path,
-            params,
-            timeout=15,
-            max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
-            delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
-        )
+        attempt = 0
+        while True:
+            try:
+                return self.public_get_query(
+                    base, path, params, timeout=15,
+                    max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
+                    delay=self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS,
+                )
+            except Exception as exc:
+                if not getattr(self, "_continuous_trading", False) or getattr(self, "_bounded_request_depth", 0) or getattr(self, "_cleanup_request_depth", 0) or not (self.is_temporary_request_error(exc) or isinstance(exc, ValueError)):
+                    raise
+                attempt += 1
+                self._wait_for_recovery(path, attempt, exc)
 
     def _public_get_impl(self, base, path, params=None, *, timeout: float = 15):
         params = params or {}
@@ -1190,24 +1339,32 @@ class BinanceClient:
             for item in self.spot_all_balances(fast=fast):
                 add_amount(item.get("asset", ""), item.get("total", 0))
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("查询现货资产明细失败: %s", e)
 
         try:
             for item in self.funding_positive_assets(fast=fast):
                 add_amount(item.get("asset", ""), item.get("free", 0))
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("查询资金账户资产明细失败: %s", e)
 
         try:
             for item in self.um_futures_transferable_assets(fast=fast):
                 add_amount(item.get("asset", ""), item.get("amount", 0))
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("查询 U本位资产明细失败: %s", e)
 
         try:
             for item in self.cm_futures_transferable_assets(fast=fast):
                 add_amount(item.get("asset", ""), item.get("amount", 0))
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("查询 币本位资产明细失败: %s", e)
 
         return totals
@@ -1649,12 +1806,17 @@ class BinanceClient:
         quote_id_text = str(quote_id or "").strip()
         if not quote_id_text:
             raise RuntimeError("闪兑 quoteId 为空")
-        return self.request(
-            self.spot,
-            "POST",
-            "/sapi/v1/convert/acceptQuote",
-            {"quoteId": quote_id_text},
-        )
+        try:
+            return self.request(self.spot, "POST", "/sapi/v1/convert/acceptQuote", {"quoteId": quote_id_text})
+        except UnconfirmedOperationError as original:
+            try:
+                status = self.get_convert_order_status(quote_id=quote_id_text)
+                if str(status.get("orderStatus") or "").upper() == "SUCCESS":
+                    self._uncertain_write_error = None
+                    return status
+            except Exception:
+                pass
+            raise original
 
     def get_convert_order_status(self, *, order_id: str | int | None = None, quote_id: str | None = None) -> dict[str, Any]:
         params: dict[str, Any] = {}
@@ -1724,7 +1886,12 @@ class BinanceClient:
             raise RuntimeError(f"闪兑报价返回异常：{quote}")
 
         self.accept_convert_quote(quote_id)
-        order = self.wait_convert_order_success(quote_id=quote_id)
+        try:
+            order = self.wait_convert_order_success(quote_id=quote_id)
+        except Exception as exc:
+            error = UnconfirmedOperationError(f"闪兑报价 {quote_id} 已接受，成交状态未确认，停止重新兑换：{exc}")
+            self._uncertain_write_error = error
+            raise error from exc
         logger.info(
             "闪兑完成 %s -> %s：支出=%s 到账=%s",
             from_asset_u,
@@ -1777,7 +1944,8 @@ class BinanceClient:
     @staticmethod
     def _decimal_from_str(v, default="0"):
         try:
-            return Decimal(str(v))
+            value = Decimal(str(v))
+            return value if value.is_finite() else Decimal(default)
         except (InvalidOperation, TypeError, ValueError):
             return Decimal(default)
 
@@ -1798,7 +1966,10 @@ class BinanceClient:
 
     @staticmethod
     def _format_decimal(value: Decimal) -> str:
-        text = format(Decimal(str(value)).normalize(), "f")
+        value = Decimal(str(value))
+        if not value.is_finite():
+            raise RuntimeError("数量或价格必须是有限数字")
+        text = format(value.normalize(), "f")
         if text in {"-0", "-0.0"}:
             return "0"
         return text
@@ -2159,6 +2330,8 @@ class BinanceClient:
         try:
             balances = load_asset_balances()
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             raise RuntimeError(f"合约有问题：查询 U本位全部资产余额失败: {e}") from e
 
         actual_balances = [balance for balance in balances if has_actual_balance(balance)]
@@ -2192,6 +2365,8 @@ class BinanceClient:
                     self._format_decimal(max_withdraw_amount),
                 )
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 transfer_failures.append(f"{balance_asset}: {e}")
                 logger.error("合约交易前 U本位 %s 余额划回现货失败: %s", balance_asset, e)
         if transferable:
@@ -2200,6 +2375,8 @@ class BinanceClient:
         try:
             remaining = [balance for balance in load_asset_balances() if has_actual_balance(balance)]
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             raise RuntimeError(f"合约有问题：划转后复查 U本位余额失败: {e}") from e
         if remaining:
             details = "，".join(
@@ -2234,6 +2411,8 @@ class BinanceClient:
                 )
                 time.sleep(0.5)
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 raise RuntimeError(
                     f"合约有问题：U本位存在不可划余额，且 {asset_u} 0.01 往返划转验证失败: {e}"
                 ) from e
@@ -2381,6 +2560,9 @@ class BinanceClient:
             "/fapi/v1/order",
             params,
         )
+        status = str(data.get("status") or "").upper()
+        if status and status != "FILLED":
+            raise BinanceAPIError(-2010, f"合约市价订单未完整成交，状态={status}")
         logger.info(
             "U本位合约市价下单 %s %s，数量=%s，positionSide=%s，reduceOnly=%s",
             symbol_u,
@@ -2522,53 +2704,249 @@ class BinanceClient:
             "askPrice": ask_price,
         }
 
-    def get_order_by_client_id(self, symbol: str, client_order_id: str):
+    def get_order_by_client_id(self, symbol: str, client_order_id: str, *, market: str = "spot", timeout: float = 6):
+        futures = market == "um_futures"
         return self.request_query(
-            self.spot, "GET", "/api/v3/order",
+            self.um_futures if futures else self.spot, "GET", "/fapi/v1/order" if futures else "/api/v3/order",
             {"symbol": self.normalize_trade_symbol(symbol), "origClientOrderId": client_order_id},
-            timeout=6, max_retries=self.DEFAULT_REQUEST_RETRY_COUNT,
+            timeout=timeout, max_retries=1,
         )
 
-    def _place_limit_order_with_recovery(
-        self, symbol: str, params: dict, retry_guard: Callable[[], bool] | None,
-    ):
-        """Resolve an uncertain submit by client ID, never repeating its POST."""
+    def _order_scope(self) -> str:
+        from exchange_order_recovery import exchange_operation_scope
+        return getattr(self, "operation_scope", "") or exchange_operation_scope(getattr(self, "key", ""))
+
+    def record_order_state(self, path: str, order: dict, *, entry_id: str = "", request_params: dict | None = None) -> None:
+        """Close journal entries at the same point an exchange terminal state is observed."""
+        journal = getattr(self, "operation_journal", None)
+        market = self.ORDER_PATHS[path]
+        params = request_params or {}
+        symbol = self.normalize_trade_symbol(order.get("symbol") or params.get("symbol") or "")
+        order_id = str(order.get("orderId") or "")
+        if not order_id:
+            raise ValueError(f"{symbol} 订单回复缺少 orderId，保留恢复记录")
+        entries = getattr(self, "_order_journal_entries", None)
+        if entries is None:
+            entries = self._order_journal_entries = {}
+        key = (market, symbol, order_id)
+        entry_id = entry_id or entries.get(key, "")
+        if not entry_id:
+            # An unconfirmed submit may first be resolved by a cleanup query.
+            for client_id, payload in getattr(self, "_pending_order_requests", {}).items():
+                if payload.get("market") == market and payload.get("symbol") == symbol and (
+                    str(payload.get("order_id") or "") == order_id
+                    or client_id == str(order.get("clientOrderId") or order.get("origClientOrderId") or "")
+                ):
+                    entry_id = str(payload.get("entry_id") or "")
+                    break
+        status = str(order.get("status") or "").upper()
+        terminal = status in self.ORDER_TERMINAL_STATUSES
+        if journal is not None and entry_id:
+            journal.update(
+                entry_id, "completed" if status == "FILLED" else ("cancelled" if terminal else "open"),
+                order_id=order_id, exchange_status=status,
+            )
+        if terminal:
+            entries.pop(key, None)
+            for client_id, payload in list(getattr(self, "_pending_order_requests", {}).items()):
+                if payload.get("market") == market and payload.get("symbol") == symbol and (
+                    (entry_id and payload.get("entry_id") == entry_id)
+                    or (order_id and str(payload.get("order_id") or "") == order_id)
+                    or client_id == str(order.get("clientOrderId") or params.get("newClientOrderId") or "")
+                ):
+                    self._pending_order_requests.pop(client_id, None)
+        elif order_id:
+            if entry_id:
+                entries[key] = entry_id
+            for payload in getattr(self, "_pending_order_requests", {}).values():
+                if (entry_id and payload.get("entry_id") == entry_id) or payload.get("client_order_id") == params.get("newClientOrderId"):
+                    payload["order_id"] = order_id
+
+    def pending_order_requests(self) -> list[dict]:
+        return [dict(value) for value in getattr(self, "_pending_order_requests", {}).values()]
+
+    def get_pending_order_for_cleanup(self, payload: dict):
+        """Reconcile abandoned attempts; cancel by client ID before accepting absence."""
+        market = payload.get("market", "spot")
+        symbol = payload["symbol"]
+        client_id = payload["client_order_id"]
+        try:
+            order = self.get_order_by_client_id(symbol, client_id, **({"market": market} if market != "spot" else {}))
+        except BinanceAPIError as exc:
+            if exc.code != -2013 or not payload.get("confirmation_timed_out"):
+                raise
+            path = "/fapi/v1/order" if market == "um_futures" else "/api/v3/order"
+            base = self.um_futures if market == "um_futures" else self.spot
+            try:
+                order = self.request_query(base, "DELETE", path, {"symbol": symbol, "origClientOrderId": client_id}, timeout=6, max_retries=1)
+            except BinanceAPIError as exc:
+                if exc.code not in {-2011, -2013}:
+                    raise
+                journal = getattr(self, "operation_journal", None)
+                if journal is not None:
+                    journal.update(payload.get("entry_id", ""), "failed", reason="confirmation-timeout-and-cancel-not-found", exchange_error_code=exc.code)
+                self._pending_order_requests.pop(client_id, None)
+                logger.warning("超时旧单 %s 查询和撤单均返回不存在，按提交失败策略结束该记录", client_id)
+                return None
+        if not isinstance(order, dict) or not order.get("orderId") or not order.get("status"):
+            raise RuntimeError(f"{symbol} 原订单 {client_id} 清理查询返回不完整")
+        returned_client_id = str(order.get("origClientOrderId") or order.get("clientOrderId") or "")
+        if returned_client_id and returned_client_id != client_id:
+            raise RuntimeError(f"{symbol} 清理查询返回的订单标识与原订单不匹配")
+        return order
+
+    def _submit_order_with_recovery(self, base: str, path: str, params: dict, *, ignore_stop_event: bool = False, retry_guard=None):
+        """Retry a submission after its 30-second confirmation grace expires."""
+        previous_client_id = ""
+        while True:
+            self._wait_for_request_gate(ignore_stop_event=ignore_stop_event)
+            if previous_client_id and not (ignore_stop_event or getattr(self, "_cleanup_request_depth", 0)):
+                check = getattr(self, "_recovery_check", None)
+                if callable(check):
+                    check()
+                self._wait_for_request_gate()
+            try:
+                return self._submit_order_attempt(
+                    base, path, params, ignore_stop_event=ignore_stop_event,
+                    retry_guard=retry_guard, previous_client_id=previous_client_id,
+                )
+            except _OrderConfirmationTimeout as exc:
+                previous_client_id = exc.client_order_id
+                logger.warning(
+                    "%s 订单 %s 超过 %g 秒仍无法确认，本次提交尝试按失败处理，重新提交当前步骤；旧单仍保留核对记录，重提可能重复成交",
+                    exc.symbol, exc.client_order_id, self.ORDER_SUBMISSION_CONFIRMATION_GRACE_SECONDS,
+                )
+
+    def _submit_order_attempt(self, base: str, path: str, params: dict, *, ignore_stop_event=False, retry_guard=None, previous_client_id=""):
+        """Persist each distinct attempt before sending it."""
+        self._wait_for_request_gate(ignore_stop_event=ignore_stop_event)
+        if getattr(self, "_uncertain_write_error", None) is not None:
+            raise self._uncertain_write_error
+        for payload in self.pending_order_requests():
+            if not payload.get("confirmation_timed_out") and (not payload.get("order_id") or payload.get("type") == "MARKET"):
+                raise UnconfirmedOrderError(payload["symbol"], payload["client_order_id"], market=payload.get("market", "spot"), journal_entry_id=payload.get("entry_id", ""))
+        symbol = self.normalize_trade_symbol(params.get("symbol") or "")
+        market = self.ORDER_PATHS[path]
         client_order_id = "xja" + uuid.uuid4().hex
         params = {**params, "newClientOrderId": client_order_id}
-        if retry_guard is not None and not retry_guard():
-            raise RuntimeError("自动分仓提交前行情不再达标")
-        try:
-            response = self.request_query(
-                self.spot, "POST", "/api/v3/order", params,
-                timeout=15, max_retries=1,
-            )
-            if isinstance(response, dict) and response.get("orderId"):
-                return response
-        except BinanceAPIError as exc:
-            uncertain = exc.code in {-1001, -1006, -1007, -1008} or (exc.status_code or 0) >= 500
-            if not uncertain:
-                raise
-        except Exception:
-            # A network error may occur after the matching engine accepted the order.
-            pass
-        logger.warning("限价挂单回复未确认，按订单标识查询交易所状态：%s", client_order_id)
-        for lookup in range(self.DEFAULT_REQUEST_RETRY_COUNT):
+        journal = getattr(self, "operation_journal", None)
+        payload = {"market": market, "symbol": symbol, "client_order_id": client_order_id, "side": params.get("side", ""), "type": params.get("type", "")}
+        if previous_client_id:
+            payload["retry_of_client_order_id"] = previous_client_id
+        payload.update({key: str(params[key]) for key in ("quantity", "quoteOrderQty", "price", "timeInForce", "positionSide", "reduceOnly") if key in params})
+        entry_id = journal.begin("exchange-order", self._order_scope(), payload) if journal is not None else ""
+        if not hasattr(self, "_pending_order_requests"):
+            self._pending_order_requests = {}
+        self._pending_order_requests[client_order_id] = {**payload, "entry_id": entry_id}
+        def discard_unsent(reason):
+            if journal is not None:
+                journal.update(entry_id, "failed", reason=reason)
+            self._pending_order_requests.pop(client_order_id, None)
+
+        def accept(response):
+            # Even a local journal write failure must not replay an accepted order.
+            self._order_submission_serial = int(getattr(self, "_order_submission_serial", 0)) + 1
+            self.record_order_state(path, response, entry_id=entry_id, request_params=params)
+            if params.get("type") == "MARKET":
+                return self._wait_submitted_market_order(base, path, params, response, ignore_stop_event=ignore_stop_event)
+            return response
+
+        submit_attempt = 0
+        while True:
             try:
-                found = self.get_order_by_client_id(symbol, client_order_id)
-            except BinanceAPIError as exc:
-                if exc.code != -2013:
-                    raise UnconfirmedOrderError(symbol, client_order_id) from exc
+                self._wait_for_request_gate(ignore_stop_event=ignore_stop_event)
+                if retry_guard is not None and not retry_guard():
+                    discard_unsent("market-guard-before-submit")
+                    raise RuntimeError("自动分仓提交前行情不再达标")
+            except RequestStoppedError:
+                discard_unsent("stopped-before-submit")
+                raise
+            except Exception:
+                discard_unsent("pre-submit-check-failed")
+                raise
+            try:
+                context = self.cleanup_requests_after_stop() if ignore_stop_event else nullcontext()
+                with context:
+                    response = self.request_query(base, "POST", path, params, timeout=15, max_retries=1)
+            except RequestStoppedError:
+                discard_unsent("stopped-before-submit")
+                raise
             except Exception as exc:
-                raise UnconfirmedOrderError(symbol, client_order_id) from exc
+                if self._order_definitely_not_accepted(exc, market):
+                    submit_attempt += 1
+                    self._reset_session_after_transport_error()
+                    try:
+                        self._wait_for_recovery(f"{symbol} 请求未被接收，重发原请求", submit_attempt, exc, ignore_stop_event=ignore_stop_event)
+                    except RequestStoppedError:
+                        discard_unsent("stopped-before-submit")
+                        raise
+                    continue
+                if isinstance(exc, BinanceAPIError) and not self._is_uncertain_write_error(exc):
+                    discard_unsent(f"exchange-rejected:{exc.code}")
+                    raise
+                # The matching engine may have accepted a request whose reply was lost.
+                break
             else:
-                if isinstance(found, dict) and found.get("orderId"):
-                    return found
-                raise UnconfirmedOrderError(symbol, client_order_id)
-            if lookup + 1 < self.DEFAULT_REQUEST_RETRY_COUNT:
-                time.sleep(self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS)
-        # Binance permits reusing a client ID after the original order fills.
-        # A temporary -2013 cannot prove the first POST was rejected.
-        raise UnconfirmedOrderError(symbol, client_order_id)
+                if isinstance(response, dict) and response.get("orderId"):
+                    return accept(response)
+                break
+
+        deadline = time.monotonic() + self.ORDER_SUBMISSION_CONFIRMATION_GRACE_SECONDS
+        logger.warning("订单回复未确认，保留当前动作并在 %g 秒宽限内查询原订单：%s", self.ORDER_SUBMISSION_CONFIRMATION_GRACE_SECONDS, client_order_id)
+        lookup = 0
+        while True:
+            self._wait_for_request_gate(ignore_stop_event=ignore_stop_event)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if journal is not None:
+                    journal.update(entry_id, "unconfirmed", confirmation_timed_out=True, reason="confirmation-timeout-resubmit")
+                self._pending_order_requests[client_order_id]["confirmation_timed_out"] = True
+                raise _OrderConfirmationTimeout(symbol, client_order_id, market=market, journal_entry_id=entry_id)
+            try:
+                context = self.cleanup_requests_after_stop() if ignore_stop_event else nullcontext()
+                with context, self.bounded_requests():
+                    found = self.get_order_by_client_id(symbol, client_order_id, timeout=min(6.0, remaining), **({"market": market} if market != "spot" else {}))
+                if not isinstance(found, dict) or not found.get("orderId"):
+                    raise ValueError("订单查询返回格式无效")
+            except RequestStoppedError:
+                # Leave the durable intent for stop cleanup; do not mark it rejected.
+                raise
+            except Exception as exc:
+                missing = isinstance(exc, BinanceAPIError) and exc.code == -2013
+                if not (missing or self.is_temporary_request_error(exc) or isinstance(exc, ValueError)):
+                    raise UnconfirmedOrderError(symbol, client_order_id, market=market, journal_entry_id=entry_id) from exc
+                lookup += 1
+                self._wait_for_recovery(f"{symbol} 查询原订单 {client_order_id}", lookup, exc, ignore_stop_event=ignore_stop_event, deadline=deadline)
+            else:
+                return accept(found)
+
+    def _wait_submitted_market_order(self, base, path, params, order, *, ignore_stop_event=False):
+        attempt = 0
+        while str(order.get("status") or "").upper() not in self.ORDER_TERMINAL_STATUSES:
+            self._wait_for_request_gate(ignore_stop_event=ignore_stop_event)
+            try:
+                context = self.cleanup_requests_after_stop() if ignore_stop_event else nullcontext()
+                with context, self.bounded_requests():
+                    found = self.request_query(base, "GET", path, {"symbol": params["symbol"], "orderId": order["orderId"]}, timeout=6, max_retries=1)
+                if not isinstance(found, dict) or not found.get("status") or str(found.get("orderId") or "") != str(order["orderId"]):
+                    raise ValueError("订单成交状态返回格式无效")
+                order = found
+                self.record_order_state(path, order, request_params=params)
+                if str(order.get("status") or "").upper() in self.ORDER_TERMINAL_STATUSES:
+                    return order
+                error = RuntimeError(f"订单状态={order.get('status')}")
+            except RequestStoppedError:
+                raise
+            except Exception as exc:
+                if not (self.is_temporary_request_error(exc) or isinstance(exc, ValueError) or isinstance(exc, BinanceAPIError) and exc.code == -2013):
+                    raise UnconfirmedOrderError(params["symbol"], params["newClientOrderId"], market=self.ORDER_PATHS[path]) from exc
+                error = exc
+            attempt += 1
+            self._wait_for_recovery(f"{params['symbol']} 等待原市价订单成交", attempt, error, ignore_stop_event=ignore_stop_event)
+        return order
+
+    def _place_limit_order_with_recovery(self, symbol: str, params: dict, retry_guard: Callable[[], bool] | None):
+        return self._submit_order_with_recovery(self.spot, "/api/v3/order", {**params, "symbol": symbol}, retry_guard=retry_guard)
 
     def place_limit_order(
         self,
@@ -2683,6 +3061,7 @@ class BinanceClient:
 
     def wait_order_filled(self, symbol: str, order_id: int | str, stop_event=None, poll_interval: float = 1.0):
         symbol_u = self.normalize_trade_symbol(symbol)
+        failed_queries = 0
         while True:
             if stop_event and stop_event.is_set():
                 try:
@@ -2690,9 +3069,16 @@ class BinanceClient:
                     logger.info("停止时已尝试撤销未完成订单 %s #%s", symbol_u, order_id)
                 except Exception as cancel_exc:
                     logger.warning("停止时撤销订单失败 %s #%s: %s", symbol_u, order_id, cancel_exc)
-                raise RuntimeError("收到停止信号，已停止等待挂单成交")
+                raise RequestStoppedError("收到停止信号，已停止等待挂单成交")
 
-            order = self.get_order(symbol_u, order_id)
+            try:
+                order = self.get_order(symbol_u, order_id)
+            except Exception as exc:
+                if not (self.is_temporary_request_error(exc) or isinstance(exc, BinanceAPIError) and exc.code == -2013):
+                    raise
+                failed_queries += 1
+                self._wait_for_recovery(f"{symbol_u} 查询订单 #{order_id}", failed_queries, exc)
+                continue
             status = str(order.get("status") or "").upper()
             if status == "FILLED":
                 return order
@@ -2707,16 +3093,17 @@ class BinanceClient:
         if status == "FILLED":
             return order_data
         if status in {"CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:
-            raise RuntimeError(f"市价订单未成交，状态={status}")
+            raise BinanceAPIError(-2010, f"市价订单未完整成交，状态={status}")
         order_id = order_data.get("orderId")
         if order_id in (None, ""):
             raise RuntimeError("市价订单返回缺少 orderId，无法确认成交")
-        return self.wait_order_filled(
-            symbol,
-            order_id,
-            stop_event=self._request_stop_event,
-            poll_interval=0.2,
-        )
+        try:
+            return self.wait_order_filled(symbol, order_id, stop_event=self._request_stop_event, poll_interval=0.2)
+        except (BinanceAPIError, RequestStoppedError):
+            raise
+        except Exception as exc:
+            client_id = str(order_data.get("clientOrderId") or f"order#{order_id}")
+            raise UnconfirmedOrderError(symbol, client_id) from exc
 
     def get_order_average_price(self, order_data: dict) -> Decimal | None:
         if not isinstance(order_data, dict):
@@ -2927,6 +3314,23 @@ class BinanceClient:
             quote_asset_override=from_asset,
         )
 
+    def spot_market_conversion_sellable_source_amount(self, symbol: str) -> Decimal:
+        """Confirm the input asset, including inverse routes, against market order minima."""
+        route = self.resolve_spot_market_conversion(symbol)
+        if route["side"] == "SELL":
+            return self.spot_market_sellable_base_quantity(route["symbol"])
+        asset = route["fromAsset"]
+        balance = self.spot_balance_snapshot({asset})[asset]["total"]
+        if balance <= 0:
+            return Decimal("0")
+        rules = self.get_symbol_trade_rules(route["symbol"])
+        if not rules or rules.get("status") != "TRADING":
+            raise RuntimeError(f"无法确认 {symbol} 清仓：交易对规则不可用或不可交易")
+        amount = self._quantize_to_fraction(balance, int(rules.get("quoteOrderQtyFraction", 8) or 8))
+        if amount <= 0 or amount < rules["minNotional"]:
+            return Decimal("0")
+        return amount
+
     def buy_bnb_with_quote_amount(
         self,
         quote_asset: str,
@@ -3103,6 +3507,8 @@ class BinanceClient:
                     sold_assets.append(asset)
                     time.sleep(0.3)
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 logger.warning("卖出大额币 %s 失败: %s", asset, e)
 
         logger.info("大额币卖出为 USDT 完成，成功处理 %d 个币种", len(sold_assets))
@@ -3135,6 +3541,8 @@ class BinanceClient:
                         continue
                     logger.info("大额资产 %s 直兑 BNB 未执行，回退到 USDT 路线", asset)
                 except Exception as e:
+                    if isinstance(e, UnconfirmedOperationError):
+                        raise
                     logger.warning("大额资产 %s 直兑 BNB 失败，回退到 USDT 路线: %s", asset, e)
             else:
                 logger.info("闪兑不支持 %s -> BNB，回退到 USDT 路线", asset)
@@ -3154,6 +3562,8 @@ class BinanceClient:
                     residual_assets.append(asset)
                     logger.warning("大额资产 %s 回退卖出 USDT 未执行，该资产仍未处理", asset)
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 residual_assets.append(asset)
                 logger.warning("大额资产 %s 回退卖出 USDT 失败: %s", asset, e)
 
@@ -3228,8 +3638,11 @@ class BinanceClient:
             qty = rules["maxQty"]
 
         price = self.get_symbol_price(symbol_u)
-        if rules["minNotional"] > 0 and (not price or qty * price < rules["minNotional"]):
-            return Decimal("0")
+        if rules["minNotional"] > 0:
+            if not price:
+                raise RuntimeError(f"无法确认 {symbol_u} 清仓：行情不可用")
+            if qty * price < rules["minNotional"]:
+                return Decimal("0")
         return qty
 
     # -------- 提现 --------
@@ -3250,6 +3663,8 @@ class BinanceClient:
                     # Give Binance a brief moment to reflect the transfer in spot balance.
                     time.sleep(0.5)
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
                 logger.warning("提现前归集 %s 到现货失败: %s", coin, e)
         balance = self.spot_asset_balance_decimal(coin)
         fee_buffer_dec = Decimal(str(fee_buffer or "0"))
@@ -3357,6 +3772,8 @@ class BinanceClient:
         try:
             available_amount = self.funding_asset_balance(asset_u)
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("查询资金账户 %s 余额失败: %s", asset_u, e)
             return Decimal("0")
         if available_amount <= 0:
@@ -3375,6 +3792,8 @@ class BinanceClient:
             time.sleep(0.5)
             return transfer_amount
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("资金账户划转到现货失败 %s %s: %s", asset_u, self._format_decimal(transfer_amount), e)
             return Decimal("0")
 
@@ -3492,6 +3911,8 @@ class BinanceClient:
         try:
             spot_balance = self.spot_asset_balance_decimal(asset_u)
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("查询现货 %s 余额失败: %s", asset_u, e)
             return Decimal("0")
         if spot_balance <= 0:
@@ -3509,6 +3930,8 @@ class BinanceClient:
             time.sleep(0.5)
             return transfer_amount
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("现货划转到 U本位失败 %s %s: %s", asset_u, self._format_decimal(transfer_amount), e)
             return Decimal("0")
 
@@ -3591,6 +4014,11 @@ class BinanceClient:
             try:
                 return self.universal_transfer(transfer_type, asset, amount)
             except Exception as e:
+                if isinstance(e, UnconfirmedOperationError):
+                    raise
+                # Definite temporary rejections can be retried without replaying a completed transfer.
+                if isinstance(e, BinanceAPIError) and e.code not in {-1003, 32020}:
+                    raise
                 if attempt >= retries:
                     raise
                 logger.warning(
@@ -3625,6 +4053,8 @@ class BinanceClient:
                     self._universal_transfer_with_retry("UMFUTURE_MAIN", asset_u, amount, context=f"{context_text} U本位划转")
                     total_count += 1
                 except Exception as e:
+                    if isinstance(e, UnconfirmedOperationError):
+                        raise
                     logger.warning(
                         "%s U本位划转失败 %s %s: %s",
                         context_text,
@@ -3633,6 +4063,8 @@ class BinanceClient:
                         e,
                     )
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("%s查询 U本位 %s 余额失败: %s", context_text, asset_u, e)
 
         try:
@@ -3647,6 +4079,8 @@ class BinanceClient:
                     self._universal_transfer_with_retry("CMFUTURE_MAIN", asset_u, amount, context=f"{context_text} 币本位划转")
                     total_count += 1
                 except Exception as e:
+                    if isinstance(e, UnconfirmedOperationError):
+                        raise
                     logger.warning(
                         "%s 币本位划转失败 %s %s: %s",
                         context_text,
@@ -3655,6 +4089,8 @@ class BinanceClient:
                         e,
                     )
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("%s查询 币本位 %s 余额失败: %s", context_text, asset_u, e)
 
         try:
@@ -3669,6 +4105,8 @@ class BinanceClient:
                     self._universal_transfer_with_retry("FUNDING_MAIN", asset_u, amount, context=f"{context_text} 资金账户划转")
                     total_count += 1
                 except Exception as e:
+                    if isinstance(e, UnconfirmedOperationError):
+                        raise
                     logger.warning(
                         "%s 资金账户划转失败 %s %s: %s",
                         context_text,
@@ -3677,6 +4115,8 @@ class BinanceClient:
                         e,
                     )
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("%s查询 资金账户 %s 余额失败: %s", context_text, asset_u, e)
 
         if total_count > 0:
@@ -3698,8 +4138,12 @@ class BinanceClient:
                     self.universal_transfer("UMFUTURE_MAIN", asset, amount)
                     total_count += 1
                 except Exception as e:
+                    if isinstance(e, UnconfirmedOperationError):
+                        raise
                     logger.warning("U本位划转失败 %s %s: %s", asset, self._format_decimal(amount), e)
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("查询 U本位合约余额失败: %s", e)
 
         try:
@@ -3713,8 +4157,12 @@ class BinanceClient:
                     self.universal_transfer("CMFUTURE_MAIN", asset, amount)
                     total_count += 1
                 except Exception as e:
+                    if isinstance(e, UnconfirmedOperationError):
+                        raise
                     logger.warning("币本位划转失败 %s %s: %s", asset, self._format_decimal(amount), e)
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("查询 币本位合约余额失败: %s", e)
 
         try:
@@ -3728,8 +4176,12 @@ class BinanceClient:
                     self.universal_transfer("FUNDING_MAIN", asset, amount)
                     total_count += 1
                 except Exception as e:
+                    if isinstance(e, UnconfirmedOperationError):
+                        raise
                     logger.warning("资金账户划转失败 %s %s: %s", asset, self._format_decimal(amount), e)
         except Exception as e:
+            if isinstance(e, UnconfirmedOperationError):
+                raise
             logger.warning("查询资金账户余额失败: %s", e)
 
         logger.info("归集到现货完成，共处理 %d 项资产", total_count)
@@ -3777,8 +4229,9 @@ class BinanceClient:
 
 __all__ = [
     "BinanceAPIError",
+    "UnconfirmedOperationError",
+    "UnconfirmedOrderError",
     "SharedRateLimitGate",
-    "retry_request",
     "BinanceClient",
     "explain_binance_api_error",
     "short_binance_api_error",

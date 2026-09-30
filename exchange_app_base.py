@@ -13,7 +13,7 @@ import re
 import sys
 import threading
 import time
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 
 import tkinter as tk
@@ -108,6 +108,7 @@ from exchange_logging import (
 from exchange_proxy_runtime import ExchangeProxyRuntime, http_get_via_proxy
 from exchange_strategy import CombinedStopEvent, MarketStaggerCoordinator, Strategy
 from operation_journal import OperationJournal
+from input_validation import bounded_int, finite_decimal, MAX_WAIT_SECONDS
 from secret_box import SECRET_BOX
 from shared_utils import (
     SolidButton,
@@ -198,7 +199,10 @@ class ExchangeAppBase(tk.Tk):
         self._batch_task_active = False
         self._closing = False
         self._close_finalized = False
-        self._close_deadline_monotonic = 0.0
+        self._cleanup_state_lock = threading.RLock()
+        self._pending_strategy_cleanups: dict[int, Strategy] = {}
+        self._cleanup_retry_running = False
+        self._cleanup_retry_after = 0.0
         self._close_wait_after_token = None
         self._log_poll_after_token = None
         self._accounts_save_after_token = None
@@ -355,7 +359,7 @@ class ExchangeAppBase(tk.Tk):
         self._closing = True
         self._finalize_close()
 
-    def _flush_runtime_sensitive_stores(self) -> None:
+    def _flush_runtime_sensitive_stores(self, *, strict: bool = False) -> None:
         page = getattr(self, "onchain_page", None)
         if page is None:
             return
@@ -367,6 +371,8 @@ class ExchangeAppBase(tk.Tk):
             flush()
         except Exception:
             logger.exception("中转钱包运行状态加密落盘失败")
+            if strict:
+                raise
 
     def _build_ui(self):
         self.api_key_var = tk.StringVar(value=API_KEY_DEFAULT)
@@ -923,7 +929,7 @@ class ExchangeAppBase(tk.Tk):
         text = self._normalized_entry_text(variable.get(), placeholder)
         if not text:
             return int(default)
-        return int(text)
+        return bounded_int(text, f"{placeholder}延迟(毫秒)", minimum=0, maximum=MAX_WAIT_SECONDS * 1000)
     @staticmethod
     def _normalize_trade_account_type(value) -> str:
         text = str(value or "").strip()
@@ -1045,13 +1051,7 @@ class ExchangeAppBase(tk.Tk):
         text = str(raw_value or "").strip()
         if not text:
             raise RuntimeError(f"{field_label}不能为空")
-        try:
-            value = Decimal(text)
-        except (InvalidOperation, ValueError, TypeError) as exc:
-            raise RuntimeError(f"{field_label}格式不正确") from exc
-        if value < Decimal(str(min_value)):
-            raise RuntimeError(f"{field_label}不能小于 {min_value}")
-        return value
+        return finite_decimal(text, field_label, minimum=min_value)
     def _collect_trade_mode_settings(
         self,
         *,
@@ -1622,8 +1622,8 @@ class ExchangeAppBase(tk.Tk):
         if bool(getattr(self, "_app_locked", False)):
             self._finalize_close()
             return
-        self._close_deadline_monotonic = time.monotonic() + 2.5
         logger.info("收到窗口关闭请求，开始优雅停止后台任务")
+        self.status_var.set("状态：正在停止并清理，完成后退出")
         self._cancel_after_token("_accounts_save_after_token")
         self._save_accounts_silently()
         self._cancel_after_token("_update_ip_after_token")
@@ -1635,7 +1635,7 @@ class ExchangeAppBase(tk.Tk):
         page = getattr(self, "onchain_page", None)
         if page is not None:
             try:
-                page.shutdown()
+                page.request_shutdown()
             except Exception:
                 pass
         self._complete_close_when_idle()
@@ -1688,28 +1688,87 @@ class ExchangeAppBase(tk.Tk):
         if self._managed_threads_snapshot():
             return True
         page = getattr(self, "onchain_page", None)
-        if page is not None and bool(getattr(page, "is_running", False)):
+        if page is not None and (bool(getattr(page, "is_running", False)) or bool(getattr(page, "shutdown_pending", lambda: False)())):
             return True
         return False
+
+    def _pending_cleanup_snapshot(self) -> list[Strategy]:
+        with self._cleanup_state_lock:
+            return list(self._pending_strategy_cleanups.values())
+
+    def _record_strategy_cleanup(self, strategy: Strategy) -> None:
+        with self._cleanup_state_lock:
+            if strategy.cleanup_confirmed:
+                self._pending_strategy_cleanups.pop(id(strategy), None)
+            else:
+                self._pending_strategy_cleanups[id(strategy)] = strategy
+        if not self._closing and strategy.stop_cleanup_requested:
+            self._dispatch_ui(self._retry_pending_cleanups)
+
+    def _retry_pending_cleanups(self) -> None:
+        if self._cleanup_retry_running or not self._pending_cleanup_snapshot():
+            return
+        if not self._closing and not any(strategy.stop_cleanup_requested for strategy in self._pending_cleanup_snapshot()):
+            return
+        if self._background_shutdown_pending() or time.monotonic() < self._cleanup_retry_after:
+            if not self._closing:
+                self.after(500, self._retry_pending_cleanups)
+            return
+        self._cleanup_retry_running = True
+
+        def retry():
+            try:
+                for strategy in self._pending_cleanup_snapshot():
+                    if not self._closing and not strategy.stop_cleanup_requested:
+                        continue
+                    try:
+                        strategy.retry_stop_cleanup()
+                    except Exception as exc:
+                        strategy.cleanup_error = str(exc)
+                        logger.error("停止清理重试失败：%s", exc)
+                    finally:
+                        self._close_binance_client_instance(strategy.c)
+                self._dispatch_ui(lambda: self.status_var.set("状态：停止清理完成" if not self._pending_cleanup_snapshot() else "状态：清理未确认，继续等待重试"))
+            finally:
+                self._cleanup_retry_after = time.monotonic() + 2.0
+                self._cleanup_retry_running = False
+                if not self._closing:
+                    self._dispatch_ui(self._retry_pending_cleanups)
+
+        self._start_managed_thread(retry, name="exchange-stop-cleanup")
     def _complete_close_when_idle(self):
         self._close_wait_after_token = None
-        if self._background_shutdown_pending() and time.monotonic() < self._close_deadline_monotonic:
+        self._retry_pending_cleanups()
+        pending = self._pending_cleanup_snapshot()
+        if pending:
+            self.status_var.set("状态：清理未确认，完成后退出：" + str(pending[0].cleanup_error)[:100])
+        if self._background_shutdown_pending() or pending:
             try:
                 self._close_wait_after_token = self.after(100, self._complete_close_when_idle)
                 return
             except Exception:
                 self._close_wait_after_token = None
+                logger.exception("无法安排关闭等待；清理未完成，保留窗口")
+                return
         self._finalize_close()
 
     def _finalize_close(self):
         if self._close_finalized:
+            return
+        if self._background_shutdown_pending() or self._pending_cleanup_snapshot():
+            self._complete_close_when_idle()
+            return
+        try:
+            self._flush_runtime_sensitive_stores(strict=True)
+        except Exception as exc:
+            self.status_var.set(f"状态：运行状态保存失败，等待重试：{exc}")
+            self._close_wait_after_token = self.after(1000, self._complete_close_when_idle)
             return
         self._close_finalized = True
         self._cancel_after_token("_accounts_save_after_token")
         self._cancel_after_token("_close_wait_after_token")
         self._cancel_after_token("_update_ip_after_token")
         self._cancel_after_token("_log_poll_after_token")
-        self._flush_runtime_sensitive_stores()
         page = getattr(self, "onchain_page", None)
         if page is not None:
             try:

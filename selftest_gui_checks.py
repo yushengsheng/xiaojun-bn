@@ -7,6 +7,8 @@ import contextlib
 import os
 import tempfile
 import time
+import threading
+from types import SimpleNamespace
 from pathlib import Path
 
 from core_models import OnchainPairEntry
@@ -272,12 +274,42 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 if help_bubbles[0]._bubble is None or not help_bubbles[0]._bubble.winfo_exists():
                     raise RuntimeError("GUI 自检失败：自动分仓悬浮说明未显示")
                 help_bubbles[0]._hide()
-                buttons = [widget for widget in window.winfo_children()[0].winfo_children()
-                           if widget.winfo_class() == "TButton" and widget.cget("text") == "保存并运行"]
-                if len(buttons) != 1:
-                    raise RuntimeError("GUI 自检失败：自动分仓设置保存按钮缺失")
-                buttons[0].invoke()
-                if not auto_ladder_path.exists() or app.auto_ladder_settings_store.snapshot()[1] != 1:
+                controls = window.winfo_children()[0].winfo_children()
+                buttons = {widget.cget("text"): widget for widget in controls if widget.winfo_class() == "TButton"}
+                if not {"分享策略", "导入策略", "保存并运行"}.issubset(buttons):
+                    raise RuntimeError("GUI 自检失败：自动分仓分享、导入或保存按钮缺失")
+                volume_entry = next(widget for widget in controls
+                                    if widget.winfo_class() == "TEntry" and int(widget.grid_info()["row"]) == 2)
+                clipboard = {"text": ""}
+                with temporary_attr_overrides([
+                    (app, "clipboard_clear", lambda: clipboard.update(text="")),
+                    (app, "clipboard_append", lambda value: clipboard.update(text=value)),
+                    (app, "clipboard_get", lambda: clipboard["text"]),
+                ]):
+                    volume_entry.delete(0, "end")
+                    volume_entry.insert(0, "250000")
+                    buttons["分享策略"].invoke()
+                    shared = clipboard["text"]
+                    if exchange_app_auto_ladder.import_auto_ladder_settings(shared).start_volume != 250000:
+                        raise RuntimeError("GUI 自检失败：分享未复制当前表单参数")
+                    if app.auto_ladder_settings_store.snapshot()[1] != 0:
+                        raise RuntimeError("GUI 自检失败：分享时意外更新了运行参数")
+                    volume_entry.delete(0, "end")
+                    volume_entry.insert(0, "300000")
+                    clipboard["text"] = "无效策略"
+                    buttons["导入策略"].invoke()
+                    if volume_entry.get() != "300000" or app.auto_ladder_settings_store.snapshot()[1] != 0:
+                        raise RuntimeError("GUI 自检失败：无效策略导入改动了现有参数")
+                    if not dialogs or dialogs[-1][:2] != ("error", "导入失败"):
+                        raise RuntimeError("GUI 自检失败：无效策略导入未提示错误")
+                    dialogs.pop()
+                    clipboard["text"] = shared
+                    buttons["导入策略"].invoke()
+                    if volume_entry.get() != "250000" or app.auto_ladder_settings_store.snapshot()[1] != 0:
+                        raise RuntimeError("GUI 自检失败：导入策略未正确回填或提前生效")
+                buttons["保存并运行"].invoke()
+                saved_settings, saved_version = app.auto_ladder_settings_store.snapshot()
+                if not auto_ladder_path.exists() or saved_version != 1 or saved_settings.start_volume != 250000:
                     raise RuntimeError("GUI 自检失败：自动分仓设置未原子保存并更新")
                 app._set_combo_states_for_run(True)
                 try:
@@ -542,6 +574,34 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 error_dialogs = [item for item in dialogs if item[0] == "error"]
                 if error_dialogs:
                     raise RuntimeError(f"GUI 自检失败：出现错误弹窗 {error_dialogs[0][2]}")
+
+                # Keep a real Tk window alive past the former 2.5 second exit deadline.
+                worker_release = threading.Event()
+                cleanup_done = threading.Event()
+                cleanup = SimpleNamespace(cleanup_confirmed=False, cleanup_error="自检待清理", stop_cleanup_requested=False,
+                                          c=SimpleNamespace(close=lambda: None))
+                def complete_cleanup():
+                    if app._close_finalized:
+                        raise RuntimeError("GUI 自检失败：清理前已经最终退出")
+                    cleanup.cleanup_confirmed = True
+                    cleanup_done.set()
+                    app._record_strategy_cleanup(cleanup)
+                    return True
+                cleanup.retry_stop_cleanup = complete_cleanup
+                app._record_strategy_cleanup(cleanup)
+                app._start_managed_thread(lambda: worker_release.wait(8), name="selftest-close-worker")
+                close_started = time.monotonic()
+                try:
+                    app._on_close()
+                    pump_tk_events(app, timeout=5, predicate=lambda: time.monotonic() - close_started >= 2.8)
+                    if app._close_finalized or not app.winfo_exists() or cleanup_done.is_set():
+                        raise RuntimeError("GUI 自检失败：后台任务结束前退出或开始清理")
+                finally:
+                    worker_release.set()
+                pump_tk_events(app, timeout=8, predicate=lambda: app._close_finalized)
+                if not cleanup_done.is_set():
+                    raise RuntimeError("GUI 自检失败：未完成状态清理便退出")
+                checks.append("close-after-cleanup-gui=ok")
             finally:
                 if app is not None:
                     try:

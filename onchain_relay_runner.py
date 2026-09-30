@@ -34,6 +34,14 @@ RELAY_BNB_DUST_THRESHOLD = Decimal("0.000005")
 _RELAY_SWEEP_LOG_LOCK = threading.Lock()
 
 
+def _relay_mode_is(owner, params: WithdrawRuntimeParams, mode: str) -> bool:
+    # Older direct callers may omit mode; GUI tasks always supply an immutable snapshot.
+    if params.mode:
+        return params.mode in ({"1对多", "1M"} if mode == "1m" else {"多对1", "M1"})
+    checker = getattr(owner, "_is_mode_" + mode, None)
+    return bool(checker()) if callable(checker) else False
+
+
 def _start_relay_rpc_worker(owner, target, *, name: str) -> threading.Thread:
     starter = getattr(owner, "_start_rpc_worker_thread", None)
     if callable(starter):
@@ -1006,8 +1014,8 @@ def _relay_job_key(source_addr: str, target: str) -> tuple[str, str]:
     return (str(source_addr or "").strip().lower(), str(target or "").strip().lower())
 
 
-def _relay_reuse_key(owner, network: str, source_addr: str, target: str) -> str:
-    mode = owner._mode() if hasattr(owner, "_mode") else ""
+def _relay_reuse_key(owner, network: str, source_addr: str, target: str, *, mode: str = "") -> str:
+    mode = mode or (owner._mode() if hasattr(owner, "_mode") else "")
     return "|".join(
         (
             str(mode or "").strip(),
@@ -1044,7 +1052,7 @@ def _build_resume_candidates(
         if row_key in row_source_wallets
     }
     wanted_reuse_keys = {
-        _relay_reuse_key(owner, params.network, row_source_wallets[row_key][1], target)
+        _relay_reuse_key(owner, params.network, row_source_wallets[row_key][1], target, mode=params.mode)
         for row_key, _source, target in jobs_data
         if row_key in row_source_wallets
     }
@@ -1083,12 +1091,11 @@ def _pick_or_create_relay_records(
         candidates = resume_candidates_by_pair.get(pair_key) or []
         if candidates:
             candidate = candidates.pop()
-            reuse_key = _relay_reuse_key(owner, params.network, source_addr, target)
+            reuse_key = _relay_reuse_key(owner, params.network, source_addr, target, mode=params.mode)
             candidate_status = str(candidate.status or "").strip()
             reset_unsubmitted_1m_native = bool(
                 params.token_is_native
-                and hasattr(owner, "_is_mode_1m")
-                and owner._is_mode_1m()
+                and _relay_mode_is(owner, params, "1m")
                 and candidate_status in {"", "created", "failed"}
                 and not str(candidate.token_funded_txid or "").strip()
                 and not str(candidate.token_funded_nonce or "").strip()
@@ -1138,7 +1145,7 @@ def _pick_or_create_relay_records(
         is_native=params.token_is_native,
     )
     relay_records = []
-    is_many_to_one_mode = bool(hasattr(owner, "_is_mode_m1") and owner._is_mode_m1())
+    is_many_to_one_mode = bool(_relay_mode_is(owner, params, "m1"))
     if jobs_missing_relay:
         relay_wallets = owner.client.create_wallets(
             len(jobs_missing_relay),
@@ -1146,7 +1153,7 @@ def _pick_or_create_relay_records(
         )
         for (row_key, source_addr, target), relay_wallet in zip(jobs_missing_relay, relay_wallets):
             sweep_target = target if is_many_to_one_mode else source_addr
-            reuse_key = _relay_reuse_key(owner, params.network, source_addr, target)
+            reuse_key = _relay_reuse_key(owner, params.network, source_addr, target, mode=params.mode)
             relay_record = owner.relay_wallet_store.build_record(
                 batch_id=batch_id,
                 network=params.network,
@@ -3054,7 +3061,7 @@ def _relay_source_stage(
         if not active_items:
             return
         submit_interval = _source_stage_submit_interval(params)
-        if hasattr(owner, "_is_mode_1m") and owner._is_mode_1m():
+        if _relay_mode_is(owner, params, "1m"):
             worker_count = max(
                 1,
                 min(
@@ -3175,7 +3182,7 @@ def _relay_prepare_items(
     relay_records_by_row_key: dict[str, RelayWalletRecord],
     row_source_wallets: dict[str, tuple[str, str]],
 ) -> list[_RelayBatchItem]:
-    is_many_to_one_mode = bool(hasattr(owner, "_is_mode_m1") and owner._is_mode_m1())
+    is_many_to_one_mode = bool(_relay_mode_is(owner, params, "m1"))
     items: list[_RelayBatchItem] = []
     for index, (row_key, source, target) in enumerate(jobs_data, start=1):
         record = relay_records_by_row_key[row_key]
@@ -3227,7 +3234,7 @@ def _relay_prepare_items(
             item.relay_addr,
             batch_id=item.relay_record.batch_id,
             status=str(item.relay_record.status or "created") or "created",
-            reuse_key=_relay_reuse_key(owner, params.network, source_addr, target),
+            reuse_key=_relay_reuse_key(owner, params.network, source_addr, target, mode=params.mode),
             token_symbol=str(params.coin or "").strip().upper(),
             token_contract=str(params.token_contract or "").strip(),
             token_decimals=max(0, int(params.token_decimals)),
@@ -3361,7 +3368,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
             row_key: owner._row_context_for_values(row_key, source, target)
             for row_key, source, target in jobs_data
         }
-        is_many_to_one_mode = bool(hasattr(owner, "_is_mode_m1") and owner._is_mode_m1())
+        is_many_to_one_mode = bool(_relay_mode_is(owner, params, "m1"))
         dispatch_ui(lambda keys=progress_keys: owner._begin_progress("transfer", keys))
         dispatch_ui(
             lambda a=owner._token_amount_text(params.coin, Decimal("0")), g=("-" if dry_run else owner._estimated_gas_fee_text(params.network, 0)): owner._set_progress_metrics(
@@ -3371,7 +3378,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
         )
         dispatch_ui(
             lambda: owner.log(
-                  f"开始批量链上中转：mode={owner._mode()}，任务={len(jobs_data)}，network={params.network}，"
+                  f"开始批量链上中转：mode={params.mode or owner._mode()}，任务={len(jobs_data)}，network={params.network}，"
                   f"coin={token_desc}，amount={params.amount}，delay={params.delay}，threads={params.threads}，"
                   f"1m_source_threads={params.one_to_many_source_threads}，"
                 f"receipt_interval={params.receipt_poll_interval_seconds}，receipt_retries={params.receipt_retry_count}，"
@@ -3527,7 +3534,7 @@ def run_relay_batch(owner, jobs_data: list[tuple[str, str, str]], params: Withdr
             )
         elif params.token_is_native:
             native_done_statuses = {"token_funded", "forwarded", "completed", "completed_pending_sweep"}
-            if hasattr(owner, "_is_mode_1m") and owner._is_mode_1m():
+            if _relay_mode_is(owner, params, "1m"):
                 _relay_clear_missing_source_txids(
                     owner,
                     params,

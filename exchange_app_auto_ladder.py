@@ -8,7 +8,7 @@ from tkinter import messagebox, ttk
 
 from app_paths import STRATEGY_CONFIG_FILE
 from exchange_app_base import _atomic_write_config_json, _load_authenticated_config, _require_dict_payload
-from exchange_auto_ladder import AutoLadderSettings
+from exchange_auto_ladder import AutoLadderSettings, export_auto_ladder_settings, import_auto_ladder_settings
 from exchange_logging import logger
 from stores import config_or_backup_exists
 
@@ -46,7 +46,7 @@ FIELD_HELP = {
     "turn_seconds": "观察最近多少秒的盘口中间价；中间价是买一价与卖一价的平均值。用于识别短时间来回折返。",
     "turn_ticks": "价格先朝一个方向走，再反向走至少多少 tick，才记作一次折返。小于这个幅度的抖动不计数；单向上涨或下跌也不算折返。",
     "turn_count": "在上述秒数内，折返次数达到此值就暂停，并尝试撤销当前挂单。数值越小越容易因来回波动暂停。",
-    "stable_seconds": "暂停后，成交额和价格条件持续达标、且没有达到折返次数，保持这么久才重新挂单。短暂行情读取失败会冻结计时，恢复后接着算；连续失联达到 10 秒或条件不达标才重新计时。首次入场由“入场连续确认”控制。",
+    "stable_seconds": "暂停后，成交额和价格条件持续达标、且没有达到折返次数，保持这么久才重新挂单。短暂行情读取失败会冻结计时，恢复后接着算；连续失联达到 30 秒或条件不达标才重新计时。首次入场由“入场连续确认”控制。",
 }
 
 
@@ -158,8 +158,34 @@ class ExchangeAppAutoLadderMixin:
             logger.info("自动分仓判断参数已保存并生效；当前账号下次行情判断使用新版设置")
             window.destroy()
 
+        share_status = tk.StringVar(window)
+
+        def share_settings() -> None:
+            try:
+                current = AutoLadderSettings.parse({name: variable.get() for name, variable in variables.items()})
+                self.clipboard_clear()
+                self.clipboard_append(export_auto_ladder_settings(current))
+            except (ValueError, tk.TclError) as exc:
+                messagebox.showerror("分享失败", str(exc), parent=window)
+                return
+            share_status.set("已复制当前表单参数，可发送到另一台机器。")
+
+        def import_settings() -> None:
+            try:
+                imported = import_auto_ladder_settings(self.clipboard_get())
+            except (ValueError, tk.TclError) as exc:
+                messagebox.showerror("导入失败", str(exc), parent=window)
+                return
+            for name, variable in variables.items():
+                variable.set(str(getattr(imported, name)))
+            share_status.set("已填入导入参数；检查后点击“保存并运行”生效。")
+
         ttk.Label(main, text="运行中保存立即更新判断参数；已有下单档位、金额、溢价和重挂设置不变。",
                   wraplength=500).grid(row=len(FIELDS)+1, column=0, columnspan=3, sticky="w", pady=(10, 6))
-        ttk.Button(main, text="保存并运行", command=save_and_run).grid(
-            row=len(FIELDS)+2, column=0, columnspan=3, pady=(6, 0)
+        button_row = len(FIELDS) + 2
+        ttk.Button(main, text="分享策略", command=share_settings).grid(row=button_row, column=0, sticky="e", pady=(6, 0))
+        ttk.Button(main, text="导入策略", command=import_settings).grid(row=button_row, column=1, sticky="w", pady=(6, 0))
+        ttk.Button(main, text="保存并运行", command=save_and_run).grid(row=button_row, column=2, sticky="w", pady=(6, 0))
+        ttk.Label(main, textvariable=share_status, wraplength=500).grid(
+            row=button_row+1, column=0, columnspan=3, sticky="w", pady=(6, 0)
         )

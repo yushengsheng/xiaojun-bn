@@ -50,6 +50,7 @@ from exchange_app_base import (
     tk,
     ttk,
 )
+from input_validation import bounded_int, finite_float
 from exchange_order_recovery import exchange_operation_scope, reconcile_exchange_orders
 from exchange_auto_ladder_observer import AutoLadderMarketObserver
 from shared_utils import decimal_to_stat_text
@@ -125,6 +126,9 @@ class ExchangeAppBatchMixin(object):
         return exchange_operation_scope(api_key)
 
     def _reconcile_exchange_orders(self, client, api_key: str) -> None:
+        pending_reader = getattr(self, "_pending_cleanup_snapshot", None)
+        if callable(pending_reader) and any(getattr(strategy.c, "key", "") == api_key for strategy in pending_reader()):
+            raise RuntimeError("该账号停止清理尚未完成，请等待清理确认后再启动")
         reconcile_exchange_orders(getattr(self, "exchange_operation_journal", None), client, api_key)
 
     def _resolve_earn_subscribe_amount(self, client, asset: str, configured_amount, earn_amount_all: bool) -> Decimal:
@@ -408,10 +412,10 @@ class ExchangeAppBatchMixin(object):
             earn_amount_all = bool(trade_settings.get("earn_amount_all"))
             earn_auto_subscribe = bool(trade_settings.get("earn_auto_subscribe"))
             earn_auto_subscribe_only = bool(trade_settings.get("earn_auto_subscribe_only"))
-            withdraw_buffer = float(self.withdraw_buffer_var.get())
+            withdraw_buffer = finite_float(self.withdraw_buffer_var.get(), "提现预留", maximum=None)
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "\u6700\u5c0f")
             max_delay = self._delay_var_value(self.max_delay_var, 3000, "\u6700\u5927")
-            usdt_timeout = int(self.usdt_timeout_var.get())
+            usdt_timeout = bounded_int(self.usdt_timeout_var.get(), "到账超时", minimum=0, maximum=86400)
             rate_limit_wait_seconds = self._rate_limit_wait_seconds_value()
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("错误", str(e) or "参数格式不正确")
@@ -627,6 +631,7 @@ class ExchangeAppBatchMixin(object):
             futures_side=futures_side,
             operation_journal=self.exchange_operation_journal,
             operation_scope=self._exchange_operation_scope(key),
+            cleanup_callback=getattr(self, "_record_strategy_cleanup", None),
         )
 
         def progress_cb(step, total, text):
@@ -741,32 +746,15 @@ class ExchangeAppBatchMixin(object):
                     spot_symbol=spot_symbol,
                     quote_asset=quote_asset,
                 )
-                cleanup_error = (
-                    str(strategy_result.get("ladder_cleanup_error") or "").strip()
-                    if isinstance(strategy_result, dict)
-                    else ""
-                )
-                if cleanup_error:
-                    failure_text = f"停止清理失败：{cleanup_error}"
-                elif trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and not self.stop_event.is_set():
-                    result = strategy_result if isinstance(strategy_result, dict) else {}
-                    if result.get("trade_error"):
-                        failure_text = self._format_trade_failure_status(
-                            result.get("trade_error_stage", ""), result["trade_error"],
-                        )
-                    elif result.get("withdraw_error") and not result.get("withdraw_amount"):
-                        failure_text = f"提现失败：{result['withdraw_error']}"
-                        if trade_stats_text:
-                            failure_text = f"{failure_text}｜{trade_stats_text}"
-                    else:
-                        completion_status, _ = self._format_batch_strategy_completion_status(
-                            float(result.get("withdraw_amount") or 0),
-                            withdraw_coin,
-                            enable_withdraw=enable_withdraw,
-                            strategy_result=result,
-                            completion_text=self._spot_strategy_completion_text(trade_mode, spot_rounds, result),
-                            trade_stats_text=trade_stats_text,
-                        )
+                result = strategy_result if isinstance(strategy_result, dict) else {}
+                failure_text = self._strategy_failure_text(result, stopped=self.stop_event.is_set(), trade_stats_text=trade_stats_text)
+                if not failure_text and trade_account_type == TRADE_ACCOUNT_TYPE_SPOT and not self.stop_event.is_set():
+                    completion_status, _ = self._format_batch_strategy_completion_status(
+                        float(result.get("withdraw_amount") or 0), withdraw_coin,
+                        enable_withdraw=enable_withdraw, strategy_result=result,
+                        completion_text=self._spot_strategy_completion_text(trade_mode, spot_rounds, result),
+                        trade_stats_text=trade_stats_text,
+                    )
             except Exception as e:
                 failure_text = str(e)
                 logger.error("运行过程中出现异常: %s", e)
@@ -778,7 +766,7 @@ class ExchangeAppBatchMixin(object):
         self._batch_task_active = False
         self._clear_account_batch_runtime()
         self.btn_start.config(state="normal")
-        self.btn_stop.config(state="disabled")
+        self.btn_stop.config(state="normal" if getattr(self, "_pending_cleanup_snapshot", lambda: [])() else "disabled")
         self.btn_run_accounts.config(state="normal")
         self.btn_query_all_assets.config(state="normal")
         self.btn_collect_bnb_combo.config(state="normal")
@@ -794,6 +782,20 @@ class ExchangeAppBatchMixin(object):
             self.after(80, self._set_retry_failed_button_state)
         self.status_var.set(str(status_text or "状态：已完成/已停止"))
         self.progress["value"] = 0
+    @classmethod
+    def _strategy_failure_text(cls, result: dict, *, stopped: bool = False, trade_stats_text: str = "") -> str:
+        cleanup_error = str(result.get("cleanup_error") or result.get("ladder_cleanup_error") or "").strip()
+        if cleanup_error:
+            return f"停止清理失败：{cleanup_error}"
+        if stopped:
+            return ""
+        if result.get("trade_error"):
+            return cls._format_trade_failure_status(result.get("trade_error_stage", ""), result["trade_error"])
+        if result.get("withdraw_error") and not result.get("withdraw_amount"):
+            text = f"提现失败：{result['withdraw_error']}"
+            return f"{text}｜{trade_stats_text}" if trade_stats_text else text
+        return ""
+
     def _on_worker_finished(self, failure_text: str = "", completion_status: str = ""):
         status_text = f"状态：{completion_status}" if completion_status else "状态：已完成/已停止"
         if failure_text:
@@ -805,6 +807,11 @@ class ExchangeAppBatchMixin(object):
         if self.stop_event:
             self.stop_event.set()
             logger.info("已请求停止任务")
+        retry_cleanup = getattr(self, "_retry_pending_cleanups", None)
+        if callable(retry_cleanup):
+            for strategy in self._pending_cleanup_snapshot():
+                strategy.stop_cleanup_requested = True
+            retry_cleanup()
     def refresh_balances(self, silent=False):
         key = self.api_key_var.get().strip()
         secret = self.api_secret_var.get().strip()
@@ -846,9 +853,9 @@ class ExchangeAppBatchMixin(object):
         network = self.withdraw_net_var.get().strip()
         coin = self.withdraw_coin_var.get().strip().upper()
         try:
-            buffer_val = float(self.withdraw_buffer_var.get())
-        except ValueError:
-            messagebox.showerror("错误", "提现预留格式不正确")
+            buffer_val = finite_float(self.withdraw_buffer_var.get(), "提现预留", maximum=None)
+        except (ValueError, RuntimeError) as exc:
+            messagebox.showerror("错误", str(exc) or "提现预留格式不正确")
             return
 
         if not address or not network or not coin:
@@ -2067,7 +2074,7 @@ class ExchangeAppBatchMixin(object):
             return
         try:
             base_asset = BinanceClient.get_spot_base_asset(symbol)
-            max_threads = max(1, int(self.max_threads_var.get()))
+            max_threads = bounded_int(self.max_threads_var.get(), "线程数")
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "最小")
             max_delay = self._delay_var_value(self.max_delay_var, 3000, "最大")
         except Exception as exc:
@@ -2458,13 +2465,10 @@ class ExchangeAppBatchMixin(object):
         try:
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "最小")
             max_delay = self._delay_var_value(self.max_delay_var, 3000, "最大")
-            max_threads = int(self.max_threads_var.get())
+            max_threads = bounded_int(self.max_threads_var.get(), "线程数")
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("错误", str(e) or "参数格式不正确")
             return
-
-        if max_threads < 1:
-            max_threads = 1
 
         if require_confirm:
             text = (
@@ -2779,11 +2783,11 @@ class ExchangeAppBatchMixin(object):
 
         trade_settings = None
         try:
-            withdraw_buffer = float(self.withdraw_buffer_var.get())
+            withdraw_buffer = finite_float(self.withdraw_buffer_var.get(), "提现预留", maximum=None)
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "\u6700\u5c0f")
             max_delay = self._delay_var_value(self.max_delay_var, 3000, "\u6700\u5927")
-            usdt_timeout = int(self.usdt_timeout_var.get())
-            max_threads = int(self.max_threads_var.get())
+            usdt_timeout = bounded_int(self.usdt_timeout_var.get(), "到账超时", minimum=0, maximum=86400)
+            max_threads = bounded_int(self.max_threads_var.get(), "线程数")
             if (not batch_total_asset_only) and (not batch_collect_bnb_mode):
                 trade_settings = (
                     dict(trade_settings_override)
@@ -2793,9 +2797,6 @@ class ExchangeAppBatchMixin(object):
         except (ValueError, RuntimeError) as e:
             messagebox.showerror("错误", str(e) or "参数格式不正确 (请检查轮数/线程数/延迟等)")
             return
-
-        if max_threads < 1:
-            max_threads = 1
 
         spot_symbol = BinanceClient.normalize_trade_symbol(self.spot_symbol_var.get())
         enable_withdraw = (
@@ -3698,6 +3699,7 @@ class ExchangeAppBatchMixin(object):
                             futures_side=futures_side,
                             operation_journal=self.exchange_operation_journal,
                             operation_scope=self._exchange_operation_scope(acc["api_key"]),
+                            cleanup_callback=getattr(self, "_record_strategy_cleanup", None),
                         )
 
                         strategy_result, trade_stats_text = self._run_strategy_with_spot_statistics(
@@ -3963,14 +3965,11 @@ class ExchangeAppBatchMixin(object):
             return
 
         try:
-            withdraw_buffer = float(self.withdraw_buffer_var.get())
-            max_threads = int(self.max_threads_var.get())
-        except ValueError:
-            messagebox.showerror("错误", "参数格式不正确")
+            withdraw_buffer = finite_float(self.withdraw_buffer_var.get(), "提现预留", maximum=None)
+            max_threads = bounded_int(self.max_threads_var.get(), "线程数")
+        except (ValueError, RuntimeError) as exc:
+            messagebox.showerror("错误", str(exc) or "参数格式不正确")
             return
-
-        if max_threads < 1:
-            max_threads = 1
 
         coin = self.withdraw_coin_var.get().strip().upper()
         if not coin:

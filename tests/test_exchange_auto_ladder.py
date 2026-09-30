@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import threading
 import time
+import json
 from decimal import Decimal
 from unittest.mock import patch
 import requests
@@ -10,7 +11,7 @@ import requests
 from exchange_binance_client import BinanceAPIError, BinanceClient, UnconfirmedOrderError
 from exchange_auto_ladder import (
     AutoLadderSettings, AutoLadderSettingsStore, price_risk_reason, price_risk_safe, reversal_count,
-    trade_is_recent, volume_and_price_signal,
+    trade_is_recent, volume_and_price_signal, export_auto_ladder_settings, import_auto_ladder_settings,
 )
 from exchange_auto_ladder_observer import AutoLadderMarketObserver
 from exchange_constants import TRADE_MODE_AUTO_LADDER
@@ -65,6 +66,22 @@ class _ObserverClient:
 
 
 class AutoLadderTests(unittest.TestCase):
+    def test_settings_share_round_trip_and_rejects_incompatible_content(self):
+        original = AutoLadderSettings.parse({"start_volume": "250000.5", "dry_volume": "30000", "entry_confirm_seconds": "0"})
+        shared = export_auto_ladder_settings(original)
+        self.assertEqual(import_auto_ladder_settings(shared), original)
+        self.assertEqual(set(json.loads(shared)), {"format", "version", "settings"})
+
+        payload = json.loads(shared)
+        invalid = ["", "not json", "{}", "x" * 8193]
+        invalid.append(json.dumps({**payload, "version": 2}))
+        invalid.append(json.dumps({**payload, "api_key": "secret"}))
+        invalid.append(json.dumps({**payload, "settings": {k: v for k, v in payload["settings"].items() if k != "turn_count"}}))
+        invalid.append(json.dumps({**payload, "settings": {**payload["settings"], "dry_volume": "250000.5"}}))
+        for text in invalid:
+            with self.subTest(text=text[:60]), self.assertRaises(ValueError):
+                import_auto_ladder_settings(text)
+
     def test_settings_validate_and_replace_atomically(self):
         store = AutoLadderSettingsStore()
         original, version = store.snapshot()
@@ -382,7 +399,7 @@ class AutoLadderTests(unittest.TestCase):
                 clock[0] = 102.0
                 before_recovery.append((len(client.placements), len(client.events)))
             elif stop.wait_count == 2:
-                clock[0] = 104.0
+                clock[0] = 124.0
                 before_recovery.append((len(client.placements), len(client.events)))
             elif stop.wait_count == 3:
                 before_recovery.append((len(client.placements), len(client.events)))
@@ -399,7 +416,7 @@ class AutoLadderTests(unittest.TestCase):
         self.assertEqual(before_recovery[1][1], before_recovery[2][1])
         self.assertTrue(any(event.startswith("cancel-") for event in client.events))  # 人工停止清理
 
-    def test_auto_mode_cancels_orders_after_ten_second_market_gap(self):
+    def test_auto_mode_cancels_orders_after_thirty_second_market_gap(self):
         stop = _StopAfterOrders()
         client = _BnbStopLadderClient(stop)
         strategy = _strategy(client)
@@ -425,9 +442,9 @@ class AutoLadderTests(unittest.TestCase):
             if stop.wait_count == 1:
                 clock[0] = 102.0
             elif stop.wait_count == 2:
-                clock[0] = 109.0
+                clock[0] = 131.0
             elif stop.wait_count == 3:
-                clock[0] = 112.0
+                clock[0] = 132.0
             elif stop.wait_count == 4:
                 stop.stopped = True
             return stop.stopped
@@ -484,7 +501,7 @@ class AutoLadderTests(unittest.TestCase):
             "dry_minutes": "1", "dry_confirm_minutes": "1",
         }))
         clock = [100.0]
-        next_times = [102.0, 103.0, 107.0, 109.0, 111.0, 115.0]
+        next_times = [102.0, 103.0, 107.0, 109.0, 129.0, 133.0]
         reads = [0]
         placements_at_wait = []
 
@@ -549,7 +566,7 @@ class AutoLadderTests(unittest.TestCase):
         self.assertGreater(orders_at_wait[1], 0)
         self.assertFalse(any(event.startswith("cancel-") for event in events_at_wait[1]))
 
-    def test_repeated_submit_guard_failures_hit_ten_second_limit(self):
+    def test_repeated_submit_guard_failures_hit_thirty_second_limit(self):
         stop = _StopAfterOrders()
         client = _BnbStopLadderClient(stop)
         store = AutoLadderSettingsStore(AutoLadderSettings.parse({"entry_confirm_seconds": "0"}))
@@ -578,7 +595,7 @@ class AutoLadderTests(unittest.TestCase):
         def wait(_seconds):
             stop.wait_count += 1
             clock[0] = 100.0 + 5 * stop.wait_count
-            if stop.wait_count == 3:
+            if stop.wait_count == 7:
                 stop.stopped = True
             return stop.stopped
 
@@ -587,7 +604,7 @@ class AutoLadderTests(unittest.TestCase):
         stop.wait = wait
         with patch("exchange_auto_ladder_observer.time.monotonic", side_effect=lambda: clock[0]):
             strategy._run_ladder_mode(stop)
-        self.assertEqual(cancel_times, [(110.0, "auto-error")])
+        self.assertEqual(cancel_times, [(130.0, "auto-error")])
         self.assertEqual(client.placements, [])
 
     def test_five_account_workers_do_not_fetch_public_data_while_observing(self):
@@ -889,19 +906,25 @@ class AutoLadderTests(unittest.TestCase):
         self.assertEqual(order["orderId"], 42)
         self.assertEqual(len(posts), 1)
 
-    def test_missing_order_after_lost_reply_never_reposts_even_if_first_filled(self):
+    def test_missing_order_recovers_within_grace_without_reposting_even_if_first_filled(self):
         client = BinanceClient.__new__(BinanceClient)
         client.spot = "https://unused.example"
         posts = []
+        queries = 0
         def request_query(_base, method, _path, params, **_kwargs):
+            nonlocal queries
             if method == "POST":
                 posts.append(params["newClientOrderId"])
                 raise requests.Timeout("response lost after first order filled")
-            raise BinanceAPIError(-2013, "Order does not exist")
+            queries += 1
+            if queries <= 15:
+                raise BinanceAPIError(-2013, "Order does not exist")
+            return {"orderId": 42, "status": "FILLED"}
         client.request_query = request_query
         with patch("exchange_binance_client.time.sleep"):
-            with self.assertRaises(UnconfirmedOrderError):
-                client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT"}, lambda: True)
+            order = client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT"}, lambda: True)
+        self.assertEqual(order["status"], "FILLED")
+        self.assertEqual(queries, 16)
         self.assertEqual(len(posts), 1)
 
     def test_known_rejected_limit_order_does_not_create_recovery_blocker(self):
@@ -916,20 +939,26 @@ class AutoLadderTests(unittest.TestCase):
             client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT"}, lambda: True)
         self.assertEqual(calls, ["POST"])
 
-    def test_order_status_query_failure_stops_without_duplicate_post(self):
+    def test_order_status_query_failure_recovers_without_duplicate_post(self):
         client = BinanceClient.__new__(BinanceClient)
         client.spot = "https://unused.example"
         posts = []
+        queries = 0
         def request_query(_base, method, _path, params, **_kwargs):
+            nonlocal queries
             if method == "POST":
                 posts.append(params["newClientOrderId"])
                 raise requests.Timeout("response lost")
-            raise ConnectionError("order status unavailable")
+            queries += 1
+            if queries <= 15:
+                raise ConnectionError("order status unavailable")
+            return {"orderId": 42, "status": "NEW"}
         client.request_query = request_query
-        with self.assertRaises(UnconfirmedOrderError) as captured:
-            client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT"}, lambda: True)
+        with patch("exchange_binance_client.time.sleep"):
+            order = client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT"}, lambda: True)
         self.assertEqual(len(posts), 1)
-        self.assertEqual(captured.exception.client_order_id, posts[0])
+        self.assertEqual(order["orderId"], 42)
+        self.assertEqual(queries, 16)
 
     def test_running_settings_store_is_same_instance(self):
         store = AutoLadderSettingsStore()
