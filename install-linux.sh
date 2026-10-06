@@ -19,9 +19,17 @@ if [[ "$EUID" -ne 0 ]]; then
     printf '%s\n' '请使用 sudo bash install-linux.sh --host 公网IP' >&2
     exit 1
 fi
-if ! command -v python3 >/dev/null || ! command -v curl >/dev/null; then
+if [[ -e /opt/xiaojun-exchange || -e /etc/xiaojun-exchange || -e /var/lib/xiaojun-exchange ]] || compgen -G '/etc/systemd/system/xiaojun-exchange-*' >/dev/null; then
+    printf '%s\n' '检测到已有安装，拒绝覆盖；请保留现有交易和数据。' >&2
+    exit 1
+fi
+missing=()
+command -v python3 >/dev/null || missing+=(python3)
+command -v curl >/dev/null || missing+=(curl)
+[[ -f /etc/ssl/certs/ca-certificates.crt ]] || missing+=(ca-certificates)
+if [[ ${#missing[@]} -gt 0 ]]; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 curl ca-certificates
+    DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends "${missing[@]}"
 fi
 stage="$(mktemp -d -t xiaojun-install.XXXXXXXX)"
 trap 'rm -rf -- "$stage"' EXIT

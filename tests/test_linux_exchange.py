@@ -8,6 +8,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@unittest.skipUnless(os.name == 'posix', 'Unix socket server is validated on the Ubuntu release runner')
 class LinuxServerTests(unittest.TestCase):
     def run_script(self, script, *args):
         env = os.environ.copy()

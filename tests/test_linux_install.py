@@ -3,6 +3,7 @@ import argparse
 from contextlib import ExitStack
 import hashlib
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -28,6 +29,20 @@ class LinuxInstallTests(unittest.TestCase):
         self.assertEqual(install.validate_host('panel.example.com'), 'panel.example.com')
         self.assertEqual(install.validate_host('127.0.0.1', True), '127.0.0.1')
 
+    def test_installed_dependencies_are_not_upgraded_or_restarted(self):
+        with patch.object(install.subprocess, 'run', return_value=argparse.Namespace(returncode=0, stdout='installed')), patch.object(install, 'run') as run:
+            install.dependencies(False)
+            run.assert_not_called()
+
+    def test_only_missing_dependencies_are_installed(self):
+        def status(command, **kwargs):
+            return argparse.Namespace(returncode=0, stdout='installed' if command[-1] != 'python3-tk' else 'not-installed')
+        with patch.object(install.subprocess, 'run', side_effect=status), patch.object(install, 'run') as run:
+            install.dependencies(False)
+            commands = [call.args for call in run.call_args_list]
+            self.assertEqual(commands, [('apt-get','update'), ('apt-get','install','-y','--no-install-recommends','python3-tk')])
+            self.assertEqual(run.call_args.kwargs['env']['NEEDRESTART_MODE'], 'l')
+
     def test_existing_install_refused_before_dependency_changes(self):
         root = self.fixture(); (root / 'existing').mkdir()
         args = argparse.Namespace(host='8.8.8.8', port=26483, backend_port=18880, tls_cert=None, tls_key=None)
@@ -44,6 +59,7 @@ class LinuxInstallTests(unittest.TestCase):
                 install.preflight(args)
             dependencies.assert_not_called()
 
+    @unittest.skipUnless(os.name == 'posix', 'Linux bind semantics are validated on the Ubuntu release runner')
     def test_conflicting_ports_rejected_without_killing_listener(self):
         with socket.socket() as sock:
             sock.bind(('127.0.0.1', 0)); sock.listen()

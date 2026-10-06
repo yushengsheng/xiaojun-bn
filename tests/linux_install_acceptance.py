@@ -10,6 +10,7 @@ import socket
 import ssl
 import subprocess
 import tarfile
+import time
 import urllib.error
 import urllib.request
 
@@ -65,6 +66,17 @@ def main():
         pid = run('systemctl', 'show', 'xiaojun-exchange-worker.service', '--property=MainPID', '--value')
         request('/api/logout', {}, headers)
         run('systemctl', 'restart', 'xiaojun-exchange-web.service')
+        # Type=simple becomes active before uvicorn binds. Require a successful
+        # HTTPS request after restart before checking service isolation/listeners.
+        for attempt in range(20):
+            try:
+                _, body = request('/api/health')
+                assert json.loads(body)['configured'] is True
+                break
+            except (urllib.error.URLError, TimeoutError):
+                if attempt == 19:
+                    raise
+                time.sleep(0.25)
         assert pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
         data = Path('/var/lib/xiaojun-exchange')
         snapshot = {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in data.iterdir() if p.is_file()}

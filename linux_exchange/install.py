@@ -132,14 +132,25 @@ def nginx_config(host, panel, backend, cert=None, key=None, acme=True):
 def dependencies(custom):
     # Mask only a previously absent default nginx unit during package installation.
     # The app runs its own nginx; existing system nginx is never restarted.
-    missing_nginx = not shutil.which('nginx')
-    masked = missing_nginx and not Path('/etc/systemd/system/nginx.service').exists()
+    packages = ('python3-venv', 'python3-tk', 'nginx', 'logrotate', 'ca-certificates')
+    missing = []
+    for package in packages:
+        status = subprocess.run(['dpkg-query', '-W', '-f=${db:Status-Status}', package],
+                                capture_output=True, text=True, check=False)
+        if status.returncode != 0 or status.stdout.strip() != 'installed':
+            missing.append(package)
+    if not missing:
+        return
+    masked = 'nginx' in missing
+    unit = Path('/etc/systemd/system/nginx.service')
+    if masked and (unit.exists() or unit.is_symlink() or shutil.which('nginx')):
+        raise ValueError('检测到非系统包管理的 nginx 配置，请保留原服务并先安装所需系统依赖')
     if masked:
         run('systemctl', 'mask', 'nginx.service')
     try:
         run('apt-get', 'update')
-        run('apt-get', 'install', '-y', '--no-install-recommends', 'python3-venv', 'python3-tk', 'nginx', 'logrotate', 'ca-certificates',
-            env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'})
+        run('apt-get', 'install', '-y', '--no-install-recommends', *missing,
+            env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive', 'NEEDRESTART_MODE': 'l'})
     finally:
         if masked:
             run('systemctl', 'unmask', 'nginx.service')

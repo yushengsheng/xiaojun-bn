@@ -110,6 +110,7 @@ def check_release_guardrails() -> None:
     for needle in (
         'runs-on: ubuntu-24.04', 'needs: build-linux',
         'python -m pip install --require-hashes -r requirements-linux-test.lock',
+        "python -m unittest discover -s tests -p 'test_linux_*.py' -v",
         'python tools/build_linux_release.py', 'sudo python3 tests/linux_install_acceptance.py',
         'gh run download', '--name xiaojun-bn-linux',
     ):
