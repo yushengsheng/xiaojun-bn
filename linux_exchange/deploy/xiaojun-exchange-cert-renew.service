@@ -1,0 +1,12 @@
+[Unit]
+Description=Renew Xiaojun exchange IP TLS certificate
+After=network-online.target xiaojun-exchange-nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/xiaojun-exchange/certbot-venv/bin/certbot renew --config-dir /etc/xiaojun-exchange/letsencrypt --work-dir /var/lib/xiaojun-exchange-acme --logs-dir /var/log/xiaojun-exchange-acme --quiet
+Nice=15
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true

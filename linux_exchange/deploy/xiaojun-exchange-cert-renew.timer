@@ -1,0 +1,11 @@
+[Unit]
+Description=Twice-daily Xiaojun exchange TLS renewal check
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=12h
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -107,6 +107,8 @@ from exchange_logging import (
 )
 from exchange_proxy_runtime import ExchangeProxyRuntime, http_get_via_proxy
 from exchange_strategy import CombinedStopEvent, MarketStaggerCoordinator, Strategy
+from exchange_app_stocks import init_stock_variables, build_stock_row, stock_payload
+from exchange_stocks import STOCK_TYPE, StockSettings
 from operation_journal import OperationJournal
 from input_validation import bounded_int, finite_decimal, MAX_WAIT_SECONDS
 from secret_box import SECRET_BOX
@@ -383,6 +385,7 @@ class ExchangeAppBase(tk.Tk):
         self.exchange_proxy_var.trace_add("write", self._on_exchange_proxy_config_changed)
         self.use_exchange_config_proxy_var.trace_add("write", self._on_exchange_proxy_config_changed)
         self.trade_account_type_var = tk.StringVar(value=TRADE_ACCOUNT_TYPE_DEFAULT)
+        init_stock_variables(self)
         self.spot_rounds_var = tk.IntVar(value=SPOT_ROUNDS_DEFAULT)
         self.market_stop_mode_var = tk.StringVar(value=MARKET_STOP_MODE_DEFAULT)
         self.market_stagger_enabled_var = tk.BooleanVar(value=MARKET_STAGGER_ENABLED_DEFAULT)
@@ -1212,6 +1215,9 @@ class ExchangeAppBase(tk.Tk):
                             "追加挂单",
                             min_value=0,
                         )
+        elif trade_account_type == STOCK_TYPE:
+            runtime_rounds = stored_rounds if stored_rounds >= 0 else SPOT_ROUNDS_DEFAULT
+            StockSettings.parse(stock_payload(self))
         elif trade_account_type == TRADE_ACCOUNT_TYPE_EARN:
             runtime_rounds = stored_rounds if stored_rounds >= 0 else SPOT_ROUNDS_DEFAULT
             if not earn_asset:
@@ -1254,6 +1260,7 @@ class ExchangeAppBase(tk.Tk):
 
         return {
             "trade_account_type": trade_account_type,
+            "stock_settings": stock_payload(self),
             "trade_mode": mode,
             "market_stop_mode": market_stop_mode,
             "market_stagger_enabled": market_stagger_enabled,
@@ -1480,6 +1487,8 @@ class ExchangeAppBase(tk.Tk):
             if current_trade_mode == TRADE_MODE_AUTO_LADDER:
                 self.btn_auto_ladder_settings = ttk.Button(row2_left, text="策略设置", command=self.open_auto_ladder_settings)
                 self.btn_auto_ladder_settings.pack(side="left", padx=(0, 8))
+        elif current_trade_account_type == STOCK_TYPE:
+            build_stock_row(self, row2_left)
         elif current_trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
             ttk.Label(row2_left, text="合约交易对:", style="ExchangeAccent.TLabel").pack(side="left")
             ttk.Entry(row2_left, textvariable=self.futures_symbol_var, width=14).pack(side="left", padx=(4, 12))
@@ -1593,6 +1602,10 @@ class ExchangeAppBase(tk.Tk):
             ttk.Label(row3_right, text="提现预留:").pack(side="left")
             ttk.Entry(row3_right, textvariable=self.withdraw_buffer_var, width=row3_withdraw_width).pack(side="left", padx=row3_withdraw_pad)
             ttk.Checkbutton(row3_right, text="\u81ea\u52a8\u63d0\u73b0", variable=self.enable_withdraw_var, style="AutoWithdraw.TCheckbutton").pack(side="left")
+        elif current_trade_account_type == STOCK_TYPE:
+            ttk.Label(row3_left, text="自动限价：买入卖一+1步长，卖出买一-1步长；开始前现货USDC归集至资金账户，全程使用资金账户").pack(side="left")
+            ttk.Label(row3_right, text="限流等待(秒):").pack(side="left")
+            ttk.Entry(row3_right, textvariable=self.rate_limit_wait_var, width=row3_rate_limit_width).pack(side="left", padx=row3_item_pad)
         elif current_trade_account_type == TRADE_ACCOUNT_TYPE_FUTURES:
             ttk.Label(row3_left, text="保证金模式:").pack(side="left")
             self.futures_margin_type_combo = ttk.Combobox(

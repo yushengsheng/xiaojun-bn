@@ -1,0 +1,41 @@
+[Unit]
+Description=Xiaojun exchange execution worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=xiaojun-exchange
+Group=xiaojun-exchange
+WorkingDirectory=/opt/xiaojun-exchange/current
+EnvironmentFile=/etc/xiaojun-exchange/server.env
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ExecStart=/opt/xiaojun-exchange/venv/bin/python -m linux_exchange.worker --data /var/lib/xiaojun-exchange --socket /run/xiaojun-exchange/worker.sock --setup-token-file /var/lib/xiaojun-exchange/setup-token
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=300
+RuntimeDirectory=xiaojun-exchange
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xiaojun-exchange /run/xiaojun-exchange
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+TasksMax=180
+MemoryHigh=450M
+MemoryMax=650M
+CPUWeight=50
+OOMScoreAdjust=300
+
+[Install]
+WantedBy=multi-user.target

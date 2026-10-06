@@ -1,0 +1,18 @@
+[Unit]
+Description=Clean disposable Xiaojun exchange files
+
+[Service]
+Type=oneshot
+User=xiaojun-exchange
+Group=xiaojun-exchange
+WorkingDirectory=/opt/xiaojun-exchange/current
+ExecStart=/opt/xiaojun-exchange/venv/bin/python -m linux_exchange.maintenance --data /var/lib/xiaojun-exchange
+Environment=PYTHONDONTWRITEBYTECODE=1
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xiaojun-exchange
+MemoryMax=64M

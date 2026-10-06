@@ -1,0 +1,3 @@
+# Isolated certificate renewal environment; never updates the system Certbot.
+-c requirements.txt
+certbot==5.8.0

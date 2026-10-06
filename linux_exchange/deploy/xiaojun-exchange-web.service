@@ -1,0 +1,38 @@
+[Unit]
+Description=Xiaojun exchange web management
+After=network-online.target xiaojun-exchange-worker.service
+Wants=xiaojun-exchange-worker.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=xiaojun-exchange
+Group=xiaojun-exchange
+WorkingDirectory=/opt/xiaojun-exchange/current
+EnvironmentFile=/etc/xiaojun-exchange/server.env
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ExecStart=/opt/xiaojun-exchange/venv/bin/python -m uvicorn linux_exchange.web:app_factory --factory --host 127.0.0.1 --port 18880 --workers 1 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1 --limit-concurrency 48 --timeout-keep-alive 10
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xiaojun-exchange /run/xiaojun-exchange
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+TasksMax=64
+MemoryHigh=100M
+MemoryMax=180M
+CPUWeight=30
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,6 @@
 -r requirements.txt
+-r requirements-linux.txt
+httpx==0.28.1
 altgraph==0.17.5
 packaging==24.2
 pefile==2024.8.26

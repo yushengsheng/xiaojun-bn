@@ -19,6 +19,8 @@ class PyInstallerArgsTests(unittest.TestCase):
             "secure_config",
             "operation_journal",
             "exchange_order_recovery",
+            "exchange_stocks",
+            "exchange_app_stocks",
             "exchange_account_destruction",
             "secure_delete",
             "selftest_basic_checks",

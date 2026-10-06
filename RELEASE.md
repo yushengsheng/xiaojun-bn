@@ -40,11 +40,14 @@ methods after a failure.
    it instead of triggering another run or creating another tag:
    - `gh run list --workflow release-windows-exe.yml --limit 10`
    - `gh run watch <run-id> --exit-status`
-8. Verify the published release and all three expected assets:
+8. Verify the published release and all six expected assets:
    - `gh release view <tag>`
    - `xiaojun-bn-<tag>-windows-x64.exe`
    - `xiaojun-bn-<tag>-windows-x64.zip`
    - `xiaojun-bn-<tag>-windows-x64-portable.zip`
+   - `xiaojun-bn-<tag>-linux-amd64.tar.gz`
+   - `install-linux.sh`
+   - `SHA256SUMS` (Linux archive and installer hashes)
 9. Report success only after the workflow and release asset checks both pass.
    On a genuine failure, stop at that step and diagnose it; never hide the
    failure by changing the tag or publishing path.
@@ -97,5 +100,28 @@ Current release asset naming:
 - `xiaojun-bn-<tag>-windows-x64.exe`
 - `xiaojun-bn-<tag>-windows-x64.zip`
 - `xiaojun-bn-<tag>-windows-x64-portable.zip`
+- `xiaojun-bn-<tag>-linux-amd64.tar.gz`
+- `install-linux.sh`
+- `SHA256SUMS`
+
+Linux assets are built by the same release workflow on a clean `ubuntu-24.04`
+runner. The Linux job installs hash-locked test dependencies, tests the exchange
+worker/API and installation safeguards, verifies both archive and executable
+hashes for all three proxy runtimes, and tests a fresh systemd/HTTPS installation
+with a disposable certificate explicitly trusted by the test client. Its source
+bundle uses an allowlist and a per-file manifest; no local data, credentials,
+logs, virtual environments or server-specific deployment scripts are included.
+The Windows publication job requires this Linux job to succeed, downloads its
+verified assets, then publishes all six assets together only after the existing
+source audit and both packaged GUI selftests pass. No second publishing path is
+permitted. `RELEASE_NOTES.md` describes the version's user-visible changes.
+
+The installer supports fresh Ubuntu 24.04 and Debian 12/13 x86_64 hosts with
+Python 3.11+ and systemd. It refuses existing installations and occupied ports,
+uses dedicated users/directories/venvs and an independent nginx service, and
+starts locked without accounts. Automatic IP/domain TLS uses the pinned
+Certbot lock and TCP 80; supplied certificates omit port 80 and retain renewal
+responsibility with the supplying tool. A live financial worker is never
+upgraded by this first-install command.
 
 If new internal modules are added, update the workflow hidden imports when needed so packaged builds remain complete. If selftest modules are split, keep `tools/pyinstaller_common_args.py` and `tests/test_packaging_args.py` in sync.

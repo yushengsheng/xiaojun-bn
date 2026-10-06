@@ -1,0 +1,17 @@
+{
+  "sing-box": {
+    "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.5/sing-box-1.13.5-linux-amd64.tar.gz",
+    "archive_sha256": "645d2f30bc984177dc48c749d2e856ccad915df412dc364ca0b312385b3ef255",
+    "executable_sha256": "a8ab4c71962da9f96b2ab7f2d34ae570c1b920143e2c56c5fca0c1b47d5b5ea6"
+  },
+  "hysteria": {
+    "url": "https://github.com/apernet/hysteria/releases/download/app/v2.9.2/hysteria-linux-amd64",
+    "archive_sha256": "86fef8e2f1b2bf41318ac96724eee6c3b449e4e510022cc89658b63a6713922a",
+    "executable_sha256": "86fef8e2f1b2bf41318ac96724eee6c3b449e4e510022cc89658b63a6713922a"
+  },
+  "xray": {
+    "url": "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip",
+    "archive_sha256": "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae",
+    "executable_sha256": "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed"
+  }
+}

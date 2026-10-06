@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 env:
   XRAY_TAG: v26.3.27
@@ -21,7 +22,41 @@ env:
   HYSTERIA_SHA256: 103c7258384d0ebbf0d19ca4bec50d6cb9b0b7be33f5b76f004fed0a8805ff9f
 
 jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Check tracked sensitive artifacts
+        run: python3 tools/check_sensitive_artifacts.py --root . --git-only
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: '3.11'
+      - name: Install locked Linux test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-tk
+          python -m pip install --require-hashes -r requirements-linux-test.lock
+          python -m pip check
+      - name: Test exchange server and installation safety
+        run: |
+          python -m unittest discover -s tests -p 'test_linux_*.py' -v
+          python tools/check_release_guardrails.py
+      - name: Build verified Linux release
+        env:
+          LINUX_RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.0.0' }}
+        run: python tools/build_linux_release.py --version "$LINUX_RELEASE_TAG" --output release-linux
+      - name: Test fresh Linux installation with isolated HTTPS
+        run: sudo python3 tests/linux_install_acceptance.py release-linux/*.tar.gz
+      - name: Upload verified Linux assets
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: xiaojun-bn-linux
+          path: release-linux/*
+          if-no-files-found: error
   build-windows:
+    needs: build-linux
     runs-on: windows-latest
 
     steps:
@@ -216,6 +251,14 @@ jobs:
           Compress-Archive -Path "$portableStage/*" -DestinationPath "release/$portableZipName" -Force
           Remove-Item $portableStage -Recurse -Force
 
+      - name: Collect verified Linux assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "${{ github.run_id }}" --name xiaojun-bn-linux --dir release
+          if ($LASTEXITCODE -ne 0) { throw "Verified Linux assets are missing." }
+
       - name: Upload workflow artifact
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -237,4 +280,4 @@ jobs:
             throw "GitHub Release $tag already exists; refusing to overwrite published assets."
           }
           $global:LASTEXITCODE = 0
-          gh release create $tag $assets --generate-notes
+          gh release create $tag $assets --generate-notes --notes-file RELEASE_NOTES.md

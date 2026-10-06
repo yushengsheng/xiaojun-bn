@@ -1,0 +1,29 @@
+[Unit]
+Description=Xiaojun exchange isolated HTTPS gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+RuntimeDirectory=xiaojun-exchange-nginx
+RuntimeDirectoryMode=0755
+PIDFile=/run/xiaojun-exchange-nginx/nginx.pid
+ExecStartPre=/usr/sbin/nginx -t -c /etc/xiaojun-exchange/nginx.conf
+ExecStart=/usr/sbin/nginx -c /etc/xiaojun-exchange/nginx.conf
+ExecReload=/usr/sbin/nginx -s reload -c /etc/xiaojun-exchange/nginx.conf
+KillSignal=SIGQUIT
+KillMode=mixed
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/nginx /run/xiaojun-exchange-nginx
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE
+MemoryMax=128M
+CPUWeight=30
+
+[Install]
+WantedBy=multi-user.target

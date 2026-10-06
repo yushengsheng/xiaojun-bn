@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -106,6 +107,26 @@ def check_release_guardrails() -> None:
     ci_pins = _proxy_runtime_pins(ci_workflow)
     if len(release_pins) != 9 or ci_pins != release_pins:
         raise AssertionError("CI and release proxy runtime pins must match exactly")
+    for needle in (
+        'runs-on: ubuntu-24.04', 'needs: build-linux',
+        'python -m pip install --require-hashes -r requirements-linux-test.lock',
+        'python tools/build_linux_release.py', 'sudo python3 tests/linux_install_acceptance.py',
+        'gh run download', '--name xiaojun-bn-linux',
+    ):
+        _require(release_workflow, needle, source='.github/workflows/release-windows-exe.yml')
+    linux_pins = json.loads(_read('linux_exchange/deploy/proxy-runtimes.json'))
+    if set(linux_pins) != {'xray', 'sing-box', 'hysteria'}:
+        raise AssertionError('Linux must bundle all three verified proxy runtimes')
+    for name, variable in (('xray','XRAY'), ('sing-box','SING_BOX'), ('hysteria','HYSTERIA')):
+        pin = linux_pins[name]
+        if f'/download/{release_pins[variable+"_TAG"]}/' not in pin['url']:
+            raise AssertionError(f'{name} Linux and Windows runtime versions differ')
+        for field in ('archive_sha256', 'executable_sha256'):
+            if not re.fullmatch(r'[0-9a-f]{64}', pin[field]):
+                raise AssertionError(f'{name} Linux {field} is invalid')
+    for needle in ('linux-amd64.tar.gz', 'install-linux.sh', 'SHA256SUMS'):
+        _require(release_doc, needle, source='RELEASE.md')
+        _require(_read('tools/build_linux_release.py'), needle, source='tools/build_linux_release.py')
 
     _require(regression, "tools/check_release_guardrails.py", source="tools/run_regression.py")
     for needle in (

@@ -61,6 +61,14 @@ def main(argv: list[str] | None = None) -> int:
             "build dependency vulnerability audit",
             [python, "-m", "pip_audit", "--strict", "--disable-pip", "-r", "requirements-build.lock"],
         )
+        _run(
+            "Linux server dependency vulnerability audit",
+            [python, "-m", "pip_audit", "--strict", "--disable-pip", "-r", "requirements-linux.lock"],
+        )
+        _run(
+            "TLS renewal dependency vulnerability audit",
+            [python, "-m", "pip_audit", "--strict", "--disable-pip", "-r", "requirements-certbot.lock"],
+        )
 
     if not args.skip_app_selftest:
         selftest_args = [python, "小军bn.py", "--selftest"]

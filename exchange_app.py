@@ -9,9 +9,11 @@ from exchange_app_base import ExchangeAppBase
 from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_app_config import ExchangeAppConfigMixin
 from exchange_app_log_view import ExchangeAppLogViewMixin
+from exchange_app_stocks import ExchangeAppStocksMixin
 
 
 class App(
+    ExchangeAppStocksMixin,
     ExchangeAppAutoLadderMixin,
     ExchangeAppBatchMixin,
     ExchangeAppAccountsMixin,

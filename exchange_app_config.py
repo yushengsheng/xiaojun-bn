@@ -58,6 +58,7 @@ from exchange_app_base import (
 )
 from sensitive_data import redact_sensitive_text
 from system_proxy import refresh_system_proxy_cache, system_proxy_map
+from exchange_app_stocks import stock_payload
 
 
 class ExchangeAppConfigMixin(object):
@@ -307,6 +308,7 @@ class ExchangeAppConfigMixin(object):
             "api_key": SECRET_BOX.encrypt(self.api_key_var.get().strip()),
             "api_secret": SECRET_BOX.encrypt(self.api_secret_var.get().strip()),
             "trade_account_type": trade_settings["trade_account_type"],
+            "stock_settings": stock_payload(self),
             "spot_rounds": int(trade_settings["stored_spot_rounds"]),
             "trade_mode": trade_settings["trade_mode"],
             "market_stop_mode": trade_settings["market_stop_mode"],
@@ -425,6 +427,11 @@ class ExchangeAppConfigMixin(object):
             return
         try:
             raw, recovered = _load_authenticated_config(STRATEGY_CONFIG_FILE, validator=_require_dict_payload)
+            stock_raw = raw.get("stock_settings", {})
+            if isinstance(stock_raw, dict):
+                for key, variable in vars(self).get("stock_vars", {}).items():
+                    if key in stock_raw:
+                        variable.set("USDC" if key == "asset" else str(stock_raw[key]))
             if recovered:
                 logger.warning("交易所策略配置损坏，已自动从备份恢复：%s", STRATEGY_CONFIG_FILE)
 

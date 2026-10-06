@@ -54,6 +54,7 @@ from input_validation import bounded_int, finite_float
 from exchange_order_recovery import exchange_operation_scope, reconcile_exchange_orders
 from exchange_auto_ladder_observer import AutoLadderMarketObserver
 from shared_utils import decimal_to_stat_text
+from exchange_stocks import STOCK_TYPE
 
 
 class ExchangeAppBatchMixin(object):
@@ -176,6 +177,7 @@ class ExchangeAppBatchMixin(object):
             "futures_margin_type_combo",
             "futures_side_combo",
             "ladder_layout_combo",
+            "stock_wallet_combo",
             "withdraw_net_combo",
             "acc_network_combo",
             "withdraw_coin_combo",
@@ -374,6 +376,8 @@ class ExchangeAppBatchMixin(object):
         logger.error("在 %d 秒内未检测到 %s 到账，终止任务", timeout_sec, wait_asset)
         return False
     def start_bot(self):
+        if self.trade_account_type_var.get() == STOCK_TYPE:
+            return self.start_stock_tasks()
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("提示", "任务已经在运行中")
             return
@@ -2780,6 +2784,10 @@ class ExchangeAppBatchMixin(object):
         if not selected:
             messagebox.showinfo("提示", "当前没有可执行的账号")
             return
+
+        account_type = (trade_settings_override or {}).get("trade_account_type", self.trade_account_type_var.get())
+        if not batch_total_asset_only and not batch_collect_bnb_mode and account_type == STOCK_TYPE:
+            return self.start_stock_tasks(selected, raw=(trade_settings_override or {}).get("stock_settings"), require_confirm=require_confirm)
 
         trade_settings = None
         try:

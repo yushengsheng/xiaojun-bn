@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 
 
 def exchange_operation_scope(api_key: str) -> str:
@@ -13,9 +14,14 @@ def exchange_operation_scope(api_key: str) -> str:
     return f"account:{digest[:16]}"
 
 
-def reconcile_exchange_orders(journal, client, api_key: str) -> None:
+def reconcile_exchange_orders(journal, client, api_key: str, *, allow_stock_tasks: bool = False) -> None:
     if journal is None:
         return
+    if not allow_stock_tasks:
+        for entry in journal.active_entries(kind="stock-task", scope=exchange_operation_scope(api_key)):
+            payload = entry.get("payload", {})
+            if payload.get("active") or payload.get("conversion") or payload.get("funding_transfer") or Decimal(str(payload.get("inventory", "0"))) != 0:
+                raise RuntimeError("存在待核对股票划转、订单或持仓，请先恢复股票任务或停止清理")
     pending: list[str] = []
     for entry in journal.active_entries(kind="exchange-order", scope=exchange_operation_scope(api_key)):
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}

@@ -42,13 +42,30 @@ fi
 "$PYTHON_BIN" -c 'import sys; assert sys.version_info[:2] == (3, 11)' >>"$LOG_FILE" 2>&1 || fail "项目 Python 必须为 3.11。"
 
 cd "$PROJECT_DIR"
-if ! "$PYTHON_BIN" -c 'import tkinter, requests, eth_account, eth_utils, socks, cryptography' >>"$LOG_FILE" 2>&1; then
+check_runtime_dependencies() {
+  "$PYTHON_BIN" - "$PROJECT_DIR/requirements.lock" <<'PY'
+import importlib.metadata as metadata
+from pathlib import Path
+import re
+import sys
+import tkinter, requests, eth_account, eth_utils, socks, cryptography
+
+locked = re.findall(r"^([A-Za-z0-9_.-]+)==([^\s\\]+)", Path(sys.argv[1]).read_text(), re.MULTILINE)
+if not locked:
+    raise RuntimeError("运行依赖锁文件没有有效版本")
+for name, required in locked:
+    installed = metadata.version(name)
+    if installed != required:
+        raise RuntimeError(f"运行依赖 {name} 版本不一致：已安装 {installed}，需要 {required}")
+PY
+}
+if ! check_runtime_dependencies >>"$LOG_FILE" 2>&1; then
   if [ -n "$UV_BIN" ]; then
     "$UV_BIN" pip install --python "$PYTHON_BIN" --require-hashes -r "$PROJECT_DIR/requirements.lock" >>"$LOG_FILE" 2>&1 || fail "安装运行依赖失败。"
   else
     "$PYTHON_BIN" -m pip install --require-hashes -r "$PROJECT_DIR/requirements.lock" >>"$LOG_FILE" 2>&1 || fail "安装运行依赖失败。"
   fi
-  "$PYTHON_BIN" -c 'import tkinter, requests, eth_account, eth_utils, socks, cryptography' >>"$LOG_FILE" 2>&1 || fail "运行依赖校验失败。"
+  check_runtime_dependencies >>"$LOG_FILE" 2>&1 || fail "运行依赖校验失败。"
 fi
 
 # .app 内由 AppleScript 后台调用，不会打开终端窗口。

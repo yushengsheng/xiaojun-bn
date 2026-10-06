@@ -165,9 +165,9 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：交易所账号销毁按钮未紧随清空按钮")
                 checks.append("exchange-destroy-control-gui=ok")
 
-                def _strategy_row3_labels() -> list[str]:
+                def _strategy_row3_labels(frame=None) -> list[str]:
                     labels: list[str] = []
-                    for widget in app._strategy_row3_right.pack_slaves():
+                    for widget in (app._strategy_row3_right if frame is None else frame).pack_slaves():
                         try:
                             text = str(widget.cget("text") or "")
                         except Exception:
@@ -186,6 +186,7 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     ("现货", "分仓挂单", True),
                     ("合约", "市价", True),
                     ("理财", "市价", True),
+                    ("股票", "市价", True),
                 ]
                 for account_type, trade_mode, expected_visible in expected_gate_modes:
                     app.trade_account_type_var.set(account_type)
@@ -200,6 +201,30 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                         )
                     if visible and "提现预留:" in labels and labels.index("限流等待(秒):") > labels.index("提现预留:"):
                         raise RuntimeError("GUI 自检失败：限流等待未放在提现预留前")
+                if "股票" not in app.trade_account_type_combo.cget("values"):
+                    raise RuntimeError("GUI 自检失败：交易类型下拉框缺少股票入口")
+                app.trade_account_type_combo.set("股票")
+                app.trade_account_type_combo.event_generate("<<ComboboxSelected>>")
+                pump_tk_events(app, timeout=2.0)
+                if "wallet" in app.stock_vars or hasattr(app, "stock_wallet_combo"):
+                    raise RuntimeError("GUI 自检失败：股票仍显示账户选择控件")
+                app.stock_vars["symbol"].set("MSFT")
+                app.stock_vars["rounds"].set("3")
+                app._refresh_strategy_panel_layout()
+                pump_tk_events(app, timeout=2.0)
+                stock_settings = app._collect_trade_mode_settings()["stock_settings"]
+                if stock_settings["symbol"] != "MSFT" or stock_settings["rounds"] != "3":
+                    raise RuntimeError("GUI 自检失败：股票参数未生效")
+                if not any("归集至资金账户" in label for label in _strategy_row3_labels(app._strategy_row3_left)):
+                    raise RuntimeError("GUI 自检失败：股票未提示USDC归集至资金账户")
+                if "自动提现" in _strategy_row3_labels():
+                    raise RuntimeError("GUI 自检失败：股票模式错误显示自动提现")
+                app.save_strategy_config()
+                app.stock_vars["rounds"].set("1")
+                app._load_strategy_config()
+                if app.stock_vars["rounds"].get() != "3":
+                    raise RuntimeError("GUI 自检失败：股票配置保存/加载异常")
+                checks.append("exchange-stocks-gui=ok")
                 app.trade_account_type_var.set("现货")
                 app.trade_mode_var.set("市价")
                 app.market_stop_mode_var.set("剩余BNB")

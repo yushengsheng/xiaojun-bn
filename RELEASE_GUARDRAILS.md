@@ -65,4 +65,6 @@
 - 不得降低 release workflow 中 packaged `--selftest --selftest-gui` 的要求。
 - 不得移除 proxy runtime 哈希校验。
 - 不得把本地运行状态、日志、账号、私钥、中转钱包文件打进 release 包。
+- Linux 安装包必须在同一个 release workflow 的 Ubuntu clean runner 完成安装验收；Windows 发布 job 必须依赖其成功，六项资产一起发布。
+- Linux 代理运行时必须同时校验归档与可执行文件 SHA-256；安装器不得覆盖已有服务、账号或正在运行的交易。
 - 修改 GUI、代理、启动入口、PyInstaller 参数、运行时下载、发版 workflow 时，必须同步更新测试或 guardrail 检查。
