@@ -109,7 +109,7 @@ class LinuxInstallTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(archive.extractfile(name).read()).hexdigest(), expected)
         sums = (output/'SHA256SUMS').read_text()
         self.assertIn(hashlib.sha256(asset.read_bytes()).hexdigest(), sums)
-        self.assertNotIn('__RELEASE_VERSION__', (output/'install-linux.sh').read_text())
+        self.assertNotIn('__RELEASE_VERSION__', (output/'install-linux.sh').read_text(encoding='utf-8'))
 
     def test_runtime_digest_mismatch_blocks_packaging(self):
         root = self.fixture(); (root/'xray').write_bytes(b'wrong')
