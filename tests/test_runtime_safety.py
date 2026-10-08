@@ -266,6 +266,8 @@ class RuntimeSafetyTests(unittest.TestCase):
         with patch.object(stores, "SECRET_BOX", self.box):
             stores._save_authenticated_config(first, {"value": "old-account"})
             stores._save_authenticated_config(second, {"value": "old-settings"})
+            for path in (first, second, Path(str(first)+".bak"), Path(str(second)+".bak")):
+                path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
             before = {p: p.read_bytes() for p in (first, second, Path(str(first)+".bak"), Path(str(second)+".bak"))}
             with self.assertRaises(OSError):
                 with update_group(marker, [first, second]):
@@ -285,6 +287,10 @@ class RuntimeSafetyTests(unittest.TestCase):
             stores._save_authenticated_config(first, {"value": "old-account"})
             stores._save_authenticated_config(second, {"value": "old-settings"})
             paths = (first, second, Path(str(first) + ".bak"), Path(str(second) + ".bak"))
+            # Existing files may mix Windows CRLF and LF from earlier versions.
+            for path in paths:
+                data = path.read_bytes().replace(b"\r\n", b"\n")
+                path.write_bytes(data.replace(b"\n", b"\r\n") if path in (first, paths[2]) else data)
             before = {p: p.read_bytes() for p in paths}
             with self.assertRaises(SimulatedPowerLoss):
                 with update_group(marker, [first, second]):

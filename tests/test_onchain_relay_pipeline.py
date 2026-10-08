@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -38,6 +39,19 @@ from onchain_relay_runner import (
     run_relay_fee_recovery,
 )
 from onchain_relay_wallets import RelayWalletRecord
+
+
+@contextmanager
+def _close_sweep_log_after():
+    """Release the fixture's file before Windows removes its directory."""
+    try:
+        yield
+    finally:
+        import onchain_relay_runner as runner
+        with runner._RELAY_SWEEP_LOG_LOCK:
+            if runner._RELAY_SWEEP_LOG_HANDLER is not None:
+                runner._RELAY_SWEEP_LOG_HANDLER.close()
+                runner._RELAY_SWEEP_LOG_HANDLER = None
 
 
 class _FakeClient:
@@ -482,6 +496,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             with (
                 patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
                 patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+                _close_sweep_log_after(),
             ):
                 run_relay_fee_recovery(
                     owner,
@@ -524,6 +539,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             with (
                 patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
                 patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+                _close_sweep_log_after(),
             ):
                 run_relay_fee_recovery(
                     owner,
@@ -568,6 +584,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             with (
                 patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
                 patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+                _close_sweep_log_after(),
             ):
                 run_relay_fee_recovery(
                     owner,
@@ -605,6 +622,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             with (
                 patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
                 patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+                _close_sweep_log_after(),
             ):
                 run_relay_fee_recovery(
                     owner,
@@ -646,6 +664,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             with (
                 patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"),
                 patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
+                _close_sweep_log_after(),
             ):
                 run_relay_fee_recovery(
                     owner,

@@ -47,11 +47,11 @@ def _fsync_parent_dir(path: Path) -> None:
             pass
 
 
-def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8", *, newline: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w", encoding=encoding) as fp:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as fp:
             fp.write(content)
             fp.flush()
             os.fsync(fp.fileno())

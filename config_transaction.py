@@ -15,7 +15,9 @@ def _restore(files, paths):
         if value is None:
             path.unlink(missing_ok=True)
         else:
-            _atomic_write_text(path, base64.b64decode(value, validate=True).decode("utf-8"))
+            # Snapshots already contain their original line endings. Translating
+            # CRLF again on Windows would change the restored file bytes.
+            _atomic_write_text(path, base64.b64decode(value, validate=True).decode("utf-8"), newline="")
 
 
 def _clear(marker):

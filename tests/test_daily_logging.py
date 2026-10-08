@@ -90,13 +90,13 @@ class DailyLoggingTests(unittest.TestCase):
                 page.OnchainTransferPageBase.log(owner, 'private_key=' + key)
             logs = list((root/'logs').glob('onchain_runtime_*.log'))
             assert len(logs) == 1
-            content = logs[0].read_text()
+            content = logs[0].read_text(encoding='utf-8')
             assert content.count('收到 USDT 1.25') == 1500
             assert '账号 #0' in content and '账号 #1499' in content
             assert key not in content and '0x123' in content
             exchange_logging.logger.info('exchange row')
-            assert 'exchange row' in root.joinpath('bot_log.txt').read_text()
-            assert '收到 USDT' not in root.joinpath('bot_log.txt').read_text()
+            assert 'exchange row' in root.joinpath('bot_log.txt').read_text(encoding='utf-8')
+            assert '收到 USDT' not in root.joinpath('bot_log.txt').read_text(encoding='utf-8')
         ''').replace('__ROOT__', repr(str(root)))
         result = subprocess.run([sys.executable, '-c', script], cwd=Path(__file__).resolve().parents[1],
                                 capture_output=True, text=True, timeout=30)
