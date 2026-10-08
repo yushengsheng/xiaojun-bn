@@ -20,6 +20,10 @@ from retry_utils import RetryPolicy
 class _Journal:
     def __init__(self):
         self.entries = {}
+        self._operation_lock = threading.RLock()
+
+    def operation_lock(self, _kind, _scope):
+        return self._operation_lock
 
     def begin(self, kind, scope, payload):
         entry_id = str(len(self.entries) + 1)

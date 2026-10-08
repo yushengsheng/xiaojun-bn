@@ -102,6 +102,11 @@ def assert_funds_clear(journal, client):
 
 
 def run_funds_request(client, base, path, params, submit):
+    with client.operation_journal.operation_lock("exchange-funds", exchange_operation_scope(client.key)):
+        return _run_funds_request_locked(client, base, path, params, submit)
+
+
+def _run_funds_request_locked(client, base, path, params, submit):
     from exchange_binance_client import BinanceAPIError, RequestStoppedError, UnconfirmedOperationError
     journal = client.operation_journal
     assert_funds_clear(journal, client)

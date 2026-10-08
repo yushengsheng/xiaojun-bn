@@ -355,6 +355,8 @@ class StockStrategy:
         row = self.api.call("GET", "order/detail", {"clientOrderId": active["clientOrderId"]})
         if not isinstance(row, dict) or row.get("clientOrderId") != active["clientOrderId"] or row.get("symbol") != self.settings.symbol or row.get("side") != active["side"]:
             raise RuntimeError("股票订单查询返回不完整或标识不匹配，保留原订单等待核对")
+        if active.get("orderId") and str(row.get("orderId")) != str(active["orderId"]):
+            raise RuntimeError("股票订单编号与原订单不匹配，保留原订单等待核对")
         status = row.get("status")
         if status not in TERMINAL | {"NEW", "ACCEPTED", "PARTIALLY_FILLED"}:
             raise RuntimeError("股票订单状态未知，禁止重挂")

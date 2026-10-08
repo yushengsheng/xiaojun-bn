@@ -14,6 +14,18 @@ def exchange_operation_scope(api_key: str) -> str:
     return f"account:{digest[:16]}"
 
 
+def validate_order_identity(order, *, symbol, order_id=None, client_order_id="", side=""):
+    """An unrelated terminal order must never release another order's guard."""
+    if not isinstance(order, dict) or not order.get("orderId"):
+        raise ValueError("订单回复缺少 orderId，保留原订单待核对")
+    returned_client_id = str(order.get("origClientOrderId") or order.get("clientOrderId") or "")
+    if (str(order.get("symbol", "")).upper() != str(symbol).upper()
+            or order_id not in (None, "") and str(order.get("orderId")) != str(order_id)
+            or client_order_id and (returned_client_id or order_id in (None, "")) and returned_client_id != str(client_order_id)
+            or order.get("side") and side and str(order["side"]).upper() != str(side).upper()):
+        raise RuntimeError("订单回复的交易对、订单编号、客户端标识或方向与原请求不匹配，保留原订单待核对")
+
+
 def reconcile_exchange_orders(journal, client, api_key: str, *, allow_stock_tasks: bool = False) -> None:
     if journal is None:
         return
@@ -40,6 +52,8 @@ def reconcile_exchange_orders(journal, client, api_key: str, *, allow_stock_task
                 order = client.request(client.um_futures, "GET", "/fapi/v1/order", params)
             else:
                 order = client.get_order(symbol, order_id) if order_id not in (None, "") else client.get_order_by_client_id(symbol, client_order_id)
+            validate_order_identity(order, symbol=symbol, order_id=order_id,
+                                    client_order_id=client_order_id, side=payload.get("side", ""))
             status = str(order.get("status") or "").upper()
         except Exception as exc:
             # A crash can leave an intent that never reached the exchange. Use
@@ -51,6 +65,8 @@ def reconcile_exchange_orders(journal, client, api_key: str, *, allow_stock_task
                         order = cleanup({**payload, "entry_id": entry_id, "confirmation_timed_out": True})
                         if order is None:
                             continue
+                        validate_order_identity(order, symbol=symbol, order_id=order_id,
+                                                client_order_id=client_order_id, side=payload.get("side", ""))
                         status = str(order.get("status") or "").upper()
                     except Exception:
                         pending.append(entry_id)

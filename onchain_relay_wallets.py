@@ -296,7 +296,7 @@ class RelayWalletFileStore:
             self._save_records_locked(current)
 
     def remove_records(self, record_keys: set[tuple[str, str]]) -> int:
-        """Remove records by (batch_id, relay_address) after the caller has confirmed they are empty."""
+        """Remove records after confirming all tracked balances are zero/below recovery margins."""
         normalized_keys = {
             (str(batch_id or "").strip(), str(relay_address or "").strip())
             for batch_id, relay_address in (record_keys or set())
@@ -318,7 +318,7 @@ class RelayWalletFileStore:
                 self._save_records_locked(remaining)
             return removed
 
-    def update_record(self, relay_address: str, *, batch_id: str = "", **changes: object) -> RelayWalletRecord:
+    def update_record(self, relay_address: str, *, batch_id: str = "", new_batch_id: str = "", **changes: object) -> RelayWalletRecord:
         relay_key = str(relay_address or "").strip()
         batch_key = str(batch_id or "").strip()
         if not relay_key:
@@ -332,6 +332,8 @@ class RelayWalletFileStore:
                     continue
                 updated_raw = asdict(record)
                 updated_raw.update(changes)
+                if new_batch_id:
+                    updated_raw["batch_id"] = str(new_batch_id).strip()
                 updated = RelayWalletRecord.from_raw(updated_raw)
                 records[idx] = updated
                 self._records_cache = list(records)

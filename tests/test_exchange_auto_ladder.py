@@ -900,7 +900,7 @@ class AutoLadderTests(unittest.TestCase):
                 posts.append(params["newClientOrderId"])
                 raise requests.Timeout("response lost")
             self.assertEqual(params["origClientOrderId"], posts[0])
-            return {"orderId": 42, "status": "NEW"}
+            return {"orderId": 42, "status": "NEW", "symbol": params["symbol"], "clientOrderId": params["origClientOrderId"]}
         client.request_query = request_query
         order = client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT"}, lambda: True)
         self.assertEqual(order["orderId"], 42)
@@ -919,7 +919,7 @@ class AutoLadderTests(unittest.TestCase):
             queries += 1
             if queries <= 15:
                 raise BinanceAPIError(-2013, "Order does not exist")
-            return {"orderId": 42, "status": "FILLED"}
+            return {"orderId": 42, "status": "FILLED", "symbol": params["symbol"], "clientOrderId": params["origClientOrderId"]}
         client.request_query = request_query
         with patch("exchange_binance_client.time.sleep"):
             order = client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT"}, lambda: True)
@@ -952,7 +952,7 @@ class AutoLadderTests(unittest.TestCase):
             queries += 1
             if queries <= 15:
                 raise ConnectionError("order status unavailable")
-            return {"orderId": 42, "status": "NEW"}
+            return {"orderId": 42, "status": "NEW", "symbol": params["symbol"], "clientOrderId": params["origClientOrderId"]}
         client.request_query = request_query
         with patch("exchange_binance_client.time.sleep"):
             order = client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT"}, lambda: True)

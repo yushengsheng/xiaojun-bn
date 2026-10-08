@@ -27,6 +27,7 @@ class OperationJournal:
     VERSION = 1
     HISTORY_ENTRY_LIMIT = 500
     _path_locks: dict[str, threading.RLock] = {}
+    _operation_locks: dict[tuple[str, str, str], threading.RLock] = {}
     _path_locks_guard = threading.Lock()
 
     def __init__(self, file_path: Path, *, secret_box=None):
@@ -34,6 +35,12 @@ class OperationJournal:
         self.secret_box = secret_box or SECRET_BOX
         with self._path_locks_guard:
             self._lock = self._path_locks.setdefault(str(self.file_path.resolve()), threading.RLock())
+
+    def operation_lock(self, kind: str, scope: str):
+        """Serialize check + intent + submission across clients for one account."""
+        key = (str(self.file_path.resolve()), str(kind), str(scope))
+        with self._path_locks_guard:
+            return self._operation_locks.setdefault(key, threading.RLock())
 
     def _load_locked(self, *, allow_recovery: bool = False) -> dict[str, object]:
         if not config_or_backup_exists(self.file_path):

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock
 
 from exchange_order_recovery import exchange_operation_scope, reconcile_exchange_orders
 
@@ -25,10 +26,10 @@ class _Client:
         self.status = status
 
     def get_order(self, _symbol, _order_id):
-        return {"status": self.status}
+        return {"status": self.status, "symbol": _symbol, "orderId": _order_id}
 
     def get_order_by_client_id(self, _symbol, _client_order_id):
-        return {"status": self.status}
+        return {"status": self.status, "symbol": _symbol, "orderId": "101", "clientOrderId": _client_order_id}
 
 
 class ExchangeOrderRecoveryTests(unittest.TestCase):
@@ -48,6 +49,18 @@ class ExchangeOrderRecoveryTests(unittest.TestCase):
     def test_open_order_blocks_new_execution(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "未完成交易所挂单"):
             reconcile_exchange_orders(_Journal([self._entry()]), _Client("NEW"), "api-key")
+
+    def test_unrelated_filled_order_never_releases_original_guard(self) -> None:
+        for changes in ({"orderId": "102"}, {"symbol": "ETHUSDT"}, {"clientOrderId": "other"}, {"side": "SELL"}):
+            entry = self._entry()
+            entry["payload"].update(client_order_id="original", side="BUY")
+            journal = _Journal([entry])
+            client = _Client("FILLED")
+            client.get_order = Mock(return_value={"orderId": "101", "symbol": "BTCUSDT", "clientOrderId": "original",
+                                                  "side": "BUY", "status": "FILLED", **changes})
+            with self.subTest(changes=changes), self.assertRaisesRegex(RuntimeError, "未完成交易所挂单"):
+                reconcile_exchange_orders(journal, client, "api-key")
+            self.assertEqual(journal.updates, [])
 
     def test_unconfirmed_client_order_id_blocks_until_exchange_confirms_terminal_state(self) -> None:
         entry = {"id": "entry-2", "payload": {"symbol": "BTCUSDT", "client_order_id": "xja123"}}

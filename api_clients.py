@@ -39,6 +39,10 @@ class SubmittedTransaction:
     nonce: int | None = None
 
 
+class RpcTransactionRejected(RuntimeError):
+    """Every broadcast node explicitly rejected a fresh transaction's funds."""
+
+
 class EvmClient:
     MAX_WALLET_CREATE_COUNT = 9999
     _DEPENDENCY_LOCK = threading.Lock()
@@ -516,6 +520,7 @@ class EvmClient:
 
         last_err = ""
         saw_null_result = False
+        only_funds_rejections = method == "eth_sendRawTransaction"
         rpc_urls = self._ordered_rpc_urls(network, list(info["rpc_urls"]))
         if try_next_on_null_result:
             with self._preferred_rpc_urls_lock:
@@ -523,6 +528,16 @@ class EvmClient:
                 cooldowns = dict(self._receipt_rpc_cooldowns)
             now = time.monotonic()
             rpc_urls.sort(key=lambda url: (cooldowns.get((network, url), 0.0) > now, url != receipt_preferred))
+        with self._preferred_rpc_urls_lock:
+            cooldowns = dict(self._rpc_failure_cooldowns)
+            if try_next_on_null_result:
+                for key, until in self._receipt_rpc_cooldowns.items():
+                    cooldowns[key] = max(cooldowns.get(key, 0.0), until)
+        now = time.monotonic()
+        ready_urls = [url for url in rpc_urls if cooldowns.get((network, url), 0.0) <= now]
+        # Do not repeatedly hit forbidden/rate-limited nodes during large scans.
+        # If all are cooling, probe only the earliest recovering node.
+        rpc_urls = ready_urls or sorted(rpc_urls, key=lambda url: cooldowns.get((network, url), 0.0))[:1]
         for round_index in range(max_rounds):
             for url_index, url in enumerate(rpc_urls):
                 if stop_event is not None and stop_event.is_set():
@@ -541,6 +556,9 @@ class EvmClient:
                     )
                 session = None
                 proxy_url = ""
+                http_failed = False
+                funds_rejected = False
+                rate_limited = False
                 try:
                     session, proxy_url = self._rpc_session(url)
                     resp = session.post(
@@ -551,6 +569,7 @@ class EvmClient:
                     )
                     text = resp.text
                     if resp.status_code >= 400:
+                        http_failed = True
                         preview = (text or "").strip()
                         if len(preview) > 240:
                             preview = preview[:240] + "..."
@@ -560,6 +579,8 @@ class EvmClient:
                         err = j.get("error") or {}
                         code = err.get("code")
                         msg = err.get("message")
+                        funds_rejected = code == -32000 and "insufficient funds" in str(msg or "").lower()
+                        rate_limited = code == -32005 or "rate limit" in str(msg or "").lower()
                         raise RuntimeError(f"RPC({url}) code={code} msg={msg}")
                     result = j.get("result")
                     if try_next_on_null_result and result is None:
@@ -575,10 +596,12 @@ class EvmClient:
                             self._receipt_rpc_cooldowns.pop((network, url), None)
                     return result
                 except Exception as exc:
+                    only_funds_rejections = only_funds_rejections and funds_rejected
                     err_text = str(exc)
+                    if http_failed or rate_limited or isinstance(exc, (requests.exceptions.RequestException, json.JSONDecodeError)):
+                        self._cooldown_failed_rpc_url(network, url)
                     if session is not None and isinstance(exc, requests.exceptions.RequestException):
                         self._close_thread_rpc_session(session)
-                        self._cooldown_failed_rpc_url(network, url)
                         if "Too many open files" in err_text:
                             self._prune_dead_rpc_sessions()
                     if proxy_url and "Missing dependencies for SOCKS support" in err_text:
@@ -591,6 +614,8 @@ class EvmClient:
                 time.sleep(2.0)
         if saw_null_result:
             return None
+        if only_funds_rejections and last_err:
+            raise RpcTransactionRejected(f"{network} RPC 拒绝交易：{last_err}")
         raise RuntimeError(f"{network} RPC 请求失败：{last_err}")
 
     @staticmethod
@@ -750,6 +775,9 @@ class EvmClient:
             status = int(str(result["status"]), 0)
             for entry in journal.active_entries(kind="onchain-transfer"):
                 if entry["payload"].get("network") == network.upper() and str(entry["payload"].get("tx_hash", "")).lower() == txid.lower():
+                    if status:
+                        from onchain_transaction_recovery import verify_transfer_receipt
+                        verify_transfer_receipt(result, entry["payload"]["tx"], entry["payload"]["source"], tx_hash=txid)
                     journal.update(entry["id"], "completed" if status else "failed")
         return dict(result)
 

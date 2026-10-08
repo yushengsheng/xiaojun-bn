@@ -2633,6 +2633,8 @@ class OnchainTransferPageBase:
         self.setting_frame.columnconfigure(3, weight=0)
         self.setting_frame.columnconfigure(4, weight=0)
     def _on_root_resize(self, _event=None):
+        if self._closing:
+            return
         width = self.root.winfo_width()
         layout_mode = self._layout_mode_for_width(width)
         if layout_mode != self._layout_mode:

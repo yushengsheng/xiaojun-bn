@@ -55,6 +55,33 @@ class RuntimeSafetyTests(unittest.TestCase):
                           [(self.journal, 1), (other, 2)]))
         self.assertEqual(len(self.journal.active_entries()), 2)
 
+    def test_live_funds_submission_does_not_falsely_block_same_account_client(self):
+        first, second = self.exchange(), self.exchange(OperationJournal(self.journal.file_path, secret_box=self.box))
+        started, release, second_started = threading.Event(), threading.Event(), threading.Event()
+        def post(*_args, **_kwargs):
+            started.set()
+            if not release.wait(3):
+                raise AssertionError("test release missing")
+            return {"tranId": 1}
+        first._request_impl = Mock(side_effect=post)
+        second._request_impl = Mock(return_value={"tranId": 2})
+        def run(client, is_second=False):
+            if is_second:
+                second_started.set()
+            return client.request(client.spot, "POST", "/sapi/v1/asset/transfer", {"asset": "USDT", "amount": "1"})
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future1 = pool.submit(run, first)
+            try:
+                self.assertTrue(started.wait(2))
+                future2 = pool.submit(run, second, True)
+                self.assertTrue(second_started.wait(2))
+                second._request_impl.assert_not_called()
+            finally:
+                release.set()
+            self.assertEqual(future1.result(), {"tranId": 1})
+            self.assertEqual(future2.result(), {"tranId": 2})
+        self.assertEqual(self.journal.active_entries(), [])
+
     def test_backup_failure_prevents_financial_post(self):
         import stores
         original = stores._atomic_write_text
@@ -94,6 +121,90 @@ class RuntimeSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "拒绝"):
             client.request(client.spot, "POST", "/sapi/v1/asset/transfer", {"amount": "1"})
         self.assertIsNone(client._uncertain_write_error)
+        self.assertEqual(self.journal.active_entries(), [])
+
+    def test_every_funds_module_blocks_replay_after_lost_reply_and_restart(self):
+        from exchange_funds_recovery import FUNDS_WRITE_PATHS
+        for index, path in enumerate(sorted(FUNDS_WRITE_PATHS)):
+            with self.subTest(path=path):
+                journal_path = self.root / f"funds-lost-{index}.json"
+                journal = OperationJournal(journal_path, secret_box=self.box)
+                client = self.exchange(journal)
+                client._request_impl = Mock(side_effect=requests.ReadTimeout("reply lost after submit"))
+                with self.assertRaises(UnconfirmedOperationError):
+                    client.request(client.spot, "POST", path, {"asset": "USDT", "amount": "20", "quoteId": "original"})
+                self.assertEqual(client._request_impl.call_count, 1)
+                restarted = self.exchange(OperationJournal(journal_path, secret_box=self.box))
+                restarted.request_query = Mock(return_value=[])
+                restarted.get_convert_order_status = Mock(return_value={})
+                restarted._request_impl = Mock(return_value={"tranId": 999})
+                for next_path in (path, "/sapi/v1/asset/transfer"):
+                    with self.assertRaises(UnconfirmedOperationError):
+                        restarted.request(restarted.spot, "POST", next_path, {"asset": "USDT", "amount": "20"})
+                restarted._request_impl.assert_not_called()
+                self.assertEqual(journal.active_entries()[0]["state"], "unconfirmed")
+
+    def test_every_funds_module_new_action_cannot_reuse_completed_receipt(self):
+        from exchange_funds_recovery import FUNDS_WRITE_PATHS, _RECEIPT_KEYS
+        for index, path in enumerate(sorted(FUNDS_WRITE_PATHS)):
+            with self.subTest(path=path):
+                journal = OperationJournal(self.root / f"funds-new-{index}.json", secret_box=self.box)
+                client = self.exchange(journal)
+                if path.endswith("/dust"):
+                    replies = [{"transferResult": [{"tranId": number}]} for number in (1, 2)]
+                else:
+                    replies = [{_RECEIPT_KEYS[path]: number, "orderStatus": "SUCCESS"} for number in (1, 2)]
+                client._request_impl = Mock(side_effect=replies)
+                for number in (1, 2):
+                    client.request(client.spot, "POST", path, {"asset": "USDT", "amount": str(number), "quoteId": f"quote-{number}"})
+                self.assertEqual(client._request_impl.call_count, 2)
+                entries = journal.recovery_snapshot()["entries"]
+                self.assertEqual(len(entries), 2)
+                self.assertEqual(len({entry["id"] for entry in entries}), 2)
+                self.assertTrue(all(entry["state"] == "completed" for entry in entries))
+
+    def test_unknown_funds_operation_blocks_its_account_without_cross_account_recovery(self):
+        first = self.exchange()
+        first._request_impl = Mock(side_effect=requests.ReadTimeout("lost"))
+        with self.assertRaises(UnconfirmedOperationError):
+            first.request(first.spot, "POST", "/sapi/v1/asset/transfer", {"asset": "USDT", "amount": "20"})
+        with patch.object(BinanceClient, "_build_session", return_value=Mock()):
+            second = BinanceClient("another-test-key", "test-secret", operation_journal=self.journal)
+        self.addCleanup(second.close)
+        second._request_impl = Mock(return_value={"tranId": 123})
+        second.request(second.spot, "POST", "/sapi/v1/asset/transfer", {"asset": "USDT", "amount": "20"})
+        second._request_impl.assert_called_once()
+        self.assertEqual(len(self.journal.active_entries()), 1)
+        self.assertEqual(self.journal.active_entries()[0]["state"], "unconfirmed")
+
+    def test_wrong_order_ack_cannot_complete_or_allow_a_second_payment(self):
+        from exchange_binance_client import UnconfirmedOrderError
+        for index, mismatch in enumerate(({"symbol": "ETHUSDT"}, {"clientOrderId": "old-order"}, {"side": "SELL"})):
+            with self.subTest(mismatch=mismatch):
+                journal = OperationJournal(self.root / f"order-identity-{index}.json", secret_box=self.box)
+                client = self.exchange(journal)
+                client._request_impl = Mock(side_effect=lambda _base, _method, _path, params, **_: {
+                    "orderId": 123, "symbol": params["symbol"], "clientOrderId": params["newClientOrderId"],
+                    "status": "FILLED", "side": params["side"], **mismatch})
+                params = {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY", "quantity": "1", "price": "10"}
+                with self.assertRaisesRegex(RuntimeError, "不匹配"):
+                    client.request(client.spot, "POST", "/api/v3/order", params)
+                self.assertEqual(journal.active_entries()[0]["state"], "prepared")
+                with self.assertRaises(UnconfirmedOrderError):
+                    client.request(client.spot, "POST", "/api/v3/order", params)
+                self.assertEqual(client._request_impl.call_count, 1)
+
+    def test_order_identity_preserves_slash_symbol_query_compatibility(self):
+        client = self.exchange()
+        order = {"symbol": "BTCETH", "orderId": 123, "clientOrderId": "original", "status": "FILLED"}
+        client.request_query = Mock(return_value=order)
+        for market in ("spot", "um_futures"):
+            with self.subTest(market=market):
+                self.assertEqual(client.get_order_by_client_id(" btc / eth ", "original", market=market), order)
+                self.assertEqual(client.request_query.call_args.args[3]["symbol"], "BTCETH")
+        entry_id = self.journal.begin("exchange-order", client._order_scope(), {"symbol": "BTCETH"})
+        client.record_order_state("/api/v3/order", order, entry_id=entry_id,
+                                  request_params={"symbol": " btc / eth ", "origClientOrderId": "original"})
         self.assertEqual(self.journal.active_entries(), [])
 
     def test_withdraw_history_clears_durable_and_memory_guard(self):

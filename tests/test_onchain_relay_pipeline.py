@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 from core_models import EvmToken, GeneratedWalletEntry, WithdrawRuntimeParams
 from onchain_relay_runner import (
     _RelayBatchItem,
+    _build_resume_candidates,
     _receipt_state,
     _relay_confirm_auto_sweep,
     _relay_clear_missing_source_txids,
@@ -36,9 +37,12 @@ from onchain_relay_runner import (
     _relay_token_dust_below_threshold,
     _relay_token_dust_requires_native_recovery,
     _wait_for_receipt_success,
+    _wait_for_transaction_success,
     run_relay_fee_recovery,
 )
-from onchain_relay_wallets import RelayWalletRecord
+from onchain_relay_wallets import RelayWalletFileStore, RelayWalletRecord
+from operation_journal import OperationJournal
+from secret_box import SecretBox
 
 
 @contextmanager
@@ -135,12 +139,15 @@ class _FakeStore:
     def load_records(self) -> list[RelayWalletRecord]:
         return list(_RECORDS.values())
 
-    def update_record(self, relay_address: str, *, batch_id: str = "", **changes: object) -> RelayWalletRecord:
+    def update_record(self, relay_address: str, *, batch_id: str = "", new_batch_id: str = "", **changes: object) -> RelayWalletRecord:
         record = _RECORDS[(relay_address, batch_id)]
         raw = dict(record.__dict__)
         raw.update(changes)
+        if new_batch_id:
+            raw["batch_id"] = new_batch_id
         updated = RelayWalletRecord.from_raw(raw)
-        _RECORDS[(relay_address, batch_id)] = updated
+        _RECORDS.pop((relay_address, batch_id))
+        _RECORDS[(relay_address, updated.batch_id)] = updated
         return updated
 
     def remove_records(self, record_keys: set[tuple[str, str]]) -> int:
@@ -317,7 +324,278 @@ def _item(index: int) -> _RelayBatchItem:
     )
 
 
+def _forward_receipt(item, txid, *, native=False):
+    receipt = {"status": "0x1", "transactionHash": txid, "from": item.relay_addr,
+               "to": item.target if native else _params().token_contract, "logs": []}
+    if not native:
+        receipt["logs"] = [{
+            "address": receipt["to"],
+            "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                       "0x" + item.relay_addr[2:].rjust(64, "0"),
+                       "0x" + item.target[2:].rjust(64, "0")],
+            "data": f"0x{item.value_units:064x}",
+        }]
+    return receipt
+
+
 class OnchainRelayPipelineTests(unittest.TestCase):
+    def test_historical_scan_reads_encrypted_pending_journal_once(self):
+        owner = _FakeOwner()
+        owner.client.native_balance_wei = 0
+        owner.client.erc20_balance_units = 0
+        for index in range(10):
+            record = RelayWalletRecord(created_at="", expires_at="", network="BSC",
+                source="0x" + "a" * 40, target="0x" + "b" * 40,
+                relay_address=f"0x{index + 10:040x}", private_key="test-key",
+                status="completed", batch_id=f"legacy-{index}")
+            _RECORDS[(record.relay_address, record.batch_id)] = record
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            journal = OperationJournal(root / "operations.json", secret_box=SecretBox(root / ".key"))
+            journal.begin("exchange-funds", "other-account", {"amount": "1"})
+            owner.client.operation_journal = journal
+            with patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", root / "manual.txt"), patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", root / "sweep.jsonl"), _close_sweep_log_after(), patch.object(journal, "_load_locked", wraps=journal._load_locked) as load:
+                run_relay_fee_recovery(owner, False, use_progress=False, manage_running_state=False)
+                self.assertEqual(load.call_count, 1)
+        self.assertEqual(owner.result_dialogs[0]["failed"], 0)
+        self.assertEqual(len(_RECORDS), 0)
+
+    def test_recovery_confirmation_queries_real_receipt_and_rejects_revert(self):
+        owner = _FakeOwner()
+        txid = "0x" + "d" * 64
+        owner.client.receipts = [None, {"status": "0x0"}]
+        with patch("onchain_relay_runner.RELAY_POLL_INTERVAL_SECONDS", 0.01):
+            with self.assertRaisesRegex(RuntimeError, "receipt status=0"):
+                _wait_for_transaction_success(owner, "BSC", txid, label="回收确认", timeout_seconds=1)
+        self.assertEqual(owner.client.receipt_requests, [txid, txid])
+
+    def test_full_recovery_deletes_empty_legacy_wallet_without_false_failure(self):
+        owner = _FakeOwner()
+        record = RelayWalletRecord(created_at="", expires_at="", network="BSC",
+            source="0x" + "a" * 40, target="0x" + "b" * 40,
+            relay_address="0x" + "c" * 40, private_key="legacy-test-key",
+            status="completed", batch_id="legacy-empty", sweep_resolution="manual_empty")
+        _RECORDS[(record.relay_address, record.batch_id)] = record
+        owner.client.native_balance_wei = 0
+        owner.client.erc20_balance_units = 0
+        with TemporaryDirectory() as tmp_dir, patch("onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"), patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"), _close_sweep_log_after():
+            run_relay_fee_recovery(owner, False, use_progress=False, manage_running_state=False)
+        self.assertEqual(_RECORDS, {})
+        self.assertEqual(owner.result_dialogs[0]["failed"], 0)
+        self.assertEqual(owner.client.submitted_native_transfers, [])
+        self.assertFalse(any("二次验证" in log for log in owner.logs))
+
+    def _run_isolated_recovery(self, owner, dry_run=False, **kwargs):
+        with TemporaryDirectory() as tmp_dir, patch(
+            "onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE", Path(tmp_dir) / "manual.txt"
+        ), patch(
+            "onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"
+        ), _close_sweep_log_after():
+            run_relay_fee_recovery(owner, dry_run, use_progress=False, manage_running_state=False, **kwargs)
+
+    def test_recovery_deletes_empty_or_dust_wallets_regardless_of_old_payment_metadata(self):
+        for status in ("created", "failed", "token_forward_submitted", "completed"):
+            for txid in ("", "0x" + "f" * 64):
+                for native, stable in ((0, 0), (7_500_000_000_000, 400_000_000_000_000),
+                                       (9_999_999_999_999, 499_999_999_999_999)):
+                    with self.subTest(status=status, txid=bool(txid), native=native, stable=stable):
+                        _RECORDS.clear()
+                        owner, item = _FakeOwner(), _item(1)
+                        record = replace(item.relay_record, status=status, token_forward_txid=txid,
+                                         sweep_resolution="dust_left", last_error="old failure")
+                        _RECORDS[(record.relay_address, record.batch_id)] = record
+                        owner.client.native_balance_wei = native
+                        owner.client.erc20_balance_units = stable
+                        owner.client.get_transaction_receipt = Mock(side_effect=AssertionError("old receipt must not gate cleanup"))
+                        with patch.object(owner.relay_wallet_store, "update_record", wraps=owner.relay_wallet_store.update_record) as update:
+                            self._run_isolated_recovery(owner)
+                            update.assert_not_called()  # Cleanup must not declare the old payment successful.
+                        self.assertEqual(_RECORDS, {})
+                        self.assertEqual(owner.client.submitted_native_transfers, [])
+                        self.assertEqual(owner.result_dialogs[0]["failed"], 0)
+                        self.assertTrue(any("本轮结束后删除钱包记录" in line for line in owner.logs))
+
+    def test_recovery_keeps_any_asset_at_margin_or_above_even_when_gas_is_insufficient(self):
+        for native, usdt, usdc in (
+            (10_000_000_000_000, 0, 0),
+            (10_000_000_000_001, 0, 0),
+            (0, 500_000_000_000_000, 0),
+            (0, 0, 500_000_000_000_000),
+            (0, 500_000_000_000_001, 0),
+            (0, 0, 500_000_000_000_001),
+            (9_999_999_999_999, 20 * 10**18, 499_999_999_999_999),
+            (0, 499_999_999_999_999, 20 * 10**18),
+        ):
+            with self.subTest(native=native, usdt=usdt, usdc=usdc):
+                _RECORDS.clear()
+                owner, item = _FakeOwner(), _item(1)
+                owner.client.native_balance_wei = native
+                owner.client.gas_price_wei = 1_000_000_000
+                tokens = owner.client.get_default_tokens("BSC")
+                balances = {tokens[1].contract: usdt, tokens[2].contract: usdc}
+                owner.client.get_erc20_balance = Mock(side_effect=lambda _network, contract, _addr: balances[contract])
+                owner.client.estimate_erc20_transfer_gas = Mock(return_value=65_000)
+                self._run_isolated_recovery(owner)
+                self.assertIn((item.relay_addr, item.relay_record.batch_id), _RECORDS)
+                self.assertEqual(owner.client.submitted_native_transfers, [])
+
+    def test_recovery_keeps_wallet_if_one_tracked_balance_query_fails(self):
+        owner, item = _FakeOwner(), _item(1)
+        owner.client.native_balance_wei = 0
+        tokens = owner.client.get_default_tokens("BSC")
+        def balance(_network, contract, _addr):
+            if contract == tokens[2].contract:
+                raise RuntimeError("USDC balance RPC failed")
+            return 0
+        owner.client.get_erc20_balance = Mock(side_effect=balance)
+        self._run_isolated_recovery(owner)
+        self.assertIn((item.relay_addr, item.relay_record.batch_id), _RECORDS)
+        self.assertEqual(owner.result_dialogs[0]["failed"], 1)
+
+    def test_recovery_keeps_wallet_for_incomplete_or_negative_balance_snapshot(self):
+        for invalid in ("no_native", "negative"):
+            with self.subTest(invalid=invalid):
+                _RECORDS.clear()
+                owner, item = _FakeOwner(), _item(1)
+                owner.client.native_balance_wei = -1 if invalid == "negative" else 0
+                owner.client.erc20_balance_units = 0
+                if invalid == "no_native":
+                    tokens = owner.client.get_default_tokens("BSC")[1:]
+                    owner.client.get_default_tokens = Mock(return_value=tokens)
+                self._run_isolated_recovery(owner)
+                self.assertIn((item.relay_addr, item.relay_record.batch_id), _RECORDS)
+                self.assertEqual(owner.result_dialogs[0]["failed"], 1)
+
+    def test_recovery_checks_record_token_even_when_default_token_has_same_symbol(self):
+        owner, item = _FakeOwner(), _item(1)
+        contract = "0x" + "d" * 40
+        record = replace(item.relay_record, token_is_native=False, token_symbol="USDT", token_contract=contract)
+        _RECORDS[(item.relay_addr, record.batch_id)] = record
+        owner.client.native_balance_wei = 0
+        owner.client.gas_price_wei = 1_000_000_000
+        owner.client.estimate_erc20_transfer_gas = Mock(return_value=65_000)
+        owner.client.get_erc20_balance = Mock(side_effect=lambda _network, token_contract, _addr: 20 * 10**18 if token_contract == contract else 0)
+        self._run_isolated_recovery(owner)
+        self.assertIn((item.relay_addr, record.batch_id), _RECORDS)
+        queried_contracts = {call.args[1] for call in owner.client.get_erc20_balance.call_args_list}
+        self.assertIn(contract, queried_contracts)
+
+    def test_recovery_keeps_positive_custom_token_without_defined_margin(self):
+        owner, item = _FakeOwner(), _item(1)
+        contract = "0x" + "d" * 40
+        record = replace(item.relay_record, token_is_native=False, token_symbol="CUSTOM", token_contract=contract)
+        _RECORDS[(item.relay_addr, record.batch_id)] = record
+        owner.client.native_balance_wei = 0
+        owner.client.gas_price_wei = 1_000_000_000
+        owner.client.estimate_erc20_transfer_gas = Mock(return_value=65_000)
+        owner.client.get_erc20_balance = Mock(side_effect=lambda _network, token_contract, _addr: 1 if token_contract == contract else 0)
+        self._run_isolated_recovery(owner)
+        self.assertIn((item.relay_addr, record.batch_id), _RECORDS)
+
+    def test_recovery_keeps_positive_eth_without_defined_native_margin(self):
+        owner, item = _FakeOwner(), _item(1)
+        record = replace(item.relay_record, network="ETH")
+        _RECORDS[(item.relay_addr, record.batch_id)] = record
+        owner.client.get_default_tokens = Mock(return_value=[EvmToken("ETH", "", 18, True)])
+        owner.client.native_balance_wei = 1
+        owner.client.gas_price_wei = 1_000_000_000
+        self._run_isolated_recovery(owner)
+        self.assertIn((item.relay_addr, record.batch_id), _RECORDS)
+
+    def test_recovery_dry_run_preserves_empty_and_dust_wallet_records(self):
+        for native, stable in ((0, 0), (9_999_999_999_999, 499_999_999_999_999)):
+            with self.subTest(native=native, stable=stable):
+                _RECORDS.clear()
+                owner, item = _FakeOwner(), _item(1)
+                owner.client.native_balance_wei = native
+                owner.client.erc20_balance_units = stable
+                self._run_isolated_recovery(owner, dry_run=True)
+                self.assertEqual(_RECORDS[(item.relay_addr, item.relay_record.batch_id)], item.relay_record)
+                self.assertTrue(any("模拟执行不删除记录" in line for line in owner.logs))
+                self.assertEqual(owner.client.submitted_native_transfers, [])
+
+    def test_recovery_stop_skips_final_deletion(self):
+        owner, item = _FakeOwner(), _item(1)
+        owner.client.native_balance_wei = 0
+        owner.client.erc20_balance_units = 0
+        original_log = owner.log
+        def log(message):
+            original_log(message)
+            if "本轮结束后删除钱包记录" in message:
+                owner.stop_requested.set()
+        owner.log = log
+        self._run_isolated_recovery(owner)
+        self.assertEqual(_RECORDS[(item.relay_addr, item.relay_record.batch_id)], item.relay_record)
+
+    def test_batch_recovery_scans_terminal_records_and_cleans_only_requested_batch(self):
+        owner, first, second = _FakeOwner(), _item(1), _item(2)
+        record = replace(first.relay_record, status="completed", sweep_resolution="manual_empty")
+        _RECORDS[(first.relay_addr, record.batch_id)] = record
+        other = replace(second.relay_record, batch_id="other-batch")
+        _RECORDS.pop((second.relay_addr, second.relay_record.batch_id))
+        _RECORDS[(second.relay_addr, other.batch_id)] = other
+        owner.client.native_balance_wei = 0
+        owner.client.erc20_balance_units = 0
+        self._run_isolated_recovery(owner, batch_ids={record.batch_id}, run_label="batch-dialog")
+        self.assertEqual(owner.relay_wallet_store.load_records(), [other])
+        self.assertIsNone(owner.result_dialogs[0]["action_buttons"])
+
+    def test_recovery_cleanup_persists_with_encrypted_store_and_keeps_operation_journal(self):
+        owner = _FakeOwner()
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            box = SecretBox(root / ".key")
+            journal = OperationJournal(root / "operations.json", secret_box=box)
+            journal.begin("exchange-funds", "unrelated-account", {"amount": "20"})
+            before_journal = (root / "operations.json").read_bytes()
+            empty = replace(_item(1).relay_record, private_key="1" * 64)
+            dust = replace(_item(2).relay_record, private_key="2" * 64)
+            funded = replace(_item(3).relay_record, private_key="3" * 64)
+            with patch("onchain_relay_wallets.SECRET_BOX", box):
+                store = RelayWalletFileStore(root / "wallets.txt", operation_journal=journal)
+                store.append_records([empty, dust, funded])
+                owner.relay_wallet_store = store
+                owner.client.operation_journal = journal
+                owner.client.get_balance_wei = Mock(return_value=0)
+                amounts = {empty.relay_address: 0, dust.relay_address: 499_999_999_999_999,
+                           funded.relay_address: 20 * 10**18}
+                owner.client.get_erc20_balance = Mock(side_effect=lambda _network, _contract, addr: amounts[addr])
+                owner.client.gas_price_wei = 1_000_000_000
+                owner.client.estimate_erc20_transfer_gas = Mock(return_value=65_000)
+                self._run_isolated_recovery(owner)
+                reopened = RelayWalletFileStore(root / "wallets.txt", operation_journal=journal)
+                remaining = reopened.load_records()
+                self.assertEqual([record.relay_address for record in remaining], [funded.relay_address])
+                self.assertEqual(remaining[0].private_key, funded.private_key)
+                self.assertNotIn(funded.private_key, (root / "wallets.txt").read_text())
+                backup_records = reopened._parse_records_text((root / "wallets.txt.bak").read_text())
+                self.assertEqual([record.relay_address for record in backup_records], [funded.relay_address])
+                self.assertEqual(backup_records[0].private_key, funded.private_key)
+                self.assertEqual((root / "operations.json").read_bytes(), before_journal)
+
+    def test_legacy_completed_wallet_cannot_be_reused_on_another_network(self):
+        owner, item = _FakeOwner(mode_1m=True), _item(1)
+        record = replace(item.relay_record, network="ETH", status="completed", reuse_key="")
+        result = _build_resume_candidates(owner, [record], [(item.row_key, item.source_raw, item.target)],
+                                         _params(), {item.row_key: (item.source_private_key, item.source_addr)})
+        self.assertEqual(result, {})
+
+    def test_old_successful_bnb_receipt_cannot_complete_usdt_second_hop(self):
+        owner, item = _FakeOwner(mode_1m=True), _item(1)
+        txid = "0x" + "a" * 64
+        item.relay_record = owner.relay_wallet_store.update_record(item.relay_addr, batch_id="batch",
+                                                                  status="token_funded", token_forward_txid=txid)
+        owner.client.get_transaction_receipt = Mock(return_value=_forward_receipt(item, txid, native=True))
+        submit = Mock(side_effect=AssertionError("must not rebroadcast"))
+        _relay_simple_stage(owner, _params(), [item], stage_label="中转第二跳", tx_attr="token_forward_txid",
+                            nonce_attr="token_forward_nonce", submitted_status="token_forward_submitted",
+                            done_status="forwarded", done_statuses={"forwarded", "completed"},
+                            submit_one=submit, status_text="第二跳")
+        self.assertTrue(item.failed)
+        self.assertEqual(item.relay_record.status, "failed")
+        self.assertIn("不符", item.relay_record.last_error)
+        submit.assert_not_called()
+
     def test_relay_wallet_preparation_uses_shared_wallet_generator(self) -> None:
         owner = Mock()
         owner._is_mode_m1.return_value = False
@@ -403,19 +681,18 @@ class OnchainRelayPipelineTests(unittest.TestCase):
 
     def test_relay_dust_thresholds_match_cleanup_policy(self) -> None:
         owner = _FakeOwner()
-        bnb_threshold_units = 5_000_000_000_000
+        bnb_threshold_units = 10_000_000_000_000
         self.assertTrue(_relay_native_dust_below_threshold(owner, "BSC", bnb_threshold_units - 1)[0])
         self.assertFalse(_relay_native_dust_below_threshold(owner, "BSC", bnb_threshold_units)[0])
 
-        usdt = EvmToken(
-            symbol="USDT",
-            contract="0x55d398326f99059ff775485246999027b3197955",
-            decimals=18,
-            is_native=False,
-        )
-        usdt_threshold_units = 100_000_000_000_000
-        self.assertTrue(_relay_token_dust_below_threshold(owner, {"USDT": (usdt, usdt_threshold_units - 1)})[0])
-        self.assertFalse(_relay_token_dust_below_threshold(owner, {"USDT": (usdt, usdt_threshold_units)})[0])
+        for symbol in ("USDT", "USDC"):
+            for decimals, threshold_units in ((18, 500_000_000_000_000), (6, 500)):
+                with self.subTest(symbol=symbol, decimals=decimals):
+                    token = EvmToken(symbol=symbol, contract="0x" + "d" * 40,
+                                     decimals=decimals, is_native=False)
+                    self.assertTrue(_relay_token_dust_below_threshold(owner, {symbol: (token, threshold_units - 1)})[0])
+                    self.assertFalse(_relay_token_dust_below_threshold(owner, {symbol: (token, threshold_units)})[0])
+                    self.assertFalse(_relay_token_dust_below_threshold(owner, {symbol: (token, threshold_units + 1)})[0])
 
     def test_relay_cleanup_requires_every_asset_below_threshold(self) -> None:
         owner = _FakeOwner()
@@ -426,8 +703,8 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             decimals=18,
             is_native=False,
         )
-        bnb_threshold_units = 5_000_000_000_000
-        usdt_threshold_units = 100_000_000_000_000
+        bnb_threshold_units = 10_000_000_000_000
+        usdt_threshold_units = 500_000_000_000_000
 
         self.assertTrue(
             _relay_snapshot_cleanup_allowed(
@@ -517,7 +794,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
         self.assertEqual(result["action_buttons"][0][0], "复制待人工账号")
         self.assertFalse(result["action_buttons"][0][2])
 
-    def test_manual_recovery_does_not_treat_empty_relay_as_completed_transfer(self) -> None:
+    def test_batch_recovery_deletes_empty_wallet_without_marking_payment_completed(self) -> None:
         owner = _FakeOwner()
         relay_addr = "0x00000000000000000000000000000000000000d0"
         record = RelayWalletRecord(
@@ -541,24 +818,23 @@ class OnchainRelayPipelineTests(unittest.TestCase):
                 patch("onchain_relay_runner.RELAY_SWEEP_LOG_FILE", Path(tmp_dir) / "sweep.jsonl"),
                 _close_sweep_log_after(),
             ):
-                run_relay_fee_recovery(
-                    owner,
-                    False,
-                    batch_ids={record.batch_id},
-                    show_dialog=True,
-                    use_progress=False,
-                    manage_running_state=False,
-                    run_label="batch-empty-without-forward",
-                )
+                with patch.object(owner.relay_wallet_store, "update_record", wraps=owner.relay_wallet_store.update_record) as update:
+                    run_relay_fee_recovery(
+                        owner,
+                        False,
+                        batch_ids={record.batch_id},
+                        show_dialog=True,
+                        use_progress=False,
+                        manage_running_state=False,
+                        run_label="batch-empty-without-forward",
+                    )
+                    update.assert_not_called()
 
-        self.assertIn((relay_addr, record.batch_id), _RECORDS)
-        saved = _RECORDS[(relay_addr, record.batch_id)]
-        self.assertEqual(saved.status, "failed")
-        self.assertIn("缺少第二跳交易记录", saved.last_error)
-        self.assertFalse(any("无需回收" in message for message in owner.logs))
+        self.assertEqual(_RECORDS, {})
+        self.assertTrue(any("无需回收" in message for message in owner.logs))
         result = owner.result_dialogs[0]
-        self.assertEqual(result["success"], 0)
-        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["success"], 1)
+        self.assertEqual(result["failed"], 0)
 
     def test_manual_recovery_counts_persistent_rpc_failure_once(self) -> None:
         owner = _FakeOwner()
@@ -596,7 +872,8 @@ class OnchainRelayPipelineTests(unittest.TestCase):
                 )
 
         self.assertEqual(len(_RECORDS), 1)
-        self.assertEqual(_RECORDS[(relay_addr, record.batch_id)].status, "failed")
+        self.assertEqual(_RECORDS[(relay_addr, record.batch_id)].status, "forwarded")
+        self.assertIn("persistent RPC failure", _RECORDS[(relay_addr, record.batch_id)].last_error)
         result = owner.result_dialogs[0]
         self.assertEqual(result["success"], 0)
         self.assertEqual(result["failed"], 1)
@@ -656,7 +933,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             batch_id="batch-manual",
         )
         _RECORDS[(relay_addr, record.batch_id)] = record
-        owner.client.native_balance_responses = [5_000_000_000_000, 5_000_000_000_000]
+        owner.client.native_balance_responses = [10_000_000_000_000, 10_000_000_000_000]
         owner.client.erc20_balance_units = 0
         owner.client.gas_price_wei = 1_000_000_000
 
@@ -686,7 +963,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
     def test_terminal_dust_record_does_not_ignore_bnb_at_threshold(self) -> None:
         owner = _FakeOwner()
         bnb = EvmToken(symbol="BNB", contract="", decimals=18, is_native=True)
-        bnb_threshold_units = 5_000_000_000_000
+        bnb_threshold_units = 10_000_000_000_000
         record = RelayWalletRecord(
             created_at="",
             expires_at="",
@@ -734,7 +1011,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
             decimals=18,
             is_native=False,
         )
-        bnb_threshold_units = 5_000_000_000_000
+        bnb_threshold_units = 10_000_000_000_000
         usdt_dust_units = 50_000_000_000_000
 
         self.assertFalse(
@@ -859,7 +1136,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
                 raise RuntimeError("RPC 节点超时")
             if index == 6 and calls[index] == 1:
                 return None
-            return {"status": "0x1"}
+            return _forward_receipt(items[index - 1], txid, native=True)
 
         submit = Mock(side_effect=lambda item, nonce: f"0x{item.index:064x}")
         stage_args = dict(
@@ -877,7 +1154,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
 
         # 模拟重新载入保存记录：全部记录都复核第二跳回执，已提交交易不再次转账。
         resumed = [replace(item, failed=False, failure_reason="") for item in items]
-        owner.client.get_transaction_receipt = Mock(return_value={"status": "0x1"})
+        owner.client.get_transaction_receipt = Mock(side_effect=lambda _network, txid, **_: _forward_receipt(items[int(txid, 16) - 1], txid, native=True))
         submit.reset_mock()
         _relay_simple_stage(owner, params, resumed, **stage_args)
         submit.assert_not_called()
@@ -934,7 +1211,7 @@ class OnchainRelayPipelineTests(unittest.TestCase):
         self.assertEqual(item.relay_record.token_forward_txid, "0x" + "a" * 64)
         owner.stop_requested.clear()
         resumed = replace(item, failed=False, failure_reason="")
-        owner.client.get_transaction_receipt = Mock(return_value={"status": "0x1"})
+        owner.client.get_transaction_receipt = Mock(return_value=_forward_receipt(item, "0x" + "a" * 64))
         submit.reset_mock()
         _relay_simple_stage(owner, _params(), [resumed], **stage_args)
         submit.assert_not_called()

@@ -229,6 +229,19 @@ class StockTests(unittest.TestCase):
         self.assertTrue(result["success"], result)
         self.assertEqual(client.transfers, [])
 
+    def test_wrong_stock_order_number_cannot_change_inventory_or_release_task(self):
+        client, task, _ = self.strategy()
+        task.load()
+        task.state.update(wallet="CARD", cash="1000", phase="BUY", target="2")
+        task.place("BUY", Decimal(2), Decimal("100.03"), "RTH")
+        original = deepcopy(task.state)
+        row = {**task.state["active"], "orderId": "unrelated", "status": "FILLED", "filledQty": "2", "avgFilledPrice": "100.03"}
+        task.api.call = Mock(return_value=row)
+        with self.assertRaisesRegex(RuntimeError, "订单编号"):
+            task.reconcile()
+        self.assertEqual(task.state, original)
+        self.assertEqual(len(client.operation_journal.active_entries()), 1)
+
     def test_buy_waits_for_transfer_history_and_funding_credit(self):
         client, task, stop = self.strategy()
         client.transfer_history_delay = 2

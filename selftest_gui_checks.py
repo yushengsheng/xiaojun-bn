@@ -90,6 +90,8 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
         auto_ladder_path = tmp_root / "auto_ladder_settings.json"
         proxy_path = tmp_root / "exchange_proxy_settings.json"
         onchain_path = tmp_root / "onchain.json"
+        onchain_journal_path = tmp_root / "onchain_operations.json"
+        relay_wallet_path = tmp_root / "relay_wallets.txt"
         withdraw_result_path = tmp_root / "withdraw_success.txt"
         total_asset_result_path = tmp_root / "total_asset_result.txt"
         patches = [
@@ -109,6 +111,8 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
             (exchange_app_config, "STRATEGY_CONFIG_FILE", strategy_path),
             (exchange_app_config, "EXCHANGE_PROXY_CONFIG_FILE", proxy_path),
             (page_onchain_base, "ONCHAIN_DATA_FILE", onchain_path),
+            (page_onchain_base, "ONCHAIN_OPERATION_JOURNAL_FILE", onchain_journal_path),
+            (page_onchain_base, "RELAY_WALLET_FILE", relay_wallet_path),
             (onchain_imports, "ONCHAIN_DATA_FILE", onchain_path),
             (messagebox, "showinfo", _dialog_stub("info")),
             (messagebox, "showwarning", _dialog_stub("warning")),
@@ -480,6 +484,8 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 page = app.onchain_page
                 if page is None:
                     raise RuntimeError("GUI 自检失败：链上页面未成功加载")
+                if page.relay_wallet_store.file_path != relay_wallet_path or page.operation_journal.file_path != onchain_journal_path:
+                    raise RuntimeError("GUI 自检失败：链上钱包/账本未隔离到自检目录")
                 if int(page.tree.cget("height")) != 10:
                     raise RuntimeError("GUI 自检失败：链上账号列表高度不是10行")
                 if str(page.log_tree.winfo_class()) != "Text" or str(page.error_log_tree.winfo_class()) != "Text":

@@ -2731,12 +2731,16 @@ class BinanceClient:
         }
 
     def get_order_by_client_id(self, symbol: str, client_order_id: str, *, market: str = "spot", timeout: float = 6):
+        symbol = self.normalize_trade_symbol(symbol)
         futures = market == "um_futures"
-        return self.request_query(
+        result = self.request_query(
             self.um_futures if futures else self.spot, "GET", "/fapi/v1/order" if futures else "/api/v3/order",
-            {"symbol": self.normalize_trade_symbol(symbol), "origClientOrderId": client_order_id},
+            {"symbol": symbol, "origClientOrderId": client_order_id},
             timeout=timeout, max_retries=1,
         )
+        from exchange_order_recovery import validate_order_identity
+        validate_order_identity(result, symbol=symbol, client_order_id=client_order_id)
+        return result
 
     def _order_scope(self) -> str:
         from exchange_order_recovery import exchange_operation_scope
@@ -2748,6 +2752,10 @@ class BinanceClient:
         market = self.ORDER_PATHS[path]
         params = request_params or {}
         symbol = self.normalize_trade_symbol(order.get("symbol") or params.get("symbol") or "")
+        from exchange_order_recovery import validate_order_identity
+        validate_order_identity(order, symbol=self.normalize_trade_symbol(params.get("symbol") or symbol), order_id=params.get("orderId"),
+                                client_order_id=params.get("origClientOrderId") or params.get("newClientOrderId") or "",
+                                side=params.get("side", ""))
         order_id = str(order.get("orderId") or "")
         if not order_id:
             raise ValueError(f"{symbol} 订单回复缺少 orderId，保留恢复记录")
@@ -2901,6 +2909,8 @@ class BinanceClient:
             self._pending_order_requests.pop(client_order_id, None)
 
         def accept(response):
+            from exchange_order_recovery import validate_order_identity
+            validate_order_identity(response, symbol=symbol, client_order_id=client_order_id, side=params.get("side", ""))
             # Even a local journal write failure must not replay an accepted order.
             self._order_submission_serial = int(getattr(self, "_order_submission_serial", 0)) + 1
             self.record_order_state(path, response, entry_id=entry_id, request_params=params)
@@ -2987,6 +2997,9 @@ class BinanceClient:
                     found = self.request_query(base, "GET", path, {"symbol": params["symbol"], "orderId": order["orderId"]}, timeout=6, max_retries=1)
                 if not isinstance(found, dict) or not found.get("status") or str(found.get("orderId") or "") != str(order["orderId"]):
                     raise ValueError("订单成交状态返回格式无效")
+                from exchange_order_recovery import validate_order_identity
+                validate_order_identity(found, symbol=params["symbol"], order_id=order["orderId"],
+                                        client_order_id=params.get("newClientOrderId", ""), side=params.get("side", ""))
                 order = found
                 self.record_order_state(path, order, request_params=params)
                 if str(order.get("status") or "").upper() in self.ORDER_TERMINAL_STATUSES:

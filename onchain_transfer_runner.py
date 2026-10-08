@@ -11,7 +11,7 @@ import hashlib
 import json
 from tkinter import ttk
 
-from onchain_relay_runner import run_relay_batch, run_relay_fee_recovery
+from onchain_relay_runner import RELAY_RECOVERY_MAX_WORKERS, run_relay_batch, run_relay_fee_recovery
 from page_onchain_base import (
     Decimal,
     InvalidOperation,
@@ -546,14 +546,16 @@ class OnchainTransferRunnerMixin(object):
             except Exception as exc:
                 messagebox.showerror("依赖缺失", str(exc))
                 return False
-        worker_threads = max(1, int(self._runtime_worker_threads()))
+        worker_threads = max(1, min(int(self._runtime_worker_threads()), len(records), RELAY_RECOVERY_MAX_WORKERS))
         sweep_target_override = str(sweep_target_override or "").strip()
         if confirm:
             scope_text = f"本次批量 {len(batch_filter)} 个批次" if batch_filter else "全部历史记录"
             text = (
                 f"即将扫描 {scope_text} 中的 {len(records)} 条中转记录，\n"
                 "检测并回收中转钱包中的 BNB / USDT / USDC 余额。\n"
-                "第二跳未确认成功的记录会自动跳过，避免误操作。\n\n"
+                "真实回收结束后，零余额或全部余额低于回收边际的钱包记录统一删除；\n"
+                "无需旧第二跳记录。仍有可回收余额或余额查询失败的钱包保留。\n"
+                "模拟执行不删除钱包记录。\n\n"
                 f"当前模式：{'模拟执行' if dry_run else '真实执行'}\n"
                 f"回收线程数：{worker_threads}\n\n"
                 "确认继续？"
