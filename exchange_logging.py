@@ -4,29 +4,20 @@
 from __future__ import annotations
 
 import logging
-from logging.handlers import RotatingFileHandler
-import os
 import queue
 import re
 import threading
-import time
 from pathlib import Path
 
 from app_paths import LOG_DIR, LOG_FILE_PATH
+from daily_logging import BeijingFormatter, DailyFileHandler, log_day, prune_logs
 from secure_delete import SecureDeleteReport, secure_unlink_all
 from sensitive_data import redact_sensitive_text
 from shared_utils import LOG_MAX_ROWS
 
 
-log_queue: "queue.Queue[object]" = queue.Queue()
+log_queue: "queue.Queue[object]" = queue.Queue(maxsize=2000)
 LOG_FILE_RUNTIME_PREFIX = "exchange_runtime"
-LOG_FILE_RETENTION_COUNT = 10
-LOG_FILE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
-LOG_FILE_MAX_BYTES = 10 * 1024 * 1024
-LOG_FILE_TOTAL_SIZE_LIMIT_BYTES = 50 * 1024 * 1024
-LOG_FILE_BACKUP_COUNT = 3
-COMPAT_LOG_MAX_BYTES = 5 * 1024 * 1024
-COMPAT_LOG_BACKUP_COUNT = 3
 EXCHANGE_LOG_MAX_ROWS = LOG_MAX_ROWS
 _ACCOUNT_LOG_CONTEXT = threading.local()
 _ACCOUNT_TEXT_RE = re.compile(r"账号\s*[#＃]?\s*\d+")
@@ -70,7 +61,7 @@ def current_exchange_account_log_index() -> str:
     return str(getattr(_ACCOUNT_LOG_CONTEXT, "account_index", "") or "").strip()
 
 
-class SensitiveFormatter(logging.Formatter):
+class SensitiveFormatter(BeijingFormatter):
     def format(self, record):
         account_index = current_exchange_account_log_index()
         message = str(record.getMessage() or "")
@@ -115,15 +106,22 @@ class TkLogHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            log_queue.put(TkLogEntry(msg, levelno=record.levelno, levelname=record.levelname))
+            entry = TkLogEntry(msg, levelno=record.levelno, levelname=record.levelname)
+            try:
+                log_queue.put_nowait(entry)
+            except queue.Full:
+                try:
+                    log_queue.get_nowait()
+                    log_queue.put_nowait(entry)
+                except (queue.Empty, queue.Full):
+                    pass
         except Exception:
             pass
 
 
 def _create_runtime_log_path() -> Path:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    return LOG_DIR / f"{LOG_FILE_RUNTIME_PREFIX}_{timestamp}_{os.getpid()}.log"
+    return LOG_DIR / f"{LOG_FILE_RUNTIME_PREFIX}_{log_day():%Y%m%d}.log"
 
 
 def _prune_runtime_logs(current_path: Path | None = None) -> None:
@@ -132,37 +130,7 @@ def _prune_runtime_logs(current_path: Path | None = None) -> None:
     except Exception:
         return
 
-    entries: list[tuple[Path, float, int]] = []
-    for path in LOG_DIR.glob(f"{LOG_FILE_RUNTIME_PREFIX}_*.log*"):
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        entries.append((path, stat.st_mtime, stat.st_size))
-
-    now = time.time()
-    entries.sort(key=lambda item: item[1], reverse=True)
-    kept_count = 0
-    kept_size = 0
-    for path, mtime, size in entries:
-        if current_path is not None and path == current_path:
-            kept_count += 1
-            kept_size += size
-            continue
-        if (now - mtime) > LOG_FILE_MAX_AGE_SECONDS:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-            continue
-        if kept_count < LOG_FILE_RETENTION_COUNT and (kept_size + size) <= LOG_FILE_TOTAL_SIZE_LIMIT_BYTES:
-            kept_count += 1
-            kept_size += size
-            continue
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    prune_logs(LOG_DIR.glob(f"{LOG_FILE_RUNTIME_PREFIX}_*.log*"), protected=(current_path,))
 
 
 _tk_handler = TkLogHandler()
@@ -170,8 +138,8 @@ _tk_handler.setFormatter(_tk_formatter)
 logger.addHandler(_tk_handler)
 
 runtime_log_path: Path | None = None
-_runtime_file_handler: RotatingFileHandler | None = None
-_compat_file_handler: RotatingFileHandler | None = None
+_runtime_file_handler: DailyFileHandler | None = None
+_compat_file_handler: DailyFileHandler | None = None
 
 
 def _close_file_handler(handler: logging.Handler | None) -> None:
@@ -195,12 +163,7 @@ def _configure_file_handlers(*, announce_runtime_path: bool) -> None:
     try:
         _prune_runtime_logs()
         runtime_log_path = _create_runtime_log_path()
-        _runtime_file_handler = RotatingFileHandler(
-            runtime_log_path,
-            maxBytes=LOG_FILE_MAX_BYTES,
-            backupCount=LOG_FILE_BACKUP_COUNT,
-            encoding="utf-8",
-        )
+        _runtime_file_handler = DailyFileHandler(runtime_log_path, prefix=LOG_FILE_RUNTIME_PREFIX)
         _runtime_file_handler.setFormatter(_formatter)
         logger.addHandler(_runtime_file_handler)
         _prune_runtime_logs(runtime_log_path)
@@ -208,13 +171,7 @@ def _configure_file_handlers(*, announce_runtime_path: bool) -> None:
         print(f"无法创建日志文件: {exc}")
 
     try:
-        _compat_file_handler = RotatingFileHandler(
-            LOG_FILE_PATH,
-            mode="w",
-            maxBytes=COMPAT_LOG_MAX_BYTES,
-            backupCount=COMPAT_LOG_BACKUP_COUNT,
-            encoding="utf-8",
-        )
+        _compat_file_handler = DailyFileHandler(LOG_FILE_PATH)
         _compat_file_handler.setFormatter(_formatter)
         logger.addHandler(_compat_file_handler)
     except Exception as exc:
@@ -256,3 +213,32 @@ def purge_exchange_file_logs() -> SecureDeleteReport:
 
 
 _configure_file_handlers(announce_runtime_path=True)
+
+
+_onchain_logger = logging.getLogger("onchain.runtime")
+_onchain_logger.setLevel(logging.INFO)
+_onchain_logger.propagate = False
+
+
+def log_onchain_message(text: object) -> None:
+    # The UI keeps only 500 rows; this independent sink saves every ordinary
+    # chain message without feeding it back into the exchange UI queue.
+    with _file_handler_lock:
+        if not _onchain_logger.handlers:
+            try:
+                handler = DailyFileHandler(LOG_DIR / "onchain_runtime.log", prefix="onchain_runtime")
+            except OSError as exc:
+                logger.error("无法创建链上运行日志：%s", exc)
+                return
+            handler.setFormatter(SensitiveFormatter("%(asctime)s %(message)s"))
+            _onchain_logger.addHandler(handler)
+    _onchain_logger.info("%s", text)
+
+
+def persist_exchange_message(text: object) -> None:
+    """Save service notices without putting the same notice back in its queue."""
+    record = logger.makeRecord(logger.name, logging.INFO, __file__, 0, "%s", (text,), None)
+    with _file_handler_lock:
+        for handler in (_runtime_file_handler, _compat_file_handler):
+            if handler is not None:
+                handler.handle(record)

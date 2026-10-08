@@ -169,6 +169,9 @@ class HeadlessExchange(ExchangeAppStocksMixin, ExchangeAppBatchMixin,
         self.exchange_operation_journal = base.OperationJournal(base.EXCHANGE_OPERATION_JOURNAL_FILE)
         self.auto_ladder_settings_store = AutoLadderSettingsStore()
         self.settings_file = base.DATA_FILE.parent / "linux_settings.json"
+        self.config_update_file = base.DATA_FILE.parent / "linux_account_update.json"
+        from config_transaction import recover
+        recover(self.config_update_file, [base.DATA_FILE, self.settings_file])
         self.settings = {f["name"]: f["default"] for f in field_schema()}
         self.account_meta = {}
         if base.config_or_backup_exists(self.settings_file):
@@ -177,6 +180,7 @@ class HeadlessExchange(ExchangeAppStocksMixin, ExchangeAppBatchMixin,
             self.account_meta = dict(raw.get("accounts", {}))
             self.auto_ladder_settings_store.replace(AutoLadderSettings.parse(raw.get("auto_ladder", {})))
         self.apply_settings()
+        self._load_trade_volume_query_settings()
         # Loading failure must block control, rather than silently showing an
         # empty list which could overwrite recoverable encrypted accounts.
         self.account_store.load()
@@ -254,6 +258,7 @@ class HeadlessExchange(ExchangeAppStocksMixin, ExchangeAppBatchMixin,
                     or self._pending_cleanup_snapshot())
 
     def _append_account_row(self, key, secret, addr, net, selected=True):
+        self.accounts_revision = getattr(self, "accounts_revision", 0) + 1
         if any(a["api_key"] == key for a in self.accounts):
             raise ValueError("账号 API Key 重复")
         ident = account_id(key)
@@ -301,23 +306,27 @@ class HeadlessExchange(ExchangeAppStocksMixin, ExchangeAppBatchMixin,
         # All validation precedes any mutation.
         from core_models import AccountEntry
         old_entries = self.account_store.accounts
-        self.account_store.accounts = [AccountEntry(key, secret, addr, net)
-                                      for key, secret, addr, net, _, _ in normalized]
+        old_accounts, old_meta = self.accounts, self.account_meta
+        from config_transaction import update_group
         try:
-            self.account_store.save()
+            with update_group(self.config_update_file, [self.account_store.file_path, self.settings_file]):
+                self.account_store.accounts = [AccountEntry(key, secret, addr, net)
+                                              for key, secret, addr, net, _, _ in normalized]
+                self.account_store.save()
+                self.accounts = []
+                self.account_meta = {}
+                for key, secret, addr, net, selected, topup in normalized:
+                    a = self._append_account_row(key, secret, addr, net, selected)
+                    a["bnb_topup_var"].set(topup)
+                    old = previous.get(a["id"])
+                    if old and (old["api_secret"], old["address"], self._account_network_value(old)) == (secret, addr, net):
+                        a["status_var"].set(old["status_var"].get())
+                    self.account_meta[a["id"]] = dict(selected=selected, bnb_topup=topup)
+                self.save_settings()
         except Exception:
             self.account_store.accounts = old_entries
+            self.accounts, self.account_meta = old_accounts, old_meta
             raise
-        self.accounts = []
-        self.account_meta = {}
-        for key, secret, addr, net, selected, topup in normalized:
-            a = self._append_account_row(key, secret, addr, net, selected)
-            a["bnb_topup_var"].set(topup)
-            old = previous.get(a["id"])
-            if old and (old["api_secret"], old["address"], self._account_network_value(old)) == (secret, addr, net):
-                a["status_var"].set(old["status_var"].get())
-            self.account_meta[a["id"]] = dict(selected=selected, bnb_topup=topup)
-        self.save_settings()
 
     def selected_accounts(self, identifiers=None):
         if identifiers is None:
@@ -346,7 +355,7 @@ class HeadlessExchange(ExchangeAppStocksMixin, ExchangeAppBatchMixin,
         elif action == "query_assets":
             self.run_selected_accounts(accounts, batch_total_asset_only=True, require_confirm=False)
         elif action == "query_volume":
-            self.run_query_monthly_trade_volume(accounts)
+            self.run_query_monthly_trade_volume(accounts, query_options=options)
         elif action == "collect_bnb":
             self.run_selected_accounts(accounts, batch_collect_bnb_mode=True, require_confirm=False)
         elif action == "withdraw":

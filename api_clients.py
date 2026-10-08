@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from contextlib import contextmanager
 import importlib
 import json
 import logging
@@ -35,6 +36,7 @@ class SubmittedTransaction:
     acknowledged: bool = True
     recovered: bool = False
     recovery_reason: str = ""
+    nonce: int | None = None
 
 
 class EvmClient:
@@ -97,8 +99,11 @@ class EvmClient:
         *,
         allow_system_proxy: bool = True,
         allow_system_proxy_provider: Callable[[], bool] | None = None,
+        operation_journal=None,
     ):
         self._proxy_provider = proxy_provider
+        self.operation_journal = operation_journal
+        self._transaction_context = threading.local()
         self._allow_system_proxy = bool(allow_system_proxy)
         self._allow_system_proxy_provider = allow_system_proxy_provider
         self._rpc_session_local = threading.local()
@@ -111,6 +116,15 @@ class EvmClient:
         self._receipt_rpc_cooldowns: dict[tuple[str, str], float] = {}
         self._gas_price_locks = {network: threading.Lock() for network in self.NETWORKS}
         self._gas_price_cache: dict[str, tuple[float, int]] = {}
+
+    @contextmanager
+    def transaction_context(self, **metadata):
+        previous = getattr(self._transaction_context, "metadata", {})
+        self._transaction_context.metadata = metadata
+        try:
+            yield
+        finally:
+            self._transaction_context.metadata = previous
 
     def _allow_system_proxy_now(self) -> bool:
         if self._allow_system_proxy_provider is None:
@@ -727,6 +741,16 @@ class EvmClient:
             return None
         if not isinstance(result, dict):
             raise RuntimeError(f"交易回执格式异常：{result}")
+        if str(result.get("transactionHash", "")).lower() != txid.lower():
+            raise RuntimeError("交易回执哈希与原交易不符")
+        if str(result.get("status", "")) not in {"0x0", "0x1", "0", "1"}:
+            raise RuntimeError("交易回执缺少有效执行状态")
+        journal = getattr(self, "operation_journal", None)
+        if journal is not None and str(result.get("status", "")) in {"0x0", "0x1", "0", "1"}:
+            status = int(str(result["status"]), 0)
+            for entry in journal.active_entries(kind="onchain-transfer"):
+                if entry["payload"].get("network") == network.upper() and str(entry["payload"].get("tx_hash", "")).lower() == txid.lower():
+                    journal.update(entry["id"], "completed" if status else "failed")
         return dict(result)
 
     @classmethod
@@ -862,22 +886,26 @@ class EvmClient:
         except Exception as exc:
             raise RuntimeError(f"{error_prefix}结果解析失败：{exc}") from exc
 
-    def get_transaction_by_hash(self, network: str, tx_hash: str) -> dict | None:
+    def get_transaction_by_hash(self, network: str, tx_hash: str, *, timeout_seconds=8, stop_event=None) -> dict | None:
         txid = self._ensure_hex_prefixed(str(tx_hash or "").strip())
         if not re.fullmatch(r"0x[a-fA-F0-9]{64}", txid):
             raise RuntimeError(f"交易哈希格式错误：{tx_hash}")
-        result = self._rpc_call(network, "eth_getTransactionByHash", [txid])
+        result = self._rpc_call(network, "eth_getTransactionByHash", [txid], try_next_on_null_result=True,
+                                timeout_seconds=timeout_seconds, stop_event=stop_event)
         if result is None:
             return None
         if not isinstance(result, dict):
             raise RuntimeError(f"交易详情格式异常：{result}")
+        if str(result.get("hash", "")).lower() != txid.lower():
+            raise RuntimeError("交易详情哈希与原交易不符")
         return dict(result)
 
     def send_raw_transaction(self, network: str, raw_transaction_hex: str) -> str:
         raw = self._ensure_hex_prefixed(str(raw_transaction_hex or "").strip())
         if not re.fullmatch(r"0x[a-fA-F0-9]+", raw):
             raise RuntimeError("原始交易格式错误")
-        tx_hash = self._rpc_call(network, "eth_sendRawTransaction", [raw])
+        stop = getattr(getattr(self, "_transaction_context", None), "metadata", {}).get("stop_event")
+        tx_hash = self._rpc_call(network, "eth_sendRawTransaction", [raw], timeout_seconds=30, stop_event=stop)
         return self._ensure_hex_prefixed(str(tx_hash or "").strip())
 
     def submit_prepared_transaction(
@@ -889,18 +917,8 @@ class EvmClient:
         nonce: int | None = None,
         recovery_timeout_seconds: float = 8.0,
     ) -> SubmittedTransaction:
-        expected_tx_hash = self._ensure_hex_prefixed(str(prepared.tx_hash or "").strip())
-        try:
-            returned_tx_hash = self.send_raw_transaction(network, prepared.raw_transaction)
-            normalized_returned = self._ensure_hex_prefixed(str(returned_tx_hash or "").strip())
-            return SubmittedTransaction(
-                tx_hash=normalized_returned or expected_tx_hash,
-                acknowledged=True,
-                recovered=False,
-                recovery_reason="rpc-ack",
-            )
-        except Exception as exc:
-            raise RuntimeError(str(exc)) from exc
+        from onchain_transaction_recovery import submit
+        return submit(self, network, prepared, source_address, nonce, recovery_timeout_seconds)
 
     def _build_native_transfer_tx(
         self,

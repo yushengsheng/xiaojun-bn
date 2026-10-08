@@ -237,6 +237,7 @@ class ExchangeAppBase(tk.Tk):
         self._sync_exchange_proxy_state()
         start_ui_bridge(self, root=self)
         self._load_strategy_config()
+        self._load_trade_volume_query_settings()
         self._load_auto_ladder_settings()
         self._load_exchange_proxy_config()
         self._load_accounts()
@@ -615,7 +616,7 @@ class ExchangeAppBase(tk.Tk):
         self.account_row_menu.add_command(label="复制提现地址", command=self.copy_context_account_withdraw_address)
         self.account_row_menu.add_separator()
         self.account_row_menu.add_command(label="查询", command=self.run_context_account_query)
-        self.account_row_menu.add_command(label="查询月成交额", command=self.run_context_account_monthly_trade_volume)
+        self.account_row_menu.add_command(label="查询成交额", command=self.run_context_account_monthly_trade_volume)
         self.account_row_menu.add_command(label="执行", command=self.run_context_account_execute)
         self.account_row_menu.add_command(label="停止", command=self.run_context_account_stop)
         self.account_row_menu.add_command(label="提现", command=self.run_context_account_withdraw)
@@ -674,10 +675,13 @@ class ExchangeAppBase(tk.Tk):
         self.btn_paste_accounts.pack(side="left", padx=5)
         self.btn_query_monthly_volume = ttk.Button(
             frame_batch_ctrl,
-            text="查询月成交额",
+            text="查询成交额",
             command=self.run_query_monthly_trade_volume,
         )
         self.btn_query_monthly_volume.pack(side="left", padx=5)
+        self.btn_volume_settings = ttk.Button(frame_batch_ctrl, text="设置", width=5,
+                                               command=self.show_trade_volume_query_settings)
+        self.btn_volume_settings.pack(side="left", padx=(0, 5))
         ttk.Label(frame_batch_ctrl, text="绾跨▼鏁?").pack(side="left", padx=(10, 2))
         ttk.Spinbox(frame_batch_ctrl, from_=1, to=50, textvariable=self.max_threads_var, width=3).pack(side="left", padx=2)
         try:
@@ -716,6 +720,7 @@ class ExchangeAppBase(tk.Tk):
             state="disabled",
         )
         self.btn_retry_failed_accounts.pack(side="left", padx=(8, 0))
+        ttk.Button(frame_batch_opts, text="核对未确认", command=self.review_unconfirmed_operations).pack(side="left", padx=(8, 0))
         ttk.Label(frame_batch_opts, textvariable=self.exchange_batch_summary_var, foreground="#666666").pack(side="left", padx=(12, 0))
 
         frame_log = ttk.Frame(self.exchange_tab)

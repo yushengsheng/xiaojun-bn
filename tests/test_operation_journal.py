@@ -51,6 +51,10 @@ class OperationJournalTests(unittest.TestCase):
             entry_id = journal.begin("exchange-order", "account", {"order_id": "1"})
             path.unlink()
 
+            with self.assertRaisesRegex(RuntimeError, "从备份恢复"):
+                journal.active_entries(kind="exchange-order")
+            self.assertTrue(journal.recovery_snapshot()["recovery_required"])
+            journal.acknowledge_recovery("已核对全部操作")
             active = journal.active_entries(kind="exchange-order")
 
             self.assertTrue(path.exists())

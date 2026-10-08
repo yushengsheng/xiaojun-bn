@@ -30,6 +30,7 @@ from onchain_relay_runner import (
     _relay_snapshot_cleanup_allowed,
     _relay_source_stage,
     _relay_simple_stage,
+    _relay_submit_with_retry,
     _relay_terminal_snapshot_can_be_ignored,
     _relay_token_dust_below_threshold,
     _relay_token_dust_requires_native_recovery,
@@ -354,6 +355,20 @@ class OnchainRelayPipelineTests(unittest.TestCase):
         self.assertEqual(_receipt_state({"status": "1"}), "success")
         self.assertEqual(_receipt_state({"status": "0x0"}), "failed")
         self.assertEqual(_receipt_state(None), "pending")
+
+    def test_stop_during_retry_retains_original_unconfirmed_transaction(self) -> None:
+        from onchain_transaction_recovery import UnconfirmedTransactionError
+        owner, item = _FakeOwner(), _item(1)
+        original = UnconfirmedTransactionError("reply lost", "0x" + "a" * 64, 7, "intent")
+        def lost_reply():
+            owner.stop_requested.set()
+            raise original
+        submitter = Mock(side_effect=lost_reply)
+        with self.assertRaises(UnconfirmedTransactionError) as raised:
+            _relay_submit_with_retry(owner, _params(), item, "source transfer", submitter)
+        self.assertIs(raised.exception, original)
+        self.assertEqual(raised.exception.nonce, 7)
+        submitter.assert_called_once()
 
     def test_relay_amount_branch_uses_started_mode_even_after_ui_mode_changes(self) -> None:
         owner = _FakeOwner(mode_m1=True)
@@ -1336,6 +1351,24 @@ class OnchainRelayPipelineTests(unittest.TestCase):
         self.assertEqual(submissions, [1, 2, 3, 4])
         self.assertEqual(events[:4], ["submit-1", "submit-2", "submit-3", "submit-4"])
         self.assertEqual(events.count("receipt"), 4)
+
+    def test_unknown_source_submission_keeps_original_hash_and_nonce(self) -> None:
+        from onchain_transaction_recovery import UnconfirmedTransactionError
+        for own in (True, False):
+            with self.subTest(own_transaction=own):
+                owner = _FakeOwner()
+                item = _item(10 if own else 11)
+                txid = "0x" + "a" * 64
+                def submit(*_args):
+                    raise UnconfirmedTransactionError("reply lost", txid, 7, own_transaction=own)
+                _relay_source_stage(owner, _params(delay=0), [item], stage_label="测试",
+                                    tx_attr="token_funded_txid", nonce_attr="token_funded_nonce",
+                                    submitted_status="token_funding_submitted", done_status="token_funded",
+                                    done_statuses={"token_funded"}, submit_one=submit, status_text="测试")
+                self.assertTrue(item.failed)
+                self.assertEqual(item.relay_record.token_funded_txid, txid if own else "")
+                if own:
+                    self.assertEqual(item.relay_record.token_funded_nonce, "7")
 
     def test_prepare_items_does_not_perform_rpc_work(self) -> None:
         owner = _FakeOwner(mode_1m=True)

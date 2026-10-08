@@ -85,9 +85,12 @@ def _safe_write_backup_text(path: Path, content: str, encoding: str = "utf-8") -
         pass
 
 
-def _atomic_write_text_with_backup(path: Path, content: str, encoding: str = "utf-8") -> None:
+def _atomic_write_text_with_backup(path: Path, content: str, encoding: str = "utf-8", *, strict_backup: bool = False) -> None:
     _atomic_write_text(path, content, encoding=encoding)
-    _safe_write_backup_text(path, content, encoding=encoding)
+    if strict_backup:
+        _atomic_write_text(_config_backup_path(path), content, encoding=encoding)
+    else:
+        _safe_write_backup_text(path, content, encoding=encoding)
 
 
 def _atomic_write_json_with_backup(
@@ -97,11 +100,12 @@ def _atomic_write_json_with_backup(
     *,
     secret_box=None,
     config_context: str = "",
+    strict_backup: bool = False,
 ) -> None:
     data = payload
     if secret_box is not None:
         data = seal_config_payload(payload, secret_box=secret_box, context=config_context)
-    _atomic_write_text_with_backup(path, json.dumps(data, ensure_ascii=False, indent=2), encoding=encoding)
+    _atomic_write_text_with_backup(path, json.dumps(data, ensure_ascii=False, indent=2), encoding=encoding, strict_backup=strict_backup)
 
 
 def _load_json_with_backup(
@@ -112,6 +116,7 @@ def _load_json_with_backup(
     secret_box=None,
     config_context: str = "",
     migrate_legacy: bool = False,
+    recovery_marker_key: str = "",
 ) -> tuple[object, bool]:
     backup_path = _config_backup_path(path)
     candidates: list[tuple[Path, bool]] = []
@@ -135,6 +140,9 @@ def _load_json_with_backup(
             if validator is not None:
                 validator(payload)
             if is_backup:
+                if recovery_marker_key:
+                    payload = dict(payload)
+                    payload[recovery_marker_key] = True
                 if secret_box is not None:
                     _atomic_write_json_with_backup(
                         path,
@@ -145,7 +153,7 @@ def _load_json_with_backup(
                     )
                 else:
                     try:
-                        _atomic_write_text(path, text, encoding=encoding)
+                        _atomic_write_text(path, json.dumps(payload, ensure_ascii=False) if recovery_marker_key else text, encoding=encoding)
                     except Exception:
                         pass
             elif not backup_path.exists():
@@ -174,13 +182,14 @@ def _load_json_with_backup(
     raise RuntimeError("配置文件读取失败；" + "；".join(errors))
 
 
-def _save_authenticated_config(path: Path, payload: object, encoding: str = "utf-8") -> None:
+def _save_authenticated_config(path: Path, payload: object, encoding: str = "utf-8", *, strict_backup=False) -> None:
     _atomic_write_json_with_backup(
         path,
         payload,
         encoding=encoding,
         secret_box=SECRET_BOX,
         config_context=secure_config_context(path),
+        strict_backup=strict_backup,
     )
 
 

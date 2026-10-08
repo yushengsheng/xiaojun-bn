@@ -131,8 +131,9 @@ class RelayWalletRecord:
 
 
 class RelayWalletFileStore:
-    def __init__(self, file_path: Path | None = None):
+    def __init__(self, file_path: Path | None = None, *, operation_journal=None):
         self.file_path = Path(file_path or RELAY_WALLET_FILE)
+        self.operation_journal = operation_journal
         self._lock = threading.RLock()
         self._records_cache: list[RelayWalletRecord] | None = None
         self._cache_signature: tuple[int, int] | None = None
@@ -165,7 +166,9 @@ class RelayWalletFileStore:
                 candidate_text = candidate.read_text(encoding="utf-8")
                 records = self._parse_records_text(candidate_text)
                 if candidate == backup_path:
-                    _atomic_write_text_with_backup(self.file_path, candidate_text, encoding="utf-8")
+                    if self.operation_journal is not None:
+                        self.operation_journal.require_recovery("中转钱包文件从备份恢复，须核对中转地址及链上交易")
+                    _atomic_write_text_with_backup(self.file_path, candidate_text, encoding="utf-8", strict_backup=True)
                 self._records_cache = list(records)
                 self._cache_signature = self._file_signature(self.file_path)
                 self._dirty = False
@@ -252,7 +255,7 @@ class RelayWalletFileStore:
             context=secure_config_context(self.file_path),
         )
         content = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
-        _atomic_write_text_with_backup(self.file_path, content, encoding="utf-8")
+        _atomic_write_text_with_backup(self.file_path, content, encoding="utf-8", strict_backup=True)
         self._records_cache = list(records)
         self._cache_signature = self._file_signature(self.file_path)
         self._dirty = False

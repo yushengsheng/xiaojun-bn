@@ -13,9 +13,10 @@ from .ipc import call, RemoteError, MAX_MESSAGE
 MAX_BODY = 2 * 1024 * 1024
 
 STATIC = Path(__file__).with_name("static")
-MUTATIONS = {"command", "settings", "accounts", "import_accounts", "selection", "proxy_test",
+MUTATIONS = {"command", "settings", "volume_settings", "accounts", "import_accounts", "selection", "proxy_test",
              "export_accounts", "destroy_accounts", "asset_export", "lock", "change_password",
              "logout", "emergency_stop", "account_key", "search_accounts"}
+MUTATIONS.update({"operation_review", "operation_resolve"})
 
 
 def create_app(*, origin=None, rpc=call):

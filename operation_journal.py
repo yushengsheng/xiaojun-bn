@@ -26,13 +26,16 @@ class OperationJournal:
 
     VERSION = 1
     HISTORY_ENTRY_LIMIT = 500
+    _path_locks: dict[str, threading.RLock] = {}
+    _path_locks_guard = threading.Lock()
 
     def __init__(self, file_path: Path, *, secret_box=None):
         self.file_path = Path(file_path)
         self.secret_box = secret_box or SECRET_BOX
-        self._lock = threading.RLock()
+        with self._path_locks_guard:
+            self._lock = self._path_locks.setdefault(str(self.file_path.resolve()), threading.RLock())
 
-    def _load_locked(self) -> dict[str, object]:
+    def _load_locked(self, *, allow_recovery: bool = False) -> dict[str, object]:
         if not config_or_backup_exists(self.file_path):
             return {"version": self.VERSION, "entries": []}
         raw, _recovered = _load_json_with_backup(
@@ -41,8 +44,29 @@ class OperationJournal:
             secret_box=self.secret_box,
             config_context=secure_config_context(self.file_path),
             migrate_legacy=True,
+            recovery_marker_key="recovery_required",
         )
+        if raw.get("recovery_required") and not allow_recovery:
+            raise RuntimeError("操作账本已从备份恢复，须核对交易所及链上记录后解除恢复保护；禁止直接重试资金操作")
         return dict(raw)
+
+    def recovery_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return self._load_locked(allow_recovery=True)
+
+    def acknowledge_recovery(self, confirmation: str) -> None:
+        if confirmation != "已核对全部操作":
+            raise ValueError("须确认已核对全部操作")
+        with self._lock:
+            data = self._load_locked(allow_recovery=True)
+            data.update(recovery_required=False, recovery_reviewed_at=_utc_now())
+            self._save_locked(data)
+
+    def require_recovery(self, reason: str) -> None:
+        with self._lock:
+            data = self._load_locked(allow_recovery=True)
+            data.update(recovery_required=True, recovery_reason=str(reason))
+            self._save_locked(data)
 
     def _save_locked(self, payload: dict[str, object]) -> None:
         _atomic_write_json_with_backup(
@@ -50,6 +74,7 @@ class OperationJournal:
             payload,
             secret_box=self.secret_box,
             config_context=secure_config_context(self.file_path),
+            strict_backup=True,
         )
 
     @staticmethod
@@ -180,6 +205,7 @@ class OperationJournal:
         *,
         fingerprint: str,
         task_keys: list[str],
+        allow_subset: bool = False,
     ) -> tuple[str, bool]:
         """Return a compatible unfinished batch, or create a new batch.
 
@@ -207,7 +233,8 @@ class OperationJournal:
                 payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
                 if str(payload.get("fingerprint") or "") != clean_fingerprint:
                     continue
-                if list(payload.get("task_keys") or []) != clean_task_keys:
+                saved_keys = list(payload.get("task_keys") or [])
+                if saved_keys != clean_task_keys and not (allow_subset and set(clean_task_keys) <= set(saved_keys)):
                     continue
                 return str(raw.get("id") or ""), True
 
@@ -251,8 +278,16 @@ class OperationJournal:
                 result[task_key] = dict(raw)
         return result
 
-    def finish_batch(self, batch_id: str, *, success: int, failed: int, interrupted: bool = False) -> None:
+    def finish_batch(self, batch_id: str, *, success: int, failed: int, interrupted: bool = False, task_kind: str = "") -> None:
         """Persist a resumable terminal/partial result for an operation batch."""
+        if task_kind:
+            with self._lock:
+                data = self._load_locked()
+            header = next((e for e in data["entries"] if e.get("id") == batch_id), {})
+            keys = header.get("payload", {}).get("task_keys", [])
+            states = self.batch_task_states(batch_id, kind=task_kind)
+            success = sum(states.get(k, {}).get("state") == "completed" for k in keys)
+            failed = len(keys) - success
         if interrupted:
             state = "interrupted"
         elif failed > 0:

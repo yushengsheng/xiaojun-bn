@@ -6,6 +6,7 @@ import http.cookiejar
 import json
 import os
 import secrets
+from datetime import datetime
 import socket
 import ssl
 import subprocess
@@ -17,6 +18,32 @@ import urllib.request
 
 def run(*args):
     return subprocess.check_output(args, text=True).strip()
+
+
+def check_log_retention(root):
+    # Exercise the installed policy on disposable paths. Repeated hourly checks
+    # must not truncate a large log written today or disturb trading services.
+    directory = root / 'log-retention'; directory.mkdir()
+    unit = run('systemctl', 'cat', 'xiaojun-exchange-logrotate.service')
+    assert 'ExecStart=/usr/sbin/logrotate /etc/logrotate.d/xiaojun-exchange' in unit
+    assert '--state' not in unit, 'System and project schedulers must share the default rotation state'
+    log, cert_log = directory / 'error.log', directory / 'cert.log'
+    policy = Path('/etc/logrotate.d/xiaojun-exchange').read_text()
+    policy = policy.replace('/var/log/xiaojun-exchange-nginx/error.log', str(log))
+    policy = policy.replace('/var/log/xiaojun-exchange-acme/*.log', str(cert_log))
+    config, state = directory / 'config', directory / 'state'
+    config.write_text(policy)
+    today = datetime.now().strftime('%Y-%m-%d')
+    state.write_text(f'logrotate state -- version 2\n"{log}" {today}-0:0:0\n')
+    with log.open('wb') as target:
+        target.write(b'first recent diagnostic\n')
+        target.truncate(6 * 1024 * 1024)
+    for index in range(2):
+        with log.open('ab') as target:
+            target.write(f'recent check {index}\n'.encode())
+        run('/usr/sbin/logrotate', '--state', str(state), str(config))
+    content = log.read_bytes()
+    assert b'first recent diagnostic' in content and b'recent check 0' in content and b'recent check 1' in content
 
 
 def main():
@@ -87,6 +114,7 @@ def main():
         for unit in ('worker.service','web.service','nginx.service','maintenance.timer','logrotate.timer'):
             assert run('systemctl','is-active',f'xiaojun-exchange-{unit}') == 'active'
         run('systemctl','start','xiaojun-exchange-maintenance.service','xiaojun-exchange-logrotate.service')
+        check_log_retention(root)
         assert run('systemctl','show','xiaojun-exchange-worker.service','--property=NRestarts','--value') == '0'
         assert data.stat().st_mode & 0o777 == 0o700
         assert Path('/run/xiaojun-exchange/worker.sock').stat().st_mode & 0o777 == 0o600

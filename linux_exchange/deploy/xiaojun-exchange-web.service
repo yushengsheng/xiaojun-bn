@@ -12,7 +12,8 @@ Group=xiaojun-exchange
 WorkingDirectory=/opt/xiaojun-exchange/current
 EnvironmentFile=/etc/xiaojun-exchange/server.env
 Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-ExecStart=/opt/xiaojun-exchange/venv/bin/python -m uvicorn linux_exchange.web:app_factory --factory --host 127.0.0.1 --port 18880 --workers 1 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1 --limit-concurrency 48 --timeout-keep-alive 10
+ExecStart=/opt/xiaojun-exchange/venv/bin/python -m uvicorn linux_exchange.web:app_factory --factory --host 127.0.0.1 --port 18880 --workers 1 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1 --limit-concurrency 48 --timeout-keep-alive 10 --timeout-graceful-shutdown 10
+TimeoutStopSec=20
 Restart=on-failure
 RestartSec=5
 UMask=0077

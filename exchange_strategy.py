@@ -74,25 +74,45 @@ def _normalize_futures_margin_type(value) -> str:
 
 
 class MarketStaggerCoordinator:
-    """Keep market-order worker lanes in two strictly alternating phase groups."""
+    """Keep live market-order lanes balanced in two alternating phase groups."""
 
     def __init__(self, lane_ids):
         self._condition = threading.Condition()
         self._known_lanes = {max(1, int(lane_id)) for lane_id in lane_ids}
         self._active_lanes = set(self._known_lanes)
+        self._odd_group = {lane: lane % 2 == 1 for lane in self._known_lanes}
+        self._next_side = {lane: "BUY" for lane in self._known_lanes}
+        self._deferred_phase: dict[int, int] = {}
         self._phase = 0
         self._phase_open = False
         self._phase_tokens: dict[int, dict[str, object]] = {}
         self._pending: dict[int, dict[str, object]] = {}
 
-    @staticmethod
-    def _side_for_phase(lane_id: int, phase: int) -> str | None:
-        odd_lane = int(lane_id) % 2 == 1
+    def _side_for_phase(self, lane_id: int, phase: int) -> str | None:
+        odd_lane = self._odd_group[lane_id]
         if phase == 0:
             return "BUY" if odd_lane else None
         if phase % 2 == 1:
             return "SELL" if odd_lane else "BUY"
         return "BUY" if odd_lane else "SELL"
+
+    def _rebalance_lanes_locked(self) -> None:
+        groups = {
+            group: sorted(lane for lane in self._active_lanes if self._odd_group[lane] == group)
+            for group in (True, False)
+        }
+        majority = len(groups[True]) > len(groups[False])
+        moves = abs(len(groups[True]) - len(groups[False])) // 2
+        for lane in reversed(groups[majority]):
+            if not moves:
+                break
+            # Never skip a sell or change an order already released. Holding a
+            # fresh buy for one phase safely puts this lane in the other group.
+            if self._next_side[lane] != "BUY" or self._side_for_phase(lane, self._phase) != "BUY":
+                continue
+            self._odd_group[lane] = not majority
+            self._deferred_phase[lane] = self._phase
+            moves -= 1
 
     def _expected_lanes_locked(self) -> dict[int, str]:
         while self._known_lanes:
@@ -103,9 +123,11 @@ class MarketStaggerCoordinator:
                     and self._side_for_phase(lane_id, self._phase) == token["side"]
                 ):
                     self._active_lanes.add(lane_id)
+            self._rebalance_lanes_locked()
             expected = {
                 lane_id: side
                 for lane_id in self._active_lanes
+                if self._deferred_phase.get(lane_id) != self._phase
                 if (side := self._side_for_phase(lane_id, self._phase)) is not None
             }
             if expected:
@@ -153,6 +175,7 @@ class MarketStaggerCoordinator:
 
     def _suspend_locked(self, lane: int) -> None:
         self._active_lanes.discard(lane)
+        self._deferred_phase.pop(lane, None)
         pending = self._pending.pop(lane, None)
         if pending is not None:
             pending["cancelled"] = True
@@ -198,6 +221,7 @@ class MarketStaggerCoordinator:
             else:
                 if lane in self._pending:
                     raise RuntimeError(f"市价交错线程 {lane} 存在未完成动作")
+                self._next_side[lane] = side_u
                 self._pending[lane] = token
                 self._try_open_phase_locked()
             while not bypass_coordination and not bool(token["released"]):
@@ -219,6 +243,7 @@ class MarketStaggerCoordinator:
             action_error = exc
         finally:
             with self._condition:
+                self._next_side[lane] = "SELL" if side_u == "BUY" else "BUY"
                 token["finished"] = True
                 self._try_finish_phase_locked()
                 while not bool(token["phase_done"]):
@@ -482,6 +507,8 @@ class Strategy:
                         base_asset, _quote_asset = self._spot_pair_assets()
                         self._ladder_sell_all_base_and_confirm(base_asset, reason="停止现货任务后")
             self.cleanup_confirmed = True
+            if isinstance(self.c, BinanceClient):
+                self.c._order_recovery_requires_cleanup = False
             self.ladder_cleanup_confirmed = True
             if self.trade_error_stage == "停止清理":
                 self.trade_error = ""
@@ -506,9 +533,9 @@ class Strategy:
         return self.cleanup_confirmed
 
     def _has_timed_out_submissions(self) -> bool:
-        return isinstance(self.c, BinanceClient) and any(
+        return isinstance(self.c, BinanceClient) and (getattr(self.c, "_order_recovery_requires_cleanup", False) or any(
             payload.get("confirmation_timed_out") for payload in self.c.pending_order_requests()
-        )
+        ))
 
     def _wait_for_completion_cleanup(self, stop_event, progress_cb=None) -> bool:
         """Keep the original task and withdrawal step until cleanup succeeds or stops."""
@@ -3460,6 +3487,8 @@ class Strategy:
                     self.c._continuous_trading = False
                 if (stop_event and stop_event.is_set()) or self._has_timed_out_submissions():
                     self._cleanup_after_stop()
+                    if self.cleanup_confirmed and isinstance(self.c, BinanceClient):
+                        self.c._order_recovery_requires_cleanup = False
                 elif self._active_spot_orders or (isinstance(self.c, BinanceClient) and self.c.pending_order_requests()):
                     self.cleanup_error = "任务结束后仍有未确认订单，需完成清理"
                     if callable(self.cleanup_callback):

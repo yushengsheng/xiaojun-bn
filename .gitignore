@@ -4,6 +4,7 @@ __pycache__/
 .venv-linux-tools/
 .live-source-baseline.json
 .linux-tests/
+临时登录信息.txt
 .regression-proxy-*/
 *.pyc
 *.pyo

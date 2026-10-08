@@ -146,11 +146,44 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 batch_controls = list(app.btn_paste_accounts.master.pack_slaves())
                 paste_index = batch_controls.index(app.btn_paste_accounts)
                 monthly_volume_index = batch_controls.index(app.btn_query_monthly_volume)
-                if str(app.btn_query_monthly_volume.cget("text")) != "查询月成交额":
+                if str(app.btn_query_monthly_volume.cget("text")) != "查询成交额":
                     raise RuntimeError("GUI 自检失败：月成交额查询按钮缺失")
                 if monthly_volume_index != paste_index + 1:
                     raise RuntimeError("GUI 自检失败：月成交额查询按钮未紧随粘贴导入")
                 checks.append("exchange-monthly-volume-control-gui=ok")
+                if batch_controls.index(app.btn_volume_settings) != monthly_volume_index + 1:
+                    raise RuntimeError("GUI 自检失败：成交额设置按钮未紧随查询按钮")
+                volume_errors = []
+
+                def exercise_volume_settings():
+                    dialog = next(w for w in app.winfo_children()
+                                  if w.winfo_class() == "Toplevel" and w.title() == "成交额查询设置")
+                    try:
+                        body = dialog.winfo_children()[0]
+                        entries = [w for w in body.winfo_children() if w.winfo_class() == "TEntry"]
+                        entries[1].insert(0, "20260902")
+                        if entries[1].get() != "2026-09-02":
+                            raise RuntimeError("纯数字日期未自动插入间隔符")
+                        entries[1].delete(0, "end")
+                        entries[1].insert(0, "2026-9-2")
+                        entries[1].event_generate("<FocusOut>")
+                        if entries[1].get() != "2026-09-02":
+                            raise RuntimeError("月日未自动补零")
+                        actions = next(w for w in body.winfo_children() if w.winfo_class() == "TFrame")
+                        next(w for w in actions.winfo_children() if str(w.cget("text")) == "保存").invoke()
+                    except Exception as exc:
+                        volume_errors.append(str(exc))
+                    finally:
+                        if dialog.winfo_exists():
+                            dialog.destroy()
+
+                app.after(50, exercise_volume_settings)
+                app.show_trade_volume_query_settings()
+                app._load_trade_volume_query_settings()
+                if volume_errors or app.trade_volume_query_dates != {"start_date": "", "end_date": "2026-09-02"}:
+                    raise RuntimeError("GUI 自检失败：成交额条件保存或重载异常 " + str(volume_errors))
+                app.save_trade_volume_query_settings("", "")
+                checks.append("exchange-volume-settings-memory-gui=ok")
                 context_menu_labels = [
                     str(app.account_row_menu.entrycget(index, "label") or "")
                     for index in range(int(app.account_row_menu.index("end") or 0) + 1)
@@ -158,7 +191,7 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                 ]
                 if "自动申购" not in context_menu_labels:
                     raise RuntimeError("GUI 自检失败：账号右键自动申购菜单缺失")
-                if "查询月成交额" not in context_menu_labels:
+                if "查询成交额" not in context_menu_labels:
                     raise RuntimeError("GUI 自检失败：账号右键月成交额查询菜单缺失")
                 header_children = list(app.btn_clear_account_search.master.pack_slaves())
                 if header_children.index(app.btn_destroy_all_accounts) != header_children.index(app.btn_clear_account_search) + 1:

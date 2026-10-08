@@ -35,6 +35,12 @@ class LogAmountHighlightTests(unittest.TestCase):
         text = "账号 #8 serverTime=1710000000000，delay=3，threads=2，确认 0 笔失败"
         self.assertEqual(self._highlighted_values(text), [])
 
+    def test_highlights_trade_results_and_fee_stop_values(self) -> None:
+        text = "✔市价59轮结束｜交易量≈67087.24099 USDT｜买卖收支差≈+0.17009 USDT"
+        self.assertEqual(self._highlighted_values(text), ["67087.24099", "+0.17009"])
+        text = "闪兑完成：支出=50 到账=0.06414189，停止值=0.0005 BNB"
+        self.assertEqual(self._highlighted_values(text), ["50", "0.06414189", "0.0005"])
+
 
 class TextViewStateTests(unittest.TestCase):
     def test_shift_text_view_state_after_trim(self) -> None:

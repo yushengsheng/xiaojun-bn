@@ -2,7 +2,7 @@
 const autoFields=[["volume_minutes", "成交额窗口（分钟）"], ["start_volume", "开始挂单成交额（计价币）"], ["recent_minutes", "近期有成交窗口（分钟）"], ["entry_confirm_seconds", "入场连续确认（秒）"], ["no_trade_seconds", "无成交暂停（秒）"], ["price_minutes", "入场价格窗口（分钟）"], ["price_ticks", "入场最大振幅（tick）"], ["pause_price_ticks", "运行中价格暂停幅度（tick）"], ["dry_minutes", "缩量观察窗口（分钟）"], ["dry_volume", "缩量暂停成交额（计价币）"], ["dry_confirm_minutes", "缩量连续确认（分钟）"], ["turn_seconds", "反向折返窗口（秒）"], ["turn_ticks", "最小反向幅度（tick）"], ["turn_count", "暂停折返次数"], ["stable_seconds", "恢复平稳时长（秒）"]];
 const autoHelp={"volume_minutes": "入场看当前正在走的 1 分钟，加上前面已收盘的分钟，合计这么多分钟的成交额。例：填 5，就是当前分钟已发生的成交额＋前 4 个完整分钟；不必等当前分钟收盘。", "start_volume": "只有上述时间段的总成交额达到这个数，才允许首次入场或暂停后恢复。单位是交易对右边的计价币；例如 BTCUSDT 填 100000，就是至少成交 10 万 USDT。", "recent_minutes": "最近这几分钟里至少要有一笔成交，包含当前正在走的分钟。填 1 就要求当前分钟已有成交；这里只检查成交额大于 0，不要求达到启动门槛。", "entry_confirm_seconds": "首次入场前，成交额、价格、盘口与最近成交都必须连续达标这么久，才开始挂单。有一项不达标就重新计时；短暂获取失败会先重试，重试期间暂停计时。填 0 可关闭首次入场等待；暂停后恢复仍由“恢复平稳时长”控制。", "no_trade_seconds": "交易所公布的最近一笔成交距现在达到这么久，就暂时观察并尝试撤销挂单，不等几分钟的缩量窗口。再次出现成交后，还要满足其他条件才能入场或恢复。", "price_minutes": "入场看当前正在走的分钟和前面的完整分钟，取这段时间的最高价减最低价，与“入场最大振幅”比较。填 5 就是当前分钟＋前 4 分钟。", "price_ticks": "入场时允许的价格上下波动上限。tick 是该交易对最小的报价变化单位；如 1 tick=0.001，填 5 就是最近价格最高与最低最多相差 0.005。数值越小越难入场。", "pause_price_ticks": "运行中用这条较宽的线防突发价格风险：最近价格振幅、当前买卖价差，或实时盘口偏离近期价格区间超过这个幅度时，暂停新挂单并尝试撤单。价格重新稳定后仍需满足成交额、近期成交与恢复平稳时长才能再挂单。应不小于入场最大振幅。", "dry_minutes": "运行中用最近这些已经收盘的完整分钟的总成交额判断是否缩量，避免刚进入新分钟时因当前分钟成交尚少而误判。", "dry_volume": "滚动窗口的总成交额低于此值，算一次“缩量”。低于启动门槛但还没低于这里时，已启动的挂单不会仅因成交额下降而暂停。单位同样是计价币。", "dry_confirm_minutes": "需要连续多少次、每次相隔 1 分钟的缩量窗口都低于门槛，才暂停挂单。例：观察 5 分钟、确认 2 分钟，要连续两个重叠的 5 分钟窗口都缩量。", "turn_seconds": "观察最近多少秒的盘口中间价；中间价是买一价与卖一价的平均值。用于识别短时间来回折返。", "turn_ticks": "价格先朝一个方向走，再反向走至少多少 tick，才记作一次折返。小于这个幅度的抖动不计数；单向上涨或下跌也不算折返。", "turn_count": "在上述秒数内，折返次数达到此值就暂停，并尝试撤销当前挂单。数值越小越容易因来回波动暂停。", "stable_seconds": "暂停后，成交额和价格条件持续达标、且没有达到折返次数，保持这么久才重新挂单。短暂行情读取失败会冻结计时，恢复后接着算；连续失联达到 30 秒或条件不达标才重新计时。首次入场由“入场连续确认”控制。"};
 const $=id=>document.getElementById(id);
-const tasks={run:'批量执行',query_assets:'查询全部总资产',query_volume:'查询月成交额',collect_bnb:'归集BNB并提现',withdraw:'批量提现',redeem_earn:'批量赎回理财',earn_auto_subscribe:'自动申购',retry_failed:'失败重试'};
+const tasks={run:'批量执行',query_assets:'查询全部总资产',query_volume:'查询成交额',collect_bnb:'归集BNB并提现',withdraw:'批量提现',redeem_earn:'批量赎回理财',earn_auto_subscribe:'自动申购',retry_failed:'失败重试'};
 let csrf='',schema=[],state=null,events=null,settingsDirty=false,initialized=false,seq=0,boot='',logs=[];
 let highlighted='',contextId='',currentId='',singleReady=false,lastSearch='',lastSummary='',pendingTask=null;
 let layoutKey='';
@@ -109,7 +109,7 @@ function render(current){
  if(!$('auto-dialog').open)for(const [name] of autoFields)$('auto-'+name).value=current.auto_ladder[name];
  layoutSettings();
  for(const b of document.querySelectorAll('[data-action]'))b.disabled=current.busy||(b.dataset.action==='retry_failed'&&!current.can_retry);
- for(const id of ['lock','change-password','destroy-accounts','add-account','import-file','paste-accounts','delete-selected','edit-highlighted','single-run','single-query','single-withdraw','stock-open','use-current','topup-all'])$(id).disabled=current.busy;
+ for(const id of ['lock','change-password','destroy-accounts','add-account','import-file','paste-accounts','delete-selected','edit-highlighted','single-run','single-query','single-withdraw','stock-open','use-current','topup-all','volume-open','operation-review'])$(id).disabled=current.busy;
  renderAccounts();renderAssets();
  $('proxy-status').textContent=current.proxy_configured&&current.settings.use_exchange_config_proxy?'已启用':'未启用';
  for(const entry of current.logs){const match=entry.text.match(/连接出口 ([\d.:a-f]+)，耗时 (\d+) ms/i);if(match){$('exit-ip').textContent=match[1];$('proxy-test').textContent='延迟 '+match[2]+' ms';}}
@@ -118,24 +118,43 @@ function render(current){
  lastSummary=current.summary;
 }
 const problemPattern=/\[(WARNING|ERROR|CRITICAL)\]|失败|异常|错误|报错|Traceback|Exception|Client Error|API error|APIError/i;
-function updateLogPane(id,text){const pane=$(id),follow=pane.scrollTop+pane.clientHeight>=pane.scrollHeight-25;if(pane.textContent!==text)pane.textContent=text;if(follow)pane.scrollTop=pane.scrollHeight;}
-function renderLogs(){const query=$('log-search').value.toLowerCase(),shown=logs.filter(x=>x.text.toLowerCase().includes(query)),errors=shown.filter(x=>problemPattern.test(x.text));updateLogPane('logs',shown.map(x=>x.text).join('\n'));updateLogPane('error-logs',errors.map(x=>x.text).join('\n'));$('error-count').textContent=errors.length?'报错 / 警告 '+errors.length+' 条':'暂无报错';}
+function updateLogPane(id,entries){
+ const pane=$(id),follow=pane.scrollTop+pane.clientHeight>=pane.scrollHeight-25,text=entries.map(x=>x.text).join('\n');
+ if(pane.textContent!==text){
+  const fragment=document.createDocumentFragment();
+  entries.forEach((entry,index)=>{
+   if(index)fragment.append(document.createTextNode('\n'));
+   const chars=Array.from(entry.text);let cursor=0;
+   for(const [start,end] of entry.amount_spans||[]){
+    if(!Number.isInteger(start)||!Number.isInteger(end)||start<cursor||end<=start||end>chars.length)continue;
+    fragment.append(document.createTextNode(chars.slice(cursor,start).join('')),node('span',chars.slice(start,end).join(''),'log-amount'));cursor=end;
+   }
+   fragment.append(document.createTextNode(chars.slice(cursor).join('')));
+  });
+  pane.replaceChildren(fragment);
+ }
+ if(follow)pane.scrollTop=pane.scrollHeight;
+}
+function renderLogs(){const query=$('log-search').value.toLowerCase(),shown=logs.filter(x=>x.text.toLowerCase().includes(query)),errors=shown.filter(x=>problemPattern.test(x.text));updateLogPane('logs',shown);updateLogPane('error-logs',errors);$('error-count').textContent=errors.length?'报错 / 警告 '+errors.length+' 条':'暂无报错';}
 function preservedRows(){return state.accounts.map(a=>({...a,api_key:'',api_secret:''}));}
 async function selection(rows){await api('selection',{accounts:rows.map(a=>({id:a.id,selected:a.selected,bnb_topup:a.bnb_topup}))});await refresh();}
 function rowClass(a){if(a.active)return'running';if(/失败|错误|异常/.test(a.status))return'failed';if(/警告|暂停|停止/.test(a.status))return'warn';if(/✔|成功|完成|总资产|已赎回/.test(a.status))return'success';return'';}
 function highlight(id){highlighted=id;for(const row of $('accounts').children)row.classList.toggle('highlighted',row.dataset.id===id);}
 function renderAccounts(){
- const table=$('accounts'),previous=table.parentElement.scrollTop,signature=JSON.stringify(state.accounts);
+ const table=$('accounts'),previous=table.parentElement.scrollTop,signature=JSON.stringify([state.accounts,state.busy]);
  if(table.dataset.signature!==signature){
-  table.dataset.signature=signature;table.replaceChildren();
+  table.dataset.signature=signature;const existing=new Map([...table.children].map(row=>[row.dataset.id,row]));let position=0;
   for(const a of state.accounts){
-   const row=node('tr',undefined,rowClass(a));row.dataset.id=a.id;row.classList.toggle('highlighted',highlighted===a.id);
-   const selected=node('input');selected.type='checkbox';selected.checked=a.selected;selected.setAttribute('aria-label','勾选账号 '+a.index);selected.onclick=e=>e.stopPropagation();selected.onchange=guard(async()=>{selected.disabled=true;await selection([{...a,selected:selected.checked}]);});
+   const rowSignature=JSON.stringify([a,state.busy]),old=existing.get(a.id);existing.delete(a.id);
+   if(old&&old.dataset.signature===rowSignature){old.classList.toggle('highlighted',highlighted===a.id);if(table.children[position]!==old)table.insertBefore(old,table.children[position]||null);position++;continue;}
+   const row=node('tr',undefined,rowClass(a));row.dataset.signature=rowSignature;row.dataset.id=a.id;row.classList.toggle('highlighted',highlighted===a.id);
+   const selected=node('input');selected.type='checkbox';selected.checked=a.selected;selected.setAttribute('aria-label','勾选账号 '+a.index);selected.onclick=e=>e.stopPropagation();selected.onchange=guard(async()=>{selected.disabled=true;try{await selection([{...a,selected:selected.checked}]);}finally{selected.disabled=false;selected.checked=(state?.accounts.find(x=>x.id===a.id)||a).selected;}});
    const selectedCell=node('td');selectedCell.append(selected);row.append(selectedCell,node('td',a.index),node('td',a.api_key),node('td',a.address||''),node('td',a.network));row.children[3].title=a.address;
-   const topup=node('input');topup.type='checkbox';topup.checked=a.bnb_topup;topup.disabled=state.busy;topup.setAttribute('aria-label','账号 '+a.index+' 预买BNB');topup.onclick=e=>e.stopPropagation();topup.onchange=guard(()=>selection([{...a,bnb_topup:topup.checked}]));const topupCell=node('td');topupCell.append(topup);row.append(topupCell,node('td',a.status));
+   const topup=node('input');topup.type='checkbox';topup.checked=a.bnb_topup;topup.disabled=state.busy;topup.setAttribute('aria-label','账号 '+a.index+' 预买BNB');topup.onclick=e=>e.stopPropagation();topup.onchange=guard(async()=>{try{await selection([{...a,bnb_topup:topup.checked}]);}finally{topup.checked=(state?.accounts.find(x=>x.id===a.id)||a).bnb_topup;}});const topupCell=node('td');topupCell.append(topup);row.append(topupCell,node('td',a.status));
    const more=node('button','⋯','row-menu-button');more.setAttribute('aria-label','账号 '+a.index+' 菜单');more.onclick=e=>{e.stopPropagation();highlight(a.id);showMenu(a,e.clientX,e.clientY,more);};const moreCell=node('td');moreCell.append(more);row.append(moreCell);
-   row.onclick=()=>highlight(a.id);row.ondblclick=guard(e=>{if(e.target.closest('input,button')||e.target.closest('td')?.cellIndex===5)return;return selection([{...a,selected:!a.selected}]);});row.oncontextmenu=e=>{e.preventDefault();highlight(a.id);showMenu(a,e.clientX,e.clientY);};table.append(row);
+   row.onclick=()=>highlight(a.id);row.ondblclick=guard(e=>{if(e.target.closest('input,button')||e.target.closest('td')?.cellIndex===5)return;return selection([{...a,selected:!a.selected}]);});row.oncontextmenu=e=>{e.preventDefault();highlight(a.id);showMenu(a,e.clientX,e.clientY);};if(old)old.replaceWith(row);if(table.children[position]!==row)table.insertBefore(row,table.children[position]||null);position++;
   }
+  for(const row of existing.values())row.remove();
   table.parentElement.scrollTop=previous;
  }
  if(highlighted&&!state.accounts.some(a=>a.id===highlighted))highlighted='';
@@ -146,7 +165,7 @@ function renderAccounts(){
 async function copyText(text,message='已复制'){try{await navigator.clipboard.writeText(text);feedback(message);return true;}catch(e){await textInput('浏览器无法写入剪贴板，请选择内容后复制：',text,'复制内容');return false;}}
 function showMenu(a,x,y,anchor){
  contextId=a.id;const menu=$('account-menu');menu.replaceChildren();
- const items=[['复制 API KEY',async()=>copyText((await api('account_key',{id:a.id})).text)],['复制提现地址',()=>copyText(a.address)],null,['查询',()=>command('query_assets',[a.id])],['查询月成交额',()=>command('query_volume',[a.id])],['执行',()=>command('run',[a.id])],['停止',()=>command('stop',[a.id]),!a.active],['提现',()=>command('withdraw',[a.id])],['自动申购',()=>command('earn_auto_subscribe',[a.id])],['赎回理财',()=>command('redeem_earn',[a.id])],['归集BNB并提现',()=>command('collect_bnb',[a.id])],null,['删除该行',()=>deleteAccounts([a.id])]];
+ const items=[['复制 API KEY',async()=>copyText((await api('account_key',{id:a.id})).text)],['复制提现地址',()=>copyText(a.address)],null,['查询',()=>command('query_assets',[a.id])],['查询成交额',()=>command('query_volume',[a.id])],['执行',()=>command('run',[a.id])],['停止',()=>command('stop',[a.id]),!a.active],['提现',()=>command('withdraw',[a.id])],['自动申购',()=>command('earn_auto_subscribe',[a.id])],['赎回理财',()=>command('redeem_earn',[a.id])],['归集BNB并提现',()=>command('collect_bnb',[a.id])],null,['删除该行',()=>deleteAccounts([a.id])]];
  for(const item of items){if(!item){menu.append(node('hr'));continue;}const [text,fn,disabled]=item,b=node('button',text);b.setAttribute('role','menuitem');b.disabled=!!disabled||(state.busy&&!['复制 API KEY','复制提现地址','停止'].includes(text));b.onclick=guard(async()=>{closeMenu();await fn();});menu.append(b);}
  menu.hidden=false;if(anchor){const rect=anchor.getBoundingClientRect();x=rect.right;y=rect.bottom;}
  menu.style.left=Math.max(4,Math.min(x,innerWidth-menu.offsetWidth-5))+'px';menu.style.top=Math.max(4,Math.min(y,innerHeight-menu.offsetHeight-5))+'px';menu.querySelector('button:not(:disabled)').focus();
@@ -177,6 +196,16 @@ async function command(action,ids,{single=false}={}){
  if(!result.accepted)throw Error(result.error||'操作未启动');
  if(action!=='stop')pendingTask={action,summary:state.summary};feedback(action==='stop'?'已请求停止，等待订单清理确认。':'');await refresh();
 }
+function normalizeVolumeDate(value){
+ const text=value.trim();if(!text)return '';
+ let parts=text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/),year,month,day;
+ if(parts){[,year,month,day]=parts.map(Number);}
+ else if(/^\d{6,8}$/.test(text)){year=Number(text.slice(0,4));const rest=text.slice(4),width=rest.length===4||(rest.length===3&&Number(rest.slice(0,2))>=1&&Number(rest.slice(0,2))<=12)?2:1;month=Number(rest.slice(0,width));day=Number(rest.slice(width));}
+ else throw Error('日期可输入 YYYYMMDD 或 YYYY-M-D，例如 20260902、2026-9-2');
+ const date=new Date(Date.UTC(year,month-1,day));if(date.getUTCFullYear()!==year||date.getUTCMonth()+1!==month||date.getUTCDate()!==day)throw Error('查询日期无效，请检查年月日');
+ return String(year).padStart(4,'0')+'-'+String(month).padStart(2,'0')+'-'+String(day).padStart(2,'0');
+}
+function openVolumeSettings(){const saved=state.volume_query||{};$('volume-start').value=saved.start_date||'';$('volume-end').value=saved.end_date||'';$('volume-error').hidden=true;$('volume-dialog').showModal();}
 function questionInput(message,{title='确认执行',accept='确认',textMode=false,value='',execution=false,ids=[]}={}){
  if(resolveQuestion)throw Error('请先完成当前确认操作');
  return new Promise(resolve=>{resolveQuestion=resolve;questionMode=textMode?'text':execution?'execution':'confirm';$('question-title').textContent=title;$('question-message').textContent=message;$('question-input-label').hidden=!textMode;$('question-input').value=value;$('question-accept').textContent=accept;$('execution-options').hidden=!execution;
@@ -189,6 +218,19 @@ const textInput=(message,value='',title='导入参数')=>questionInput(message,{
 function passwordInput(change=false){return new Promise(resolve=>{resolvePassword=resolve;$('new-password-label').hidden=$('repeat-password-label').hidden=!change;$('new-password').required=$('repeat-password').required=change;$('password-title').textContent=change?'修改程序密码':'再次验证密码';$('password-dialog').showModal();$('verify-password').focus();});}
 function finishPassword(value){for(const id of ['verify-password','new-password','repeat-password'])$(id).value='';$('password-dialog').close();const resolve=resolvePassword;resolvePassword=null;if(resolve)resolve(value);}
 async function sensitive(method,warning){if(warning&&!await confirmInput(warning,method==='destroy_accounts'?'确认销毁所有':'确认操作'))return;const passwords=await passwordInput(method==='change_password');if(!passwords)return;const result=await api(method,{...passwords,confirmed:true});if(result.text!==undefined)download(result.text,result.filename);if(['lock','change_password'].includes(method))signedOut();else await refresh();if(method==='destroy_accounts'){$('single-key').value=$('single-secret').value=$('single-address').value='';currentId='';singleReady=false;notice('账号相关信息已销毁；共享策略参数和代理设置已保留。','销毁完成');}else feedback('操作完成。');}
+async function reviewOperations(){
+ const data=await api('operation_review',{}),text=data.entries.map(e=>[e.id,e.time+' '+e.action+' '+e.coin+' '+e.amount,e.address+' '+e.reference+' ['+e.state+']'].join('\n')).join('\n\n')||'没有待核对操作。';
+ let id='',outcome='',confirmation='',evidence='';
+ if(data.recovery_required){outcome='restore';confirmation=await textInput('账本从备份恢复，可能缺少最近记录。核对全部交易所历史后输入：已核对全部操作\n\n'+text,'','解除恢复保护');}
+ else if(data.entries.some(e=>e.kind==='exchange-funds')){
+  id=await textInput(text+'\n\n在交易所核对历史后，填写要处理的资金记录编号：','','核对未确认');if(id===null)return;
+  outcome=await textInput('原操作已执行输入 completed；确认未执行输入 failed。不能确定时取消。','','核对结果');if(outcome===null)return;
+  evidence=await textInput('填写交易所回执编号或查询结果及时间：','','核对依据');if(evidence===null)return;
+  confirmation=await textInput('输入：已在交易所核对','','确认核对');
+ }else{notice(text+'\n\n订单会在再次执行时查询原单。','核对未确认');return;}
+ if(confirmation===null)return;const passwords=await passwordInput();if(!passwords)return;
+ await api('operation_resolve',{id:id.trim(),outcome:outcome.trim(),confirmation,evidence,...passwords,confirmed:true});await refresh();notice('核对结果已保存。');
+}
 function download(text,filename){const blob=new Blob([text],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=node('a');a.href=url;a.download=filename;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 function editAccount(a){$('edit-id').value=a?.id||'';$('edit-key').value=$('edit-secret').value='';$('edit-key').placeholder=a?.api_key||'';$('edit-address').value=a?.address||'';$('edit-network').value=a?.network||state.settings.acc_network;$('account-dialog').showModal();}
 function closeAccount(){for(const id of ['edit-key','edit-secret'])$(id).value='';$('account-dialog').close();}
@@ -218,6 +260,10 @@ $('password-form').addEventListener('submit',e=>{e.preventDefault();if(!$('new-p
 for(const b of document.querySelectorAll('[data-close]'))b.onclick=()=>{const id=b.dataset.close;if(id==='auto-dialog')cancelAuto();if(id==='stock-dialog')cancelStock();if(id==='import-dialog')$('import-text').value='';$(id).close();};
 $('auto-dialog').addEventListener('cancel',cancelAuto);$('stock-dialog').addEventListener('cancel',cancelStock);$('import-dialog').addEventListener('cancel',()=>{$('import-text').value='';});
 for(const b of document.querySelectorAll('[data-action]'))b.onclick=guard(()=>command(b.dataset.action));
+$('volume-open').onclick=openVolumeSettings;
+for(const id of ['volume-start','volume-end']){const input=$(id);const format=()=>{try{input.value=normalizeVolumeDate(input.value);}catch(e){}};input.oninput=()=>{if(/^\d{8}$/.test(input.value))format();$('volume-error').hidden=true;};input.onblur=format;}
+$('volume-form').onsubmit=async e=>{e.preventDefault();const button=$('volume-save');button.disabled=true;try{const dates={start_date:normalizeVolumeDate($('volume-start').value),end_date:normalizeVolumeDate($('volume-end').value)};if(dates.start_date&&dates.end_date&&dates.start_date>dates.end_date)throw Error('开始日期不能晚于结束日期');const result=await api('volume_settings',dates);state.volume_query=result.dates;$('volume-dialog').close();await refresh();feedback('查询条件已保存，点击“查询成交额”即可使用。');}catch(e){$('volume-error').textContent=e.message;$('volume-error').hidden=false;}finally{button.disabled=false;}};
+$('volume-cancel').onclick=()=>$('volume-dialog').close();
 $('stop-all').onclick=guard(async()=>{await api('emergency_stop',{});feedback('已请求停止，等待订单清理确认。');await refresh();});
 $('select-all').onclick=guard(()=>selection(state.accounts.map(a=>({...a,selected:!state.accounts.every(x=>x.selected)}))));$('topup-all').onclick=guard(()=>selection(state.accounts.map(a=>({...a,bnb_topup:true}))));
 $('delete-selected').onclick=guard(()=>deleteAccounts(state.accounts.filter(a=>a.selected).map(a=>a.id)));$('add-account').onclick=()=>editAccount(null);$('edit-highlighted').onclick=guard(()=>{const a=state.accounts.find(a=>a.id===highlighted);if(!a)throw Error('请先选中一行账号');editAccount(a);});$('cancel-account').onclick=closeAccount;$('account-dialog').addEventListener('cancel',closeAccount);
@@ -230,6 +276,7 @@ $('log-search').oninput=renderLogs;$('clear-view').onclick=()=>{logs=[];renderLo
 $('export-accounts').onclick=guard(()=>{if(!state.accounts.length){notice('当前账号列表为空，无需导出');return;}return sensitive('export_accounts',null);});
 $('destroy-accounts').onclick=guard(()=>sensitive('destroy_accounts','将直接销毁服务器交易所账号、提现/资产结果、交易恢复账本、交易所运行日志及运行时代理临时文件。\n\n共享策略参数和代理设置会保留。\n\n此操作不会使用回收站，程序无法恢复。已导出的账号文件不在本次范围。'));
 $('asset-export').onclick=guard(async()=>{const r=await api('asset_export',{});download(r.text,r.filename);});$('lock').onclick=guard(()=>sensitive('lock',null));$('change-password').onclick=guard(()=>sensitive('change_password',null));$('logout').onclick=guard(async()=>{await api('logout',{});signedOut();});
+$('operation-review').onclick=guard(reviewOperations);
 $('proxy-test').onclick=guard(async()=>{if(settingsDirty)await saveSettings();await api('proxy_test',{});$('proxy-test').textContent='测试中…';});$('proxy-clear').onclick=guard(async()=>{if(await confirmInput('清除服务器的加密代理配置？')){await api('settings',{settings:{exchange_proxy:'',use_exchange_config_proxy:false}});await refresh();}});
 $('auto-save').onclick=guard(async()=>{const auto_ladder=Object.fromEntries(autoFields.map(([name])=>[name,$('auto-'+name).value]));await api('settings',{settings:{},auto_ladder});autoSnapshot=null;$('auto-dialog').close();await refresh();feedback('自动分仓判断参数已保存并生效。');});
 $('stock-save').onclick=()=>{stockSnapshot=null;dirty();$('stock-dialog').close();};

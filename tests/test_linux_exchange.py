@@ -32,6 +32,9 @@ class LinuxServerTests(unittest.TestCase):
     def test_encrypted_persistence_and_interrupted_commands(self):
         self.run_case("persistence")
 
+    def test_shutdown_serializes_checkpoints_and_disk_failure_does_not_crash_worker(self):
+        self.run_case("checkpoint")
+
     def test_all_exchange_task_dispatch_and_selection(self):
         self.run_case("dispatch")
 
@@ -43,6 +46,9 @@ class LinuxServerTests(unittest.TestCase):
 
     def test_web_authentication_csrf_and_credentials(self):
         self.run_case("web")
+
+    def test_web_stops_with_an_open_event_stream(self):
+        self.run_case("web_shutdown")
 
     def test_automatic_cleanup_preserves_recovery(self):
         self.run_case("maintenance")

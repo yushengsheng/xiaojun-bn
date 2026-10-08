@@ -58,6 +58,11 @@ def auth():
     assert "example-key-123456789012345678901234" not in serialized
     call("settings", {"settings": {"exchange_proxy": "http://proxy-user:proxy-password@127.0.0.1:10080"}})
     assert "proxy-password" not in json.dumps(call("state"), default=str)
+    message = "✔ [账号 #1] 市价买入 BTCUSDT，金额 12.3456，API Secret=" + s.runtime.accounts[0]["api_secret"]
+    s.add_log(message)
+    entry = call("state")["logs"][-1]
+    assert "example-secret" not in entry["text"]
+    assert [entry["text"][start:end] for start, end in entry["amount_spans"]] == ["12.3456"]
     export = call("export_accounts", dict(password="test-password-strong", confirmed=True))
     assert "example-secret" in export["text"]
     archive=WORK/"data/withdraw_success.txt.1"
@@ -82,11 +87,20 @@ def persistence():
     for path in (WORK/"data").glob("*.json*"):
         raw = path.read_text()
         assert "example-secret" not in raw and "example-key-" not in raw
+    with patch.object(type(s.runtime), 'busy', new_callable=lambda: property(lambda _r: True)), patch.object(s.runtime, 'stop_accounts') as stop:
+        import signal
+        s.prepare_shutdown(signal.SIGTERM)
+        stop.assert_called_once()
+    # Graceful cancellation has finished, but the encrypted run must remain
+    # interrupted instead of being marked completed by pump().
+    s.pump()
     s.runtime.close_idle()
     restarted = Service(WORK/"data", WORK/"no-setup")
     assert restarted.runtime is None and not restarted.lock.is_unlocked()
     session = restarted.dispatch(dict(method="login", payload={"password": "test-password-strong"}))
     assert restarted.interrupted and restarted.interrupted["command_id"] == request["command_id"]
+    assert restarted.interrupted['reason'] == 'SIGTERM'
+    assert 'SIGTERM' in next((WORK/'data/logs').glob('service_runtime_*.log')).read_text()
     assert len(restarted.runtime.accounts) == 2
     with patch.object(restarted.runtime, "execute") as execute:
         result = restarted.dispatch(dict(method="command", payload=request, **session))
@@ -95,6 +109,56 @@ def persistence():
         assert_error(lambda: restarted.dispatch(dict(method="command", payload=expired, **session)))
         assert execute.call_count == 0
     restarted.runtime.close_idle()
+
+
+def checkpoint():
+    import signal
+    import threading
+    s, call, _ = fixture()
+    import stores
+    s.active_run = dict(active=True, action="run", command_id="checkpoint-race", started=time.time())
+    entered, release, shutdown_started = threading.Event(), threading.Event(), threading.Event()
+    errors = []
+    original = stores._save_authenticated_config
+    def save(path, data, **kwargs):
+        if threading.current_thread().name == "checkpoint-test":
+            entered.set()
+            assert release.wait(5), "checkpoint release timed out"
+        original(path, data, **kwargs)
+    def run_checkpoint():
+        try:
+            s._checkpoint_account(s.runtime.accounts[0], True)
+        except Exception as exc:
+            errors.append(exc)
+    def shutdown():
+        shutdown_started.set()
+        try:
+            s.prepare_shutdown(signal.SIGTERM)
+        except Exception as exc:
+            errors.append(exc)
+    with patch.object(type(s.runtime), "busy", new_callable=lambda: property(lambda _r: True)), patch.object(s.runtime, "stop_accounts") as stop, patch.object(stores, "_save_authenticated_config", side_effect=save):
+        writer = threading.Thread(target=run_checkpoint, name="checkpoint-test")
+        writer.start()
+        assert entered.wait(5)
+        stopper = threading.Thread(target=shutdown)
+        stopper.start()
+        assert shutdown_started.wait(5)
+        time.sleep(0.1)
+        assert not stop.called, "shutdown must wait for the in-flight checkpoint"
+        release.set()
+        writer.join(5); stopper.join(5)
+        assert not writer.is_alive() and not stopper.is_alive() and not errors, errors
+    saved = stores._load_authenticated_config(s.run_file)[0]
+    assert saved["reason"] == "SIGTERM" and saved["active"] is True
+    assert list(saved["results"].values()) == [True]
+    assert s.active_run is None
+    # A disk failure after completion keeps the worker alive and the prior
+    # intent intact, without repeatedly hammering a failing disk.
+    s.active_run = dict(active=True, action="run", command_id="disk-failure")
+    with patch.object(stores, "_save_authenticated_config", side_effect=OSError("disk full")) as save:
+        s.pump(); s.pump()
+        assert save.call_count == 1 and s.active_run["active"] is True
+    s.runtime.close_idle()
 
 
 def dispatch():
@@ -206,6 +270,10 @@ def web():
     assert client.post("/api/settings",headers={"Origin":origin},json={"settings":{}}).status_code==403
     headers={"Origin":origin,"X-CSRF-Token":login.json()["csrf"]}
     assert client.post("/api/settings",headers=headers,json={"settings":{"max_threads":2}}).status_code==200
+    assert client.post("/api/volume_settings",headers={"Origin":origin},json={}).status_code==403
+    saved=client.post("/api/volume_settings",headers=headers,json={"start_date":"202692","end_date":""})
+    assert saved.status_code==200 and saved.json()["dates"]==dict(start_date="2026-09-02",end_date="")
+    assert client.get("/api/state").json()["volume_query"]==saved.json()["dates"]
     response=client.get("/api/state")
     assert response.status_code==200 and "example-secret" not in response.text
     assert response.headers["cache-control"]=="no-store"
@@ -216,11 +284,75 @@ def web():
     s.runtime.close_idle()
 
 
+def web_shutdown():
+    import requests
+    import shlex
+    import signal as signals
+    import socket as network_socket
+    import threading
+    # Run the real service command with a fake RPC and an open real SSE stream.
+    # An unbounded graceful shutdown would hang until the fixture is killed.
+    with network_socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        port = listener.getsockname()[1]
+    factory = WORK/'slow_web.py'
+    marker = WORK/'rpc-entered'
+    factory.write_text("from linux_exchange.web import create_app\nfrom pathlib import Path\nimport time\n"
+                       "def rpc(method, *a, **k):\n"
+                       " if method == 'health':\n"
+                       f"  Path({str(marker)!r}).write_text('entered')\n"
+                       "  time.sleep(60)\n"
+                       " return {'seq': 0}\n"
+                       "def app_factory():\n"
+                       f" return create_app(origin='https://127.0.0.1:{port}', rpc=rpc)\n")
+    unit = (ROOT/'linux_exchange/deploy/xiaojun-exchange-web.service').read_text()
+    args = shlex.split(next(line.split('=', 1)[1] for line in unit.splitlines() if line.startswith('ExecStart=')))
+    args[0] = sys.executable
+    args[args.index('linux_exchange.web:app_factory')] = 'slow_web:app_factory'
+    args[args.index('--port')+1] = str(port)
+    env = {**os.environ, 'PYTHONPATH': os.pathsep.join((str(WORK), str(ROOT)))}
+    process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stream = None
+    try:
+        deadline = time.monotonic()+10
+        while True:
+            assert process.poll() is None
+            try:
+                ready = requests.get(f'http://127.0.0.1:{port}/', timeout=.5)
+                if ready.status_code == 200: break
+            except requests.RequestException: pass
+            assert time.monotonic() < deadline
+            time.sleep(.05)
+        stream = requests.get(f'http://127.0.0.1:{port}/api/events', stream=True, timeout=15)
+        assert stream.status_code == 200
+        assert next(stream.iter_lines(chunk_size=1)) == b'event: state'
+        def slow_request():
+            try: requests.get(f'http://127.0.0.1:{port}/api/health', timeout=20)
+            except requests.RequestException: pass
+        pending = threading.Thread(target=slow_request, daemon=True)
+        pending.start()
+        deadline = time.monotonic()+5
+        while not marker.exists():
+            assert time.monotonic() < deadline
+            time.sleep(.05)
+        process.terminate()
+        output = process.communicate(timeout=15)
+        # Uvicorn restores/re-raises SIGTERM after orderly application shutdown.
+        assert process.returncode in (0, -signals.SIGTERM), output
+        assert 'Application shutdown complete' in output[1], output
+    finally:
+        if stream is not None: stream.close()
+        if process.poll() is None:
+            process.kill();process.communicate(timeout=5)
+
+
 def maintenance():
     from linux_exchange.maintenance import clean
     data=WORK/"data";data.mkdir();logs=data/"logs";logs.mkdir()
     old=logs/"exchange_runtime_old_99999999.log";old.write_bytes(b"x"*100)
     live=logs/f"exchange_runtime_now_{os.getpid()}.log";live.write_text("protected-live-log")
+    recent = logs/'exchange_runtime_recent_99999997.log'
+    with recent.open('wb') as f: f.truncate(25*1024*1024)
     os.utime(old,(time.time()-9*86400,)*2)
     protected=["accounts.json","accounts.json.bak",".secret.key","app_lock.json","exchange_operations.json","withdraw_success.txt"]
     for name in protected:(data/name).write_text("protected-"+name)
@@ -232,7 +364,8 @@ def maintenance():
     result=clean(data)
     assert result["removed"]==2 and not old.exists() and not temp.exists()
     assert live.exists() and link.exists()
-    assert proxy.stat().st_size==0 and proxy.with_name(proxy.name+".tail").stat().st_size==1024*1024
+    assert recent.stat().st_size == 25*1024*1024
+    assert proxy.stat().st_size==6*1024*1024 and not proxy.with_name(proxy.name+".tail").exists()
     assert all((data/name).read_text()=="protected-"+name for name in protected)
 
 
@@ -293,7 +426,32 @@ def desktop():
         for invalid in (dict(enable_withdraw="false"), dict(unrecognized=True), []):
             assert_error(lambda invalid=invalid: call("command", command(options=invalid)))
         assert_error(lambda: call("command", command("withdraw", options=dict(enable_withdraw=True))))
+    with patch.object(r, "run_query_monthly_trade_volume") as query:
+        options = dict(period="custom", end_date="2026-10-01")
+        request = command("query_volume", options=options)
+        assert call("command", request)["accepted"]
+        assert query.call_args.kwargs["query_options"] == options
+        assert call("command", request)["replay"] and query.call_count == 1
+        assert r.settings == old_settings
+        for invalid in (dict(period="custom", start_date="bad"),
+                        dict(period="custom", start_date="2026-10-03", end_date="2026-10-01"),
+                        dict(period="custom", start_date="2999-10-01"), dict(enable_withdraw=True)):
+            assert_error(lambda invalid=invalid: call("command", command("query_volume", options=invalid)))
+        assert query.call_count == 1
+    saved=call("volume_settings",dict(start_date="202692",end_date="2026/9/3"))["dates"]
+    assert saved==dict(start_date="2026-09-02",end_date="2026-09-03")
+    assert call("state")["volume_query"]==saved
+    assert r.settings==old_settings
+    with patch.object(r,"_start_managed_thread") as start:
+        assert_error(lambda: call("volume_settings",dict(start_date="2026-09-04",end_date="2026-09-03")))
+        start.assert_not_called()
+    assert r.trade_volume_query_dates==saved
     r.close_idle()
+    # Both service restart and a new login reload durable query conditions.
+    restarted=Service(s.directory,WORK/"no-setup")
+    session=restarted.dispatch(dict(method="login",payload={"password":"test-password-strong"}))
+    assert restarted.dispatch(dict(method="state",payload={},**session))["volume_query"]==saved
+    restarted.runtime.close_idle()
 
 
 if __name__=="__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+import logging
 import queue
 import threading
 import time
@@ -18,6 +19,7 @@ from app_defaults import (
 )
 from app_paths import RELAY_FAILED_EXPORT_FILE, RELAY_MANUAL_EXPORT_FILE, RELAY_SWEEP_LOG_FILE
 from core_models import EvmToken, WithdrawRuntimeParams
+from daily_logging import DailyFileHandler
 from onchain_relay_wallets import RelayWalletRecord, _atomic_write_text
 from shared_utils import set_ui_batch_size
 
@@ -32,6 +34,7 @@ RELAY_STABLE_TOKEN_SYMBOLS = {"USDT", "USDC"}
 RELAY_STABLE_TOKEN_DUST_THRESHOLD = Decimal("0.0001")
 RELAY_BNB_DUST_THRESHOLD = Decimal("0.000005")
 _RELAY_SWEEP_LOG_LOCK = threading.Lock()
+_RELAY_SWEEP_LOG_HANDLER = None
 
 
 def _relay_mode_is(owner, params: WithdrawRuntimeParams, mode: str) -> bool:
@@ -70,6 +73,7 @@ def _relay_sweep_timeout_seconds(base_timeout_seconds: float | None = None) -> f
 
 
 def _append_relay_sweep_log(event: str, **fields: object) -> None:
+    global _RELAY_SWEEP_LOG_HANDLER
     payload = {
         "ts": _utc_now_text(),
         "event": str(event or "").strip() or "unknown",
@@ -78,13 +82,16 @@ def _append_relay_sweep_log(event: str, **fields: object) -> None:
         if value is None:
             continue
         payload[str(key)] = value
-    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    from sensitive_data import redact_sensitive_text
+    line = redact_sensitive_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     path = RELAY_SWEEP_LOG_FILE
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         with _RELAY_SWEEP_LOG_LOCK:
-            with path.open("a", encoding="utf-8") as fp:
-                fp.write(line)
+            if _RELAY_SWEEP_LOG_HANDLER is None or _RELAY_SWEEP_LOG_HANDLER.path != path:
+                if _RELAY_SWEEP_LOG_HANDLER is not None:
+                    _RELAY_SWEEP_LOG_HANDLER.close()
+                _RELAY_SWEEP_LOG_HANDLER = DailyFileHandler(path)
+            _RELAY_SWEEP_LOG_HANDLER.handle(logging.LogRecord("relay.sweep", logging.INFO, __file__, 0, line, (), None))
     except Exception:
         pass
 
@@ -2943,24 +2950,37 @@ def _relay_run_parallel(owner, units: list, worker_count: int, func) -> None:
 
 
 def _relay_submit_with_retry(owner, params: WithdrawRuntimeParams, item: _RelayBatchItem, label: str, submitter) -> str:
+    from onchain_transaction_recovery import transaction_context, UnconfirmedTransactionError
     attempts = _receipt_retry_count(params)
     interval = _receipt_poll_interval_seconds(params)
     last_error = ""
+    last_unconfirmed = None
     for attempt in range(1, attempts + 1):
         if owner.stop_requested.is_set():
+            if last_unconfirmed is not None:
+                raise last_unconfirmed
             raise RuntimeError("任务已停止")
         try:
-            submission = submitter()
+            with transaction_context(owner.client, batch_id=item.relay_record.batch_id,
+                                     task_key=f"{item.relay_addr.lower()}:{label}", stop_event=owner.stop_requested):
+                submission = submitter()
+            item._last_submitted_nonce = getattr(submission, "nonce", None)
             txid = str(getattr(submission, "tx_hash", "") or "").strip()
             if txid:
                 return txid
             last_error = "未拿到 txid"
         except Exception as exc:
             last_error = str(exc)
+            if isinstance(exc, UnconfirmedTransactionError):
+                last_unconfirmed = exc
         if attempt < attempts:
             owner._dispatch_ui(lambda m=f"{item.prefix} {label}提交重试 {attempt}/{attempts}：{last_error}": owner.log(m))
             if owner.stop_requested.wait(interval):
+                if last_unconfirmed is not None:
+                    raise last_unconfirmed
                 raise RuntimeError("任务已停止")
+    if last_unconfirmed is not None:
+        raise last_unconfirmed
     raise RuntimeError(f"{label}提交失败：{last_error}")
 
 
@@ -3029,6 +3049,7 @@ def _relay_source_stage(
         try:
             used_nonce = alloc_nonce(item.source_addr, _relay_record_txid(item, nonce_attr))
             txid = submit_one(item, used_nonce)
+            used_nonce = getattr(item, "_last_submitted_nonce", None) if getattr(item, "_last_submitted_nonce", None) is not None else used_nonce
             _relay_update_item_record(
                 owner,
                 item,
@@ -3038,7 +3059,11 @@ def _relay_source_stage(
             _relay_dispatch_row_status(owner, item, "running", f"{status_text}已提交")
             owner._dispatch_ui(lambda m=f"{item.prefix} {stage_label}已提交：txid={txid}": owner.log(m))
         except Exception as exc:
-            if used_nonce is not None:
+            from onchain_transaction_recovery import UnconfirmedTransactionError
+            if isinstance(exc, UnconfirmedTransactionError) and exc.own_transaction:
+                _relay_update_item_record(owner, item, submitted_status,
+                                          **{tx_attr: exc.tx_hash, nonce_attr: _tx_nonce_text(exc.nonce), "last_error": str(exc)})
+            elif used_nonce is not None:
                 rollback_nonce(item.source_addr, used_nonce)
             _relay_fail_item(owner, item, exc, log_prefix=f"{stage_label}提交失败")
 
@@ -3139,6 +3164,7 @@ def _relay_simple_stage(
             stored_nonce = _tx_nonce_value(_relay_record_txid(item, nonce_attr))
             nonce = stored_nonce if stored_nonce is not None else owner.client.get_nonce(params.network, item.relay_addr)
             txid = submit_one(item, nonce)
+            nonce = getattr(item, "_last_submitted_nonce", None) if getattr(item, "_last_submitted_nonce", None) is not None else nonce
             item.gas_fee_wei += int(getattr(item, "_last_forward_gas_fee_wei", 0) or 0)
             _relay_update_item_record(
                 owner,
@@ -3149,6 +3175,10 @@ def _relay_simple_stage(
             _relay_dispatch_row_status(owner, item, "running", f"{status_text}已提交")
             owner._dispatch_ui(lambda m=f"{item.prefix} {stage_label}已提交：txid={txid}": owner.log(m))
         except Exception as exc:
+            from onchain_transaction_recovery import UnconfirmedTransactionError
+            if isinstance(exc, UnconfirmedTransactionError) and exc.own_transaction:
+                _relay_update_item_record(owner, item, submitted_status,
+                                          **{tx_attr: exc.tx_hash, nonce_attr: _tx_nonce_text(exc.nonce), "last_error": str(exc)})
             _relay_fail_item(owner, item, exc, log_prefix=f"{stage_label}提交失败")
 
     def confirm_item(item: _RelayBatchItem) -> None:

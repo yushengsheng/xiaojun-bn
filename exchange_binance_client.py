@@ -251,6 +251,8 @@ class BinanceClient:
     ORDER_TERMINAL_STATUSES = frozenset({"FILLED", "CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"})
     _shared_convert_exchange_info_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     _shared_convert_asset_info_cache: dict[str, int] | None = None
+    _shared_convert_cached_at: dict[object, float] = {}
+    RULE_CACHE_SECONDS = 300
     _shared_convert_cache_lock = threading.Lock()
     _shared_spot_market_direct_routes: dict[str, dict[str, str]] | None = None
     _shared_spot_market_reverse_routes: dict[str, list[dict[str, str]]] | None = None
@@ -296,6 +298,7 @@ class BinanceClient:
             self.recv_window_ms = self.DEFAULT_RECV_WINDOW_MS
 
         self._exchange_info_cache = {}
+        self._rule_cached_at = {}
         self._price_cache = {}
         self._um_futures_exchange_info_cache = {}
         self._um_futures_price_cache = {}
@@ -703,6 +706,10 @@ class BinanceClient:
         return isinstance(exc, (requests.exceptions.RequestException, ConnectionError, TimeoutError, ValueError))
 
     def _run_signed_request(self, base, method, path, params, *, timeout, max_retries, ignore_stop_event=False):
+        from exchange_funds_recovery import FUNDS_WRITE_PATHS, run_funds_request
+        if method == "POST" and path in FUNDS_WRITE_PATHS and getattr(self, "operation_journal", None) is not None:
+            return run_funds_request(self, base, path, params, lambda values: self._run_signed_request_once(
+                base, method, path, values, timeout=timeout, max_retries=max_retries, ignore_stop_event=ignore_stop_event))
         continuous = bool(
             getattr(self, "_continuous_trading", False)
             and not getattr(self, "_bounded_request_depth", 0)
@@ -727,7 +734,8 @@ class BinanceClient:
 
     def _run_signed_request_once(self, base, method, path, params, *, timeout, max_retries, ignore_stop_event=False):
         replay_safe = method != "POST" or path in self.REPLAY_SAFE_POST_PATHS
-        if not replay_safe and getattr(self, "_uncertain_write_error", None) is not None:
+        cleanup_order = path in self.ORDER_PATHS and bool(getattr(self, "_cleanup_request_depth", 0))
+        if not replay_safe and getattr(self, "_uncertain_write_error", None) is not None and not cleanup_order:
             raise self._uncertain_write_error
         try:
             return self._run_request_with_retry(
@@ -1585,42 +1593,43 @@ class BinanceClient:
                 inverse = True
             if route_symbol not in symbol_map:
                 continue
-            try:
-                requester = self.public_get if max_retries is None else self.public_get_query
-                rows = requester(
-                    self.spot,
-                    "/api/v3/klines",
-                    {
-                        "symbol": route_symbol,
-                        "interval": "1h",
-                        "startTime": first_hour_ms,
-                        "endTime": end_ms,
-                        "limit": 1000,
-                    },
-                    **({"timeout": 15, "max_retries": max_retries} if max_retries is not None else {}),
-                )
-            except InterruptedError:
-                raise
-            except Exception as exc:
-                if stop_event is not None and stop_event.is_set():
-                    raise InterruptedError("成交额查询已停止") from exc
-                logger.warning("查询 %s 历史USDT价格失败，保留原币种明细: %s", asset, exc)
-                continue
-
-            if stop_event is not None and stop_event.is_set():
-                raise InterruptedError("成交额查询已停止")
             asset_rates: dict[int, Decimal] = {}
-            for row in rows if isinstance(rows, list) else []:
-                if not isinstance(row, (list, tuple)) or len(row) < 5:
-                    continue
+            requester = self.public_get if max_retries is None else self.public_get_query
+            # Each request covers at most 1000 hourly candles, including sparse history.
+            cursor = first_hour_ms
+            while cursor <= end_ms:
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("成交额查询已停止")
+                window_end = min(end_ms, cursor + 1000 * hour_ms - 1)
                 try:
-                    open_time = int(row[0])
-                    close_price = Decimal(str(row[4]))
-                except (InvalidOperation, TypeError, ValueError):
-                    continue
-                if not close_price.is_finite() or close_price <= 0:
-                    continue
-                asset_rates[open_time] = (Decimal("1") / close_price) if inverse else close_price
+                    rows = requester(
+                        self.spot,
+                        "/api/v3/klines",
+                        {"symbol": route_symbol, "interval": "1h", "startTime": cursor,
+                         "endTime": window_end, "limit": 1000},
+                        **({"timeout": 15, "max_retries": max_retries} if max_retries is not None else {}),
+                    )
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    if stop_event is not None and stop_event.is_set():
+                        raise InterruptedError("成交额查询已停止") from exc
+                    logger.warning("查询 %s 历史USDT价格失败，保留原币种明细: %s", asset, exc)
+                    break
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("成交额查询已停止")
+                for row in rows if isinstance(rows, list) else []:
+                    if not isinstance(row, (list, tuple)) or len(row) < 5:
+                        continue
+                    try:
+                        open_time = int(row[0])
+                        close_price = Decimal(str(row[4]))
+                    except (InvalidOperation, TypeError, ValueError):
+                        continue
+                    if not cursor <= open_time <= window_end or not close_price.is_finite() or close_price <= 0:
+                        continue
+                    asset_rates[open_time] = (Decimal("1") / close_price) if inverse else close_price
+                cursor = window_end + 1
             if asset_rates:
                 rates[asset] = asset_rates
         return rates
@@ -1640,7 +1649,7 @@ class BinanceClient:
 
     def get_exchange_info(self, symbol: str):
         symbol = self.normalize_trade_symbol(symbol)
-        if symbol in self._exchange_info_cache:
+        if symbol in self._exchange_info_cache and time.monotonic() - self._rule_cached_at.get(("spot", symbol), 0) < self.RULE_CACHE_SECONDS:
             return self._exchange_info_cache[symbol]
         data = self.public_get(self.spot, "/api/v3/exchangeInfo", {"symbol": symbol})
         symbols = data.get("symbols", [])
@@ -1648,6 +1657,7 @@ class BinanceClient:
             return None
         info = symbols[0]
         self._exchange_info_cache[symbol] = info
+        self._rule_cached_at[("spot", symbol)] = time.monotonic()
         return info
 
     def get_symbol_price(self, symbol: str) -> Optional[Decimal]:
@@ -1677,7 +1687,7 @@ class BinanceClient:
             params["toAsset"] = to_asset_u
 
         with self._shared_convert_cache_lock:
-            if cache_key in self._shared_convert_exchange_info_cache:
+            if cache_key in self._shared_convert_exchange_info_cache and time.monotonic() - self._shared_convert_cached_at.get(cache_key, 0) < self.RULE_CACHE_SECONDS:
                 return list(self._shared_convert_exchange_info_cache[cache_key])
             data = self.public_get(self.spot, "/sapi/v1/convert/exchangeInfo", params)
             rows = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
@@ -1697,6 +1707,7 @@ class BinanceClient:
                     }
                 )
             self._shared_convert_exchange_info_cache[cache_key] = list(normalized)
+            self._shared_convert_cached_at[cache_key] = time.monotonic()
             return list(normalized)
 
     def get_convert_pair_info(self, from_asset: str, to_asset: str) -> dict[str, Any] | None:
@@ -1720,7 +1731,7 @@ class BinanceClient:
     def get_convert_asset_info(self) -> dict[str, int]:
         with self._shared_convert_cache_lock:
             cached = self._shared_convert_asset_info_cache
-            if isinstance(cached, dict) and cached:
+            if isinstance(cached, dict) and cached and time.monotonic() - self._shared_convert_cached_at.get("assets", 0) < self.RULE_CACHE_SECONDS:
                 return dict(cached)
             data = self.request(self.spot, "GET", "/sapi/v1/convert/assetInfo", {})
             rows = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
@@ -1736,6 +1747,7 @@ class BinanceClient:
                 except Exception:
                     result[asset] = 8
             self._shared_convert_asset_info_cache = dict(result)
+            self._shared_convert_cached_at["assets"] = time.monotonic()
             return dict(result)
 
     def get_convert_asset_fraction(self, asset: str) -> int:
@@ -1812,6 +1824,9 @@ class BinanceClient:
             try:
                 status = self.get_convert_order_status(quote_id=quote_id_text)
                 if str(status.get("orderStatus") or "").upper() == "SUCCESS":
+                    if self.operation_journal is not None:
+                        from exchange_funds_recovery import assert_funds_clear
+                        assert_funds_clear(self.operation_journal, self)
                     self._uncertain_write_error = None
                     return status
             except Exception:
@@ -1826,7 +1841,17 @@ class BinanceClient:
             params["quoteId"] = str(quote_id).strip()
         if not params:
             raise RuntimeError("闪兑订单状态查询必须提供 orderId 或 quoteId")
-        return self.request(self.spot, "GET", "/sapi/v1/convert/orderStatus", params)
+        row = self.request(self.spot, "GET", "/sapi/v1/convert/orderStatus", params)
+        if self.operation_journal is not None:
+            from exchange_funds_recovery import pending_funds, record_convert_receipt
+            for entry in pending_funds(self.operation_journal, self.key):
+                payload = entry.get("payload", {})
+                if payload.get("path") != "/sapi/v1/convert/acceptQuote":
+                    continue
+                if (params.get("quoteId") == payload.get("params", {}).get("quoteId")
+                        or params.get("orderId") and str(params["orderId"]) == str(payload.get("receipt", {}).get("orderId", ""))):
+                    record_convert_receipt(self.operation_journal, entry, row)
+        return row
 
     def wait_convert_order_success(
         self,
@@ -2067,7 +2092,7 @@ class BinanceClient:
         symbol_u = self.normalize_trade_symbol(symbol)
         if not symbol_u:
             return None
-        if symbol_u in self._um_futures_exchange_info_cache:
+        if symbol_u in self._um_futures_exchange_info_cache and time.monotonic() - self._rule_cached_at.get(("futures", symbol_u), 0) < self.RULE_CACHE_SECONDS:
             return self._um_futures_exchange_info_cache[symbol_u]
         data = self.public_get(self.um_futures, "/fapi/v1/exchangeInfo", {})
         symbols = data.get("symbols", [])
@@ -2081,6 +2106,7 @@ class BinanceClient:
         if info is None:
             return None
         self._um_futures_exchange_info_cache[symbol_u] = info
+        self._rule_cached_at[("futures", symbol_u)] = time.monotonic()
         return info
 
     def ensure_um_futures_symbol_supported(self, symbol: str) -> dict[str, Any]:
@@ -2791,6 +2817,8 @@ class BinanceClient:
         if not isinstance(order, dict) or not order.get("orderId") or not order.get("status"):
             raise RuntimeError(f"{symbol} 原订单 {client_id} 清理查询返回不完整")
         returned_client_id = str(order.get("origClientOrderId") or order.get("clientOrderId") or "")
+        if order.get("symbol") and str(order["symbol"]).upper() != symbol:
+            raise RuntimeError("清理查询返回的交易对与原订单不匹配")
         if returned_client_id and returned_client_id != client_id:
             raise RuntimeError(f"{symbol} 清理查询返回的订单标识与原订单不匹配")
         return order
@@ -2811,16 +2839,45 @@ class BinanceClient:
                     retry_guard=retry_guard, previous_client_id=previous_client_id,
                 )
             except _OrderConfirmationTimeout as exc:
+                self._order_recovery_requires_cleanup = True
                 previous_client_id = exc.client_order_id
                 logger.warning(
-                    "%s 订单 %s 超过 %g 秒仍无法确认，本次提交尝试按失败处理，重新提交当前步骤；旧单仍保留核对记录，重提可能重复成交",
+                    "%s 订单 %s 超过 %g 秒仍无法确认，先核对原单并确认撤单/不存在后再重试当前步骤",
                     exc.symbol, exc.client_order_id, self.ORDER_SUBMISSION_CONFIRMATION_GRACE_SECONDS,
                 )
+                attempt = 0
+                payload = next(p for p in self.pending_order_requests() if p["client_order_id"] == previous_client_id)
+                if callable(retry_guard) and not retry_guard():
+                    raise RuntimeError("行情不再达标，停止当前步骤并核对原订单")
+                while True:
+                    try:
+                        check = getattr(self, "_recovery_check", None)
+                        if callable(check) and not ignore_stop_event:
+                            check()
+                        self._wait_for_request_gate(ignore_stop_event=ignore_stop_event)
+                        with self.bounded_requests(), self.cleanup_requests_after_stop():
+                            found = self.get_pending_order_for_cleanup(payload)
+                        if found is None:
+                            break
+                        self.record_order_state(path, found, entry_id=payload.get("entry_id", ""), request_params={**params, "newClientOrderId": previous_client_id})
+                        if found.get("status") in {"CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}:
+                            break
+                        if params.get("type") == "MARKET":
+                            return self._wait_submitted_market_order(base, path, params, found, ignore_stop_event=ignore_stop_event)
+                        return found
+                    except RequestStoppedError:
+                        raise
+                    except Exception as error:
+                        attempt += 1
+                        self._wait_for_recovery(f"{exc.symbol} 核对原订单 {previous_client_id}", attempt, error, ignore_stop_event=ignore_stop_event)
 
     def _submit_order_attempt(self, base: str, path: str, params: dict, *, ignore_stop_event=False, retry_guard=None, previous_client_id=""):
         """Persist each distinct attempt before sending it."""
         self._wait_for_request_gate(ignore_stop_event=ignore_stop_event)
-        if getattr(self, "_uncertain_write_error", None) is not None:
+        if getattr(self, "operation_journal", None) is not None and not self._cleanup_request_depth:
+            from exchange_funds_recovery import assert_funds_clear
+            assert_funds_clear(self.operation_journal, self)
+        if getattr(self, "_uncertain_write_error", None) is not None and not self._cleanup_request_depth:
             raise self._uncertain_write_error
         for payload in self.pending_order_requests():
             if not payload.get("confirmation_timed_out") and (not payload.get("order_id") or payload.get("type") == "MARKET"):
@@ -3686,6 +3743,22 @@ class BinanceClient:
         }
 
         if enable_withdraw:
+            rows = self.request_query(self.spot, "GET", "/sapi/v1/capital/config/getall", {}, timeout=8, max_retries=1)
+            coin_info = next((r for r in rows if isinstance(r, dict) and str(r.get("coin", "")).upper() == coin), None) if isinstance(rows, list) else None
+            rule = next((r for r in (coin_info or {}).get("networkList", []) if str(r.get("network", "")).upper() == str(network).upper()), None)
+            if not rule or rule.get("withdrawEnable") is not True:
+                raise RuntimeError(f"{coin} 的 {network} 网络当前不可提现，请检查交易所网络状态")
+            if rule.get("withdrawTag") is True:
+                raise RuntimeError("该提现网络要求 MEMO/Tag，请在交易所完成提现；当前客户端没有 MEMO 输入")
+            multiple = Decimal(str(rule.get("withdrawIntegerMultiple") or "0"))
+            if multiple > 0:
+                amount = self._floor_to_step(amount, multiple)
+                params["amount"] = self._format_decimal(amount)
+            minimum = Decimal(str(rule.get("withdrawMin") or "0"))
+            maximum = Decimal(str(rule.get("withdrawMax") or "0"))
+            fee = Decimal(str(rule.get("withdrawFee") or "0"))
+            if amount <= fee or amount < minimum or maximum > 0 and amount > maximum:
+                raise RuntimeError(f"提现数量 {amount} 不符合当前网络限额/手续费，请调整预留或到交易所提现")
             self.request(
                 self.spot,
                 "POST",

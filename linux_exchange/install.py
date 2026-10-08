@@ -156,12 +156,44 @@ def dependencies(custom):
             run('systemctl', 'unmask', 'nginx.service')
 
 
+def install_restart_guard(directory=Path('/etc/needrestart/conf.d')):
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / 'xiaojun-exchange.conf'
+    source = Path(__file__).parent / 'deploy' / 'needrestart.conf'
+    target.write_text(source.read_text(), encoding='utf-8')
+    target.chmod(0o644)
+
+
+def retry_incomplete(args):
+    """Discard a proven first-install workspace before any unit is created."""
+    if platform.system() != 'Linux' or os.geteuid() != 0:
+        raise ValueError('修复未完成安装须在 Linux 使用 sudo')
+    marker = ROOT / '.install-incomplete.json'
+    if ROOT.is_symlink() or marker.is_symlink() or not marker.is_file():
+        raise ValueError('没有可安全重试的首次安装标记；拒绝覆盖已有安装')
+    saved = json.loads(marker.read_text())
+    version, _ = verify_payload(args.source)
+    if saved != dict(version=version, host=args.host, port=args.port, backend_port=args.backend_port, phase='bootstrap'):
+        raise ValueError('安装已进入服务配置阶段或参数变化，请保留现场；禁止覆盖交易配置')
+    if any(UNITS.glob('xiaojun-exchange-*')) or any(p.is_symlink() for p in (ROOT, CONFIG, DATA)):
+        raise ValueError('检测到服务或异常路径，拒绝清理')
+    if DATA.exists() and any(p.name != 'setup-token' for p in DATA.iterdir()):
+        raise ValueError('检测到运行数据，拒绝清理')
+    for path in (DATA, CONFIG, ROOT):
+        if path.exists():
+            shutil.rmtree(path)
+
+
 def install(args, version, manifest):
     import pwd
     source = Path(args.source).resolve()
     custom = bool(args.tls_cert)
     dependencies(custom)
+    install_restart_guard()
     ROOT.mkdir(mode=0o755)
+    marker = ROOT / '.install-incomplete.json'
+    marker.write_text(json.dumps(dict(version=version, host=args.host, port=args.port,
+                                     backend_port=args.backend_port, phase='bootstrap')))
     target = ROOT / 'releases' / version
     target.mkdir(parents=True)
     for name in manifest:
@@ -200,11 +232,13 @@ def install(args, version, manifest):
     (CONFIG / 'server.env').write_text('\n'.join(env) + '\n'); (CONFIG / 'server.env').chmod(0o600)
     (CONFIG / 'proxy-headers.conf').write_text((target / 'linux_exchange/deploy/proxy-headers.conf').read_text())
     (CONFIG / 'proxy-headers.conf').chmod(0o644)
-    for path in (Path('/var/log/nginx'), Path('/var/lib/xiaojun-exchange-acme'), Path('/var/log/xiaojun-exchange-acme'),
+    for path in (Path('/var/log/xiaojun-exchange-nginx'), Path('/var/lib/xiaojun-exchange-acme'), Path('/var/log/xiaojun-exchange-acme'),
                  Path('/var/lib/xiaojun-exchange-acme-webroot/.well-known/acme-challenge')):
         path.mkdir(parents=True, exist_ok=True)
     (ROOT / 'current').symlink_to(target)
     deploy = target / 'linux_exchange/deploy'
+    marker.write_text(json.dumps(dict(version=version, host=args.host, port=args.port,
+                                     backend_port=args.backend_port, phase='services')))
     for pattern in ('*.service', '*.timer'):
         for unit in deploy.glob(pattern):
             content = unit.read_text().replace('--port 18880', f'--port {args.backend_port}')
@@ -212,11 +246,12 @@ def install(args, version, manifest):
     hook = CONFIG / 'reload-nginx.sh'
     hook.write_text('#!/bin/sh\nset -eu\n/usr/sbin/nginx -t -c /etc/xiaojun-exchange/nginx.conf\n/bin/systemctl reload xiaojun-exchange-nginx.service\n')
     hook.chmod(0o700)
-    Path('/etc/logrotate.d/xiaojun-exchange').write_text('''/var/log/nginx/xiaojun-exchange-error.log /var/log/xiaojun-exchange-acme/*.log {
+    Path('/etc/logrotate.d/xiaojun-exchange').write_text('''/var/log/xiaojun-exchange-nginx/error.log /var/log/xiaojun-exchange-acme/*.log {
     daily
-    maxsize 2M
-    rotate 3
-    maxage 7
+    rotate 2
+    maxage 2
+    dateext
+    dateyesterday
     compress
     missingok
     notifempty
@@ -264,6 +299,7 @@ def install(args, version, manifest):
             time.sleep(1)
     else:
         raise ValueError('执行服务检查未通过，请检查本项目服务日志')
+    marker.unlink(missing_ok=True)
     print(f'安装成功：{version}\n网页：https://{args.host}:{args.port}/\n读取首次初始化码：sudo cat {token}\n在网页录入初始化码并设置程序密码。关闭网页不停止服务器任务。')
     if custom:
         print('使用自备证书：请由原证书管理工具负责续期。')
@@ -277,8 +313,13 @@ def main(argv=None):
     parser.add_argument('--source', default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument('--tls-cert'); parser.add_argument('--tls-key')
     parser.add_argument('--check', action='store_true', help='只检查，不安装或更改服务')
+    parser.add_argument('--retry-incomplete', action='store_true', help='重试尚未创建服务的首次安装；拒绝清理运行数据')
     args = parser.parse_args(argv)
     try:
+        if args.retry_incomplete:
+            if args.check:
+                raise ValueError('--check 不能与 --retry-incomplete 同用')
+            retry_incomplete(args)
         preflight(args)
         version, manifest = verify_payload(args.source)
         if args.check:
@@ -287,7 +328,7 @@ def main(argv=None):
         install(args, version, manifest)
         return 0
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-        print(f'安装失败：{exc}\n未覆盖已有安装。若为首次安装中途失败，请保留现场并检查日志，勿重装已有交易数据。', file=sys.stderr)
+        print(f'安装失败：{exc}\n保留配置和数据。若尚未创建服务，可用相同参数加 --retry-incomplete 重试；其他情况请检查服务日志，勿覆盖交易数据。', file=sys.stderr)
         return 1
 
 

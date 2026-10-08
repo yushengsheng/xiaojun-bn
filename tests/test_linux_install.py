@@ -34,6 +34,17 @@ class LinuxInstallTests(unittest.TestCase):
             install.dependencies(False)
             run.assert_not_called()
 
+    def test_auto_updates_defer_only_trading_worker_restart(self):
+        directory = self.fixture() / 'needrestart'
+        directory.mkdir()
+        other = directory / 'other-service.conf'
+        other.write_text('existing administrator policy')
+        install.install_restart_guard(directory)
+        content = (directory / 'xiaojun-exchange.conf').read_text()
+        self.assertIn('$nrconf{override_rc}->{qr(^xiaojun-exchange-worker\\.service$)} = 0;', content)
+        self.assertNotIn('blacklist_rc', content)
+        self.assertEqual(other.read_text(), 'existing administrator policy')
+
     def test_only_missing_dependencies_are_installed(self):
         def status(command, **kwargs):
             return argparse.Namespace(returncode=0, stdout='installed' if command[-1] != 'python3-tk' else 'not-installed')
@@ -88,6 +99,8 @@ class LinuxInstallTests(unittest.TestCase):
         self.assertIn('127.0.0.1:19880', custom)
         self.assertNotIn('listen 80;', custom)
         self.assertIn('/run/xiaojun-exchange-nginx/nginx.pid', custom)
+        self.assertIn('error_log /var/log/xiaojun-exchange-nginx/error.log', custom)
+        self.assertNotIn('/var/log/nginx/', custom)
         challenge = install.nginx_config('8.8.8.8', 26483, 18880)
         self.assertIn('listen 80;', challenge)
         self.assertNotIn('listen 26483', challenge)

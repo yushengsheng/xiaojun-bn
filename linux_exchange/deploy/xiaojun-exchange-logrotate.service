@@ -3,7 +3,7 @@ Description=Bound Xiaojun exchange nginx and certificate logs
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/logrotate --state /var/lib/xiaojun-exchange-acme/logrotate.state /etc/logrotate.d/xiaojun-exchange
+ExecStart=/usr/sbin/logrotate /etc/logrotate.d/xiaojun-exchange
 Nice=15
 IOSchedulingClass=idle
 NoNewPrivileges=true

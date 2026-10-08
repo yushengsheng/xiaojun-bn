@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import time
+from daily_logging import expired_log
 
 MIB = 1024 * 1024
 MIN_FREE_BYTES = 512 * MIB
@@ -39,58 +40,43 @@ def clean(directory, *, now=None):
         path.unlink()
         removed += 1
         reclaimed += size
-    # Current runtime logs stay open; rotating handlers bound each to 5 MiB.
-    # Only old processes' logs and rotation files are eligible for removal.
+    # Retain all records in the latest three Beijing calendar days. Size and
+    # process restart count must never delete recent transaction diagnostics.
     logs = root / "logs"
     if logs.is_dir() and not logs.is_symlink():
-        eligible = []
-        for p in logs.glob("exchange_runtime_*.log*"):
+        for p in logs.iterdir():
             if p.is_symlink() or not p.is_file():
                 continue
-            match = re.search(r"_(\d+)\.log(?:\.\d+)?$", p.name)
-            if not match or _pid_alive(match[1]):
+            if not re.fullmatch(r"(?:exchange|onchain|service)_runtime_.*\.log(?:\..*)?", p.name):
                 continue
-            eligible.append(p)
-        eligible.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        retained = 0
-        for p in eligible:
-            size = p.stat().st_size
-            if now - p.stat().st_mtime > 7*86400 or retained + size > 20*MIB:
+            match = re.search(r"_(\d+)\.log(?:\.\d+)?$", p.name)
+            # Date-only filenames are closed on midnight rollover. Legacy PID
+            # files still belonging to a live old client remain protected.
+            dated = bool(re.fullmatch(r"(?:exchange|onchain|service)_runtime_\d{8}\.log", p.name))
+            if not dated and match and _pid_alive(match[1]):
+                continue
+            if expired_log(p, now=now):
                 delete(p)
-            else:
-                retained += size
+    for p in root.glob("bot_log.txt.*"):
+        if expired_log(p, now=now):
+            delete(p)
     # Interrupted atomic writes are safe to delete after 24 h. Final files,
     # .bak backups, journals, account files, and lock data never match this rule.
     for p in root.glob(".*.tmp"):
         if p.is_file() and not p.is_symlink() and now-p.stat().st_mtime > 86400:
             delete(p)
-    # Proxy children write in append mode. Truncating their own diagnostic file
-    # preserves the descriptor and connection; no process or route is changed.
+    # Keep complete recent diagnostics; size truncation used to discard logs
+    # from the same day. Live child descriptors must not be replaced.
     for p in root.glob("exchange_proxy_runtime_*.log"):
         if p.is_symlink() or not p.is_file():
             continue
         match = re.fullmatch(r"exchange_proxy_runtime_(\d+)\.log", p.name)
         if not match:
             continue
-        size = p.stat().st_size
-        if not _pid_alive(match[1]) and now-p.stat().st_mtime > 7*86400:
+        if not _pid_alive(match[1]) and expired_log(p, now=now):
             delete(p)
-        elif size > 5*MIB:
-            # Keep bounded recent diagnostics as a single companion snapshot.
-            with p.open("rb") as source:
-                source.seek(max(0, size-MIB))
-                tail = source.read(MIB)
-            backup = p.with_name(p.name + ".tail")
-            if backup.is_symlink():
-                continue
-            with backup.open("wb") as target:
-                target.write(tail)
-            backup.chmod(0o600)
-            with p.open("r+b") as current:
-                current.truncate(0)
-            reclaimed += size
     for p in root.glob("exchange_proxy_runtime_*.log.tail"):
-        if not p.is_symlink() and p.is_file() and now-p.stat().st_mtime > 7*86400:
+        if not p.is_symlink() and p.is_file() and expired_log(p, now=now):
             delete(p)
     # Proxy downloads use disposable, named extraction directories. Never prune
     # version directories, manifests, configured binaries, or live process files.

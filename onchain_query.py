@@ -260,7 +260,7 @@ class OnchainQueryMixin(object):
         if mode == self.MODE_M2M:
             for item in self.store.multi_to_multi_pairs:
                 key = self._m2m_key(item)
-                if self._display_status(key) == "failed":
+                if self._display_status(key) in {"failed", "submitted"}:
                     try:
                         target = self._validate_recipient_address(item.target, "接收地址")
                     except Exception as exc:
@@ -276,7 +276,7 @@ class OnchainQueryMixin(object):
                 return []
             for target in self.store.one_to_many_addresses:
                 key = self._one_to_many_key(target)
-                if self._display_status(key) == "failed":
+                if self._display_status(key) in {"failed", "submitted"}:
                     try:
                         safe_target = self._validate_recipient_address(target, "接收地址")
                     except Exception as exc:
@@ -299,7 +299,7 @@ class OnchainQueryMixin(object):
             self.target_address_var.set(target)
             for source in self.store.many_to_one_sources:
                 key = self._many_to_one_key(source)
-                if self._display_status(key) == "failed":
+                if self._display_status(key) in {"failed", "submitted"}:
                     jobs.append((key, source, target))
 
         if with_message and not jobs:

@@ -167,7 +167,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         client.withdraw_all_coin.assert_called_once()
         callback.assert_called_once_with(10.0)
         notifications.assert_called_once_with(strategy)
-        self.assertEqual(len(outage.posts), 2)
+        self.assertEqual(len(outage.posts), 1)
         self.assertEqual(client.pending_order_requests(), [])
 
     def test_cleanup_balance_recovers_after_old_order_has_already_been_resolved(self):
@@ -455,8 +455,8 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
             result = strategy.run(client.stop)
         self.assertEqual(result["market_round_completed"], 1)
         self.assertEqual(result["market_round_failed_count"], 0)
-        self.assertEqual([item[1]["side"] for item in outage.posts], ["BUY", "BUY", "SELL"])
-        self.assertEqual(Decimal(outage.posts[-1][1]["quantity"]), 2)
+        self.assertEqual([item[1]["side"] for item in outage.posts], ["BUY", "SELL"])
+        self.assertEqual(Decimal(outage.posts[-1][1]["quantity"]), 1)
         self.assertEqual(position, 0)
         self.assertTrue(result["cleanup_confirmed"])
         self.assertEqual(client.journal.active_entries(), [])
@@ -489,8 +489,8 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
             result = strategy.run(client.stop)
         self.assertTrue(result["cleanup_confirmed"])
         self.assertFalse(result["trade_failed"])
-        self.assertEqual([item[1]["side"] for item in outage.posts], ["BUY", "BUY", "SELL"])
-        self.assertEqual(Decimal(outage.posts[-1][1]["quantity"]), 2)
+        self.assertEqual([item[1]["side"] for item in outage.posts], ["BUY", "SELL"])
+        self.assertEqual(Decimal(outage.posts[-1][1]["quantity"]), 1)
         self.assertEqual(outage.posts[-1][1]["reduceOnly"], "true")
         self.assertEqual(position, 0)
         self.assertEqual(client.journal.active_entries(), [])
@@ -516,7 +516,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         self.assertEqual(client.sale_calls, ["BTCUSDT"])
         self.assertEqual(client.journal.active_entries(), [])
 
-    def test_unconfirmed_spot_limit_and_futures_submissions_resubmit_after_thirty_seconds(self):
+    def test_unconfirmed_spot_limit_and_futures_submissions_query_original_after_thirty_seconds(self):
         for path, order_type in (("/api/v3/order", "MARKET"), ("/api/v3/order", "LIMIT"), ("/fapi/v1/order", "MARKET")):
             with self.subTest(path=path, order_type=order_type):
                 client = _Client()
@@ -524,14 +524,11 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
                 params = {"symbol": "BTCUSDT", "type": order_type, "side": "BUY", "quantity": "1"}
                 with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
                     order = client.request(client.spot if path == "/api/v3/order" else client.um_futures, "POST", path, params)
-                self.assertEqual([item[0] for item in outage.posts], [0, 30])
-                old_id, new_id = [item[1]["newClientOrderId"] for item in outage.posts]
-                self.assertNotEqual(old_id, new_id)
-                self.assertEqual(order["clientOrderId"], new_id)
-                self.assertEqual(client.journal.entries["1"]["state"], "unconfirmed")
-                self.assertTrue(client.journal.entries["1"]["payload"]["confirmation_timed_out"])
-                self.assertEqual(client.journal.entries["2"]["payload"]["retry_of_client_order_id"], old_id)
-                self.assertEqual(outage.posts[0][1] | {"newClientOrderId": new_id}, outage.posts[1][1])
+                self.assertEqual([item[0] for item in outage.posts], [0])
+                original_id = outage.posts[0][1]["newClientOrderId"]
+                self.assertEqual(order["clientOrderId"], original_id)
+                self.assertEqual(len(client.journal.entries), 1)
+                self.assertEqual(client.journal.entries["1"]["state"], "completed" if order_type == "MARKET" else "open")
 
     def test_confirmation_recovers_before_thirty_seconds_without_another_post(self):
         client = _Client()
@@ -545,13 +542,13 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
 
     def test_repeated_timeouts_restart_grace_per_submission_with_distinct_identifiers(self):
         client = _Client()
-        outage = _SubmissionOutage(client, lost_attempts=2)
+        outage = _SubmissionOutage(client, lost_attempts=2, create_original=False)
         with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
             order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
         self.assertEqual([item[0] for item in outage.posts], [0, 30, 60])
         self.assertEqual(len({item[1]["newClientOrderId"] for item in outage.posts}), 3)
-        self.assertEqual(order["orderId"], 3)
-        self.assertEqual([entry["state"] for entry in client.journal.entries.values()], ["unconfirmed", "unconfirmed", "completed"])
+        self.assertEqual(order["orderId"], 1)
+        self.assertEqual([entry["state"] for entry in client.journal.entries.values()], ["failed", "failed", "completed"])
 
     def test_query_timeout_is_limited_to_remaining_confirmation_grace(self):
         client = _Client()
@@ -559,7 +556,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
             client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
         self.assertEqual([item[1] for item in outage.queries], [6, 4])
-        self.assertEqual(outage.posts[-1][0], 30)
+        self.assertEqual(outage.now, 30)
 
     def test_stop_at_grace_boundary_prevents_resubmission(self):
         client = _Client()
@@ -581,7 +578,8 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
             client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"}, guard)
         self.assertEqual(len(outage.posts), 1)
         self.assertEqual(guard.call_count, 2)
-        self.assertEqual(client.journal.entries["2"]["state"], "failed")
+        self.assertEqual(len(client.journal.entries), 1)
+        self.assertEqual(client.journal.entries["1"]["state"], "unconfirmed")
         self.assertEqual(len(client.pending_order_requests()), 1)
 
     def test_task_completion_automatically_reconciles_old_attempt_and_clears_exposure(self):
@@ -598,7 +596,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
                     result = strategy.run(client.stop)
                 self.assertTrue(result["cleanup_confirmed"])
                 self.assertFalse(result["trade_failed"])
-                self.assertEqual(len(outage.posts), 2)
+                self.assertEqual(len(outage.posts), 1 if create_original else 2)
                 self.assertEqual(client.journal.entries["1"]["state"], "completed" if create_original else "failed")
                 self.assertEqual(client.journal.active_entries(), [])
                 self.assertEqual(client.pending_order_requests(), [])
@@ -618,7 +616,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
             result = strategy.run(client.stop)
         self.assertTrue(result["cleanup_confirmed"])
-        self.assertEqual([order["status"] for order in client.orders.values()], ["CANCELED", "CANCELED"])
+        self.assertEqual([order["status"] for order in client.orders.values()], ["CANCELED"])
         self.assertEqual(client.journal.active_entries(), [])
         self.assertEqual(client.pending_order_requests(), [])
         self.assertEqual(client.sale_calls, ["BTCUSDT"])
@@ -628,7 +626,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         outage = _SubmissionOutage(client)
         strategy = _strategy(client)
         def steps(*args, **kwargs):
-            client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
+            client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT"})
             client.lookup_missing = True
             original = client._request_impl
             def request(*args, **kwargs):
@@ -643,7 +641,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         self.assertFalse(result["cleanup_confirmed"])
         self.assertTrue(strategy.stop_cleanup_requested)
         self.assertEqual(len(client.journal.active_entries()), 1)
-        self.assertEqual(client.journal.entries["1"]["state"], "unconfirmed")
+        self.assertEqual(client.journal.entries["1"]["state"], "open")
         self.assertEqual(client.sale_calls, [])
         client.lookup_missing = False
         client._request_impl = outage.original_request
@@ -984,7 +982,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
                     client.request(client.spot, "POST", path, {"amount": "1"})
                 with self.assertRaises(UnconfirmedOperationError):
                     client.request(client.spot, "POST", path, {"amount": "1"})
-                self.assertEqual(len(client.requests), 1)
+                self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 1)
 
     def test_read_only_post_keeps_transport_retry(self):
         client = _Client()
@@ -1006,7 +1004,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
 
     def test_convert_accept_lost_reply_resolves_original_quote(self):
         client = _Client()
-        client._request_impl = Mock(side_effect=[requests.Timeout("accepted"), {"orderStatus": "SUCCESS", "quoteId": "original"}])
+        client._request_impl = Mock(side_effect=[requests.Timeout("accepted"), {"orderStatus": "SUCCESS", "quoteId": "original", "orderId": 123}])
         result = client.accept_convert_quote("original")
         self.assertEqual(result["orderStatus"], "SUCCESS")
         self.assertEqual(client._request_impl.call_count, 2)
@@ -1014,6 +1012,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         self.assertEqual([call.args[1] for call in calls], ["POST", "GET"])
         self.assertEqual(calls[1].args[3]["quoteId"], "original")
         self.assertIsNone(client._uncertain_write_error)
+        self.assertEqual(client.journal.active_entries(kind="exchange-funds"), [])
 
     def test_convert_accepted_then_query_failed_does_not_start_another_conversion(self):
         client = _Client()

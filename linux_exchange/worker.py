@@ -48,11 +48,16 @@ class Service:
         self.log_seq = 0
         self.boot = uuid.uuid4().hex
         self.active_run = None
+        self._checkpoint_lock = threading.RLock()
+        self._checkpoint_retry_at = 0
         self.interrupted = None
         self.dialog_context = threading.local()
         self.maintenance_at = 0
         self.maintenance_result = {}
         self.storage_check_at = 0
+        self._redact_runtime = None
+        self._redact_accounts = None
+        self._redact_pattern = None
         self._install_dialogs()
 
     def _install_dialogs(self):
@@ -79,17 +84,26 @@ class Service:
         from sensitive_data import redact_sensitive_text
         raw = str(text)
         if self.runtime:
-            for account in self.runtime.accounts:
-                for name in ("api_secret", "api_key"):
-                    value = account[name]
-                    if value:
-                        raw = raw.replace(value, "***")
+            version = (id(self.runtime.accounts), getattr(self.runtime, "accounts_revision", len(self.runtime.accounts)))
+            if self._redact_runtime is not self.runtime or self._redact_accounts != version:
+                import re
+                secrets_to_mask = {a[name] for a in self.runtime.accounts for name in ("api_key", "api_secret") if a[name]}
+                self._redact_pattern = re.compile("|".join(re.escape(s) for s in sorted(secrets_to_mask, key=len, reverse=True))) if secrets_to_mask else None
+                self._redact_runtime, self._redact_accounts = self.runtime, version
+            if self._redact_pattern is not None:
+                raw = self._redact_pattern.sub("***", raw)
         return redact_sensitive_text(raw)[:1200]
 
-    def add_log(self, text):
+    def add_log(self, text, *, persist=True):
+        from shared_utils import log_amount_value_spans
+        message = self.redact(text)
+        if persist:
+            from exchange_logging import persist_exchange_message
+            persist_exchange_message(message)
         with self.log_lock:
             self.log_seq += 1
-            self.logs.append(dict(seq=self.log_seq, text=self.redact(text)))
+            self.logs.append(dict(seq=self.log_seq, text=message,
+                                  amount_spans=log_amount_value_spans(message)))
 
     def _password(self, value):
         if not isinstance(value, str) or not value or len(value) > 1024:
@@ -143,12 +157,6 @@ class Service:
                 bounded.linux_ui_log = True
                 exchange_logging.logger.removeHandler(handler)
                 exchange_logging.logger.addHandler(bounded)
-        if exchange_logging._runtime_file_handler:
-            exchange_logging._runtime_file_handler.maxBytes = 5*1024*1024
-            exchange_logging._runtime_file_handler.backupCount = 2
-        if exchange_logging._compat_file_handler:
-            exchange_logging._compat_file_handler.maxBytes = 2*1024*1024
-            exchange_logging._compat_file_handler.backupCount = 1
         from stores import _load_authenticated_config, config_or_backup_exists
         runtime = HeadlessExchange()
         try:
@@ -163,6 +171,52 @@ class Service:
             runtime.close_idle()
             raise
         self.runtime = runtime
+        runtime.batch_checkpoint = self._checkpoint_account
+
+    def _checkpoint_account(self, account, success):
+        from stores import _save_authenticated_config
+        from .runtime import account_id
+        with self._checkpoint_lock:
+            if not self.active_run:
+                return
+            self.active_run.setdefault("results", {})[account_id(account["api_key"])] = bool(success)
+            try:
+                _save_authenticated_config(self.run_file, self.active_run, strict_backup=True)
+            except OSError:
+                self.add_log("任务检查点保存失败，已请求停止；请检查磁盘和文件权限后核对交易所记录")
+                self.runtime.stop_accounts()
+
+    def prepare_shutdown(self, signum):
+        """Record external interruption before graceful cancellation finishes."""
+        import logging
+        from contextlib import closing
+        from daily_logging import BeijingFormatter, DailyFileHandler
+        name = signal.Signals(signum).name
+        active = bool(self.runtime and self.runtime.busy)
+        message = f"服务收到 {name} 停止信号；任务运行中={active}，进程={os.getpid()}，线程数={threading.active_count()}"
+        # Also available while locked, before exchange_logging is imported.
+        try:
+            with closing(DailyFileHandler(self.directory / "logs" / "service_runtime.log", prefix="service_runtime")) as handler:
+                handler.setFormatter(BeijingFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+                handler.handle(logging.LogRecord("service.runtime", logging.WARNING, __file__, 0, message, (), None))
+        except OSError:
+            print(message, flush=True)  # systemd journal remains available.
+        with self._checkpoint_lock:
+            if self.active_run and active:
+                from stores import _save_authenticated_config
+                saved = {**self.active_run, "interrupted_at": time.time(), "reason": name}
+                self.interrupted = saved
+                # pump() must not turn a cancelled partial batch into a completed run.
+                self.active_run = None
+                try:
+                    _save_authenticated_config(self.run_file, saved, strict_backup=True)
+                except OSError:
+                    # The already persisted active=True checkpoint is still valid;
+                    # failing diagnostics must not prevent a graceful task stop.
+                    print("保存服务中断原因失败，保留原任务检查点", flush=True)
+        if self.runtime:
+            self.add_log(message)
+            self.runtime.stop_accounts()
 
     def _login(self, payload):
         password = self._password(payload.get("password"))
@@ -222,7 +276,9 @@ class Service:
                     summary=str(r.exchange_batch_summary_var.get()),
                     accounts=r.account_records(), settings=settings, proxy_configured=proxy_configured,
                     auto_ladder=auto.as_dict(), auto_revision=revision,
-                    progress=dict(r.progress), interrupted=self.interrupted,
+                    volume_query=dict(r.trade_volume_query_dates), volume_query_error=r.trade_volume_query_error,
+                    progress=dict(r.progress), interrupted=({k: v for k, v in self.interrupted.items()
+                        if k in {"active", "action", "command_id", "started", "reason", "interrupted_at", "accounts", "results"}} if self.interrupted else None),
                     can_retry=bool(r._last_batch_retry), seq=sequence, logs=logs,
                     assets=assets, maintenance=self.maintenance_result,
                     server_time=time.time())
@@ -253,7 +309,10 @@ class Service:
         if action not in TASKS | {"stop"}:
             raise ValueError("不支持的任务")
         options = payload.get("options", {})
-        if (not isinstance(options, dict) or set(options) - {"enable_withdraw", "enable_bnb_topup"}
+        if action == "query_volume":
+            from shared_utils import trade_volume_time_range
+            trade_volume_time_range(options)
+        elif (not isinstance(options, dict) or set(options) - {"enable_withdraw", "enable_bnb_topup"}
                 or any(type(value) is not bool for value in options.values())
                 or (options and action != "run")):
             raise ValueError("本次执行选项无效")
@@ -281,9 +340,17 @@ class Service:
                 # Durable intent precedes financial execution. After a crash it
                 # is surfaced for reconciliation, never automatically replayed.
                 from stores import _save_authenticated_config
-                self.active_run = dict(active=True, action=action, command_id=ident,
-                                       started=time.time())
-                _save_authenticated_config(self.run_file, self.active_run)
+                if action == "retry_failed":
+                    failed_keys = set((r._last_batch_retry or {}).get("failed_account_keys", []))
+                    account_ids = [a["id"] for a in r.accounts if r._account_batch_key(a) in failed_keys]
+                else:
+                    account_ids = [a["id"] for a in r.selected_accounts(payload.get("accounts"))]
+                with self._checkpoint_lock:
+                    self.active_run = dict(active=True, action=action, command_id=ident,
+                                           started=time.time(), accounts=account_ids,
+                                           settings=dict(r.settings), options=options)
+                    self._checkpoint_retry_at = 0
+                    _save_authenticated_config(self.run_file, self.active_run, strict_backup=True)
                 if options:
                     r.execute(action, payload.get("accounts"), options=options)
                 else:
@@ -294,9 +361,10 @@ class Service:
             record["result"] = dict(accepted=False, action=action, command_id=ident,
                                     error=self.redact(exc), state="rejected")
             if action != "stop" and not r.busy:
-                self.active_run = None
                 from stores import _save_authenticated_config
-                _save_authenticated_config(self.run_file, {"active": False, "last_rejected": ident})
+                with self._checkpoint_lock:
+                    self.active_run = None
+                    _save_authenticated_config(self.run_file, {**(self.interrupted or {"active": False}), "last_rejected": ident}, strict_backup=True)
         self._save_commands()
         return record["result"]
 
@@ -305,7 +373,8 @@ class Service:
         if not isinstance(payload, dict):
             raise ValueError("请求格式无效")
         if method == "health":
-            return dict(configured=self.lock.is_configured(), unlocked=self.runtime is not None)
+            return dict(configured=self.lock.is_configured(), unlocked=self.runtime is not None,
+                        busy=bool(self.runtime and (self.runtime.busy or self.runtime._managed_threads_snapshot())))
         if method == "login":
             return self._login(payload)
         key, session = self.authenticate(request)
@@ -320,12 +389,26 @@ class Service:
                 return self.state(payload.get("since", 0))
             if method == "command":
                 return self._command(payload)
+            if method in {"operation_review", "operation_resolve"}:
+                from operation_review import snapshot, resolve
+                if r.busy or r._managed_threads_snapshot():
+                    raise ValueError("请等待任务及清理结束后核对")
+                if method == "operation_resolve":
+                    if payload.get("confirmed") is not True:
+                        raise ValueError("该操作需要确认")
+                    self.verify_password(payload.get("password"), payload.get("peer", "unknown"))
+                    resolve(r.exchange_operation_journal, payload.get("id", ""), payload.get("outcome", ""),
+                            payload.get("confirmation", ""), payload.get("evidence", ""))
+                return snapshot(r.exchange_operation_journal)
             if method == "emergency_stop":
                 r.stop_accounts()
                 return dict(stopping=True)
             if method == "settings":
                 r.update_settings(payload.get("settings", {}), payload.get("auto_ladder"))
                 return dict(staged=r.busy)
+            if method == "volume_settings":
+                return dict(saved=True, dates=r.save_trade_volume_query_settings(
+                    payload.get("start_date", ""), payload.get("end_date", "")))
             if method == "accounts":
                 r.replace_accounts(payload.get("accounts"))
                 return dict(count=len(r.accounts))
@@ -478,12 +561,18 @@ class Service:
                 entry = log_queue.get_nowait()
             except queue.Empty:
                 break
-            self.add_log(getattr(entry, "message", entry))
-        if self.active_run and not r.busy:
-            from stores import _save_authenticated_config
-            saved = {**self.active_run, "active": False, "ended": time.time()}
-            _save_authenticated_config(self.run_file, saved)
-            self.active_run = None
+            self.add_log(getattr(entry, "message", entry), persist=False)
+        with self._checkpoint_lock:
+            if self.active_run and not r.busy and time.monotonic() >= self._checkpoint_retry_at:
+                from stores import _save_authenticated_config
+                saved = {**self.active_run, "active": False, "ended": time.time()}
+                try:
+                    _save_authenticated_config(self.run_file, saved, strict_backup=True)
+                except OSError:
+                    self._checkpoint_retry_at = time.monotonic() + 60
+                    self.add_log("任务结束记录保存失败，保留原检查点；请检查磁盘和文件权限")
+                else:
+                    self.active_run = None
 
 
 class RequestServer(socketserver.ThreadingUnixStreamServer):
@@ -500,7 +589,10 @@ def serve(args):
     service = Service(args.data, args.setup_token_file)
     jobs = queue.Queue(maxsize=64)
     stopping = threading.Event()
-    def shutdown(*_args):
+    shutdown_signal = signal.SIGTERM
+    def shutdown(signum, _frame):
+        nonlocal shutdown_signal
+        shutdown_signal = signum
         stopping.set()
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
@@ -531,8 +623,8 @@ def serve(args):
         try:
             while True:
                 if stopping.is_set():
-                    if not stop_requested and service.runtime:
-                        service.runtime.stop_accounts()
+                    if not stop_requested:
+                        service.prepare_shutdown(shutdown_signal)
                     stop_requested = True
                     if not service.runtime or (not service.runtime.busy and not service.runtime._managed_threads_snapshot()):
                         break

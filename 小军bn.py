@@ -6,9 +6,7 @@ from __future__ import annotations
 import os
 import sys
 
-from app_paths import APP_DIR
-from exchange_app import App
-from exchange_selftest import run_selftest
+from app_paths import APP_DIR, DATA_DIR
 
 
 if __name__ == '__main__':
@@ -19,8 +17,24 @@ if __name__ == '__main__':
     selftest_online = '--selftest-online' in sys.argv or os.environ.get('XIAOJUN_SELFTEST_ONLINE', '').strip() == '1'
     selftest_gui = '--selftest-gui' in sys.argv or os.environ.get('XIAOJUN_SELFTEST_GUI', '').strip() == '1'
     if '--selftest' in sys.argv or '--selftest-online' in sys.argv or '--selftest-gui' in sys.argv:
+        from exchange_selftest import run_selftest
         os.environ.setdefault('XIAOJUN_APP_LOCK_BYPASS', '1')
         raise SystemExit(run_selftest(include_online_checks=selftest_online, include_gui_checks=selftest_gui))
 
-    app = App()
-    app.mainloop()
+    from process_lock import AlreadyRunningError, ProcessLease
+    try:
+        lease = ProcessLease(DATA_DIR / '.desktop.lock').acquire()
+    except AlreadyRunningError as exc:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo('客户端已运行', str(exc), parent=root)
+        root.destroy()
+        raise SystemExit(0)
+    try:
+        from exchange_app import App
+        app = App()
+        app.mainloop()
+    finally:
+        lease.close()

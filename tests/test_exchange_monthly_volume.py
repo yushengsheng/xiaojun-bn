@@ -4,14 +4,20 @@
 from __future__ import annotations
 
 import copy
+import os
 import threading
+import tempfile
+from pathlib import Path
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch
 
 from exchange_app_batch import ExchangeAppBatchMixin
 from exchange_app_base import ExchangeAppBase
 from exchange_binance_client import BinanceClient
+from shared_utils import trade_volume_time_range, normalize_trade_volume_date
+from secret_box import SecretBox
 
 
 class _TradeHistoryClient(BinanceClient):
@@ -191,9 +197,9 @@ class _MonthlyApp(ExchangeAppBatchMixin):
         target()
         return None
 
-    def query(self):
+    def query(self, options=None):
         with patch("exchange_app_batch.time.time", return_value=_END / 1000), patch("exchange_app_batch.logger") as log:
-            self.run_query_monthly_trade_volume(accounts_to_run=self.accounts)
+            self.run_query_monthly_trade_volume(accounts_to_run=self.accounts, query_options=options)
         self.logs = "\n".join(str(call.args) for call in log.method_calls)
 
 
@@ -215,6 +221,133 @@ class ExchangeMonthlyVolumeTests(unittest.TestCase):
         ExchangeAppBatchMixin.run_context_account_monthly_trade_volume(app)
 
         self.assertEqual(app.calls, [{"accounts_to_run": [account]}])
+
+    def test_query_dates_are_inclusive_beijing_days_and_single_date_works_in_either_field(self):
+        zone = timezone(timedelta(hours=8))
+        now = int(datetime(2026, 10, 7, 12, tzinfo=zone).timestamp() * 1000)
+        first = int(datetime(2026, 10, 1, tzinfo=zone).timestamp() * 1000)
+        next_day = first + 86_400_000
+        for field in ("start_date", "end_date"):
+            self.assertEqual(trade_volume_time_range({"period": "custom", field: "2026-10-01"}, now_ms=now),
+                             (first, next_day - 1, "2026-10-01（北京时间）"))
+        start, end, label = trade_volume_time_range(
+            {"period": "custom", "start_date": "2026-10-01", "end_date": "2026-10-03"}, now_ms=now)
+        self.assertEqual((start, end), (first, first + 3 * 86_400_000 - 1))
+        self.assertIn("2026-10-01 至 2026-10-03", label)
+        self.assertEqual(trade_volume_time_range({"period": "custom", "start_date": "2026-10-07"},
+                                               now_ms=now)[1], now)
+        self.assertEqual(trade_volume_time_range(now_ms=now), (now - 30 * 86_400_000, now, "近30天"))
+
+    def test_rejects_invalid_query_dates(self):
+        for options in ([], {"period": "other"},
+                        {"period": "custom", "start_date": "2026-02-30"},
+                        {"period": "custom", "start_date": "2026-10-03", "end_date": "2026-10-01"},
+                        {"period": "custom", "start_date": "2999-10-01"},
+                        {"period": "custom", "start_date": "1969-10-01"},
+                        {"period": "custom", "start_date": 20261001},
+                        {"period": "monthly", "start_date": "2026-10-01"},
+                        {"unknown": "value"}):
+            with self.subTest(options=options), self.assertRaises(RuntimeError):
+                trade_volume_time_range(options, now_ms=_END)
+
+    def test_date_digits_separators_and_unpadded_parts_normalize_consistently(self):
+        for text in ("20260902", "202692", "2026092", "2026-9-2", "2026/9/2", " 2026.09.2 "):
+            self.assertEqual(normalize_trade_volume_date(text), "2026-09-02", text)
+        self.assertEqual(normalize_trade_volume_date("2026102"), "2026-10-02")
+        self.assertEqual(normalize_trade_volume_date("2026912"), "2026-09-12")
+        self.assertEqual(normalize_trade_volume_date("20240229"), "2024-02-29")
+        for text in ("20260229", "20261301", "20269", "2026-9", "abc", 20260902):
+            with self.subTest(text=text), self.assertRaises(RuntimeError):
+                normalize_trade_volume_date(text)
+        self.assertEqual(trade_volume_time_range({"start_date": "", "end_date": ""}, now_ms=_END),
+                         (_END - 30 * 86_400_000, _END, "近30天"))
+        self.assertEqual(trade_volume_time_range({"start_date": "  ", "end_date": " "}, now_ms=_END)[2], "近30天")
+
+    def test_saved_conditions_survive_reload_and_direct_query_uses_them(self):
+        parent = Path(os.environ.get("XIAOJUN_TEST_ROOT", Path(__file__).resolve().parents[1] / ".linux-tests"))
+        parent.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent) as directory:
+            root = Path(directory)
+            with patch.object(ExchangeAppBatchMixin, "_trade_volume_query_settings_path", return_value=root / "query.json"), \
+                    patch("stores.SECRET_BOX", SecretBox(root / ".secret.key")):
+                app = _MonthlyApp()
+                app._load_trade_volume_query_settings()
+                app.save_trade_volume_query_settings("202692", "2026-9-3")
+                restored = _MonthlyApp()
+                restored._load_trade_volume_query_settings()
+                self.assertEqual(restored.trade_volume_query_dates, {"start_date": "2026-09-02", "end_date": "2026-09-03"})
+                restored.query()
+                expected_start = trade_volume_time_range(restored.trade_volume_query_dates, now_ms=_END)[0]
+                self.assertEqual(restored.trade_requests[0][2]["startTime"], expected_start)
+                restored.save_trade_volume_query_settings("", "")
+                restored._load_trade_volume_query_settings()
+                restored.trade_requests.clear()
+                restored.query()
+                self.assertEqual(restored.trade_requests[0][2]["startTime"], _END - 30 * 86_400_000)
+
+    def test_failed_save_keeps_previous_conditions_and_corrupt_main_recovers_backup(self):
+        parent = Path(os.environ.get("XIAOJUN_TEST_ROOT", Path(__file__).resolve().parents[1] / ".linux-tests"))
+        parent.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=parent) as directory:
+            root = Path(directory)
+            path = root / "query.json"
+            with patch.object(ExchangeAppBatchMixin, "_trade_volume_query_settings_path", return_value=path), \
+                    patch("stores.SECRET_BOX", SecretBox(root / ".secret.key")):
+                app = _MonthlyApp()
+                first = app.save_trade_volume_query_settings("20260902", "")
+                original = path.read_bytes()
+                with patch("exchange_app_batch._save_authenticated_config", side_effect=OSError("disk failure")), self.assertRaises(OSError):
+                    app.save_trade_volume_query_settings("20260903", "")
+                self.assertEqual(app.trade_volume_query_dates, first)
+                self.assertEqual(path.read_bytes(), original)
+                latest = app.save_trade_volume_query_settings("20260903", "")
+                path.write_text("broken")
+                app._load_trade_volume_query_settings()
+                self.assertEqual(app.trade_volume_query_dates, latest)
+                self.assertEqual(app.trade_volume_query_error, "")
+
+    def test_custom_controller_filters_day_boundaries_and_preserves_totals(self):
+        day = datetime.fromtimestamp(_END / 1000, timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        options = {"period": "custom", "start_date": day}
+        start, end, _label = trade_volume_time_range(options, now_ms=_END)
+        app = _MonthlyApp()
+        app.pages[("0", "XPLUSDT")] = [[_fill(1, "999", timestamp=start-1),
+            _fill(2, "100", fee="1", fee_asset="USDT", timestamp=start),
+            _fill(3, "120", buy=False, timestamp=end), _fill(4, "999", timestamp=end+1)]]
+        app.query(options)
+        self.assertIn("≈220 USDT｜买卖差≈+20｜费≈1｜含费收支差≈+19", app.statuses["0"])
+        self.assertIn("订单/成交明细：2单/2笔", app.logs)
+        self.assertIn(day + "（北京时间）", app.logs)
+        self.assertNotIn("近30天", app.logs)
+        self.assertEqual(app.trade_requests[0][2]["startTime"], start)
+
+    def test_invalid_custom_range_does_not_start_task_or_request_data(self):
+        app = _MonthlyApp()
+        with patch("exchange_app_batch.messagebox.showerror") as error:
+            app.query({"period": "custom", "start_date": "bad"})
+        self.assertTrue(error.called)
+        self.assertEqual(app.trade_requests, [])
+        self.assertEqual(app.active, {})
+
+    def test_long_history_prices_page_across_sparse_and_full_windows(self):
+        class Client(_PublicMarketClient):
+            def public_get(self, _base, path, params=None, **kwargs):
+                if path != "/api/v3/klines":
+                    return super().public_get(_base, path, params, **kwargs)
+                self.public_requests.append((path, dict(params)))
+                return [[hour, "0", "0", "0", "300"]
+                        for hour in range(params["startTime"], params["endTime"] + 1, 3_600_000)]
+        client = Client([])
+        rates = client.get_historical_usdt_hourly_rates({"BNB"}, start_time_ms=0,
+            end_time_ms=2002 * 3_600_000 - 1,
+            spot_symbols=[{"symbol": "BNBUSDT", "baseAsset": "BNB", "quoteAsset": "USDT"}])
+        self.assertEqual(len(rates["BNB"]), 2002)
+        self.assertEqual([p[1]["startTime"] for p in client.public_requests],
+                         [0, 1000 * 3_600_000, 2000 * 3_600_000])
+        sparse = _PublicMarketClient([], {"BNBUSDT": [[2000 * 3_600_000, "0", "0", "0", "300"]]})
+        self.assertEqual(sparse.get_historical_usdt_hourly_rates({"BNB"}, start_time_ms=0,
+            end_time_ms=2002 * 3_600_000 - 1,
+            spot_symbols=[{"symbol": "BNBUSDT"}]), {"BNB": {2000 * 3_600_000: Decimal("300")}})
 
     def test_sums_quote_volume_and_paginates_by_trade_id(self) -> None:
         first_page = [

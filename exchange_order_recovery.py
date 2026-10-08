@@ -41,9 +41,26 @@ def reconcile_exchange_orders(journal, client, api_key: str, *, allow_stock_task
             else:
                 order = client.get_order(symbol, order_id) if order_id not in (None, "") else client.get_order_by_client_id(symbol, client_order_id)
             status = str(order.get("status") or "").upper()
-        except Exception:
-            pending.append(entry_id)
-            continue
+        except Exception as exc:
+            # A crash can leave an intent that never reached the exchange. Use
+            # the same query + cancel confirmation as live timeout cleanup.
+            if getattr(exc, "code", None) == -2013 and client_order_id:
+                cleanup = getattr(client, "get_pending_order_for_cleanup", None)
+                if callable(cleanup):
+                    try:
+                        order = cleanup({**payload, "entry_id": entry_id, "confirmation_timed_out": True})
+                        if order is None:
+                            continue
+                        status = str(order.get("status") or "").upper()
+                    except Exception:
+                        pending.append(entry_id)
+                        continue
+                else:
+                    pending.append(entry_id)
+                    continue
+            else:
+                pending.append(entry_id)
+                continue
         if status == "FILLED":
             journal.update(entry_id, "completed", exchange_status=status)
         elif status in {"CANCELED", "REJECTED", "EXPIRED", "EXPIRED_IN_MATCH"}:

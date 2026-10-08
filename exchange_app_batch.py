@@ -53,11 +53,19 @@ from exchange_app_base import (
 from input_validation import bounded_int, finite_float
 from exchange_order_recovery import exchange_operation_scope, reconcile_exchange_orders
 from exchange_auto_ladder_observer import AutoLadderMarketObserver
-from shared_utils import decimal_to_stat_text
+from shared_utils import decimal_to_stat_text, trade_volume_time_range, normalize_trade_volume_date
+from stores import _load_authenticated_config, _save_authenticated_config, config_or_backup_exists
 from exchange_stocks import STOCK_TYPE
 
 
 class ExchangeAppBatchMixin(object):
+    def review_unconfirmed_operations(self):
+        if getattr(self, "_batch_task_active", False) or getattr(self, "worker_thread", None) and self.worker_thread.is_alive():
+            messagebox.showwarning("提示", "请等待任务及清理结束后核对")
+            return
+        from operation_review import desktop_review
+        desktop_review(self, self.exchange_operation_journal)
+
     COLLECT_BNB_RESIDUAL_IGNORE_USDT = Decimal("0.1")
 
     @classmethod
@@ -160,6 +168,7 @@ class ExchangeAppBatchMixin(object):
             "btn_import_accounts",
             "btn_paste_accounts",
             "btn_query_monthly_volume",
+            "btn_volume_settings",
             "btn_destroy_all_accounts",
         ):
             btn = getattr(self, name, None)
@@ -1716,6 +1725,9 @@ class ExchangeAppBatchMixin(object):
                 return
             results[key] = bool(success)
             summary_text = self._build_batch_summary_text(summary)
+        checkpoint = getattr(self, "batch_checkpoint", None)
+        if callable(checkpoint):
+            checkpoint(acc, success)
         self._schedule_batch_summary_text(summary_text)
     def _finish_batch_summary_tracking(self) -> None:
         with self._batch_summary_lock:
@@ -2062,7 +2074,81 @@ class ExchangeAppBatchMixin(object):
             messagebox.showinfo("提示", "请至少勾选一个账号")
             return
         self.run_selected_accounts(accounts_to_run=selected_accounts, batch_total_asset_only=True, require_confirm=False)
-    def run_query_monthly_trade_volume(self, accounts_to_run=None):
+    @staticmethod
+    def _trade_volume_query_settings_path():
+        import exchange_app_base as base
+        return base.DATA_FILE.parent / "trade_volume_query.json"
+
+    def _load_trade_volume_query_settings(self):
+        self.trade_volume_query_dates = {"start_date": "", "end_date": ""}
+        self.trade_volume_query_error = ""
+        path = self._trade_volume_query_settings_path()
+        if not config_or_backup_exists(path):
+            return
+        try:
+            raw, _ = _load_authenticated_config(path, validator=trade_volume_time_range)
+            self.trade_volume_query_dates = {name: normalize_trade_volume_date(raw.get(name, ""))
+                                            for name in ("start_date", "end_date")}
+        except Exception as exc:
+            self.trade_volume_query_error = "查询条件读取失败，请打开成交额设置重新保存"
+            logger.warning("%s：%s", self.trade_volume_query_error, exc)
+
+    def save_trade_volume_query_settings(self, start_date, end_date):
+        dates = {"start_date": normalize_trade_volume_date(start_date),
+                 "end_date": normalize_trade_volume_date(end_date)}
+        trade_volume_time_range(dates)
+        _save_authenticated_config(self._trade_volume_query_settings_path(), dates)
+        self.trade_volume_query_dates = dates
+        self.trade_volume_query_error = ""
+        return dict(dates)
+
+    def show_trade_volume_query_settings(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("成交额查询设置")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill="both", expand=True)
+        saved = getattr(self, "trade_volume_query_dates", {})
+        dates = [tk.StringVar(master=dialog, value=saved.get(name, ""))
+                 for name in ("start_date", "end_date")]
+
+        def format_date(var, complete=False):
+            text = var.get().strip()
+            if complete or (len(text) == 8 and text.isdigit()):
+                try:
+                    var.set(normalize_trade_volume_date(text))
+                except RuntimeError:
+                    pass
+
+        for row, (text, var) in enumerate(zip(("开始日期", "结束日期"), dates)):
+            ttk.Label(body, text=text).grid(row=row, column=0, sticky="w", pady=5)
+            entry = ttk.Entry(body, textvariable=var, width=26)
+            entry.grid(row=row, column=1, sticky="ew", padx=(10, 0))
+            var.trace_add("write", lambda *_args, var=var: format_date(var))
+            entry.bind("<FocusOut>", lambda _event, var=var: format_date(var, True))
+        ttk.Label(body, text="均留空：近30天；只填一个：当天；填写两个：起止日期。\n"
+                  "北京时间；可输入 20260902 或 2026-9-2，自动补零。",
+                  foreground="#666666").grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        def submit():
+            try:
+                self.save_trade_volume_query_settings(dates[0].get(), dates[1].get())
+            except Exception as exc:
+                messagebox.showerror("错误", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+
+        actions = ttk.Frame(body)
+        actions.grid(row=3, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(actions, text="保存", command=submit).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="取消", command=dialog.destroy).pack(side="left")
+        dialog.bind("<Return>", lambda _event: submit())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.grab_set()
+        self.wait_window(dialog)
+
+    def run_query_monthly_trade_volume(self, accounts_to_run=None, *, query_options=None):
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("提示", "已有任务在运行中，请先停止当前任务")
             return
@@ -2077,6 +2163,11 @@ class ExchangeAppBatchMixin(object):
             messagebox.showerror("错误", "现货交易对不能为空")
             return
         try:
+            if query_options is None:
+                if getattr(self, "trade_volume_query_error", ""):
+                    raise RuntimeError(self.trade_volume_query_error)
+                query_options = dict(getattr(self, "trade_volume_query_dates", {}))
+            start_time_ms, end_time_ms, period_label = trade_volume_time_range(query_options)
             base_asset = BinanceClient.get_spot_base_asset(symbol)
             max_threads = bounded_int(self.max_threads_var.get(), "线程数")
             min_delay = self._delay_var_value(self.min_delay_var, 1000, "最小")
@@ -2085,8 +2176,8 @@ class ExchangeAppBatchMixin(object):
             messagebox.showerror("错误", str(exc) or "交易对、线程数或随机延迟格式不正确")
             return
 
-        end_time_ms = int(time.time() * 1000)
-        start_time_ms = end_time_ms - (30 * 24 * 60 * 60 * 1000)
+        query_label = "月成交额" if period_label == "近30天" else "成交额"
+        summary_label = "月成交" if period_label == "近30天" else "成交"
         self.stop_event = threading.Event()
         request_gate = SharedRateLimitGate(10, stop_event=self.stop_event)
         self._batch_task_active = True
@@ -2102,7 +2193,7 @@ class ExchangeAppBatchMixin(object):
         self.btn_withdraw.config(state="disabled")
         self._set_account_manage_buttons_state("disabled")
         self._set_combo_states_for_run(True)
-        self.status_var.set(f"状态：查询 {base_asset} 全部现货交易对近30天成交额...")
+        self.status_var.set(f"状态：查询 {base_asset} 全部现货交易对{period_label}成交额...")
         self.progress["value"] = 0
         self.progress["maximum"] = len(selected)
 
@@ -2179,7 +2270,7 @@ class ExchangeAppBatchMixin(object):
                 "买卖收支差：待折算" if missing_volume else f"买卖收支差≈{pnl_text} USDT",
                 f"手续费：{native_fee_text}（{fee_label}≈{fee_text} USDT）",
                 "含费收支差：待折算" if missing_volume or missing_fee else f"含费收支差≈{net_text} USDT",
-                "说明：这里是近30天卖出收入减买入支出及手续费，未计入期初/期末持币价值和闪兑，不等于实际盈亏。",
+                f"说明：这里是{period_label}卖出收入减买入支出及手续费，未计入期初/期末持币价值和闪兑，不等于实际盈亏。",
                 f"订单/成交明细：{int(summary['orderCount'])}单/{int(summary['tradeCount'])}笔",
             ]
             unvalued_volume = self._format_asset_breakdown_text(dict(summary["unvaluedQuoteVolumeByAsset"]))
@@ -2195,7 +2286,7 @@ class ExchangeAppBatchMixin(object):
             summaries = result["summaries"]
             stopped = result["stopped"]
             if not summaries:
-                status = "已停止" if stopped else "月成交额查询失败（无完整交易对数据）"
+                status = "已停止" if stopped else f"{query_label}查询失败（无完整交易对数据）"
                 self._schedule_account_status(acc, status if stopped else self._exchange_failed_status_text(status))
                 logger.info("账号 #%d %s：%s", idx, base_asset, status)
             else:
@@ -2208,7 +2299,7 @@ class ExchangeAppBatchMixin(object):
                 self._schedule_account_status(
                     acc, body if partial or needs_valuation(summary) else self._exchange_success_status_text(body),
                 )
-                title = f"账号 #{idx} {base_asset} 近30天成交汇总"
+                title = f"账号 #{idx} {base_asset} {period_label}成交汇总"
                 if partial:
                     title += f"（{label}，仅含已查部分）"
                 logger.info("%s", detailed_summary_text(
@@ -2235,7 +2326,7 @@ class ExchangeAppBatchMixin(object):
                         self._schedule_account_status(acc, f"{base_asset} 查询前随机等待...")
                         if not self._wait_batch_random_delay(
                             combined_stop, min_delay, max_delay,
-                            log_prefix=f"线程 {thread_id} 切换账号 #{idx} 月成交额查询前 ",
+                            log_prefix=f"线程 {thread_id} 切换账号 #{idx} {query_label}查询前 ",
                         ):
                             raise InterruptedError("成交额查询已停止")
                     self._schedule_account_status(acc, f"查询 {base_asset} 全部交易对...")
@@ -2317,8 +2408,9 @@ class ExchangeAppBatchMixin(object):
                     stop_event=self.stop_event,
                 )
                 logger.info(
-                    "%s 月成交额查询范围：%d个现货交易对：%s",
+                    "%s 成交额查询范围：%s，%d个现货交易对：%s",
                     base_asset,
+                    period_label,
                     len(spot_symbol_infos),
                     "、".join(item["symbol"] for item in spot_symbol_infos),
                 )
@@ -2327,15 +2419,15 @@ class ExchangeAppBatchMixin(object):
                     self._schedule_account_status(acc, "已停止")
                     self._set_account_batch_active(acc, False)
                 self._dispatch_ui(
-                    lambda: self._restore_batch_ui_to_idle(status_text="状态：月成交额查询已停止", finish_summary=False)
+                    lambda: self._restore_batch_ui_to_idle(status_text=f"状态：{query_label}查询已停止", finish_summary=False)
                 )
                 return
             except Exception as exc:
                 if not self.stop_event.is_set():
-                    logger.error("月成交额查询初始化失败: %s", exc)
+                    logger.error("%s查询初始化失败: %s", query_label, exc)
                 error_text = (
-                    "月成交额查询已停止" if self.stop_event.is_set()
-                    else self._exchange_error_status_text("月成交额查询失败", exc, fallback="查询失败")
+                    f"{query_label}查询已停止" if self.stop_event.is_set()
+                    else self._exchange_error_status_text(f"{query_label}查询失败", exc, fallback="查询失败")
                 )
                 for acc in selected:
                     self._schedule_account_status(acc, error_text)
@@ -2422,9 +2514,9 @@ class ExchangeAppBatchMixin(object):
                 task_queue.task_done()
 
             if not completed_summaries:
-                status_text = "月成交额查询已停止" if self.stop_event.is_set() or any(
+                status_text = f"{query_label}查询已停止" if self.stop_event.is_set() or any(
                     result["stopped"] for result in account_results
-                ) else "月成交额查询失败（无完整交易对数据）"
+                ) else f"{query_label}查询失败（无完整交易对数据）"
                 logger.info("%s %s", base_asset, status_text)
                 self._dispatch_ui(lambda: self._restore_batch_ui_to_idle(
                     status_text=f"状态：{status_text}", finish_summary=False,
@@ -2435,8 +2527,8 @@ class ExchangeAppBatchMixin(object):
             partial = success < len(selected) or self.stop_event.is_set()
             label = "已停止，部分汇总" if self.stop_event.is_set() else "部分汇总"
             title = (
-                f"{base_asset} 近30天{label}（完整账号{success}/{len(selected)}，仅含已查部分）" if partial
-                else f"{base_asset} 近30天全部账号成交汇总（成功{success}/{len(selected)}）"
+                f"{base_asset} {period_label}{label}（完整账号{success}/{len(selected)}，仅含已查部分）" if partial
+                else f"{base_asset} {period_label}全部账号成交汇总（成功{success}/{len(selected)}）"
             )
             logger.info(
                 "%s",
@@ -2447,7 +2539,7 @@ class ExchangeAppBatchMixin(object):
                 ),
             )
             status_text = (
-                f"状态：{base_asset}月成交 {label if partial else str(len(spot_symbol_infos)) + '对'}｜"
+                f"状态：{base_asset}{summary_label} {label if partial else str(len(spot_symbol_infos)) + '对'}｜"
                 f"{compact_summary_text(summary, include_total=False)}｜"
                 f"{success}/{len(selected)}（详情见日志）"
             )
@@ -3083,7 +3175,7 @@ class ExchangeAppBatchMixin(object):
         )
         if market_stagger_coordinator is not None:
             logger.info(
-                "市价严格交错已启用：%d 个工作线程，奇数线程与偶数线程反相执行",
+                "市价严格交错已启用：%d 个工作线程，随账号完成自适应平衡两组买卖方向",
                 worker_count,
             )
         auto_ladder_observer = None

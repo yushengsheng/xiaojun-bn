@@ -5,7 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$PROJECT_DIR/data/logs"
 LOG_FILE="$LOG_DIR/startup.log"
 mkdir -p "$LOG_DIR"
-: > "$LOG_FILE"
+touch "$LOG_FILE"
 
 fail() {
   printf '%s\n' "$1" >>"$LOG_FILE"

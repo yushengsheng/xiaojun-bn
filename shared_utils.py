@@ -8,7 +8,7 @@ import random
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, localcontext
 import tkinter as tk
 from tkinter import END, Scrollbar
@@ -20,20 +20,87 @@ from sensitive_data import redact_sensitive_text
 LOG_MAX_ROWS = LOG_MAX_ROWS_DEFAULT
 UI_BATCH_DELAY_MS = UI_BATCH_DELAY_MS_DEFAULT
 logger = logging.getLogger(__name__)
+
+
+def normalize_trade_volume_date(value: str) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("查询日期必须是文字")
+    text = value.strip()
+    if not text:
+        return ""
+    match = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    if match:
+        year, month, day = map(int, match.groups())
+    elif re.fullmatch(r"\d{6,8}", text):
+        year, rest = int(text[:4]), text[4:]
+        month_width = 2 if len(rest) == 4 or (len(rest) == 3 and 1 <= int(rest[:2]) <= 12) else 1
+        month, day = int(rest[:month_width]), int(rest[month_width:])
+    else:
+        raise RuntimeError("日期可输入 YYYYMMDD 或 YYYY-M-D，例如 20260902、2026-9-2")
+    try:
+        datetime(year, month, day)
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    except ValueError as exc:
+        raise RuntimeError("查询日期无效，请检查年月日") from exc
+
+
+def trade_volume_time_range(options=None, *, now_ms=None) -> tuple[int, int, str]:
+    """Keep the rolling month default; custom dates include whole Beijing days."""
+    options = {} if options is None else options
+    if (not isinstance(options, dict) or set(options) - {"period", "start_date", "end_date"}
+            or any(not isinstance(value, str) for value in options.values())):
+        raise RuntimeError("成交额查询选项无效")
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    start_text = normalize_trade_volume_date(options.get("start_date", ""))
+    end_text = normalize_trade_volume_date(options.get("end_date", ""))
+    period = options.get("period", "custom" if start_text or end_text else "monthly")
+    if period == "monthly":
+        if start_text or end_text:
+            raise RuntimeError("月成交额查询无需填写日期")
+        return now_ms - 30 * 86_400_000, now_ms, "近30天"
+    if period != "custom":
+        raise RuntimeError("请选择月成交额或自定义日期")
+    if not start_text and not end_text:
+        return now_ms - 30 * 86_400_000, now_ms, "近30天"
+    start_text, end_text = start_text or end_text, end_text or start_text
+    beijing = timezone(timedelta(hours=8))
+
+    def parse_date(text):
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+                raise ValueError
+            return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=beijing)
+        except ValueError as exc:
+            raise RuntimeError("日期格式应为 YYYY-MM-DD，且必须是有效日期") from exc
+
+    start, end = parse_date(start_text), parse_date(end_text)
+    if start > end:
+        raise RuntimeError("开始日期不能晚于结束日期")
+    if end.date() > datetime.fromtimestamp(now_ms / 1000, beijing).date():
+        raise RuntimeError("查询日期不能晚于今天（北京时间）")
+    start_ms = int(start.timestamp() * 1000)
+    if start_ms < 0:
+        raise RuntimeError("查询日期不能早于 1970-01-02")
+    end_ms = min(now_ms, int((end + timedelta(days=1)).timestamp() * 1000) - 1)
+    label = start_text if start_text == end_text else f"{start_text} 至 {end_text}"
+    return start_ms, end_ms, label + "（北京时间）"
+
+
 LOG_AMOUNT_TAG = "log_amount_value"
 LOG_AMOUNT_ROW_TAG = "log_amount_row"
-LOG_AMOUNT_COLOR = "#C2410C"
+LOG_AMOUNT_COLOR = "#C62828"
 _LOG_NUMBER_RE = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 _LOG_COIN_RE = r"(?:USDT|USDC|BUSD|BNB|BTC|ETH|SOL|TRX|XRP|DOGE|ADA|DOT|MATIC|POL|LTC)"
 _LOG_AMOUNT_LABEL_RE = (
     r"(?:预买BNB金额|剩余bnb手续费|提现总额|余额总额|转账总额|预估gas合计|"
     r"总资产|可提余额|提现额度|下单金额|当前参考价|重挂阈值|"
+    r"交易量|成交额|收支差|停止值|支出|到账|"
     r"金额|余额|总额|预估gas|gas费|gas合计|手续费|均价|价格|旧价|新价|溢价|数量|"
     r"amount|balance|total|price|qty|quantity|fee)"
 )
 _LOG_AMOUNT_VALUE_PATTERNS = (
     re.compile(
-        rf"{_LOG_AMOUNT_LABEL_RE}\s*(?:[=:：]|为|约)?\s*(?:{_LOG_COIN_RE}\s*)?"
+        rf"{_LOG_AMOUNT_LABEL_RE}\s*(?:[=:：≈]|为|约)?\s*(?:{_LOG_COIN_RE}\s*)?"
         rf"(?P<value>{_LOG_NUMBER_RE})(?![\w.])",
         re.IGNORECASE,
     ),
