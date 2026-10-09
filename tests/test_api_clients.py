@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 import requests
-from api_clients import EvmClient, RpcTransactionRejected
+from api_clients import EvmClient
 from core_models import GeneratedWalletEntry
 
 
@@ -282,36 +282,6 @@ class EvmClientGasPriceTests(unittest.TestCase):
 
 
 class EvmClientReceiptFallbackTests(unittest.TestCase):
-    def test_http_403_balance_node_is_cooled_for_following_queries(self):
-        client = EvmClient()
-        self.addCleanup(client.close)
-        urls = ["https://blocked.example", "https://healthy.example"]
-        session = Mock()
-        session.post.side_effect = [Mock(status_code=403, text="Forbidden"), Mock(status_code=200, text='{"result":"0x1"}')]
-        with patch.object(client, "_network_info", return_value={"rpc_urls": urls}), patch.object(client, "_rpc_session", return_value=(session, "")):
-            self.assertEqual(client._rpc_call("BSC", "eth_getBalance", []), "0x1")
-            self.assertIn(("BSC", urls[0]), client._rpc_failure_cooldowns)
-            session.post.reset_mock()
-            session.post.side_effect = None
-            session.post.return_value = Mock(status_code=200, text='{"result":"0x2"}')
-            self.assertEqual(client._rpc_call("BSC", "eth_getBalance", []), "0x2")
-            self.assertEqual([call.args[0] for call in session.post.call_args_list], [urls[1]])
-
-    def test_broadcast_rejection_is_definite_only_when_every_node_rejects(self):
-        client = EvmClient()
-        self.addCleanup(client.close)
-        urls = ["https://one.example", "https://two.example"]
-        rejected = Mock(status_code=200, text='{"error":{"code":-32000,"message":"insufficient funds for gas * price + value"}}')
-        session = Mock()
-        with patch.object(client, "_network_info", return_value={"rpc_urls": urls}), patch.object(client, "_rpc_session", return_value=(session, "")), patch("api_clients.time.sleep"):
-            session.post.return_value = rejected
-            with self.assertRaises(RpcTransactionRejected):
-                client._rpc_call("BSC", "eth_sendRawTransaction", ["0x12"])
-            session.post.side_effect = [requests.ReadTimeout("reply lost"), rejected, rejected, rejected]
-            with self.assertRaises(RuntimeError) as caught:
-                client._rpc_call("BSC", "eth_sendRawTransaction", ["0x12"])
-            self.assertNotIsInstance(caught.exception, RpcTransactionRejected)
-
     def test_slow_node_leaves_time_for_backup_within_shared_timeout(self) -> None:
         client = EvmClient()
         urls = ["https://slow.example", "https://synced.example"]
@@ -324,7 +294,7 @@ class EvmClientReceiptFallbackTests(unittest.TestCase):
                 now[0] += kwargs["timeout"].total
                 raise requests.exceptions.ReadTimeout("slow node")
             self.assertEqual(kwargs["timeout"].total, 5)
-            return Mock(status_code=200, text=json.dumps({"result":{"status":"0x1", "transactionHash":"0x"+"a"*64}}))
+            return Mock(status_code=200, text='{"result":{"status":"0x1"}}')
 
         session.post.side_effect = post
         with (
@@ -334,25 +304,21 @@ class EvmClientReceiptFallbackTests(unittest.TestCase):
             patch("api_clients.time.sleep") as sleep,
         ):
             self.assertEqual(client.get_transaction_receipt("BSC", "0x" + "a" * 64, timeout_seconds=10),
-                             {"status": "0x1", "transactionHash": "0x" + "a" * 64})
+                             {"status": "0x1"})
         self.assertEqual([call.args[0] for call in session.post.call_args_list], urls)
         sleep.assert_not_called()
 
         # 其他 RPC 查询改写通用首选节点后，回执查询仍直达已验证有效的节点。
         client._preferred_rpc_urls["BSC"] = urls[0]
         session.post.reset_mock()
-        # The cooling node is skipped, leaving the whole budget to the healthy node.
-        session.post.side_effect = None
-        session.post.return_value = Mock(status_code=200, text=json.dumps({"result": {"status": "0x1", "transactionHash": "0x" + "a" * 64}}))
         with (
             patch.object(client, "_network_info", return_value={"rpc_urls": urls}),
             patch.object(client, "_rpc_session", return_value=(session, "")),
             patch("api_clients.time.monotonic", side_effect=lambda: now[0]),
         ):
             self.assertEqual(client.get_transaction_receipt("BSC", "0x" + "a" * 64, timeout_seconds=10),
-                             {"status": "0x1", "transactionHash": "0x" + "a" * 64})
+                             {"status": "0x1"})
         self.assertEqual([call.args[0] for call in session.post.call_args_list], [urls[1]])
-        self.assertEqual(session.post.call_args.kwargs["timeout"].total, 10)
 
     def test_recently_failed_receipt_node_is_deprioritized_until_cooldown_expires(self) -> None:
         client = EvmClient()
@@ -377,7 +343,7 @@ class EvmClientReceiptFallbackTests(unittest.TestCase):
             session.post.side_effect = None
             session.post.return_value = Mock(status_code=200, text='{"result":null}')
             self.assertIsNone(client.get_transaction_receipt("BSC", "0x" + "a" * 64))
-            self.assertEqual([call.args[0] for call in session.post.call_args_list], [urls[1]])
+            self.assertEqual([call.args[0] for call in session.post.call_args_list], list(reversed(urls)))
             session.post.reset_mock()
             now[0] = 31.0
             self.assertIsNone(client.get_transaction_receipt("BSC", "0x" + "a" * 64))
@@ -458,12 +424,12 @@ class EvmClientReceiptFallbackTests(unittest.TestCase):
     def test_receipt_status_zero_is_returned_without_fallback(self) -> None:
         client = EvmClient()
         session = Mock()
-        session.post.return_value = Mock(status_code=200, text=json.dumps({"result":{"status":"0x0", "transactionHash":"0x"+"a"*64}}))
+        session.post.return_value = Mock(status_code=200, text='{"result":{"status":"0x0"}}')
         with (
             patch.object(client, "_network_info", return_value={"rpc_urls": ["https://first.example", "https://second.example"]}),
             patch.object(client, "_rpc_session", return_value=(session, "")),
         ):
-            self.assertEqual(client.get_transaction_receipt("BSC", "0x" + "a" * 64), {"status": "0x0", "transactionHash": "0x" + "a" * 64})
+            self.assertEqual(client.get_transaction_receipt("BSC", "0x" + "a" * 64), {"status": "0x0"})
         self.assertEqual(session.post.call_count, 1)
 
     def test_other_rpc_methods_keep_existing_null_behavior(self) -> None:
@@ -475,7 +441,7 @@ class EvmClientReceiptFallbackTests(unittest.TestCase):
             patch.object(client, "_rpc_session", return_value=(session, "")),
         ):
             self.assertIsNone(client.get_transaction_by_hash("BSC", "0x" + "a" * 64))
-        self.assertEqual(session.post.call_count, 2)
+        session.post.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -131,9 +131,8 @@ class RelayWalletRecord:
 
 
 class RelayWalletFileStore:
-    def __init__(self, file_path: Path | None = None, *, operation_journal=None):
+    def __init__(self, file_path: Path | None = None):
         self.file_path = Path(file_path or RELAY_WALLET_FILE)
-        self.operation_journal = operation_journal
         self._lock = threading.RLock()
         self._records_cache: list[RelayWalletRecord] | None = None
         self._cache_signature: tuple[int, int] | None = None
@@ -166,9 +165,7 @@ class RelayWalletFileStore:
                 candidate_text = candidate.read_text(encoding="utf-8")
                 records = self._parse_records_text(candidate_text)
                 if candidate == backup_path:
-                    if self.operation_journal is not None:
-                        self.operation_journal.require_recovery("中转钱包文件从备份恢复，须核对中转地址及链上交易")
-                    _atomic_write_text_with_backup(self.file_path, candidate_text, encoding="utf-8", strict_backup=True)
+                    _atomic_write_text_with_backup(self.file_path, candidate_text, encoding="utf-8")
                 self._records_cache = list(records)
                 self._cache_signature = self._file_signature(self.file_path)
                 self._dirty = False
@@ -255,7 +252,7 @@ class RelayWalletFileStore:
             context=secure_config_context(self.file_path),
         )
         content = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
-        _atomic_write_text_with_backup(self.file_path, content, encoding="utf-8", strict_backup=True)
+        _atomic_write_text_with_backup(self.file_path, content, encoding="utf-8")
         self._records_cache = list(records)
         self._cache_signature = self._file_signature(self.file_path)
         self._dirty = False
@@ -296,7 +293,7 @@ class RelayWalletFileStore:
             self._save_records_locked(current)
 
     def remove_records(self, record_keys: set[tuple[str, str]]) -> int:
-        """Remove records after confirming all tracked balances are zero/below recovery margins."""
+        """Remove records by (batch_id, relay_address) after the caller has confirmed they are empty."""
         normalized_keys = {
             (str(batch_id or "").strip(), str(relay_address or "").strip())
             for batch_id, relay_address in (record_keys or set())
@@ -318,7 +315,7 @@ class RelayWalletFileStore:
                 self._save_records_locked(remaining)
             return removed
 
-    def update_record(self, relay_address: str, *, batch_id: str = "", new_batch_id: str = "", **changes: object) -> RelayWalletRecord:
+    def update_record(self, relay_address: str, *, batch_id: str = "", **changes: object) -> RelayWalletRecord:
         relay_key = str(relay_address or "").strip()
         batch_key = str(batch_id or "").strip()
         if not relay_key:
@@ -332,8 +329,6 @@ class RelayWalletFileStore:
                     continue
                 updated_raw = asdict(record)
                 updated_raw.update(changes)
-                if new_batch_id:
-                    updated_raw["batch_id"] = str(new_batch_id).strip()
                 updated = RelayWalletRecord.from_raw(updated_raw)
                 records[idx] = updated
                 self._records_cache = list(records)

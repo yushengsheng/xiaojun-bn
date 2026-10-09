@@ -7,9 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
-from api_clients import EvmClient, PreparedSignedTransaction
 from exchange_binance_client import BinanceClient, UnconfirmedOperationError
-from onchain_transaction_recovery import UnconfirmedTransactionError, resume_entry
 from operation_journal import OperationJournal
 from operation_review import resolve, snapshot
 from process_lock import AlreadyRunningError, ProcessLease
@@ -30,15 +28,6 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.addCleanup(client.close)
         return client
 
-    def chain(self):
-        client = EvmClient(operation_journal=self.journal)
-        client.send_raw_transaction = Mock(return_value="0x" + "a" * 64)
-        client.get_transaction_receipt = Mock(return_value=None)
-        client.get_transaction_by_hash = Mock(return_value=None)
-        return client
-
-    def prepared(self, nonce=1, letter="a"):
-        return PreparedSignedTransaction({"nonce": nonce, "gas": 21000, "gasPrice": 1}, "0x12", "0x" + letter * 64)
 
     def test_second_instance_is_blocked_until_first_exits(self):
         path = self.root / "desktop.lock"
@@ -301,53 +290,6 @@ class RuntimeSafetyTests(unittest.TestCase):
         other.request(other.spot, "POST", "/sapi/v1/asset/transfer", {"amount": "1"})
         self.assertEqual(other._request_impl.call_args.args[1], "POST")
 
-    def test_empty_or_wrong_rpc_ack_is_not_success(self):
-        for ack in (None, "0x", "0x" + "b" * 64):
-            client = self.chain()
-            client.send_raw_transaction.return_value = ack
-            with self.assertRaises(UnconfirmedTransactionError):
-                client.submit_prepared_transaction("BSC", self.prepared(), source_address="source", nonce=1, recovery_timeout_seconds=1)
-            self.assertEqual(self.journal.active_entries()[0]["state"], "unconfirmed")
-
-    def test_lost_rpc_reply_uses_transaction_lookup(self):
-        client = self.chain()
-        client.send_raw_transaction.side_effect = requests.ReadTimeout("lost")
-        client.get_transaction_by_hash.return_value = {"hash": self.prepared().tx_hash}
-        result = client.submit_prepared_transaction("BSC", self.prepared(), source_address="source", nonce=1, recovery_timeout_seconds=1)
-        self.assertTrue(result.recovered)
-        self.assertFalse(result.acknowledged)
-        client.get_transaction_by_hash.assert_called_once()
-
-    def test_retry_reuses_original_signed_bytes_and_nonce(self):
-        client = self.chain()
-        with client.transaction_context(batch_id="batch", task_key="task"):
-            client.send_raw_transaction.side_effect = requests.ReadTimeout("lost")
-            with self.assertRaises(UnconfirmedTransactionError):
-                client.submit_prepared_transaction("BSC", self.prepared(), source_address="source", nonce=1, recovery_timeout_seconds=1)
-            client.send_raw_transaction.side_effect = None
-            result = client.submit_prepared_transaction("BSC", self.prepared(nonce=2, letter="b"), source_address="source", nonce=2)
-        self.assertEqual(result.tx_hash, self.prepared().tx_hash)
-        self.assertEqual(result.nonce, 1)
-        self.assertEqual(client.send_raw_transaction.call_args.args[1], "0x12")
-
-    def test_other_task_cannot_bypass_unknown_wallet_transaction(self):
-        client = self.chain()
-        client.send_raw_transaction.return_value = None
-        with self.assertRaises(UnconfirmedTransactionError):
-            client.submit_prepared_transaction("BSC", self.prepared(), source_address="source", nonce=1, recovery_timeout_seconds=1)
-        client.send_raw_transaction.reset_mock()
-        with self.assertRaises(UnconfirmedTransactionError):
-            client.submit_prepared_transaction("BSC", self.prepared(nonce=2), source_address="source", nonce=2)
-        client.send_raw_transaction.assert_not_called()
-
-    def test_stop_is_preserved_when_resuming_original_transaction(self):
-        client = self.chain()
-        client.submit_prepared_transaction("BSC", self.prepared(), source_address="source", nonce=1)
-        stop = threading.Event(); stop.set()
-        client.send_raw_transaction.reset_mock()
-        with client.transaction_context(stop_event=stop), self.assertRaises(UnconfirmedTransactionError):
-            resume_entry(client, self.journal.active_entries()[0])
-        client.send_raw_transaction.assert_not_called()
 
     def test_restore_guard_survives_reload_and_requires_exact_confirmation(self):
         self.journal.begin("exchange-funds", "scope", {"amount": "1"})

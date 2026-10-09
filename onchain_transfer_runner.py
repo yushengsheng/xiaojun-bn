@@ -6,12 +6,9 @@ from __future__ import annotations
 from input_validation import bounded_int, finite_decimal, finite_float, MAX_RETRY_COUNT
 
 import tkinter as tk
-from dataclasses import asdict
-import hashlib
-import json
 from tkinter import ttk
 
-from onchain_relay_runner import RELAY_RECOVERY_MAX_WORKERS, run_relay_batch, run_relay_fee_recovery
+from onchain_relay_runner import run_relay_batch, run_relay_fee_recovery
 from page_onchain_base import (
     Decimal,
     InvalidOperation,
@@ -546,15 +543,16 @@ class OnchainTransferRunnerMixin(object):
             except Exception as exc:
                 messagebox.showerror("依赖缺失", str(exc))
                 return False
-        worker_threads = max(1, min(int(self._runtime_worker_threads()), len(records), RELAY_RECOVERY_MAX_WORKERS))
+        worker_threads = max(1, int(self._runtime_worker_threads()))
         sweep_target_override = str(sweep_target_override or "").strip()
         if confirm:
             scope_text = f"本次批量 {len(batch_filter)} 个批次" if batch_filter else "全部历史记录"
             text = (
                 f"即将扫描 {scope_text} 中的 {len(records)} 条中转记录，\n"
                 "检测并回收中转钱包中的 BNB / USDT / USDC 余额。\n"
-                "真实回收结束后，零余额或全部余额低于回收边际的钱包记录统一删除；\n"
-                "无需旧第二跳记录。仍有可回收余额或余额查询失败的钱包保留。\n"
+                "按完整余额先回收达到边际的代币，再回收原生币；\n"
+                "无需原付款第二跳记录，已提交的回收须先核对。\n"
+                "零余额或全部余额低于边际的钱包会在真实回收结束后清理；\n"
                 "模拟执行不删除钱包记录。\n\n"
                 f"当前模式：{'模拟执行' if dry_run else '真实执行'}\n"
                 f"回收线程数：{worker_threads}\n\n"
@@ -725,21 +723,6 @@ class OnchainTransferRunnerMixin(object):
                 row_key: self._row_context_for_values(row_key, source, target)
                 for row_key, source, target in jobs_data
             }
-            journal = getattr(self, "operation_journal", None) if not dry_run else None
-            batch_id = ""
-            task_keys = []
-            saved_tasks = {}
-            if journal is not None:
-                values = asdict(params)
-                for name in ("threads", "one_to_many_source_threads", "delay", "receipt_poll_interval_seconds", "receipt_retry_count", "confirm_timeout_seconds", "nonce_window"):
-                    values.pop(name, None)
-                fingerprint = hashlib.sha256(json.dumps(values, sort_keys=True, default=str).encode()).hexdigest()
-                task_keys = [hashlib.sha256(f"{row_key}:{source}:{target}".encode()).hexdigest() for row_key, source, target in jobs_data]
-                batch_id, resumed = journal.resume_or_begin_batch("onchain-batch", f"direct:{params.network}", fingerprint=fingerprint,
-                                                                  task_keys=task_keys, allow_subset=True)
-                saved_tasks = journal.batch_task_states(batch_id, kind="onchain-transfer")
-                if resumed:
-                    dispatch_ui(lambda: self.log("恢复原转账批次：已确认的交易跳过，待确认交易只核对/重播原签名交易"))
             if params.random_enabled and params.random_min is not None and params.random_max is not None:
                 amount_view = f"random({self._decimal_to_text(params.random_min)}~{self._decimal_to_text(params.random_max)})"
             dispatch_ui(lambda keys=progress_keys: self._begin_progress("transfer", keys))
@@ -764,7 +747,6 @@ class OnchainTransferRunnerMixin(object):
 
             success = 0
             failed = 0
-            pending = 0
             resolved = 0
             total_amount = Decimal("0")
             total_gas_fee_wei = 0
@@ -806,7 +788,7 @@ class OnchainTransferRunnerMixin(object):
                 amount_text: str = "",
                 gas_fee_wei: int = 0,
             ):
-                nonlocal success, failed, pending, resolved, total_amount, total_gas_fee_wei
+                nonlocal success, failed, resolved, total_amount, total_gas_fee_wei
                 context_sig = context_by_row_key.get(row_key, "")
                 row_status_text = ""
                 with lock:
@@ -821,8 +803,6 @@ class OnchainTransferRunnerMixin(object):
                                 total_amount += Decimal(amount_text)
                             except Exception:
                                 pass
-                    elif result_status == "submitted":
-                        pending += 1
                     else:
                         failed += 1
                     total_gas_fee_wei += gas_fee_wei
@@ -878,70 +858,44 @@ class OnchainTransferRunnerMixin(object):
                             )
                             result_status = "success"
                         else:
-                            from onchain_transaction_recovery import resume_entry, transaction_context, UnconfirmedTransactionError
-                            from onchain_relay_runner import _wait_for_receipt_success
-                            saved = saved_tasks.get(task_keys[i - 1]) if journal is not None else None
-                            if saved and saved.get("state") != "failed":
-                                payload = saved["payload"]
-                                source_addr = payload["source"]
-                                amount_text = payload.get("amount_text", "")
-                                txid = payload["tx_hash"]
-                                tx_sent = True
-                                gas_fee_wei = int(payload["tx"]["gas"]) * int(payload["tx"]["gasPrice"])
-                                if saved.get("state") != "completed":
-                                    with transaction_context(self.client, batch_id=batch_id, task_key=task_keys[i - 1], stop_event=self.stop_requested):
-                                        resume_entry(self.client, saved)
-                                    _wait_for_receipt_success(self, params, txid, label=f"{prefix} 原交易确认")
-                                result_status = "success"
-                                msg = f"{prefix} 原交易已确认：{params.coin} {amount_text}，txid={txid}；未重复付款"
-                                continue_result = True
-                            else:
-                                continue_result = False
-                            if continue_result:
-                                finalize_job(row_key, result_status, msg, amount_text=amount_text, gas_fee_wei=gas_fee_wei)
-                                continue
                             private_key, source_addr = self._resolve_wallet(source)
                             value_units, gas_price_wei, gas_limit, amount_text = self._resolve_amount_and_gas(
                                 params, source_addr, target
                             )
                             nonce = alloc_nonce(source_addr)
                             used_nonce = nonce
-                            with transaction_context(self.client, batch_id=batch_id, task_key=task_keys[i - 1] if task_keys else "",
-                                                     amount_text=amount_text, coin=params.coin, stop_event=self.stop_requested):
-                                if params.token_is_native:
-                                    submission = self.client.submit_native_transfer_reliably(
-                                        network=params.network,
-                                        private_key=private_key,
-                                        to_address=target,
-                                        value_wei=value_units,
-                                        nonce=nonce,
-                                        gas_price_wei=gas_price_wei,
-                                        gas_limit=gas_limit,
-                                        source_address=source_addr,
-                                    )
-                                else:
-                                    submission = self.client.submit_erc20_transfer_reliably(
-                                        network=params.network,
-                                        private_key=private_key,
-                                        token_contract=params.token_contract,
-                                        to_address=target,
-                                        amount_units=value_units,
-                                        nonce=nonce,
-                                        gas_price_wei=gas_price_wei,
-                                        gas_limit=gas_limit,
-                                        source_address=source_addr,
-                                    )
+                            if params.token_is_native:
+                                submission = self.client.submit_native_transfer_reliably(
+                                    network=params.network,
+                                    private_key=private_key,
+                                    to_address=target,
+                                    value_wei=value_units,
+                                    nonce=nonce,
+                                    gas_price_wei=gas_price_wei,
+                                    gas_limit=gas_limit,
+                                    source_address=source_addr,
+                                )
+                            else:
+                                submission = self.client.submit_erc20_transfer_reliably(
+                                    network=params.network,
+                                    private_key=private_key,
+                                    token_contract=params.token_contract,
+                                    to_address=target,
+                                    amount_units=value_units,
+                                    nonce=nonce,
+                                    gas_price_wei=gas_price_wei,
+                                    gas_limit=gas_limit,
+                                    source_address=source_addr,
+                                )
                             txid = submission.tx_hash
                             tx_sent = True
                             if txid:
                                 gas_fee_wei = max(0, int(gas_limit)) * max(0, int(gas_price_wei))
                                 gas_text = self._gas_fee_amount_text(params.network, gas_fee_wei)
                                 msg = (
-                                    f"{prefix} 转账已确认，金额={params.coin} {amount_text}，预估gas={gas_text}，"
+                                    f"{prefix} 金额={params.coin} {amount_text}，预估gas={gas_text}，"
                                     f"from={source_addr}，to={target}，txid={txid}"
                                 )
-                                dispatch_ui(lambda k=row_key: self._set_status(k, "submitted"))
-                                _wait_for_receipt_success(self, params, txid, label=f"{prefix} 转账确认")
                                 result_status = "success"
                             else:
                                 msg = (
@@ -950,17 +904,9 @@ class OnchainTransferRunnerMixin(object):
                                 )
                                 result_status = "failed"
                     except Exception as exc:
-                        from onchain_transaction_recovery import UnconfirmedTransactionError
-                        if isinstance(exc, UnconfirmedTransactionError) and exc.own_transaction:
-                            tx_sent = True
-                            txid = exc.tx_hash
                         if used_nonce is not None and source_addr and not tx_sent:
                             rollback_nonce(source_addr, used_nonce)
-                        if tx_sent and "receipt status=0" not in str(exc):
-                            result_status = "submitted"
-                            msg = f"{prefix} 交易待核对，重试只核对原交易：txid={txid}；{exc}"
-                        else:
-                            msg = f"{prefix} 转账失败：{exc}"
+                        msg = f"{prefix} 转账失败：{exc}"
                     finally:
                         jobs_q.task_done()
 
@@ -1008,10 +954,6 @@ class OnchainTransferRunnerMixin(object):
                     finalize_job(row_key, "failed", timeout_msg)
 
             summary = f"链上转账任务结束：成功 {success}，失败 {failed}"
-            if pending:
-                summary += f"，待确认 {pending}（失败重试会核对原交易）"
-            if journal is not None:
-                journal.finish_batch(batch_id, success=success, failed=failed, interrupted=self.stop_requested.is_set(), task_kind="onchain-transfer")
             if not dry_run:
                 summary = (
                     f"{summary}，转账总额={self._token_amount_text(params.coin, total_amount) if track_amount_total else '-'}，"

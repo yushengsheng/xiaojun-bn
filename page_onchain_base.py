@@ -31,7 +31,6 @@ from app_defaults import (
 )
 from app_paths import (
     ONCHAIN_DATA_FILE,
-    ONCHAIN_OPERATION_JOURNAL_FILE,
     RELAY_FAILED_EXPORT_FILE,
     RELAY_MANUAL_EXPORT_FILE,
     RELAY_WALLET_FILE,
@@ -141,14 +140,12 @@ class OnchainTransferPageBase:
         self.store = OnchainStore(ONCHAIN_DATA_FILE)
         self._rpc_proxy_getter = rpc_proxy_getter
         self._proxy_text_normalizer = proxy_text_normalizer
-        from operation_journal import OperationJournal
-        self.operation_journal = OperationJournal(ONCHAIN_OPERATION_JOURNAL_FILE)
         self.client = EvmClient(
             proxy_provider=rpc_proxy_getter,
             allow_system_proxy_provider=self._allow_onchain_system_proxy,
-            operation_journal=self.operation_journal,
         )
-        self.relay_wallet_store = RelayWalletFileStore(RELAY_WALLET_FILE, operation_journal=self.operation_journal)
+        self.relay_wallet_store = RelayWalletFileStore(RELAY_WALLET_FILE)
+        self.operation_journal = None
         self._closing = False
         self.is_running = False
         self.stop_requested = threading.Event()
@@ -488,7 +485,6 @@ class OnchainTransferPageBase:
         self.btn_batch_transfer.pack(side=RIGHT)
         ttk.Button(action2, text="中转手续费回收", style="Action.TButton", command=self.start_relay_fee_recovery).pack(side=RIGHT, padx=(8, 0))
         ttk.Button(action2, text="失败重试", style="Action.TButton", command=self.start_retry_failed).pack(side=RIGHT, padx=(8, 0))
-        ttk.Button(action2, text="核对未确认", command=self.review_unconfirmed_operations).pack(side=RIGHT, padx=(8, 0))
 
         self.log_box = ttk.LabelFrame(main, text="执行日志", padding=8)
         self.log_box.pack(fill=BOTH, expand=False)
@@ -2633,8 +2629,6 @@ class OnchainTransferPageBase:
         self.setting_frame.columnconfigure(3, weight=0)
         self.setting_frame.columnconfigure(4, weight=0)
     def _on_root_resize(self, _event=None):
-        if self._closing:
-            return
         width = self.root.winfo_width()
         layout_mode = self._layout_mode_for_width(width)
         if layout_mode != self._layout_mode:
@@ -2826,43 +2820,6 @@ class OnchainTransferPageBase:
         if error_log_text is None:
             return
         append_log_row(error_log_text, text, max_rows=LOG_MAX_ROWS)
-    def review_unconfirmed_operations(self):
-        if self.is_running or self._managed_threads_snapshot():
-            messagebox.showwarning("提示", "请等待任务结束后核对", parent=self.root)
-            return
-        from operation_review import desktop_review
-        try:
-            snapshot = self.operation_journal.recovery_snapshot()
-        except Exception as exc:
-            messagebox.showerror("核对失败", str(exc), parent=self.root)
-            return
-        if snapshot.get("recovery_required"):
-            desktop_review(self.root, self.operation_journal)
-            return
-        pending = [e for e in snapshot["entries"] if e.get("kind") == "onchain-transfer" and e.get("state") in {"prepared", "submitted", "unconfirmed"}]
-        if not pending:
-            desktop_review(self.root, self.operation_journal)
-            return
-        self.stop_requested.clear()
-        self.is_running = True
-        def check():
-            try:
-                for entry in pending:
-                    if self.stop_requested.is_set():
-                        break
-                    p = entry["payload"]
-                    try:
-                        self.client.get_transaction_receipt(p["network"], p["tx_hash"], timeout_seconds=8, stop_event=self.stop_requested)
-                    except Exception:
-                        continue
-            finally:
-                self.client.release_current_thread_rpc_session()
-                def done():
-                    self.is_running = False
-                    desktop_review(self.root, self.operation_journal)
-                self._dispatch_ui(done)
-        self._start_managed_thread(check, name="onchain-operation-review")
-
     def log(self, text: str):
         log_onchain_message(text)
         queue_log_row(self, self.log_text, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)

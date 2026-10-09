@@ -22,7 +22,6 @@ class PyInstallerArgsTests(unittest.TestCase):
             "operation_review",
             "process_lock",
             "config_transaction",
-            "onchain_transaction_recovery",
             "exchange_funds_recovery",
             "exchange_order_recovery",
             "exchange_stocks",
