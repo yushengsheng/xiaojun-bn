@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 
-from exchange_binance_client import BinanceAPIError, BinanceClient, ExchangeOperationFailedError, retry_failed_operation
+from exchange_binance_client import BinanceAPIError, BinanceClient, ExchangeOperationFailedError, retry_failed_operation, retry_cleanup
 from exchange_order_recovery import exchange_operation_scope
 from exchange_constants import TRADE_ACCOUNT_TYPE_STOCK as STOCK_TYPE
 from input_validation import bounded_int, finite_decimal, finite_float
@@ -152,7 +152,7 @@ class StockAPI:
             request = lambda: self.c._public_get_impl(self.c.spot, endpoint, params or {}, timeout=6)
         else:
             request = lambda: self.c._request_impl(self.c.spot, method, endpoint, params or {}, timeout=6)
-        # Equity submissions share the enclosing step's one-retry budget.
+        # Equity submissions share the enclosing step's five-retry budget.
         submit = lambda: self.c._run_request_with_retry(
             request, max_retries=1, delay=0, base=self.c.spot, path=endpoint,
             replay_safe=method == "GET")
@@ -204,6 +204,7 @@ class StockStrategy:
         self.clock = clock or time.monotonic
         self.state, self.entry_id = {}, ""
         self.cleanup_confirmed, self.cleanup_error, self.stop_cleanup_requested = True, "", False
+        self.cleanup_exhausted, self.cleanup_failure = False, ""
         self.rules = {}
 
     def save(self, status="running"):
@@ -237,6 +238,8 @@ class StockStrategy:
                 self.journal.update(entries[0]["id"], "cancelled", reason="settings-changed-after-flat")
                 return self.load()
             self.entry_id, self.state = entries[0]["id"], state
+            if state.get("failed_rounds"):
+                self.cleanup_failure = str(state.get("cleanup_error") or "清理失败")
             self.state["settings"] = self.settings.payload()
             if self.state.get("wallet") == "MAIN":
                 if self.state.get("active") or number(self.state.get("inventory", "0")):
@@ -509,8 +512,9 @@ class StockStrategy:
                         raise RuntimeError("重挂所需资金超过任务预算，停止追加买入")
                     self.place(side, qty, price, session)
                 repriced = self.clock()
-            progress(self.state["completed"], self.settings.rounds,
-                     f"股票第{self.state['completed'] + 1}轮 {side}，剩余{remaining}股")
+            processed = self.state["completed"] + len(self.state.get("failed_rounds", []))
+            progress(processed, self.settings.rounds,
+                     f"股票第{processed + 1}轮 {side}，剩余{remaining}股")
             stop.wait(self.settings.poll)
 
     def cleanup(self):
@@ -548,17 +552,50 @@ class StockStrategy:
     def retry_stop_cleanup(self):
         if isinstance(self.c, BinanceClient) and self.c.session is None:
             self.c._reset_session_after_transport_error()
+        self.cleanup_exhausted = False
+        return self._cleanup_with_retries(refresh_rules=True)
+
+    def _cleanup_with_retries(self, *, refresh_rules=False):
+        if self.cleanup_exhausted:
+            return False
+        self.cleanup_confirmed = False
+        def attempt():
+            if refresh_rules and (self.state.get("active") or number(self.state.get("inventory", "0"))):
+                self.rules = self.api.rules(self.settings.symbol)
+            self.cleanup()
         try:
-            with self.c.cleanup_requests_after_stop():
-                if self.state.get("active") or number(self.state.get("inventory", "0")):
-                    self.rules = self.api.rules(self.settings.symbol)
-                self.cleanup()
+            retry_cleanup(self.c, attempt)
         except Exception as exc:
-            self.cleanup_error = str(exc)
-            raise
+            self.cleanup_exhausted = True
+            self.cleanup_failure = self.cleanup_error = "清理失败：" + str(exc)
+            self.state["cleanup_error"] = self.cleanup_error
+            self.save("failed")
+            logger.error("股票清理失败，结束本次清理并继续后续任务：%s", exc)
         finally:
             if self.cleanup_callback:
                 self.cleanup_callback(self)
+        return self.cleanup_confirmed
+
+    def _continue_after_failed_cleanup(self):
+        # Keep the failed task's original order and inventory in encrypted history.
+        # Later rounds own only their new fills, never the abandoned holdings.
+        failed = list(self.state.get("failed_rounds", []))
+        if self.state["completed"] + len(failed) + 1 >= self.settings.rounds:
+            failed.append({"round": self.settings.rounds, "inventory": "0", "active": None,
+                           "error": self.cleanup_error})
+            self.state["failed_rounds"] = failed
+            self.save("failed")
+            return
+        failed.append({"round": self.state["completed"] + len(failed) + 1,
+                       "inventory": self.state["inventory"], "active": self.state.get("active"),
+                       "error": self.cleanup_error})
+        next_state = {**self.state, "phase": "READY", "inventory": "0", "active": None,
+                      "failed_rounds": failed}
+        for key in ("anchor", "cleanup_anchor", "target"):
+            next_state.pop(key, None)
+        entry_id = self.journal.begin("stock-task", self.scope, next_state)
+        self.entry_id, self.state = entry_id, next_state
+        self.cleanup_exhausted = False
 
     def run(self, stop, progress=lambda *_: None):
         error = ""
@@ -567,59 +604,71 @@ class StockStrategy:
             self.rules = self.api.rules(self.settings.symbol)
             trading_session(self.now(), self.rules)
             if self.state["phase"] == "CLEANUP":
-                self.cleanup()
+                if not self._cleanup_with_retries():
+                    if stop.is_set():
+                        raise RuntimeError(self.cleanup_error)
+                    self._continue_after_failed_cleanup()
             if self.state.pop("legacy_spot_cleanup", False):
                 self.state.update(phase="INIT", cash="0", wallet="CARD")
                 self.save()
             if self.state["phase"] == "INIT":
                 self.setup_funds(stop)
-            while self.state["completed"] < self.settings.rounds:
+            while self.state["completed"] + len(self.state.get("failed_rounds", [])) < self.settings.rounds:
                 if stop.is_set():
                     raise RuntimeError("已请求停止股票任务")
-                if self.state["phase"] == "READY":
-                    price, anchor, _, fractional = self.price("BUY")
-                    budget = number(self.state["cash"]) if self.settings.amount is None else self.settings.amount
-                    if budget > min(number(self.state["cash"]), self.api.balance(self.state["wallet"])):
-                        raise RuntimeError("固定金额所需资金不足，停止后续轮次")
-                    qty = self.quantity((budget - platform_fee(budget) * 2) / price, price, fractional)
-                    self.state.update(phase="BUY", target=text_number(qty), anchor=text_number(anchor))
-                    self.save()
-                if self.state["phase"] == "BUY":
-                    self.execute_side("BUY", stop, progress)
-                    self.state["wallet"], self.state["phase"] = "CARD", "SELL"
-                    self.state.pop("anchor", None)
-                    self.save()
-                if self.state["phase"] == "SELL":
-                    self.execute_side("SELL", stop, progress)
-                    self.state["completed"] += 1
-                    self.state["phase"] = "READY"
-                    self.state.pop("anchor", None)
-                    self.save()
-                    progress(self.state["completed"], self.settings.rounds, f"股票{self.settings.symbol}完成{self.state['completed']}/{self.settings.rounds}轮")
-                    if self.state["completed"] < self.settings.rounds:
-                        stop.wait(self.settings.interval)
-            self.save("completed")
+                try:
+                    if self.state["phase"] == "READY":
+                        price, anchor, _, fractional = self.price("BUY")
+                        budget = number(self.state["cash"]) if self.settings.amount is None else self.settings.amount
+                        if budget > min(number(self.state["cash"]), self.api.balance(self.state["wallet"])):
+                            raise RuntimeError("固定金额所需资金不足，停止后续轮次")
+                        qty = self.quantity((budget - platform_fee(budget) * 2) / price, price, fractional)
+                        self.state.update(phase="BUY", target=text_number(qty), anchor=text_number(anchor))
+                        self.save()
+                    if self.state["phase"] == "BUY":
+                        self.execute_side("BUY", stop, progress)
+                        self.state["wallet"], self.state["phase"] = "CARD", "SELL"
+                        self.state.pop("anchor", None)
+                        self.save()
+                    if self.state["phase"] == "SELL":
+                        self.execute_side("SELL", stop, progress)
+                        self.state["completed"] += 1
+                        self.state["phase"] = "READY"
+                        self.state.pop("anchor", None)
+                        self.save()
+                except Exception as round_exc:
+                    if isinstance(round_exc, ExchangeOperationFailedError) or not (self.state.get("active") or number(self.state.get("inventory", "0"))):
+                        raise
+                    if self._cleanup_with_retries() or stop.is_set():
+                        raise
+                    self._continue_after_failed_cleanup()
+                processed = self.state["completed"] + len(self.state.get("failed_rounds", []))
+                progress(processed, self.settings.rounds, f"股票{self.settings.symbol}已处理{processed}/{self.settings.rounds}轮")
+                if processed < self.settings.rounds:
+                    stop.wait(self.settings.interval)
+            error = self.cleanup_failure
+            self.save("failed" if error else "completed")
         except Exception as exc:
             error = str(exc)
             self.stop_cleanup_requested = bool(stop.is_set())
             if self.entry_id:
                 self.cleanup_confirmed = not self.state.get("conversion") and not self.state.get("funding_transfer") and not self.state.get("active") and not number(self.state.get("inventory", "0"))
                 if not self.cleanup_confirmed:
-                    try:
-                        self.cleanup()
-                    except Exception as cleanup_exc:
-                        self.cleanup_error = str(cleanup_exc)
+                    self._cleanup_with_retries()
                 if self.cleanup_confirmed and self.state["phase"] != "INIT":
                     self.state["phase"] = "READY"
                     self.state.pop("anchor", None)
                 # A failed preflight has no orders to resume. A fresh start may use manually replenished USDC.
                 preflight_failed = self.cleanup_confirmed and self.state["phase"] == "INIT" and not number(self.state.get("buy_total", "0")) and not number(self.state.get("sell_total", "0"))
-                status = "cancelled" if self.stop_cleanup_requested and self.cleanup_confirmed else "failed" if preflight_failed or isinstance(exc, ExchangeOperationFailedError) and self.cleanup_confirmed else "interrupted"
+                status = "failed" if self.cleanup_exhausted or self.cleanup_failure else "cancelled" if self.stop_cleanup_requested and self.cleanup_confirmed else "failed" if preflight_failed or isinstance(exc, ExchangeOperationFailedError) and self.cleanup_confirmed else "interrupted"
                 self.save(status)
                 if not self.cleanup_confirmed and self.cleanup_callback:
                     self.cleanup_callback(self)
             logger.error("股票任务未完成：%s", error)
         return {"completed": self.state.get("completed", 0), "error": error,
-                "cleanup_error": self.cleanup_error, "success": not error,
-                "inventory": self.state.get("inventory", "0"), "fees": self.state.get("fees", "0"),
+                "cleanup_error": self.cleanup_failure or self.cleanup_error, "success": not error,
+                "cleanup_exhausted": self.cleanup_exhausted,
+                "failed_rounds": self.state.get("failed_rounds", []),
+                "processed": self.state.get("completed", 0) + len(self.state.get("failed_rounds", [])),
+                "inventory": text_number(number(self.state.get("inventory", "0")) + sum((number(row["inventory"]) for row in self.state.get("failed_rounds", [])), Decimal(0))), "fees": self.state.get("fees", "0"),
                 "buy_total": self.state.get("buy_total", "0"), "sell_total": self.state.get("sell_total", "0")}

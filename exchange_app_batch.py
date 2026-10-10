@@ -792,7 +792,7 @@ class ExchangeAppBatchMixin(object):
     def _strategy_failure_text(cls, result: dict, *, stopped: bool = False, trade_stats_text: str = "") -> str:
         cleanup_error = str(result.get("cleanup_error") or result.get("ladder_cleanup_error") or "").strip()
         if cleanup_error:
-            return f"停止清理失败：{cleanup_error}"
+            return f"{'停止清理失败' if stopped else '清理失败'}：{cleanup_error}"
         if stopped:
             return ""
         if result.get("trade_error"):
@@ -1367,6 +1367,8 @@ class ExchangeAppBatchMixin(object):
             prefix = "合约有问题"
         elif stage_text == "分仓挂单结束清理":
             prefix = "结束清理失败"
+        elif stage_text in {"清理失败", "停止清理"}:
+            prefix = "清理失败"
         elif "预检" in stage_text:
             prefix = "合约预检失败"
         else:
@@ -3816,7 +3818,12 @@ class ExchangeAppBatchMixin(object):
                                     strategy_result.get("market_round_failed_count", 0),
                                 )
 
-                            if trade_error:
+                            cleanup_error = str((strategy_result or {}).get("cleanup_error") or "")
+                            if cleanup_error:
+                                self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
+                                set_status(self._exchange_failed_status_text(f"清理失败：{cleanup_error}"))
+                                op_success = False
+                            elif trade_error:
                                 self._record_batch_withdraw_metric(acc, final_amount or 0.0, withdraw_coin)
                                 set_status(
                                     self._format_trade_failure_status(
@@ -3879,7 +3886,7 @@ class ExchangeAppBatchMixin(object):
                                 op_success = withdraw_success
                         else:
                             cleanup_error = (
-                                str(strategy_result.get("ladder_cleanup_error") or "").strip()
+                                str(strategy_result.get("cleanup_error") or strategy_result.get("ladder_cleanup_error") or "").strip()
                                 if isinstance(strategy_result, dict)
                                 else ""
                             )

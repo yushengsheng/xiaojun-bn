@@ -1715,11 +1715,11 @@ class ExchangeAppBase(tk.Tk):
 
     def _record_strategy_cleanup(self, strategy: Strategy) -> None:
         with self._cleanup_state_lock:
-            if strategy.cleanup_confirmed:
+            if strategy.cleanup_confirmed or getattr(strategy, "cleanup_exhausted", False):
                 self._pending_strategy_cleanups.pop(id(strategy), None)
             else:
                 self._pending_strategy_cleanups[id(strategy)] = strategy
-        if not self._closing and strategy.stop_cleanup_requested:
+        if not self._closing and strategy.stop_cleanup_requested and not getattr(strategy, "cleanup_exhausted", False):
             self._dispatch_ui(self._retry_pending_cleanups)
 
     def _retry_pending_cleanups(self) -> None:
@@ -1734,8 +1734,9 @@ class ExchangeAppBase(tk.Tk):
         self._cleanup_retry_running = True
 
         def retry():
+            attempted = self._pending_cleanup_snapshot()
             try:
-                for strategy in self._pending_cleanup_snapshot():
+                for strategy in attempted:
                     if not self._closing and not strategy.stop_cleanup_requested:
                         continue
                     try:
@@ -1745,7 +1746,9 @@ class ExchangeAppBase(tk.Tk):
                         logger.error("停止清理重试失败：%s", exc)
                     finally:
                         self._close_binance_client_instance(strategy.c)
-                self._dispatch_ui(lambda: self.status_var.set("状态：停止清理完成" if not self._pending_cleanup_snapshot() else "状态：清理未确认，继续等待重试"))
+                self._dispatch_ui(lambda: self.status_var.set("状态：清理失败" if any(
+                    getattr(strategy, "cleanup_exhausted", False) for strategy in attempted
+                ) else "状态：停止清理完成" if not self._pending_cleanup_snapshot() else "状态：正在清理"))
             finally:
                 self._cleanup_retry_after = time.monotonic() + 2.0
                 self._cleanup_retry_running = False

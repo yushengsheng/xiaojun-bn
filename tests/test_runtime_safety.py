@@ -139,7 +139,7 @@ class RuntimeSafetyTests(unittest.TestCase):
                     client.request(client.spot, "POST", "/sapi/v1/asset/dust", {"asset": ["ETH"]})
                 entry = self.journal.recovery_snapshot()["entries"][-1]
                 self.assertEqual(entry["state"], "failed")
-                self.assertEqual(client._request_impl.call_count, 2)
+                self.assertEqual(client._request_impl.call_count, 6)
         client._request_impl = Mock(return_value={"transferResult": [{"tranId": 123, "fromAsset": "ETH"}]})
         client.request(client.spot, "POST", "/sapi/v1/asset/dust", {"asset": ["ETH"]})
         self.assertEqual(self.journal.active_entries(), [])

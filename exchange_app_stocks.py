@@ -110,6 +110,8 @@ class ExchangeAppStocksMixin:
                     client = self._create_binance_client(acc["api_key"], acc["api_secret"], request_gate=gate, request_stop_event=stop)
                     result = StockStrategy(client, settings, cleanup_callback=self._record_strategy_cleanup).run(stop, progress)
                 status = f"股票{settings.symbol} {result.get('completed', 0)}/{settings.rounds}轮，费用{result.get('fees', '0')} USDC"
+                if result.get("failed_rounds"):
+                    status += f"；清理失败{len(result['failed_rounds'])}轮，已处理{result.get('processed', 0)}轮"
                 status += f"；买/卖额{result.get('buy_total', '0')}/{result.get('sell_total', '0')} USDC"
                 if not result["success"]:
                     status += "；" + (result.get("cleanup_error") or result["error"])

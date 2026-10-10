@@ -470,19 +470,22 @@ class StockTests(unittest.TestCase):
         self.assertFalse(task.cleanup_confirmed)
         self.assertEqual(len(client.posts), 1)
         self.assertEqual(result["completed"], 0)
-        self.assertTrue(client.operation_journal.active_entries())
+        self.assertEqual(client.operation_journal.active_entries(), [])
+        self.assertTrue(task.cleanup_exhausted)
+        self.assertTrue(client.operation_journal.entries[task.entry_id]["payload"]["active"])
 
-    def test_resume_cleanup_does_not_buy_before_old_order_is_terminal(self):
+    def test_new_task_after_exhausted_cleanup_does_not_block_or_sell_failed_task_inventory(self):
         client, task, stop = self.strategy(reprice="1", timeout="4")
         client.partial_then_cancel = client.pending_cancel = True
         client.quote_values = [(Decimal("100"), Decimal("100.02"))] * 2 + [(Decimal("100.01"), Decimal("100.03"))]
         task.run(stop)
+        remaining = client.holdings
         client.pending_cancel = client.partial_then_cancel = False
         resumed = StockStrategy(client, task.settings, now=lambda: NOW, clock=lambda: stop.time)
         result = resumed.run(stop)
         self.assertTrue(result["success"], result)
-        self.assertEqual(client.posts[1]["side"], "SELL")
-        self.assertEqual(client.holdings, Decimal("70"))
+        self.assertEqual(client.posts[1]["side"], "BUY")
+        self.assertEqual(client.holdings, remaining)
 
     def test_stop_cleanup_rule_queries_bypass_stopped_request_gate(self):
         client, task, stop = self.strategy(reprice="1", timeout="4")
@@ -506,8 +509,8 @@ class StockTests(unittest.TestCase):
         task.run(stop)
         client.pending_cancel = client.partial_then_cancel = False
         client.rules["tradability"] = "NONE"
-        with self.assertRaisesRegex(RuntimeError, "不可卖出"):
-            task.retry_stop_cleanup()
+        self.assertFalse(task.retry_stop_cleanup())
+        self.assertIn("不可卖出", task.cleanup_error)
         self.assertIsNone(task.state["active"])
         self.assertFalse(task.cleanup_confirmed)
         self.assertGreater(Decimal(task.state["inventory"]), 0)
@@ -592,7 +595,9 @@ class StockTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertFalse(task.cleanup_confirmed)
         self.assertEqual(len(client.posts), 1)
-        self.assertTrue(client.operation_journal.active_entries())
+        self.assertEqual(client.operation_journal.active_entries(), [])
+        self.assertTrue(task.cleanup_exhausted)
+        self.assertTrue(client.operation_journal.entries[task.entry_id]["payload"]["active"])
 
     def test_unknown_order_state_never_allows_another_order(self):
         client, task, stop = self.strategy()

@@ -184,10 +184,47 @@ class OrderSubmissionFailedError(ExchangeOperationFailedError):
 
 
 _failed_operation_context = threading.local()
+EXCHANGE_FAILURE_RETRIES = 5
+
+
+@contextmanager
+def cleanup_attempt(client):
+    """The cleanup owner supplies the retry budget, including nested writes."""
+    depths = getattr(_failed_operation_context, "depths", None)
+    if depths is None:
+        depths = _failed_operation_context.depths = set()
+    nested = id(client) in depths
+    depths.add(id(client))
+    previous = getattr(client, "_cleanup_attempt_depth", 0)
+    client._cleanup_attempt_depth = previous + 1
+    bounded = getattr(client, "bounded_requests", None)
+    cleanup = getattr(client, "cleanup_requests_after_stop", None)
+    try:
+        with bounded() if callable(bounded) else nullcontext():
+            with cleanup() if callable(cleanup) else nullcontext():
+                yield
+    finally:
+        client._cleanup_attempt_depth = previous
+        if not nested:
+            depths.remove(id(client))
+
+
+def retry_cleanup(client, action, *, on_retry=None):
+    """Make one cleanup attempt and at most five retries; never replay a round."""
+    for attempt in range(EXCHANGE_FAILURE_RETRIES + 1):
+        try:
+            with cleanup_attempt(client):
+                return action()
+        except Exception as exc:
+            if attempt == EXCHANGE_FAILURE_RETRIES or isinstance(exc, ExchangeOperationFailedError) and not exc.retryable:
+                raise
+            logger.warning("清理失败，重试 %d/%d：%s", attempt + 1, EXCHANGE_FAILURE_RETRIES, exc)
+            if callable(on_retry):
+                on_retry(attempt + 1, exc)
 
 
 def retry_failed_operation(client, action):
-    """Retry only this failed step once; nested request layers share the budget."""
+    """Retry only this failed step five times; nested layers share the budget."""
     depths = getattr(_failed_operation_context, "depths", None)
     if depths is None:
         depths = _failed_operation_context.depths = set()
@@ -195,13 +232,13 @@ def retry_failed_operation(client, action):
         return action()
     depths.add(id(client))
     try:
-        for attempt in range(2):
+        for attempt in range(EXCHANGE_FAILURE_RETRIES + 1):
             try:
                 return action()
             except ExchangeOperationFailedError as exc:
-                if attempt or not exc.retryable:
+                if attempt == EXCHANGE_FAILURE_RETRIES or not exc.retryable:
                     raise
-                logger.warning("当前操作按失败处理，重试一次：%s", exc)
+                logger.warning("当前操作按失败处理，重试 %d/%d：%s", attempt + 1, EXCHANGE_FAILURE_RETRIES, exc)
                 check = getattr(client, "_recovery_check", None)
                 if callable(check):
                     check()
@@ -601,6 +638,9 @@ class BinanceClient:
     ):
         last_exception = None
         retry_count = max(1, int(max_retries or self.DEFAULT_REQUEST_RETRY_COUNT))
+        cleanup_owned = bool(getattr(self, "_cleanup_attempt_depth", 0))
+        if cleanup_owned:
+            retry_count = 1
         final_attempt_limit = retry_count
         retry_delay = max(0.0, float(delay if delay is not None else self.DEFAULT_REQUEST_RETRY_DELAY_SECONDS))
 
@@ -623,6 +663,8 @@ class BinanceClient:
                 is_rate_limited, retry_after = self._shared_rate_limit_details(e, base=base, path=path)
                 if self._request_gate is not None and is_rate_limited:
                     self._pause_for_shared_rate_limit(e, retry_after)
+                    if cleanup_owned:
+                        raise
                     continue
                 if not replay_safe:
                     raise ExchangeOperationFailedError(f"{path} 无法确认结果，按失败处理") from e
@@ -650,6 +692,8 @@ class BinanceClient:
                 is_rate_limited, retry_after = self._shared_rate_limit_details(e, base=base, path=path)
                 if self._request_gate is not None and is_rate_limited:
                     self._pause_for_shared_rate_limit(e, retry_after)
+                    if cleanup_owned:
+                        raise
                     continue
                 attempt += 1
                 if e.code in self.RETRYABLE_BINANCE_ERROR_CODES:

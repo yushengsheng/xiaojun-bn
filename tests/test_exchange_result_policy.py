@@ -33,7 +33,7 @@ class ExchangeResultPolicyTests(unittest.TestCase):
             return {'transferResult': [{'tranId': 123}]}
         return {_RECEIPT_KEYS[path]: 123, 'orderStatus': 'SUCCESS'}
 
-    def test_all_funds_paths_retry_missing_reply_once_and_allow_next_action(self):
+    def test_all_funds_paths_retry_missing_reply_five_times_and_allow_next_action(self):
         for path in sorted(FUNDS_WRITE_PATHS):
             with self.subTest(path=path):
                 client = self.client()
@@ -41,10 +41,10 @@ class ExchangeResultPolicyTests(unittest.TestCase):
                 params = {'coin': 'USDT', 'asset': 'USDT', 'amount': '20', 'quoteId': 'quote', 'address': 'target'}
                 with self.assertRaises(ExchangeOperationFailedError):
                     client.request(client.spot, 'POST', path, params)
-                self.assertEqual(client._request_impl.call_count, 2)
+                self.assertEqual(client._request_impl.call_count, 6)
                 self.assertEqual(self.journal.active_entries(), [])
-                history = self.journal.recovery_snapshot()['entries'][-2:]
-                self.assertEqual([entry['state'] for entry in history], ['failed', 'failed'])
+                history = self.journal.recovery_snapshot()['entries'][-6:]
+                self.assertEqual([entry['state'] for entry in history], ['failed'] * 6)
                 if path.endswith('/apply'):
                     self.assertNotEqual(history[0]['payload']['params']['withdrawOrderId'], history[1]['payload']['params']['withdrawOrderId'])
                 restarted = self.client(journal=OperationJournal(self.journal.file_path, secret_box=self.box, fail_unconfirmed=True))
@@ -63,16 +63,16 @@ class ExchangeResultPolicyTests(unittest.TestCase):
                 self.assertEqual(client._request_impl.call_count, 2)
                 self.assertEqual([e['state'] for e in self.journal.recovery_snapshot()['entries'][-2:]], ['failed', 'completed'])
 
-    def test_invalid_receipts_retry_once_without_success_or_pending_records(self):
+    def test_invalid_receipts_retry_five_times_without_success_or_pending_records(self):
         for receipt in ({}, {'tranId': True}, {'tranId': -1}, {'tranId': []}):
             client = self.client()
             client._request_impl = Mock(return_value=receipt)
             with self.assertRaises(ExchangeOperationFailedError):
                 client.request(client.spot, 'POST', '/sapi/v1/asset/transfer', {'amount': '1'})
-            self.assertEqual(client._request_impl.call_count, 2)
+            self.assertEqual(client._request_impl.call_count, 6)
             self.assertEqual(self.journal.active_entries(), [])
 
-    def test_order_timeout_retries_once_with_distinct_ids_and_no_recovery_blocker(self):
+    def test_order_timeout_retries_five_times_with_distinct_ids_and_no_recovery_blocker(self):
         for path in ('/api/v3/order', '/fapi/v1/order'):
             for order_type in ('MARKET', 'LIMIT'):
                 with self.subTest(path=path, order_type=order_type):
@@ -83,7 +83,8 @@ class ExchangeResultPolicyTests(unittest.TestCase):
                     with self.assertRaises(ExchangeOperationFailedError):
                         client.request(client.spot if path.startswith('/api') else client.um_futures, 'POST', path, params)
                     posted = [call.args[3] for call in client._request_impl.call_args_list]
-                    self.assertEqual(len(posted), 2)
+                    self.assertEqual(len(posted), 6)
+                    self.assertEqual(len({row['newClientOrderId'] for row in posted}), 6)
                     self.assertNotEqual(posted[0]['newClientOrderId'], posted[1]['newClientOrderId'])
                     self.assertEqual(posted[0]['quantity'], posted[1]['quantity'])
                     self.assertEqual(client.pending_order_requests(), [])
@@ -109,12 +110,13 @@ class ExchangeResultPolicyTests(unittest.TestCase):
     def test_nested_convert_failures_share_one_retry_budget(self):
         client = self.client()
         client._validate_convert_from_amount = Mock(return_value=(1, {}))
-        client.get_convert_quote = Mock(side_effect=[{'quoteId': 'first'}, {'quoteId': 'second'}])
+        quotes = [str(i) for i in range(6)]
+        client.get_convert_quote = Mock(side_effect=[{'quoteId': quote} for quote in quotes])
         client._request_impl = Mock(side_effect=requests.ReadTimeout('lost'))
         with self.assertRaises(ExchangeOperationFailedError):
             client.convert_with_from_amount('BTC', 'USDT', 1)
-        self.assertEqual(client._request_impl.call_count, 2)
-        self.assertEqual([c.args[3]['quoteId'] for c in client._request_impl.call_args_list], ['first', 'second'])
+        self.assertEqual(client._request_impl.call_count, 6)
+        self.assertEqual([c.args[3]['quoteId'] for c in client._request_impl.call_args_list], quotes)
         self.assertEqual(self.journal.active_entries(), [])
 
     def test_normal_convert_confirmation_keeps_quote_and_order_id_entrypoints(self):
@@ -154,7 +156,7 @@ class ExchangeResultPolicyTests(unittest.TestCase):
             else:
                 outcomes.append(True)
         self.assertEqual(outcomes, [False, True])
-        self.assertEqual(first._request_impl.call_count, 2)
+        self.assertEqual(first._request_impl.call_count, 6)
         second._request_impl.assert_called_once()
         self.assertFalse(stop.is_set())
 
@@ -190,7 +192,7 @@ class ExchangeResultPolicyTests(unittest.TestCase):
         for _ in range(2):
             with self.assertRaises(ExchangeOperationFailedError):
                 retry_failed_operation(client, action)
-        self.assertEqual(action.call_count, 4)
+        self.assertEqual(action.call_count, 12)
 
     def test_concurrent_steps_on_one_client_keep_independent_retry_budgets(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -209,7 +211,7 @@ class ExchangeResultPolicyTests(unittest.TestCase):
             return count
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(lambda _: run(), range(2)))
-        self.assertEqual(results, [2, 2])
+        self.assertEqual(results, [6, 6])
 
     def test_removed_review_api_and_desktop_entry_are_absent(self):
         from exchange_app_batch import ExchangeAppBatchMixin

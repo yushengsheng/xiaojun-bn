@@ -11,7 +11,7 @@ from typing import Callable
 
 from exchange_auto_ladder import AutoLadderSettingsStore, price_risk_reason, trade_is_recent
 from exchange_auto_ladder_observer import AutoLadderMarketObserver
-from exchange_binance_client import BinanceAPIError, BinanceClient, RequestStoppedError, ExchangeOperationFailedError, OrderSubmissionFailedError
+from exchange_binance_client import BinanceAPIError, BinanceClient, RequestStoppedError, ExchangeOperationFailedError, OrderSubmissionFailedError, retry_cleanup
 from retry_utils import RetryAborted, RetryPolicy, run_with_retries
 from exchange_constants import (
     FUTURES_LEVERAGE_DEFAULT,
@@ -377,6 +377,8 @@ class Strategy:
             self.futures_side = FUTURES_SIDE_DEFAULT
         self.trade_error = ""
         self.trade_error_stage = ""
+        self.cleanup_exhausted = False
+        self.cleanup_failure = ""
         self.market_round_total = 0
         self.market_round_completed = 0
         self.market_round_failed_rounds: list[int] = []
@@ -451,7 +453,45 @@ class Strategy:
         self._remember_spot_order(order, str(order.get("side") or self._active_spot_orders.get(str(order_id), "")))
         return order
 
+    def _mark_cleanup_failed(self, exc) -> None:
+        self.cleanup_confirmed = False
+        self.cleanup_exhausted = True
+        self.cleanup_failure = self.cleanup_error = str(exc)
+        self.ladder_cleanup_confirmed = False
+        self.ladder_cleanup_error = str(exc)
+        if not self.trade_error or self.trade_error_stage in {"停止清理", "清理失败"}:
+            self.trade_error, self.trade_error_stage = str(exc), "清理失败"
+        logger.error("清理失败，结束本次清理并继续后续任务：%s", exc)
+        if self.operation_journal is not None:
+            try:
+                entry = self.operation_journal.begin("exchange-cleanup", self.operation_scope, {
+                    "symbol": self.futures_symbol if self._is_futures_mode() else self.spot_symbol,
+                    "mode": self._mode_name(), "reason": str(exc),
+                    "orders": self.c.pending_order_requests() if isinstance(self.c, BinanceClient) else dict(self._active_spot_orders),
+                })
+                self.operation_journal.update(entry, "failed", cleanup_failed=True)
+            except Exception:
+                logger.exception("清理失败记录保存失败")
+        if callable(self.cleanup_callback):
+            self.cleanup_callback(self)
+
     def _cleanup_after_stop(self, *, notify: bool = True) -> None:
+        if self.cleanup_exhausted:
+            return
+        def attempt():
+            self._cleanup_once(notify=False)
+            if not self.cleanup_confirmed:
+                raise RuntimeError(self.cleanup_error)
+        try:
+            retry_cleanup(self.c, attempt, on_retry=lambda *_: self._pause_with_stop(
+                getattr(self, "_running_stop_event", None), self.TRADE_OPERATION_RETRY_POLICY.delay_seconds))
+        except Exception as exc:
+            self._mark_cleanup_failed(exc)
+        finally:
+            if notify and callable(self.cleanup_callback):
+                self.cleanup_callback(self)
+
+    def _cleanup_once(self, *, notify: bool = True) -> None:
         """Finish the current task's orders and tradable exposure before reporting stopped."""
         self.cleanup_confirmed = False
         self.stop_cleanup_requested = True
@@ -529,6 +569,7 @@ class Strategy:
     def retry_stop_cleanup(self) -> bool:
         if isinstance(self.c, BinanceClient) and getattr(self.c, "session", None) is None:
             self.c._reset_session_after_transport_error()
+        self.cleanup_exhausted = False
         self._cleanup_after_stop()
         return self.cleanup_confirmed
 
@@ -538,38 +579,40 @@ class Strategy:
         ))
 
     def _wait_for_completion_cleanup(self, stop_event, progress_cb=None) -> bool:
-        """Keep the original task and withdrawal step until cleanup succeeds or stops."""
-        failed_attempts = 0
-        while not (stop_event and stop_event.is_set()):
-            # The running task owns these retries; the stop scheduler takes over
-            # only after run() returns, avoiding duplicate scheduled retry loops.
-            self._cleanup_after_stop(notify=False)
-            if self.cleanup_confirmed:
-                if callable(self.cleanup_callback):
-                    self.cleanup_callback(self)
-                return True
-            failed_attempts += 1
-            if failed_attempts == 1 or failed_attempts % 10 == 0:
-                logger.warning("结束清理暂未确认（第 %d 次），保留最终提现步骤并继续重试：%s", failed_attempts, self.cleanup_error)
-                self._emit_progress(progress_cb, 0, 1, "等待订单与仓位清理，暂缓提现")
-            if self._pause_with_stop(stop_event, self.TRADE_OPERATION_RETRY_POLICY.delay_seconds):
-                return False
-        return False
+        self._emit_progress(progress_cb, 0, 1, "清理订单与仓位")
+        self._cleanup_after_stop()
+        return self.cleanup_confirmed
+
+    def _run_round_cleanup(self, action) -> bool:
+        # A new round may try its cleanup; a completed failed budget is never
+        # restarted by the finalizer or the background stop scheduler.
+        self.cleanup_exhausted = False
+        try:
+            retry_cleanup(self.c, action)
+            return True
+        except Exception as exc:
+            self._mark_cleanup_failed(exc)
+            return False
+
+    def _finish_spot_round_cleanup(self) -> bool:
+        if self._has_orders_requiring_cleanup() or self._active_spot_orders:
+            self.cleanup_exhausted = False
+            self._cleanup_after_stop()
+            return self.cleanup_confirmed
+        return self.ensure_base_sold()
 
     def ensure_base_sold(self):
-        try:
+        def cleanup():
             if self._is_convert_mode():
                 sold = self.c.convert_base_to_quote_all(self.spot_symbol)
             else:
                 base_asset = self.c.get_spot_base_asset(self.spot_symbol)
                 small_qty_log_text = "残留BNB数量过小，跳过补救卖出" if base_asset == "BNB" else None
                 sold = self.c.spot_sell_all_base(self.spot_symbol, small_qty_log_text=small_qty_log_text)
+                self._confirm_spot_base_sold(base_asset, sold, reason="轮次清理后")
             if sold:
                 logger.info("【补救措施】检测到残留基础币，已执行补充卖出。")
-        except Exception as e:
-            if isinstance(e, ExchangeOperationFailedError):
-                raise
-            logger.warning(f"补救卖出时发生错误（可忽略）: {e}")
+        return self._run_round_cleanup(cleanup)
 
     def _trade_account_type_name(self) -> str:
         mode = str(self.trade_account_type or TRADE_ACCOUNT_TYPE_DEFAULT)
@@ -652,6 +695,8 @@ class Strategy:
         return self.c.get_um_futures_margin_asset(self.futures_symbol)
 
     def ensure_futures_position_closed(self, *, strict: bool = False):
+        if not strict:
+            return self._run_round_cleanup(lambda: self.ensure_futures_position_closed(strict=True))
         try:
             close_orders = self.c.close_all_um_futures_positions_market(self.futures_symbol)
             if close_orders:
@@ -842,6 +887,8 @@ class Strategy:
             return False
 
     def _run_trade_action_with_retry(self, stop_event, context: str, action):
+        if getattr(self.c, "_cleanup_attempt_depth", 0):
+            return action()
         context_text = str(context or "交易动作").strip() or "交易动作"
         policy = self.TRADE_OPERATION_RETRY_POLICY
 
@@ -2456,6 +2503,38 @@ class Strategy:
         active_orders: dict[str, dict[str, object]],
         base_asset: str,
     ) -> None:
+        self._ladder_cleanup_with_retries(
+            lambda: self._ladder_cleanup_after_manual_stop_once(active_orders, base_asset))
+
+    def _ladder_cleanup_with_retries(self, action) -> None:
+        def attempt():
+            self.ladder_cleanup_confirmed = False
+            self.ladder_cleanup_error = ""
+            action()
+            if not self.ladder_cleanup_confirmed:
+                raise RuntimeError(self.ladder_cleanup_error)
+        if self._run_round_cleanup(attempt):
+            self.cleanup_confirmed = True
+            if self.trade_error_stage == "分仓挂单结束清理" and not self.cleanup_failure:
+                self.trade_error = self.trade_error_stage = ""
+
+    def _ladder_cleanup_after_bnb_stop_once(self, active_orders, base_asset) -> None:
+        all_cancelled = self._ladder_cancel_all_orders(active_orders, reason="bnb-fee-stop")
+        try:
+            self._ladder_sell_all_base_and_confirm(base_asset, reason="分仓挂单BNB手续费不足停止后")
+        except Exception as exc:
+            self._set_ladder_cleanup_failure(f"市价清仓未确认：{exc}")
+            if isinstance(exc, ExchangeOperationFailedError) and not exc.retryable:
+                raise
+        if not all_cancelled:
+            self._set_ladder_cleanup_failure("部分分仓挂单撤销未确认")
+        elif not self.ladder_cleanup_error:
+            self.ladder_cleanup_confirmed = True
+            logger.info("分仓挂单BNB手续费不足停止后，已确认撤销全部挂单并完成清仓")
+
+    def _ladder_cleanup_after_manual_stop_once(
+        self, active_orders: dict[str, dict[str, object]], base_asset: str,
+    ) -> None:
         cleanup_context = getattr(self.c, "cleanup_requests_after_stop", None)
         context = cleanup_context() if callable(cleanup_context) else nullcontext()
         with context:
@@ -2465,6 +2544,8 @@ class Strategy:
                     self._ladder_sell_all_base_and_confirm(base_asset, reason="手动停止分仓挂单后")
                 except Exception as exc:
                     self._set_ladder_cleanup_failure(f"市价清仓未确认：{exc}")
+                    if isinstance(exc, ExchangeOperationFailedError) and not exc.retryable:
+                        raise
         if not all_cancelled:
             self._set_ladder_cleanup_failure("部分分仓挂单撤销未确认")
         elif not self.ladder_cleanup_error:
@@ -2481,6 +2562,9 @@ class Strategy:
 
     def _ladder_sell_all_base_and_confirm(self, base_asset: str, *, reason: str) -> None:
         sold = self.c.spot_sell_all_base(self.spot_symbol)
+        self._confirm_spot_base_sold(base_asset, sold, reason=reason)
+
+    def _confirm_spot_base_sold(self, base_asset: str, sold, *, reason: str) -> None:
         sellable_quantity = getattr(self.c, "spot_market_sellable_base_quantity", None)
         if not callable(sellable_quantity):
             if sold:
@@ -2523,6 +2607,12 @@ class Strategy:
                 confirmed = False
                 logger.error("自动分仓撤单未确认 %s #%s：%s", side, order_id, exc)
         return confirmed
+
+    def _retry_auto_ladder_cleanup(self, active_orders, *, reason):
+        def attempt():
+            if not self._auto_ladder_cancel_orders(active_orders, reason=reason):
+                raise RuntimeError("部分分仓挂单撤销未确认")
+        return self._run_round_cleanup(attempt)
 
     def _run_ladder_mode(self, stop_event, progress_cb=None):
         mode_name = self._mode_name()
@@ -2636,9 +2726,8 @@ class Strategy:
                         buy_reprice_pending = sell_reprice_pending = False
                         logger.warning("自动分仓暂停挂单：%s（折返=%d）", paused_reason, turns)
                     if auto_state == "PAUSED" and active_orders:
-                        if not self._auto_ladder_cancel_orders(active_orders, reason="auto-pause"):
-                            self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS)
-                            continue
+                        if not self._retry_auto_ladder_cleanup(active_orders, reason="auto-pause"):
+                            return
                     if auto_state != "ACTIVE":
                         if (
                             auto_state == "PAUSED" and stable_since is not None
@@ -2749,19 +2838,8 @@ class Strategy:
                         BinanceClient._format_decimal(current_bnb),
                         BinanceClient._format_decimal(bnb_stop),
                     )
-                    all_cancelled = self._ladder_cancel_all_orders(active_orders, reason="bnb-fee-stop")
-                    try:
-                        self._ladder_sell_all_base_and_confirm(
-                            base_asset,
-                            reason="分仓挂单BNB手续费不足停止后",
-                        )
-                    except Exception as exc:
-                        self._set_ladder_cleanup_failure(f"市价清仓未确认：{exc}")
-                    if not all_cancelled:
-                        self._set_ladder_cleanup_failure("部分分仓挂单撤销未确认")
-                    elif not self.ladder_cleanup_error:
-                        self.ladder_cleanup_confirmed = True
-                        logger.info("分仓挂单BNB手续费不足停止后，已确认撤销全部挂单并完成清仓")
+                    self._ladder_cleanup_with_retries(
+                        lambda: self._ladder_cleanup_after_bnb_stop_once(active_orders, base_asset))
                     return
 
                 quote_free = Decimal(str((snapshot.get(quote_asset) or {}).get("free", "0") or "0"))
@@ -2886,8 +2964,8 @@ class Strategy:
                     stable_since = None
                     stable_gap_started = None
                     pending_allocations.clear()
-                    if not self._auto_ladder_cancel_orders(active_orders, reason="auto-error"):
-                        logger.error("自动分仓仍有未确认订单，保持暂停并重试撤单")
+                    if not self._retry_auto_ladder_cleanup(active_orders, reason="auto-error"):
+                        return
 
             if self._pause_with_stop(stop_event, self.LADDER_POLL_INTERVAL_SECONDS):
                 continue
@@ -2951,7 +3029,8 @@ class Strategy:
                 logger.info("检测到停止信号，停止后续执行（现货阶段）")
                 return
 
-            self.ensure_base_sold()
+            if not self.cleanup_exhausted and not self.ensure_base_sold() and i > 0:
+                self._record_market_round_failure(i, "清理失败：" + self.cleanup_error)
             if bnb_stop_mode and self._should_stop_for_bnb_fee():
                 break
 
@@ -2960,6 +3039,7 @@ class Strategy:
             total_steps = round_number if bnb_stop_mode else total_steps
             stop_after_round = False
             round_stage = "BUY"
+            self.cleanup_exhausted = False
             logger.info("--- 现货轮 %s 开始 ---", round_label)
 
             try:
@@ -3019,6 +3099,8 @@ class Strategy:
                         logger.error("现货轮 %d 交错卖出占位异常: %s", round_number, stagger_exc)
                 stop_after_round = bnb_stop_mode
 
+            if (self._has_orders_requiring_cleanup() or self._active_spot_orders) and not self._finish_spot_round_cleanup():
+                self._record_market_round_failure(round_number, "清理失败：" + self.cleanup_error)
             step += 1
             self.market_round_completed = step
             if bnb_stop_mode:
@@ -3043,7 +3125,8 @@ class Strategy:
                 break
             self.sleep_fn()
 
-        self.ensure_base_sold()
+        if not self.cleanup_exhausted and not self.ensure_base_sold() and step:
+            self._record_market_round_failure(step, "清理失败：" + self.cleanup_error)
 
     def _run_convert_mode(self, stop_event, progress_cb=None):
         total_steps = self.spot_rounds if self.spot_rounds > 0 else 1
@@ -3057,7 +3140,9 @@ class Strategy:
                 logger.info("检测到停止信号，停止后续执行（闪兑阶段）")
                 return
 
-            self.ensure_base_sold()
+            if not self.cleanup_exhausted:
+                self.ensure_base_sold()
+            self.cleanup_exhausted = False
             logger.info("--- 闪兑轮 %d/%d 开始 ---", i + 1, self.spot_rounds)
 
             try:
@@ -3108,10 +3193,13 @@ class Strategy:
                 logger.error(f"闪兑轮 %d 执行异常: {e}", i + 1)
 
             step += 1
+            if self._has_orders_requiring_cleanup() or self._active_spot_orders:
+                self._finish_spot_round_cleanup()
             self._emit_progress(progress_cb, step, total_steps, "闪兑轮 %d/%d 完成" % (i + 1, self.spot_rounds))
             self.sleep_fn()
 
-        self.ensure_base_sold()
+        if not self.cleanup_exhausted:
+            self.ensure_base_sold()
 
     def _run_limit_mode(self, stop_event, progress_cb=None):
         step = 0
@@ -3370,7 +3458,8 @@ class Strategy:
                 logger.info("检测到停止信号，停止后续执行（合约阶段）")
                 return
 
-            self.ensure_futures_position_closed()
+            if not self.cleanup_exhausted:
+                self.ensure_futures_position_closed()
             logger.info("--- 合约轮 %d/%d 开始：%s %s ---", i + 1, self.futures_rounds, self.futures_symbol, side_text)
 
             try:
@@ -3452,7 +3541,8 @@ class Strategy:
                 progress_cb(step, total_steps, "合约轮 %d/%d" % (i + 1, self.futures_rounds))
             self.sleep_fn()
 
-        self.ensure_futures_position_closed()
+        if not self.cleanup_exhausted:
+            self.ensure_futures_position_closed()
 
     def run(self, stop_event, progress_cb=None):
         stop_event = CombinedStopEvent(stop_event, self._recovery_stop_event)
@@ -3484,11 +3574,10 @@ class Strategy:
                     if self.cleanup_confirmed and isinstance(self.c, BinanceClient):
                         self.c._order_cleanup_required = False
                 elif self._active_spot_orders or (isinstance(self.c, BinanceClient) and self.c.pending_order_requests()):
-                    self.cleanup_error = "任务结束后仍有未确认订单，需完成清理"
-                    if callable(self.cleanup_callback):
-                        self.cleanup_callback(self)
+                    self._cleanup_after_stop()
                 if isinstance(result, dict):
-                    result.update(cleanup_confirmed=self.cleanup_confirmed, cleanup_error=self.cleanup_error,
+                    result.update(cleanup_confirmed=self.cleanup_confirmed, cleanup_error=self.cleanup_failure or self.cleanup_error,
+                                  cleanup_exhausted=self.cleanup_exhausted,
                                   ladder_cleanup_confirmed=self.ladder_cleanup_confirmed,
                                   ladder_cleanup_error=self.ladder_cleanup_error,
                                   trade_error=self.trade_error, trade_error_stage=self.trade_error_stage,
@@ -3509,7 +3598,8 @@ class Strategy:
             "market_round_failed_rounds": list(self.market_round_failed_rounds),
             "market_round_failure_details": list(self.market_round_failure_details),
             "ladder_cleanup_confirmed": self.ladder_cleanup_confirmed, "ladder_cleanup_error": self.ladder_cleanup_error,
-            "cleanup_confirmed": self.cleanup_confirmed, "cleanup_error": self.cleanup_error,
+            "cleanup_confirmed": self.cleanup_confirmed, "cleanup_error": self.cleanup_failure or self.cleanup_error,
+            "cleanup_exhausted": self.cleanup_exhausted,
         }
 
     def _run_steps(self, stop_event, progress_cb=None):

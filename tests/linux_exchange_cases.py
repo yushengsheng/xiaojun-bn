@@ -256,6 +256,53 @@ def execution():
     r.close_idle()
 
 
+def cleanup_next_account():
+    import threading
+    sys.path.insert(0, str(ROOT / "tests"))
+    s, call, _ = fixture()
+    r = s.runtime
+    from test_exchange_cleanup_retry import CleanupRetryTests
+    from exchange_constants import TRADE_MODE_MARKET
+    helper = CleanupRetryTests()
+    helper.setUp()
+    try:
+        r.update_settings({"max_threads": 1, "trade_account_type": "现货", "trade_mode": TRADE_MODE_MARKET,
+                           "spot_symbol": "BTCUSDT", "spot_rounds": 6, "min_delay": "0", "max_delay": "0"})
+        rows = r.account_records()
+        for row in rows:
+            row["selected"] = True
+        r.replace_accounts(rows)
+        first, orders, cleanup_calls = helper.market_task(r.accounts[0]["api_key"], (3, 6))
+        second, next_orders, _ = helper.market_task(r.accounts[1]["api_key"])
+        clients = {task.c.key: task.c for task in (first, second)}
+        thread_ids = []
+        def client_for(key, _secret, **kwargs):
+            client = clients[key]
+            if client.session is None:
+                client._reset_session_after_transport_error()
+            return client
+        def run_strategy(strategy, client, stop, progress, **kwargs):
+            thread_ids.append(threading.get_ident())
+            return strategy.run(stop, progress_cb=progress), ""
+        with patch.object(r, "_create_binance_client", side_effect=client_for), \
+             patch.object(r, "_ensure_trade_symbol_supported", return_value="USDT"), \
+             patch.object(r, "wait_for_usdt", return_value=True), \
+             patch.object(r, "_run_strategy_with_spot_statistics", side_effect=run_strategy):
+            r.run_selected_accounts(require_confirm=False)
+            wait_idle(s)
+        assert cleanup_calls == {3: 6, 6: 6}, cleanup_calls
+        assert len(orders) == len(next_orders) == 12
+        assert len(thread_ids) == 2 and thread_ids[0] == thread_ids[1]
+        assert "清理失败" in r.accounts[0]["status_var"].get()
+        assert "清理失败" not in r.accounts[1]["status_var"].get()
+        assert "成功1" in r.exchange_batch_summary_var.get() and "失败1" in r.exchange_batch_summary_var.get()
+        assert not r.stop_event.is_set() and not r._pending_cleanup_snapshot()
+        assert not r.busy
+    finally:
+        r.close_idle()
+        helper.doCleanups()
+
+
 def failed_result_next_account():
     from decimal import Decimal
     import requests
@@ -289,7 +336,8 @@ def failed_result_next_account():
     with patch.object(r, '_create_binance_client', side_effect=make_client):
         r.batch_manual_withdraw(r.accounts, require_confirm=False)
         wait_idle(s)
-    assert [index for index, _ in posts] == [0, 0, 1], posts
+    assert [index for index, _ in posts] == [0] * 6 + [1], posts
+    assert len({params['withdrawOrderId'] for _, params in posts}) == 7
     assert posts[0][1]['withdrawOrderId'] != posts[1][1]['withdrawOrderId']
     assert not r.stop_event.is_set()
     summary = r.exchange_batch_summary_var.get()

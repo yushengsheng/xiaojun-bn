@@ -467,14 +467,14 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         self.assertEqual(outage.queries[-1][1], 1)
         self.assertEqual(client.journal.active_entries(), [])
 
-    def test_second_confirmation_timeout_ends_without_a_third_submission(self):
+    def test_sixth_confirmation_timeout_ends_without_a_seventh_submission(self):
         client = _Client()
-        outage = _SubmissionOutage(client, lost_attempts=2, create_original=False)
+        outage = _SubmissionOutage(client, lost_attempts=6, create_original=False)
         with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock), self.assertRaises(OrderSubmissionFailedError):
             client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
-        self.assertEqual([item[0] for item in outage.posts], [0, 30])
-        self.assertEqual(len({item[1]["newClientOrderId"] for item in outage.posts}), 2)
-        self.assertEqual([entry["state"] for entry in client.journal.entries.values()], ["failed", "failed"])
+        self.assertEqual([item[0] for item in outage.posts], [0, 30, 60, 90, 120, 150])
+        self.assertEqual(len({item[1]["newClientOrderId"] for item in outage.posts}), 6)
+        self.assertEqual([entry["state"] for entry in client.journal.entries.values()], ["failed"] * 6)
         self.assertEqual(client.pending_order_requests(), [])
 
     def test_query_timeout_is_limited_to_remaining_confirmation_grace(self):
@@ -588,7 +588,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
             if method == "POST":
                 client.has_base = params.get("side") == "BUY"
             if method == "GET":
-                client_id = params["origClientOrderId"]
+                client_id = params.get("origClientOrderId") or next(key for key, value in client.orders.items() if value["orderId"] == params["orderId"])
                 query_counts[client_id] = query_counts.get(client_id, 0) + 1
                 if query_counts[client_id] <= 15:
                     raise requests.ReadTimeout("response unavailable")
@@ -596,7 +596,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         client._request_impl = request
         def buy(**kwargs):
             return client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET", "side": "BUY"})
-        def sell(**kwargs):
+        def sell(symbol=None, **kwargs):
             if not client.has_base:
                 return False
             return client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET", "side": "SELL"})
@@ -864,7 +864,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
                     client.request(client.spot, "POST", path, {"amount": "1"})
                 with self.assertRaises(ExchangeOperationFailedError):
                     client.request(client.spot, "POST", path, {"amount": "1"})
-                self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 4)
+                self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 12)
 
     def test_read_only_post_keeps_transport_retry(self):
         client = _Client()
@@ -876,7 +876,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         client = _Client()
         with self.assertRaises(ExchangeOperationFailedError):
             client._universal_transfer_with_retry("MAIN_UMFUTURE", "USDT", 1, context="test", retry_delay=0)
-        self.assertEqual(len(client.requests), 2)
+        self.assertEqual(len(client.requests), 6)
 
     def test_transfer_preserves_retry_for_definite_temporary_rejection(self):
         client = _Client()
@@ -905,8 +905,8 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         client.wait_convert_order_success = Mock(side_effect=requests.Timeout("query failed"))
         with self.assertRaises(ExchangeOperationFailedError):
             strategy._run_trade_action_with_retry(client.stop, "convert", lambda: client.convert_with_from_amount("BTC", "USDT", 1))
-        self.assertEqual(client.accept_convert_quote.call_count, 2)
-        self.assertEqual(client.get_convert_quote.call_count, 2)
+        self.assertEqual(client.accept_convert_quote.call_count, 6)
+        self.assertEqual(client.get_convert_quote.call_count, 6)
 
     def test_market_acknowledged_then_query_failed_does_not_post_again(self):
         client = _Client()
