@@ -89,7 +89,13 @@ def main():
             raise AssertionError('Missing CSRF accepted')
         except urllib.error.HTTPError as exc: assert exc.code == 403
         request('/api/settings', {'settings':{'max_threads':2}}, headers)
-        for file in ('/', '/app.js', '/style.css'): request(file)
+        # Verify served assets match the release bundle whose DOM/interaction contract
+        # is checked by test_linux_frontend.py, not merely HTTP 200 responses.
+        source = root / 'source' / 'linux_exchange' / 'static'
+        for path, name in (('/', 'index.html'), ('/app.js', 'app.js'), ('/style.css', 'style.css')):
+            response, content = request(path)
+            assert response.status == 200 and content == (source / name).read_bytes(), f'Published {path} differs from tested source'
+            assert response.headers.get('Cache-Control') == 'no-store', f'{path} must not serve a stale UI'
         pid = run('systemctl', 'show', 'xiaojun-exchange-worker.service', '--property=MainPID', '--value')
         request('/api/logout', {}, headers)
         run('systemctl', 'restart', 'xiaojun-exchange-web.service')

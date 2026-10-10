@@ -109,7 +109,7 @@ function render(current){
  if(!$('auto-dialog').open)for(const [name] of autoFields)$('auto-'+name).value=current.auto_ladder[name];
  layoutSettings();
  for(const b of document.querySelectorAll('[data-action]'))b.disabled=current.busy||(b.dataset.action==='retry_failed'&&!current.can_retry);
- for(const id of ['lock','change-password','destroy-accounts','add-account','import-file','paste-accounts','delete-selected','edit-highlighted','single-run','single-query','single-withdraw','stock-open','use-current','topup-all','volume-open','operation-review'])$(id).disabled=current.busy;
+ for(const id of ['lock','change-password','destroy-accounts','add-account','import-file','paste-accounts','delete-selected','edit-highlighted','single-run','single-query','single-withdraw','stock-open','use-current','topup-all','volume-open'])$(id).disabled=current.busy;
  renderAccounts();renderAssets();
  $('proxy-status').textContent=current.proxy_configured&&current.settings.use_exchange_config_proxy?'已启用':'未启用';
  for(const entry of current.logs){const match=entry.text.match(/连接出口 ([\d.:a-f]+)，耗时 (\d+) ms/i);if(match){$('exit-ip').textContent=match[1];$('proxy-test').textContent='延迟 '+match[2]+' ms';}}
