@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 
-from exchange_binance_client import BinanceAPIError, BinanceClient, UnconfirmedOperationError
+from exchange_binance_client import BinanceAPIError, BinanceClient, ExchangeOperationFailedError, retry_failed_operation
 from exchange_order_recovery import exchange_operation_scope
 from exchange_constants import TRADE_ACCOUNT_TYPE_STOCK as STOCK_TYPE
 from input_validation import bounded_int, finite_decimal, finite_float
@@ -152,10 +152,11 @@ class StockAPI:
             request = lambda: self.c._public_get_impl(self.c.spot, endpoint, params or {}, timeout=6)
         else:
             request = lambda: self.c._request_impl(self.c.spot, method, endpoint, params or {}, timeout=6)
-        # Equity writes have their own durable recovery; never route through spot replay.
-        return self.c._run_request_with_retry(
+        # Equity submissions share the enclosing step's one-retry budget.
+        submit = lambda: self.c._run_request_with_retry(
             request, max_retries=1, delay=0, base=self.c.spot, path=endpoint,
             replay_safe=method == "GET")
+        return retry_failed_operation(self.c, submit) if method != "GET" else submit()
 
     def rules(self, symbol):
         data = self.call("GET", "market/exchangeInfo", {"symbol": symbol})
@@ -185,10 +186,11 @@ class StockAPI:
 
     def funding_transfer(self, method, params):
         endpoint = "/sapi/v1/asset/transfer"
-        return self.c._run_request_with_retry(
+        submit = lambda: self.c._run_request_with_retry(
             lambda: self.c._request_impl(self.c.spot, method, endpoint, params, timeout=6),
             max_retries=1, delay=0, base=self.c.spot, path=endpoint,
             replay_safe=method == "GET")
+        return retry_failed_operation(self.c, submit) if method != "GET" else submit()
 
 
 class StockStrategy:
@@ -209,14 +211,20 @@ class StockStrategy:
 
     def load(self):
         if self.journal is None:
-            raise RuntimeError("股票交易必须启用订单恢复记录")
+            raise RuntimeError("股票交易必须启用任务记录")
         entries = self.journal.active_entries(kind="stock-task", scope=self.scope)
         if len(entries) > 1:
-            raise RuntimeError("存在多个待核对股票任务，请先核对交易所订单")
+            raise RuntimeError("存在多个未完成股票任务，请先完成停止清理")
         if entries:
             state = dict(entries[0]["payload"])
             if state.get("conversion"):
-                raise RuntimeError("存在旧版USDT兑换待确认记录，请先在币安核对；本程序不再自动兑换")
+                state["conversion"] = None
+                if state.get("active") or number(state.get("inventory", "0")):
+                    state["phase"] = "CLEANUP"
+                    self.journal.update(entries[0]["id"], "interrupted", **state)
+                else:
+                    self.journal.update(entries[0]["id"], "failed", reason="legacy-conversion-no-result")
+                return self.load()
             original_settings = dict(state.get("settings", {}))
             original_settings.pop("wallet", None)  # Legacy UI selection no longer controls new orders.
             if original_settings.get("asset") == "USDT":
@@ -249,7 +257,7 @@ class StockStrategy:
             return True
         # Universal transfers have no client idempotency key. An unknown reply must never be replayed.
         if not transfer.get("tranId"):
-            raise UnconfirmedOperationError("USDC划转结果未确认，停止自动重发，请先在币安核对划转记录")
+            raise ExchangeOperationFailedError("USDC划转未返回有效编号，按失败处理")
         data = self.api.funding_transfer("GET", {"type": "MAIN_FUNDING", "startTime": transfer["started_ms"], "size": 100})
         if not isinstance(data, dict) or not isinstance(data.get("rows"), list):
             raise RuntimeError("USDC划转记录无效，保留恢复记录")
@@ -269,12 +277,35 @@ class StockStrategy:
         return True
 
     def setup_funds(self, stop):
+        self._funding_retry_request = None
+        def attempt():
+            try:
+                return self._setup_funds_once(stop)
+            except Exception as exc:
+                transfer = self.state.get("funding_transfer")
+                if transfer and not (stop.is_set() and transfer.get("tranId")):
+                    self._funding_retry_request = dict(transfer)
+                    self.state["funding_transfer"] = None
+                    self.save()
+                if not stop.is_set() and (self.c.is_temporary_request_error(exc)
+                    or isinstance(exc, BinanceAPIError) and (self.c._is_uncertain_write_error(exc) or exc.code in {-1000, -3000, -5012})
+                    or transfer and isinstance(exc, RuntimeError) and not isinstance(exc, BinanceAPIError)):
+                    raise ExchangeOperationFailedError("USDC划转确认失败，按失败处理") from exc
+                raise
+        try:
+            return retry_failed_operation(self.c, attempt)
+        finally:
+            self._funding_retry_request = None
+
+    def _setup_funds_once(self, stop):
         s = self.settings
         if stop.is_set():
             raise RuntimeError("已请求停止股票任务")
         if not self.state.get("funding_collected") and not self.state.get("funding_transfer"):
-            spot, funding = self.api.balance("MAIN"), self.api.balance("CARD")
-            self.state["funding_budget"] = text_number(spot + funding)
+            retry = getattr(self, "_funding_retry_request", None)
+            spot, funding = (number(retry["amount"]), number(retry["before"])) if retry else (self.api.balance("MAIN"), self.api.balance("CARD"))
+            if not retry:
+                self.state["funding_budget"] = text_number(spot + funding)
             if spot:
                 self.state["funding_transfer"] = {"amount": text_number(spot), "before": text_number(funding),
                                                   "started_ms": self.c.current_server_time_ms(self.c.spot)}
@@ -295,7 +326,7 @@ class StockStrategy:
                 if self.state.get("funding_transfer"):
                     transfer_id = str(reply.get("tranId", "")) if isinstance(reply, dict) else ""
                     if not transfer_id.isdigit() or int(transfer_id) <= 0:
-                        raise UnconfirmedOperationError("USDC划转未返回有效编号，停止自动重发，请先在币安核对")
+                        raise ExchangeOperationFailedError("USDC划转未返回有效编号，按失败处理")
                     self.state["funding_transfer"]["tranId"] = transfer_id
                     self.save()
             else:
@@ -308,7 +339,7 @@ class StockStrategy:
             if self.confirm_funding_transfer():
                 break
             if self.clock() >= deadline:
-                raise RuntimeError("USDC划转尚未确认到账，停止买入并保留恢复记录")
+                raise ExchangeOperationFailedError("USDC划转确认超时，按失败处理")
             stop.wait(s.poll)
         available = min(self.api.balance("CARD"), number(self.state["funding_budget"]))
         minimum = s.amount if s.amount is not None else number(self.rules["minNotional"]) + platform_fee(number(self.rules["minNotional"])) * 2
@@ -349,14 +380,24 @@ class StockStrategy:
         return qty
 
     def reconcile(self):
+        def attempt():
+            try:
+                return self._read_order_once()
+            except Exception as exc:
+                if isinstance(exc, ExchangeOperationFailedError) or self.c.is_temporary_request_error(exc) or isinstance(exc, BinanceAPIError) and exc.code == -2013 or isinstance(exc, (ValueError, RuntimeError)) and not isinstance(exc, BinanceAPIError):
+                    raise ExchangeOperationFailedError(f"股票订单确认失败，按失败处理：{exc}") from exc
+                raise
+        return retry_failed_operation(self.c, attempt)
+
+    def _read_order_once(self):
         active = self.state.get("active")
         if not active:
             return None
         row = self.api.call("GET", "order/detail", {"clientOrderId": active["clientOrderId"]})
         if not isinstance(row, dict) or row.get("clientOrderId") != active["clientOrderId"] or row.get("symbol") != self.settings.symbol or row.get("side") != active["side"]:
-            raise RuntimeError("股票订单查询返回不完整或标识不匹配，保留原订单等待核对")
+            raise RuntimeError("股票订单查询返回不完整或标识不匹配，按失败处理")
         if active.get("orderId") and str(row.get("orderId")) != str(active["orderId"]):
-            raise RuntimeError("股票订单编号与原订单不匹配，保留原订单等待核对")
+            raise RuntimeError("股票订单编号与原订单不匹配，按失败处理")
         status = row.get("status")
         if status not in TERMINAL | {"NEW", "ACCEPTED", "PARTIALLY_FILLED"}:
             raise RuntimeError("股票订单状态未知，禁止重挂")
@@ -367,7 +408,7 @@ class StockStrategy:
         if qty < old or qty > number(active["quantity"]):
             raise RuntimeError("股票成交股数异常")
         if status == "FILLED" and qty != number(active["quantity"]):
-            raise RuntimeError("股票完成状态与成交股数不一致，保留原订单等待核对")
+            raise RuntimeError("股票完成状态与成交股数不一致，按失败处理")
         total = qty * number(row.get("avgFilledPrice") or "0")
         fee = number(row.get("fee", "0"))
         if qty and total <= 0:
@@ -400,26 +441,31 @@ class StockStrategy:
             self.reconcile()
 
     def place(self, side, qty, price, session):
-        params = {"symbol": self.settings.symbol, "side": side, "orderType": "LIMIT",
-                  "quantity": text_number(qty), "price": text_number(price), "quoteAsset": "USDC",
-                  "walletType": self.state["wallet"], "tradingSession": session,
-                  "timeInForce": "DAY", "tokenize": "false", "clientOrderId": uuid.uuid4().hex}
-        self.state["active"] = dict(params)
-        self.save()
-        try:
-            result = self.api.call("POST", "order/place", params)
-        except BinanceAPIError as exc:
-            if not self.c._is_uncertain_write_error(exc):
+        def attempt():
+            params = {"symbol": self.settings.symbol, "side": side, "orderType": "LIMIT",
+                      "quantity": text_number(qty), "price": text_number(price), "quoteAsset": "USDC",
+                      "walletType": self.state["wallet"], "tradingSession": session,
+                      "timeInForce": "DAY", "tokenize": "false", "clientOrderId": uuid.uuid4().hex}
+            self.state["active"] = dict(params)
+            self.save()
+            try:
+                result = self.api.call("POST", "order/place", params)
+            except Exception:
                 self.state["active"] = None
                 self.save()
-            raise
-        if not isinstance(result, dict) or result.get("status") != "S" or not result.get("orderId"):
-            if isinstance(result, dict) and result.get("status") == "F":
+                raise
+            if not isinstance(result, dict) or result.get("status") != "S" or not result.get("orderId"):
                 self.state["active"] = None
                 self.save()
-            raise RuntimeError("股票下单未确认，请核对原订单")
-        self.state["active"]["orderId"] = result["orderId"]
-        self.save()
+                if isinstance(result, dict) and result.get("status") == "F":
+                    raise RuntimeError("股票下单被拒绝")
+                raise ExchangeOperationFailedError("股票下单无法确认结果，按失败处理")
+            self.state["active"]["orderId"] = result["orderId"]
+            try:
+                self.save()
+            except Exception as exc:
+                raise ExchangeOperationFailedError("股票订单回执保存失败", retryable=False) from exc
+        return retry_failed_operation(self.c, attempt)
 
     def execute_side(self, side, stop, progress):
         started, repriced = self.clock(), self.clock()
@@ -461,10 +507,7 @@ class StockStrategy:
                     qty = self.quantity(remaining, price, fractional)
                     if side == "BUY" and qty * price + platform_fee(qty * price) > min(number(self.state["cash"]), self.api.balance(self.state["wallet"])):
                         raise RuntimeError("重挂所需资金超过任务预算，停止追加买入")
-                    try:
-                        self.place(side, qty, price, session)
-                    except UnconfirmedOperationError:
-                        logger.warning("股票提交回复未确认，继续查询原订单")
+                    self.place(side, qty, price, session)
                 repriced = self.clock()
             progress(self.state["completed"], self.settings.rounds,
                      f"股票第{self.state['completed'] + 1}轮 {side}，剩余{remaining}股")
@@ -571,7 +614,7 @@ class StockStrategy:
                     self.state.pop("anchor", None)
                 # A failed preflight has no orders to resume. A fresh start may use manually replenished USDC.
                 preflight_failed = self.cleanup_confirmed and self.state["phase"] == "INIT" and not number(self.state.get("buy_total", "0")) and not number(self.state.get("sell_total", "0"))
-                status = "cancelled" if self.stop_cleanup_requested and self.cleanup_confirmed else "failed" if preflight_failed else "interrupted"
+                status = "cancelled" if self.stop_cleanup_requested and self.cleanup_confirmed else "failed" if preflight_failed or isinstance(exc, ExchangeOperationFailedError) and self.cleanup_confirmed else "interrupted"
                 self.save(status)
                 if not self.cleanup_confirmed and self.cleanup_callback:
                     self.cleanup_callback(self)

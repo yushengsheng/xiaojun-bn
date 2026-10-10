@@ -218,19 +218,6 @@ const textInput=(message,value='',title='导入参数')=>questionInput(message,{
 function passwordInput(change=false){return new Promise(resolve=>{resolvePassword=resolve;$('new-password-label').hidden=$('repeat-password-label').hidden=!change;$('new-password').required=$('repeat-password').required=change;$('password-title').textContent=change?'修改程序密码':'再次验证密码';$('password-dialog').showModal();$('verify-password').focus();});}
 function finishPassword(value){for(const id of ['verify-password','new-password','repeat-password'])$(id).value='';$('password-dialog').close();const resolve=resolvePassword;resolvePassword=null;if(resolve)resolve(value);}
 async function sensitive(method,warning){if(warning&&!await confirmInput(warning,method==='destroy_accounts'?'确认销毁所有':'确认操作'))return;const passwords=await passwordInput(method==='change_password');if(!passwords)return;const result=await api(method,{...passwords,confirmed:true});if(result.text!==undefined)download(result.text,result.filename);if(['lock','change_password'].includes(method))signedOut();else await refresh();if(method==='destroy_accounts'){$('single-key').value=$('single-secret').value=$('single-address').value='';currentId='';singleReady=false;notice('账号相关信息已销毁；共享策略参数和代理设置已保留。','销毁完成');}else feedback('操作完成。');}
-async function reviewOperations(){
- const data=await api('operation_review',{}),text=data.entries.map(e=>[e.id,e.time+' '+e.action+' '+e.coin+' '+e.amount,e.address+' '+e.reference+' ['+e.state+']'].join('\n')).join('\n\n')||'没有待核对操作。';
- let id='',outcome='',confirmation='',evidence='';
- if(data.recovery_required){outcome='restore';confirmation=await textInput('账本从备份恢复，可能缺少最近记录。核对全部交易所历史后输入：已核对全部操作\n\n'+text,'','解除恢复保护');}
- else if(data.entries.some(e=>e.kind==='exchange-funds')){
-  id=await textInput(text+'\n\n在交易所核对历史后，填写要处理的资金记录编号：','','核对未确认');if(id===null)return;
-  outcome=await textInput('原操作已执行输入 completed；确认未执行输入 failed。不能确定时取消。','','核对结果');if(outcome===null)return;
-  evidence=await textInput('填写交易所回执编号或查询结果及时间：','','核对依据');if(evidence===null)return;
-  confirmation=await textInput('输入：已在交易所核对','','确认核对');
- }else{notice(text+'\n\n订单会在再次执行时查询原单。','核对未确认');return;}
- if(confirmation===null)return;const passwords=await passwordInput();if(!passwords)return;
- await api('operation_resolve',{id:id.trim(),outcome:outcome.trim(),confirmation,evidence,...passwords,confirmed:true});await refresh();notice('核对结果已保存。');
-}
 function download(text,filename){const blob=new Blob([text],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=node('a');a.href=url;a.download=filename;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 function editAccount(a){$('edit-id').value=a?.id||'';$('edit-key').value=$('edit-secret').value='';$('edit-key').placeholder=a?.api_key||'';$('edit-address').value=a?.address||'';$('edit-network').value=a?.network||state.settings.acc_network;$('account-dialog').showModal();}
 function closeAccount(){for(const id of ['edit-key','edit-secret'])$(id).value='';$('account-dialog').close();}
@@ -276,7 +263,6 @@ $('log-search').oninput=renderLogs;$('clear-view').onclick=()=>{logs=[];renderLo
 $('export-accounts').onclick=guard(()=>{if(!state.accounts.length){notice('当前账号列表为空，无需导出');return;}return sensitive('export_accounts',null);});
 $('destroy-accounts').onclick=guard(()=>sensitive('destroy_accounts','将直接销毁服务器交易所账号、提现/资产结果、交易恢复账本、交易所运行日志及运行时代理临时文件。\n\n共享策略参数和代理设置会保留。\n\n此操作不会使用回收站，程序无法恢复。已导出的账号文件不在本次范围。'));
 $('asset-export').onclick=guard(async()=>{const r=await api('asset_export',{});download(r.text,r.filename);});$('lock').onclick=guard(()=>sensitive('lock',null));$('change-password').onclick=guard(()=>sensitive('change_password',null));$('logout').onclick=guard(async()=>{await api('logout',{});signedOut();});
-$('operation-review').onclick=guard(reviewOperations);
 $('proxy-test').onclick=guard(async()=>{if(settingsDirty)await saveSettings();await api('proxy_test',{});$('proxy-test').textContent='测试中…';});$('proxy-clear').onclick=guard(async()=>{if(await confirmInput('清除服务器的加密代理配置？')){await api('settings',{settings:{exchange_proxy:'',use_exchange_config_proxy:false}});await refresh();}});
 $('auto-save').onclick=guard(async()=>{const auto_ladder=Object.fromEntries(autoFields.map(([name])=>[name,$('auto-'+name).value]));await api('settings',{settings:{},auto_ladder});autoSnapshot=null;$('auto-dialog').close();await refresh();feedback('自动分仓判断参数已保存并生效。');});
 $('stock-save').onclick=()=>{stockSnapshot=null;dirty();$('stock-dialog').close();};

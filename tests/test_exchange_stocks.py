@@ -6,8 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from exchange_binance_client import BinanceAPIError, BinanceClient, UnconfirmedOperationError
-from exchange_order_recovery import reconcile_exchange_orders
+from exchange_binance_client import BinanceAPIError, BinanceClient, ExchangeOperationFailedError
 from exchange_stocks import STOCK_FIELDS, StockSettings, StockStrategy, platform_fee, trading_session
 
 
@@ -125,13 +124,15 @@ class Client(BinanceClient):
             if self.transfer_error:
                 raise self.transfer_error
             amount = Decimal(params["amount"])
+            if amount > self.balances["MAIN"]:
+                raise BinanceAPIError(-2010, "insufficient transfer balance")
             self.balances["MAIN"] -= amount
             if not self.transfer_credit_delay:
                 self.balances["CARD"] += amount
             self.transfer_rows.append({**params, "tranId": str(len(self.transfers)), "status": "CONFIRMED"})
             if self.lost_transfer_reply:
                 self.lost_transfer_reply = False
-                raise UnconfirmedOperationError("transfer response lost")
+                raise ExchangeOperationFailedError("transfer response lost")
             return {"tranId": len(self.transfers)}
         if path.endswith("exchangeInfo"):
             return {"symbols": [dict(self.rules)]}
@@ -146,7 +147,7 @@ class Client(BinanceClient):
             self.orders[params["clientOrderId"]] = {**params, "orderId": str(len(self.posts)), "status": "NEW", "filledQty": "0", "avgFilledPrice": None, "fee": "0"}
             if self.lost_reply:
                 self.lost_reply = False
-                raise UnconfirmedOperationError("response lost")
+                raise ExchangeOperationFailedError("response lost")
             return {"status": "S", "orderId": str(len(self.posts))}
         if path.endswith("cancel"):
             row = next(row for row in self.orders.values() if row["orderId"] == params["orderId"])
@@ -253,38 +254,20 @@ class StockTests(unittest.TestCase):
         self.assertEqual(len(client.transfers), 1)
         self.assertEqual([p["walletType"] for p in client.posts], ["CARD"] * 2)
 
-    def test_lost_transfer_reply_never_trades_or_repeats_on_resume(self):
+    def test_lost_transfer_reply_retries_once_then_later_manual_task_is_allowed(self):
         client, task, stop = self.strategy()
         client.lost_transfer_reply = True
         result = task.run(stop)
         self.assertFalse(result["success"])
-        self.assertFalse(task.cleanup_confirmed)
+        self.assertTrue(task.cleanup_confirmed)
+        self.assertEqual(len(client.transfers), 2)
         self.assertEqual(client.posts, [])
-        client.balances["MAIN"] = Decimal(500)  # A later deposit must not trigger another transfer.
-        resumed = StockStrategy(client, task.settings, now=lambda: NOW, clock=lambda: stop.time)
-        result = resumed.run(stop)
-        self.assertFalse(result["success"])
-        self.assertEqual(len(client.transfers), 1)
-        self.assertEqual(client.posts, [])
-        self.assertTrue(client.operation_journal.active_entries()[0]["payload"]["funding_transfer"])
-
-    def test_acknowledged_transfer_recovers_without_sweeping_later_deposits(self):
-        client, task, stop = self.strategy(timeout="2", reprice="1")
-        client.transfer_history_delay = 100
-        client.transfer_credit_delay = True
-        result = task.run(stop)
-        self.assertFalse(result["success"])
-        self.assertFalse(task.cleanup_confirmed)
-        self.assertEqual(client.posts, [])
+        self.assertEqual(client.operation_journal.active_entries(), [])
         client.balances["MAIN"] = Decimal(500)
-        client.balances["CARD"] += Decimal(300)  # Funding deposits cannot expand the saved budget either.
-        client.transfer_history_delay = 0
         resumed = StockStrategy(client, task.settings, now=lambda: NOW, clock=lambda: stop.time)
-        result = resumed.run(stop)
-        self.assertTrue(result["success"], result)
-        self.assertEqual(len(client.transfers), 1)
-        self.assertEqual(client.balances["MAIN"], 500)
-        self.assertLess(Decimal(client.posts[0]["quantity"]) * Decimal(client.posts[0]["price"]), 2000)
+        self.assertTrue(resumed.run(stop)["success"])
+        self.assertEqual(len(client.transfers), 3)
+
 
     def test_transfer_permission_rejection_uses_existing_funding_balance(self):
         for code in (-2015, -1002):
@@ -347,7 +330,7 @@ class StockTests(unittest.TestCase):
                 result = task.run(stop)
                 self.assertFalse(result["success"])
                 self.assertEqual(client.posts, [])
-                self.assertEqual(task.cleanup_confirmed, not uncertain)
+                self.assertTrue(task.cleanup_confirmed)
 
     def test_stop_before_funding_preparation_makes_no_transfer_or_order(self):
         client, task, stop = self.strategy()
@@ -357,16 +340,6 @@ class StockTests(unittest.TestCase):
         self.assertEqual(client.transfers, [])
         self.assertEqual(client.posts, [])
 
-    def test_pending_transfer_blocks_other_market_tasks_and_changed_stock(self):
-        client, task, stop = self.strategy()
-        client.lost_transfer_reply = True
-        task.run(stop)
-        with self.assertRaisesRegex(RuntimeError, "股票划转"):
-            reconcile_exchange_orders(client.operation_journal, client, client.key)
-        changed = StockStrategy(client, StockSettings.parse({**STOCK_FIELDS, "symbol": "TSLA"}), now=lambda: NOW)
-        self.assertFalse(changed.run(stop)["success"])
-        self.assertEqual(len(client.transfers), 1)
-        self.assertEqual(client.posts, [])
 
     def test_legacy_wallet_setting_is_ignored_and_flat_spot_task_is_migrated(self):
         client, task, stop = self.strategy(wallet="MAIN")
@@ -409,16 +382,16 @@ class StockTests(unittest.TestCase):
         def request(base, method, path, params, **kwargs):
             data = original(base, method, path, params, **kwargs)
             if path == "/sapi/v1/asset/transfer" and method == "GET":
-                data["rows"][0]["asset"] = "USDT"
+                for row in data["rows"]: row["asset"] = "USDT"
             return data
         client._request_impl = request
         result = task.run(stop)
         self.assertFalse(result["success"])
-        self.assertFalse(task.cleanup_confirmed)
-        self.assertEqual(len(client.transfers), 1)
+        self.assertTrue(task.cleanup_confirmed)
+        self.assertEqual(len(client.transfers), 2)
         self.assertEqual(client.posts, [])
 
-    def test_invalid_transfer_acknowledgement_cannot_repeat_or_buy(self):
+    def test_invalid_transfer_acknowledgement_retries_once_and_ends_failed(self):
         client, task, stop = self.strategy()
         original = client._request_impl
         def request(base, method, path, params, **kwargs):
@@ -427,9 +400,10 @@ class StockTests(unittest.TestCase):
         client._request_impl = request
         result = task.run(stop)
         self.assertFalse(result["success"])
-        self.assertFalse(task.cleanup_confirmed)
-        self.assertEqual(len(client.transfers), 1)
+        self.assertTrue(task.cleanup_confirmed)
+        self.assertEqual(len(client.transfers), 2)
         self.assertEqual(client.posts, [])
+        self.assertEqual(client.operation_journal.active_entries(), [])
 
     def test_stop_during_transfer_confirmation_only_reconciles_the_transfer(self):
         client, task, stop = self.strategy()
@@ -448,19 +422,20 @@ class StockTests(unittest.TestCase):
         self.assertEqual(client.posts, [])
         self.assertEqual(client.operation_journal.active_entries(), [])
 
-    def test_lost_submission_reply_queries_original_without_duplicate(self):
+    def test_lost_stock_submission_reply_retries_current_order_once(self):
         client, task, stop = self.strategy()
         client.lost_reply = True
         result = task.run(stop)
         self.assertTrue(result["success"], result)
-        self.assertEqual(len(client.posts), 2)
+        self.assertEqual(len(client.posts), 3)
 
-    def test_transient_order_query_does_not_repeat_submission(self):
+    def test_second_stock_order_confirmation_failure_ends_task_and_keeps_normal_cleanup(self):
         client, task, stop = self.strategy()
-        client.detail_failures = 2
+        client.detail_failures = 12
         result = task.run(stop)
-        self.assertTrue(result["success"], result)
-        self.assertEqual(len(client.posts), 2)
+        self.assertFalse(result["success"])
+        self.assertIn("确认失败", result["error"])
+        self.assertEqual(len([p for p in client.posts if p["side"] == "BUY"]), 1)
         self.assertEqual(client.holdings, Decimal("70"))
 
     def test_stop_after_partial_fill_sells_only_task_inventory(self):
@@ -564,13 +539,6 @@ class StockTests(unittest.TestCase):
         self.assertEqual(client.calls, [])
         self.assertEqual(client.posts, [])
 
-    def test_other_market_recovery_blocks_pending_equity_orders(self):
-        client, task, stop = self.strategy()
-        task.load()
-        task.state.update(inventory="1")
-        task.save()
-        with self.assertRaisesRegex(RuntimeError, "股票"):
-            reconcile_exchange_orders(client.operation_journal, client, client.key)
 
     def test_invalid_quote_and_wide_spread_do_not_submit(self):
         for quote in ((Decimal("100"), Decimal("102")), (Decimal("0"), Decimal("1")), (Decimal("100.005"), Decimal("100.025"))):
@@ -610,16 +578,6 @@ class StockTests(unittest.TestCase):
         self.assertEqual(client.posts, [])
         self.assertTrue(all("convert" not in path for _, path, _ in client.calls))
 
-    def test_legacy_uncertain_conversion_is_preserved_without_any_request(self):
-        client, task, stop = self.strategy()
-        task.load()
-        task.state["conversion"] = {"quoteId": "old-conversion"}
-        task.save()
-        resumed = StockStrategy(client, task.settings, now=lambda: NOW)
-        result = resumed.run(stop)
-        self.assertFalse(result["success"])
-        self.assertEqual(client.calls, [])
-        self.assertEqual(client.operation_journal.active_entries()[0]["payload"]["conversion"]["quoteId"], "old-conversion")
 
     def test_inconsistent_terminal_fill_does_not_submit_replacement(self):
         client, task, stop = self.strategy()

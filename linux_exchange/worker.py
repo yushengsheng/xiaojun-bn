@@ -389,17 +389,6 @@ class Service:
                 return self.state(payload.get("since", 0))
             if method == "command":
                 return self._command(payload)
-            if method in {"operation_review", "operation_resolve"}:
-                from operation_review import snapshot, resolve
-                if r.busy or r._managed_threads_snapshot():
-                    raise ValueError("请等待任务及清理结束后核对")
-                if method == "operation_resolve":
-                    if payload.get("confirmed") is not True:
-                        raise ValueError("该操作需要确认")
-                    self.verify_password(payload.get("password"), payload.get("peer", "unknown"))
-                    resolve(r.exchange_operation_journal, payload.get("id", ""), payload.get("outcome", ""),
-                            payload.get("confirmation", ""), payload.get("evidence", ""))
-                return snapshot(r.exchange_operation_journal)
             if method == "emergency_stop":
                 r.stop_accounts()
                 return dict(stopping=True)

@@ -8,7 +8,6 @@ from exchange_binance_client import SharedRateLimitGate
 from exchange_logging import logger, set_exchange_account_log_index, clear_exchange_account_log_index
 from exchange_stocks import STOCK_FIELDS, STOCK_TYPE, StockSettings, StockStrategy
 from input_validation import bounded_int
-from exchange_order_recovery import reconcile_exchange_orders
 
 
 def stock_payload(owner):
@@ -109,7 +108,6 @@ class ExchangeAppStocksMixin:
             try:
                 if not stop.is_set():
                     client = self._create_binance_client(acc["api_key"], acc["api_secret"], request_gate=gate, request_stop_event=stop)
-                    reconcile_exchange_orders(getattr(self, "exchange_operation_journal", None), client, acc["api_key"], allow_stock_tasks=True)
                     result = StockStrategy(client, settings, cleanup_callback=self._record_strategy_cleanup).run(stop, progress)
                 status = f"股票{settings.symbol} {result.get('completed', 0)}/{settings.rounds}轮，费用{result.get('fees', '0')} USDC"
                 status += f"；买/卖额{result.get('buy_total', '0')}/{result.get('sell_total', '0')} USDC"

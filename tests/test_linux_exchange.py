@@ -44,6 +44,9 @@ class LinuxServerTests(unittest.TestCase):
     def test_headless_asset_query_and_stock_trading(self):
         self.run_case("execution")
 
+    def test_failed_result_retries_once_and_same_worker_continues_next_account(self):
+        self.run_case("failed_result_next_account")
+
     def test_web_authentication_csrf_and_credentials(self):
         self.run_case("web")
 

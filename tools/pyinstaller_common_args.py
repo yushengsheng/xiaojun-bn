@@ -26,7 +26,6 @@ HIDDEN_IMPORTS = (
     "secure_config",
     "operation_journal",
     "daily_logging",
-    "operation_review",
     "process_lock",
     "config_transaction",
     "exchange_funds_recovery",

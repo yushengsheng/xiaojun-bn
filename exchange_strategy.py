@@ -11,7 +11,7 @@ from typing import Callable
 
 from exchange_auto_ladder import AutoLadderSettingsStore, price_risk_reason, trade_is_recent
 from exchange_auto_ladder_observer import AutoLadderMarketObserver
-from exchange_binance_client import BinanceAPIError, BinanceClient, RequestStoppedError, UnconfirmedOperationError, UnconfirmedOrderError
+from exchange_binance_client import BinanceAPIError, BinanceClient, RequestStoppedError, ExchangeOperationFailedError, OrderSubmissionFailedError
 from retry_utils import RetryAborted, RetryPolicy, run_with_retries
 from exchange_constants import (
     FUTURES_LEVERAGE_DEFAULT,
@@ -508,7 +508,7 @@ class Strategy:
                         self._ladder_sell_all_base_and_confirm(base_asset, reason="停止现货任务后")
             self.cleanup_confirmed = True
             if isinstance(self.c, BinanceClient):
-                self.c._order_recovery_requires_cleanup = False
+                self.c._order_cleanup_required = False
             self.ladder_cleanup_confirmed = True
             if self.trade_error_stage == "停止清理":
                 self.trade_error = ""
@@ -532,9 +532,9 @@ class Strategy:
         self._cleanup_after_stop()
         return self.cleanup_confirmed
 
-    def _has_timed_out_submissions(self) -> bool:
-        return isinstance(self.c, BinanceClient) and (getattr(self.c, "_order_recovery_requires_cleanup", False) or any(
-            payload.get("confirmation_timed_out") for payload in self.c.pending_order_requests()
+    def _has_orders_requiring_cleanup(self) -> bool:
+        return isinstance(self.c, BinanceClient) and (getattr(self.c, "_order_cleanup_required", False) or any(
+            payload.get("cleanup_required") for payload in self.c.pending_order_requests()
         ))
 
     def _wait_for_completion_cleanup(self, stop_event, progress_cb=None) -> bool:
@@ -567,7 +567,7 @@ class Strategy:
             if sold:
                 logger.info("【补救措施】检测到残留基础币，已执行补充卖出。")
         except Exception as e:
-            if isinstance(e, UnconfirmedOperationError):
+            if isinstance(e, ExchangeOperationFailedError):
                 raise
             logger.warning(f"补救卖出时发生错误（可忽略）: {e}")
 
@@ -634,7 +634,7 @@ class Strategy:
                 minimum_text = "市价最小下单额" if market_mode else "最小闪兑金额"
                 logger.info("0 轮现货兑换未执行：可能 %s 余额不足或不满足%s", base_asset, minimum_text)
         except Exception as e:
-            if isinstance(e, UnconfirmedOperationError):
+            if isinstance(e, ExchangeOperationFailedError):
                 raise
             if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                 logger.info("检测到停止信号，跳过 0 轮现货兑换")
@@ -672,7 +672,7 @@ class Strategy:
             elif strict and any(Decimal(str(position.get("positionAmt", "0"))) != 0 for position in self.c.get_um_futures_positions(self.futures_symbol)):
                 raise RuntimeError("合约仍有未清理持仓")
         except Exception as e:
-            if isinstance(e, UnconfirmedOperationError):
+            if isinstance(e, ExchangeOperationFailedError):
                 raise
             if strict:
                 raise
@@ -846,7 +846,7 @@ class Strategy:
         policy = self.TRADE_OPERATION_RETRY_POLICY
 
         def should_retry(_exc: Exception) -> bool:
-            if isinstance(_exc, UnconfirmedOperationError):
+            if isinstance(_exc, ExchangeOperationFailedError):
                 return False
             if isinstance(_exc, BinanceAPIError):
                 return _exc.code in {-1001, -1003} and not bool(stop_event and stop_event.is_set())
@@ -877,10 +877,10 @@ class Strategy:
             except Exception as exc:
                 if isinstance(exc, (RequestStoppedError, RetryAborted)):
                     raise
-                if isinstance(exc, UnconfirmedOperationError):
+                if isinstance(exc, ExchangeOperationFailedError):
                     raise
                 if getattr(self.c, "_order_submission_serial", 0) != submission_serial:
-                    raise UnconfirmedOperationError(f"{context_text}已下单，后续状态处理失败，停止重复执行：{exc}") from exc
+                    raise ExchangeOperationFailedError(f"{context_text}已下单，后续状态处理失败，停止重复执行：{exc}") from exc
                 raise
 
         while True:
@@ -892,7 +892,7 @@ class Strategy:
                     on_retry=on_retry, on_give_up=on_give_up, sleep_fn=retry_sleep,
                 )
             except Exception as exc:
-                if isinstance(exc, UnconfirmedOperationError) or not BinanceClient.is_temporary_request_error(exc):
+                if isinstance(exc, ExchangeOperationFailedError) or not BinanceClient.is_temporary_request_error(exc):
                     raise
                 # Keep this action's call frame; do not restart its containing round.
                 retry_sleep(policy.delay_seconds)
@@ -1175,7 +1175,7 @@ class Strategy:
                 if isinstance(exc, (RequestStoppedError, RetryAborted)):
                     raise
                 if buy_order:
-                    raise UnconfirmedOperationError(f"买单已提交，卖单失败，停止重放双边挂单：{exc}") from exc
+                    raise ExchangeOperationFailedError(f"买单已提交，卖单失败，停止重放双边挂单：{exc}") from exc
                 raise
             self._remember_spot_order(sell_order, "SELL")
 
@@ -1843,7 +1843,7 @@ class Strategy:
                 if not stop_event:
                     time.sleep(1.0)
             except Exception as e:
-                if isinstance(e, UnconfirmedOperationError):
+                if isinstance(e, ExchangeOperationFailedError):
                     raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
@@ -2055,7 +2055,7 @@ class Strategy:
                 if not stop_event:
                     time.sleep(1.0)
             except Exception as e:
-                if isinstance(e, UnconfirmedOperationError):
+                if isinstance(e, ExchangeOperationFailedError):
                     raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     self._cancel_premium_active_orders(active_buy_orders, active_sell_orders)
@@ -2848,23 +2848,17 @@ class Strategy:
                         logger.info("自动分仓公共行情已恢复，继续按最新行情运行")
                         market_retrying = False
             except Exception as exc:
-                if isinstance(exc, UnconfirmedOrderError):
-                    if self.operation_journal is not None and not exc.journal_entry_id:
-                        entry_id = self.operation_journal.begin(
-                            "exchange-order", self.operation_scope,
-                            {"symbol": exc.symbol, "client_order_id": exc.client_order_id},
-                        )
-                        self.operation_journal.update(entry_id, "open")
+                if isinstance(exc, OrderSubmissionFailedError):
                     self.trade_error = str(exc)
                     self.trade_error_stage = "自动分仓订单状态"
                     logger.error("自动分仓停止：%s", exc)
-                    self._auto_ladder_cancel_orders(active_orders, reason="unconfirmed-order")
+                    self._auto_ladder_cancel_orders(active_orders, reason="failed-order")
                     return
                 if isinstance(exc, RetryAborted) or (stop_event and stop_event.is_set()):
                     self._ladder_cleanup_after_manual_stop(active_orders, base_asset)
                     logger.info("检测到停止信号，已停止后续执行（%s模式）", mode_name)
                     return
-                if isinstance(exc, UnconfirmedOperationError):
+                if isinstance(exc, ExchangeOperationFailedError):
                     raise
                 if self._stop_on_permanent_trade_error(exc, mode_name):
                     return
@@ -2936,7 +2930,7 @@ class Strategy:
                 lambda: self.c.collect_asset_to_spot(quote_asset, context="交易前"),
             )
         except Exception as e:
-            if isinstance(e, UnconfirmedOperationError):
+            if isinstance(e, ExchangeOperationFailedError):
                 raise
             if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                 logger.info("检测到停止信号，停止后续执行（现货阶段）")
@@ -3008,7 +3002,7 @@ class Strategy:
                 logger.info("--- 现货轮 %d 完成 ---", round_number)
 
             except Exception as e:
-                if isinstance(e, UnconfirmedOperationError):
+                if isinstance(e, ExchangeOperationFailedError):
                     raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（现货阶段）")
@@ -3106,7 +3100,7 @@ class Strategy:
 
                 logger.info("--- 闪兑轮 %d 完成 ---", i + 1)
             except Exception as e:
-                if isinstance(e, UnconfirmedOperationError):
+                if isinstance(e, ExchangeOperationFailedError):
                     raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（闪兑阶段）")
@@ -3174,13 +3168,13 @@ class Strategy:
                 logger.info("%s模式当前无活动挂单，结束本次运行", mode_name)
                 return
             except Exception as e:
-                if isinstance(e, UnconfirmedOperationError):
+                if isinstance(e, ExchangeOperationFailedError):
                     raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
                     return
                 if self._active_spot_orders or getattr(self.c, "_order_submission_serial", 0) != round_submission_serial:
-                    raise UnconfirmedOperationError(f"{mode_name}已有订单执行进展，停止重放本轮：{e}") from e
+                    raise ExchangeOperationFailedError(f"{mode_name}已有订单执行进展，停止重放本轮：{e}") from e
                 if self._stop_on_permanent_trade_error(e, mode_name):
                     return
                 logger.error("%s轮 %d 执行异常: %s", mode_name, step, e)
@@ -3257,13 +3251,13 @@ class Strategy:
 
                 logger.info("--- %s轮 %d 完成 ---", mode_name, step)
             except Exception as e:
-                if isinstance(e, UnconfirmedOperationError):
+                if isinstance(e, ExchangeOperationFailedError):
                     raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（%s模式）", mode_name)
                     return
                 if self._active_spot_orders or getattr(self.c, "_order_submission_serial", 0) != round_submission_serial:
-                    raise UnconfirmedOperationError(f"{mode_name}已有订单执行进展，停止重放本轮：{e}") from e
+                    raise ExchangeOperationFailedError(f"{mode_name}已有订单执行进展，停止重放本轮：{e}") from e
                 if self._stop_on_permanent_trade_error(e, mode_name):
                     return
                 logger.error("%s轮 %d 执行异常: %s", mode_name, step, e)
@@ -3352,7 +3346,7 @@ class Strategy:
         try:
             self._ensure_futures_available_balance()
         except Exception as e:
-            if isinstance(e, UnconfirmedOperationError):
+            if isinstance(e, ExchangeOperationFailedError):
                 raise
             if "合约有问题" in str(e):
                 self.trade_error = str(e)
@@ -3432,7 +3426,7 @@ class Strategy:
                     BinanceClient._format_decimal(close_price),
                 )
             except Exception as e:
-                if isinstance(e, UnconfirmedOperationError):
+                if isinstance(e, ExchangeOperationFailedError):
                     raise
                 if isinstance(e, RetryAborted) or (stop_event and stop_event.is_set()):
                     logger.info("检测到停止信号，停止后续执行（合约阶段）")
@@ -3476,19 +3470,19 @@ class Strategy:
             if not (stop_event and stop_event.is_set()):
                 raise
             result = self._strategy_result()
-        except UnconfirmedOperationError as exc:
+        except ExchangeOperationFailedError as exc:
             self.trade_error = str(exc)
-            self.trade_error_stage = "交易执行状态未确认"
+            self.trade_error_stage = "交易执行失败"
             result = self._strategy_result()
         finally:
             try:
                 # Cleanup has its own retry scheduler and must not remain in a read loop.
                 if isinstance(self.c, BinanceClient):
                     self.c._continuous_trading = False
-                if (stop_event and stop_event.is_set()) or self._has_timed_out_submissions():
+                if (stop_event and stop_event.is_set()) or self._has_orders_requiring_cleanup():
                     self._cleanup_after_stop()
                     if self.cleanup_confirmed and isinstance(self.c, BinanceClient):
-                        self.c._order_recovery_requires_cleanup = False
+                        self.c._order_cleanup_required = False
                 elif self._active_spot_orders or (isinstance(self.c, BinanceClient) and self.c.pending_order_requests()):
                     self.cleanup_error = "任务结束后仍有未确认订单，需完成清理"
                     if callable(self.cleanup_callback):
@@ -3560,7 +3554,7 @@ class Strategy:
 
         # Abandoned attempts can still lock funds or fill after the trading step.
         # Reconcile and clear them before collecting or withdrawing the result.
-        if self._has_timed_out_submissions():
+        if self._has_orders_requiring_cleanup():
             if not self._wait_for_completion_cleanup(stop_event, progress_cb):
                 return result_payload()
 

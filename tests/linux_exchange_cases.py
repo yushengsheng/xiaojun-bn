@@ -239,16 +239,67 @@ def execution():
     assert "成功" in r.exchange_batch_summary_var.get(), r.exchange_batch_summary_var.get()
     # Existing stock strategy fixture simulates signed Binance endpoints,
     # durable order intent, fills and fund transfers; no live HTTP is used.
-    from test_exchange_stocks import Client
+    from test_exchange_stocks import Client, NOW
+    from exchange_stocks import StockStrategy
     stock=Client()
     r.update_settings({"trade_account_type":"股票"})
-    with patch.object(r,"_create_binance_client",return_value=stock), patch("exchange_app_stocks.reconcile_exchange_orders"):
+    with patch.object(r,"_create_binance_client",return_value=stock), patch(
+        "exchange_app_stocks.StockStrategy",
+        side_effect=lambda *args, **kwargs: StockStrategy(*args, now=lambda: NOW, **kwargs),
+    ):
         result=call("command",command())
         assert result["accepted"]
         wait_idle(s)
     assert stock.posts and len(stock.posts)==2, r.accounts[0]["status_var"].get()
     assert "1/1轮" in r.accounts[0]["status_var"].get(), r.accounts[0]["status_var"].get()
     assert not any(a["batch_active"] for a in r.accounts)
+    r.close_idle()
+
+
+def failed_result_next_account():
+    from decimal import Decimal
+    import requests
+    from exchange_binance_client import BinanceClient
+    s, call, _ = fixture()
+    r = s.runtime
+    r.update_settings({"max_threads": 1})
+    for account in r.accounts:
+        account["address"] = "test-withdraw-target"
+        account["network"] = "BSC"
+    created, posts = [], []
+    def make_client(key, secret, **kwargs):
+        with patch.object(BinanceClient, '_build_session', return_value=Mock()):
+            client = BinanceClient(key, secret, operation_journal=r.exchange_operation_journal)
+        index = len(created)
+        created.append(client)
+        client.DEFAULT_REQUEST_RETRY_DELAY_SECONDS = 0
+        client.collect_asset_to_spot = Mock(return_value=0)
+        client.spot_asset_balance_decimal = Mock(return_value=Decimal(10))
+        def network(base, method, path, params, **kw):
+            if method == 'GET' and path == '/sapi/v1/capital/config/getall':
+                return [{'coin': 'USDT', 'networkList': [{'network': 'BSC', 'withdrawEnable': True}]}]
+            if method == 'POST' and path == '/sapi/v1/capital/withdraw/apply':
+                posts.append((index, dict(params)))
+                if index == 0:
+                    raise requests.ReadTimeout('missing withdrawal result')
+                return {'id': 'second-account-receipt'}
+            raise AssertionError('Unexpected endpoint')
+        client._request_impl = network
+        return client
+    with patch.object(r, '_create_binance_client', side_effect=make_client):
+        r.batch_manual_withdraw(r.accounts, require_confirm=False)
+        wait_idle(s)
+    assert [index for index, _ in posts] == [0, 0, 1], posts
+    assert posts[0][1]['withdrawOrderId'] != posts[1][1]['withdrawOrderId']
+    assert not r.stop_event.is_set()
+    summary = r.exchange_batch_summary_var.get()
+    assert '成功1' in summary and '失败1' in summary, summary
+    assert '失败' in r.accounts[0]['status_var'].get()
+    assert '提现' in r.accounts[1]['status_var'].get()
+    assert not r.exchange_operation_journal.active_entries(kind='exchange-funds')
+    assert not r._pending_cleanup_snapshot()
+    assert_error(lambda: call('operation_review', {}))
+    assert_error(lambda: call('operation_resolve', {}))
     r.close_idle()
 
 

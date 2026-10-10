@@ -166,7 +166,7 @@ class HeadlessExchange(ExchangeAppStocksMixin, ExchangeAppBatchMixin,
         self.exchange_proxy_runtime = base.ExchangeProxyRuntime(base.STRATEGY_CONFIG_FILE.parent, "exchange")
         self.exchange_proxy_runtime.cleanup_stale_runtime()
         self.account_store = base.AccountStore(base.DATA_FILE)
-        self.exchange_operation_journal = base.OperationJournal(base.EXCHANGE_OPERATION_JOURNAL_FILE)
+        self.exchange_operation_journal = base.OperationJournal(base.EXCHANGE_OPERATION_JOURNAL_FILE, fail_unconfirmed=True)
         self.auto_ladder_settings_store = AutoLadderSettingsStore()
         self.settings_file = base.DATA_FILE.parent / "linux_settings.json"
         self.config_update_file = base.DATA_FILE.parent / "linux_account_update.json"

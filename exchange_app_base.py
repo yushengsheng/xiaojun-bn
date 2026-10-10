@@ -226,7 +226,7 @@ class ExchangeAppBase(tk.Tk):
         self.exchange_proxy_runtime.cleanup_stale_runtime()
         self.onchain_proxy_runtime.cleanup_stale_runtime()
         self.account_store = AccountStore(DATA_FILE)
-        self.exchange_operation_journal = OperationJournal(EXCHANGE_OPERATION_JOURNAL_FILE)
+        self.exchange_operation_journal = OperationJournal(EXCHANGE_OPERATION_JOURNAL_FILE, fail_unconfirmed=True)
         self.auto_ladder_settings_store = AutoLadderSettingsStore()
 
         self.accounts = []
@@ -720,7 +720,6 @@ class ExchangeAppBase(tk.Tk):
             state="disabled",
         )
         self.btn_retry_failed_accounts.pack(side="left", padx=(8, 0))
-        ttk.Button(frame_batch_opts, text="核对未确认", command=self.review_unconfirmed_operations).pack(side="left", padx=(8, 0))
         ttk.Label(frame_batch_opts, textvariable=self.exchange_batch_summary_var, foreground="#666666").pack(side="left", padx=(12, 0))
 
         frame_log = ttk.Frame(self.exchange_tab)

@@ -51,7 +51,7 @@ from exchange_app_base import (
     ttk,
 )
 from input_validation import bounded_int, finite_float
-from exchange_order_recovery import exchange_operation_scope, reconcile_exchange_orders
+from exchange_order_recovery import exchange_operation_scope
 from exchange_auto_ladder_observer import AutoLadderMarketObserver
 from shared_utils import decimal_to_stat_text, trade_volume_time_range, normalize_trade_volume_date
 from stores import _load_authenticated_config, _save_authenticated_config, config_or_backup_exists
@@ -59,12 +59,6 @@ from exchange_stocks import STOCK_TYPE
 
 
 class ExchangeAppBatchMixin(object):
-    def review_unconfirmed_operations(self):
-        if getattr(self, "_batch_task_active", False) or getattr(self, "worker_thread", None) and self.worker_thread.is_alive():
-            messagebox.showwarning("提示", "请等待任务及清理结束后核对")
-            return
-        from operation_review import desktop_review
-        desktop_review(self, self.exchange_operation_journal)
 
     COLLECT_BNB_RESIDUAL_IGNORE_USDT = Decimal("0.1")
 
@@ -134,11 +128,10 @@ class ExchangeAppBatchMixin(object):
     def _exchange_operation_scope(api_key: str) -> str:
         return exchange_operation_scope(api_key)
 
-    def _reconcile_exchange_orders(self, client, api_key: str) -> None:
+    def _assert_account_cleanup_finished(self, client, api_key: str) -> None:
         pending_reader = getattr(self, "_pending_cleanup_snapshot", None)
         if callable(pending_reader) and any(getattr(strategy.c, "key", "") == api_key for strategy in pending_reader()):
             raise RuntimeError("该账号停止清理尚未完成，请等待清理确认后再启动")
-        reconcile_exchange_orders(getattr(self, "exchange_operation_journal", None), client, api_key)
 
     def _resolve_earn_subscribe_amount(self, client, asset: str, configured_amount, earn_amount_all: bool) -> Decimal:
         asset_u = str(asset or "").strip().upper()
@@ -500,7 +493,7 @@ class ExchangeAppBatchMixin(object):
                 else:
                     effective_reprice_threshold = Decimal("0")
             if trade_account_type != TRADE_ACCOUNT_TYPE_EARN:
-                self._reconcile_exchange_orders(client, key)
+                self._assert_account_cleanup_finished(client, key)
         except Exception as e:
             self._close_binance_client_instance(client)
             messagebox.showerror("错误", "Binance 连接初始化失败: %s" % e)
@@ -3761,7 +3754,7 @@ class ExchangeAppBatchMixin(object):
                             if amt > 0:
                                 self.record_withdraw(idx_local, api_key, address, amt)
 
-                        self._reconcile_exchange_orders(client, acc["api_key"])
+                        self._assert_account_cleanup_finished(client, acc["api_key"])
                         strategy = Strategy(
                             client=client,
                             spot_rounds=spot_rounds,

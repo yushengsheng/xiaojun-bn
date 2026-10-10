@@ -7,9 +7,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
-from exchange_binance_client import BinanceClient, UnconfirmedOperationError
+from exchange_binance_client import BinanceClient, ExchangeOperationFailedError
 from operation_journal import OperationJournal
-from operation_review import resolve, snapshot
 from process_lock import AlreadyRunningError, ProcessLease
 from secret_box import SecretBox
 
@@ -85,53 +84,15 @@ class RuntimeSafetyTests(unittest.TestCase):
         client._request_impl.assert_not_called()
         self.assertEqual(len(self.journal.active_entries()), 1)
 
-    def test_lost_funds_reply_blocks_new_client_after_restart(self):
-        client = self.exchange()
-        client._request_impl = Mock(side_effect=requests.ReadTimeout("lost"))
-        with self.assertRaises(UnconfirmedOperationError):
-            client.request(client.spot, "POST", "/sapi/v1/asset/transfer", {"asset": "USDT", "amount": "1"})
-        other = self.exchange(OperationJournal(self.journal.file_path, secret_box=self.box))
-        other._request_impl = Mock()
-        with self.assertRaises(UnconfirmedOperationError):
-            other.request(other.spot, "POST", "/sapi/v1/asset/transfer", {"asset": "USDT", "amount": "1"})
-        other._request_impl.assert_not_called()
-        entry = self.journal.active_entries()[0]
-        with self.assertRaises(ValueError):
-            resolve(self.journal, entry["id"], "failed", "确认", "exchange history")
-        resolve(self.journal, entry["id"], "failed", "已在交易所核对", "交易所历史无此划转，2026-10-08")
-        other._request_impl.return_value = {"tranId": 123}
-        other.request(other.spot, "POST", "/sapi/v1/asset/transfer", {"asset": "USDT", "amount": "1"})
-        other._request_impl.assert_called_once()
-        self.assertEqual(self.journal.active_entries(), [])
 
     def test_exchange_rejection_does_not_set_uncertain_guard(self):
         client = self.exchange()
         client._request_impl = Mock(return_value={"success": False})
         with self.assertRaisesRegex(RuntimeError, "拒绝"):
             client.request(client.spot, "POST", "/sapi/v1/asset/transfer", {"amount": "1"})
-        self.assertIsNone(client._uncertain_write_error)
+        self.assertFalse(hasattr(client, "_uncertain_write_error"))
         self.assertEqual(self.journal.active_entries(), [])
 
-    def test_every_funds_module_blocks_replay_after_lost_reply_and_restart(self):
-        from exchange_funds_recovery import FUNDS_WRITE_PATHS
-        for index, path in enumerate(sorted(FUNDS_WRITE_PATHS)):
-            with self.subTest(path=path):
-                journal_path = self.root / f"funds-lost-{index}.json"
-                journal = OperationJournal(journal_path, secret_box=self.box)
-                client = self.exchange(journal)
-                client._request_impl = Mock(side_effect=requests.ReadTimeout("reply lost after submit"))
-                with self.assertRaises(UnconfirmedOperationError):
-                    client.request(client.spot, "POST", path, {"asset": "USDT", "amount": "20", "quoteId": "original"})
-                self.assertEqual(client._request_impl.call_count, 1)
-                restarted = self.exchange(OperationJournal(journal_path, secret_box=self.box))
-                restarted.request_query = Mock(return_value=[])
-                restarted.get_convert_order_status = Mock(return_value={})
-                restarted._request_impl = Mock(return_value={"tranId": 999})
-                for next_path in (path, "/sapi/v1/asset/transfer"):
-                    with self.assertRaises(UnconfirmedOperationError):
-                        restarted.request(restarted.spot, "POST", next_path, {"asset": "USDT", "amount": "20"})
-                restarted._request_impl.assert_not_called()
-                self.assertEqual(journal.active_entries()[0]["state"], "unconfirmed")
 
     def test_every_funds_module_new_action_cannot_reuse_completed_receipt(self):
         from exchange_funds_recovery import FUNDS_WRITE_PATHS, _RECEIPT_KEYS
@@ -152,36 +113,7 @@ class RuntimeSafetyTests(unittest.TestCase):
                 self.assertEqual(len({entry["id"] for entry in entries}), 2)
                 self.assertTrue(all(entry["state"] == "completed" for entry in entries))
 
-    def test_unknown_funds_operation_blocks_its_account_without_cross_account_recovery(self):
-        first = self.exchange()
-        first._request_impl = Mock(side_effect=requests.ReadTimeout("lost"))
-        with self.assertRaises(UnconfirmedOperationError):
-            first.request(first.spot, "POST", "/sapi/v1/asset/transfer", {"asset": "USDT", "amount": "20"})
-        with patch.object(BinanceClient, "_build_session", return_value=Mock()):
-            second = BinanceClient("another-test-key", "test-secret", operation_journal=self.journal)
-        self.addCleanup(second.close)
-        second._request_impl = Mock(return_value={"tranId": 123})
-        second.request(second.spot, "POST", "/sapi/v1/asset/transfer", {"asset": "USDT", "amount": "20"})
-        second._request_impl.assert_called_once()
-        self.assertEqual(len(self.journal.active_entries()), 1)
-        self.assertEqual(self.journal.active_entries()[0]["state"], "unconfirmed")
 
-    def test_wrong_order_ack_cannot_complete_or_allow_a_second_payment(self):
-        from exchange_binance_client import UnconfirmedOrderError
-        for index, mismatch in enumerate(({"symbol": "ETHUSDT"}, {"clientOrderId": "old-order"}, {"side": "SELL"})):
-            with self.subTest(mismatch=mismatch):
-                journal = OperationJournal(self.root / f"order-identity-{index}.json", secret_box=self.box)
-                client = self.exchange(journal)
-                client._request_impl = Mock(side_effect=lambda _base, _method, _path, params, **_: {
-                    "orderId": 123, "symbol": params["symbol"], "clientOrderId": params["newClientOrderId"],
-                    "status": "FILLED", "side": params["side"], **mismatch})
-                params = {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY", "quantity": "1", "price": "10"}
-                with self.assertRaisesRegex(RuntimeError, "不匹配"):
-                    client.request(client.spot, "POST", "/api/v3/order", params)
-                self.assertEqual(journal.active_entries()[0]["state"], "prepared")
-                with self.assertRaises(UnconfirmedOrderError):
-                    client.request(client.spot, "POST", "/api/v3/order", params)
-                self.assertEqual(client._request_impl.call_count, 1)
 
     def test_order_identity_preserves_slash_symbol_query_compatibility(self):
         client = self.exchange()
@@ -196,112 +128,28 @@ class RuntimeSafetyTests(unittest.TestCase):
                                   request_params={"symbol": " btc / eth ", "origClientOrderId": "original"})
         self.assertEqual(self.journal.active_entries(), [])
 
-    def test_withdraw_history_clears_durable_and_memory_guard(self):
-        client = self.exchange()
-        client._request_impl = Mock(side_effect=requests.ReadTimeout("accepted but reply lost"))
-        params = {"coin": "USDT", "address": "target", "network": "BSC", "amount": "2"}
-        with self.assertRaises(UnconfirmedOperationError):
-            client.request(client.spot, "POST", "/sapi/v1/capital/withdraw/apply", params)
-        entry = self.journal.active_entries()[0]
-        posted = entry["payload"]["params"]
-        client.request_query = Mock(return_value=[{**posted, "status": 4, "id": "original"}])
-        client._request_impl = Mock(return_value={"tranId": 123})
-        client.request(client.spot, "POST", "/sapi/v1/asset/transfer", {"asset": "BNB", "amount": "1"})
-        client._request_impl.assert_called_once()
-        self.assertIsNone(client._uncertain_write_error)
-        self.assertEqual(self.journal.active_entries(), [])
 
-    def test_malformed_money_receipts_remain_unconfirmed(self):
-        client = self.exchange()
-        for receipt in ({"tranId": True}, {"tranId": []}, {"tranId": {}}, {"tranId": -1}, {"tranId": " "}, {"orderId": 123}):
-            with self.subTest(receipt=receipt):
-                client._request_impl = Mock(return_value=receipt)
-                with self.assertRaises(UnconfirmedOperationError):
-                    client.request(client.spot, "POST", "/sapi/v1/asset/transfer", {"amount": "1"})
-                entry = self.journal.active_entries()[0]
-                self.assertEqual(entry["state"], "unconfirmed")
-                self.journal.update(entry["id"], "failed")  # Fixture never submitted a real request.
 
     def test_dust_requires_nonempty_identifiable_transfer_results(self):
         client = self.exchange()
         for rows in ([], [{}], [{"tranId": True}], "invalid"):
             with self.subTest(rows=rows):
                 client._request_impl = Mock(return_value={"transferResult": rows})
-                with self.assertRaises(UnconfirmedOperationError):
+                with self.assertRaises(ExchangeOperationFailedError):
                     client.request(client.spot, "POST", "/sapi/v1/asset/dust", {"asset": ["ETH"]})
-                entry = self.journal.active_entries()[0]
-                self.assertEqual(entry["state"], "unconfirmed")
-                self.journal.update(entry["id"], "failed")
+                entry = self.journal.recovery_snapshot()["entries"][-1]
+                self.assertEqual(entry["state"], "failed")
+                self.assertEqual(client._request_impl.call_count, 2)
         client._request_impl = Mock(return_value={"transferResult": [{"tranId": 123, "fromAsset": "ETH"}]})
         client.request(client.spot, "POST", "/sapi/v1/asset/dust", {"asset": ["ETH"]})
         self.assertEqual(self.journal.active_entries(), [])
         saved = self.journal.recovery_snapshot()["entries"][-1]["payload"]["receipt"]
         self.assertEqual(saved["transferResult"][0]["tranId"], 123)
 
-    def test_withdraw_reconciliation_accepts_evm_case_only_and_rejects_other_address_changes(self):
-        from exchange_funds_recovery import reconcile_funds_entry
-        client = self.exchange()
-        for address, returned, expected in (("0x" + "A" * 40, "0x" + "a" * 40, True),
-                                             ("CaseSensitiveAddress", "casesensitiveaddress", False),
-                                             ("0x" + "a" * 40, "0x" + "b" * 40, False)):
-            entry_id = self.journal.begin("exchange-funds", "scope", {"path": "/sapi/v1/capital/withdraw/apply",
-                "params": {"coin": "USDT", "address": address, "amount": "1", "withdrawOrderId": "original"}, "started_ms": 1000})
-            entry = next(e for e in self.journal.active_entries() if e["id"] == entry_id)
-            client.request_query = Mock(return_value=[{"coin": "USDT", "address": returned, "amount": "1", "withdrawOrderId": "original", "id": "receipt", "status": 6}])
-            if expected:
-                self.assertTrue(reconcile_funds_entry(self.journal, client, entry))
-            else:
-                with self.assertRaisesRegex(RuntimeError, "不符"):
-                    reconcile_funds_entry(self.journal, client, entry)
-                self.assertEqual(next(e for e in self.journal.active_entries() if e["id"] == entry_id)["state"], "prepared")
-
-    def test_convert_reconciliation_requires_receipt_and_matching_quote_when_returned(self):
-        from exchange_funds_recovery import reconcile_funds_entry
-        client = self.exchange()
-        entry_id = self.journal.begin("exchange-funds", "scope", {"path": "/sapi/v1/convert/acceptQuote", "params": {"quoteId": "original"}})
-        entry = self.journal.active_entries()[0]
-        client.get_convert_order_status = Mock(return_value={"orderStatus": "SUCCESS"})
-        self.assertFalse(reconcile_funds_entry(self.journal, client, entry))
-        client.get_convert_order_status.return_value = {"orderStatus": "SUCCESS", "orderId": 123, "quoteId": "other"}
-        with self.assertRaisesRegex(RuntimeError, "不符"):
-            reconcile_funds_entry(self.journal, client, entry)
-        client.get_convert_order_status.return_value = {"orderStatus": "SUCCESS", "orderId": 123}
-        self.assertTrue(reconcile_funds_entry(self.journal, client, entry))
-        self.assertEqual(self.journal.active_entries(), [])
-
-    def test_processing_convert_remains_protected_after_restart_until_terminal_receipt(self):
-        client = self.exchange()
-        client._request_impl = Mock(return_value={"orderId": 123, "orderStatus": "PROCESS"})
-        client.accept_convert_quote("original")
-        self.assertEqual(self.journal.active_entries()[0]["state"], "submitted")
-        other = self.exchange(OperationJournal(self.journal.file_path, secret_box=self.box))
-        other._request_impl = Mock(return_value={"orderId": 123, "orderStatus": "PROCESS"})
-        with self.assertRaises(UnconfirmedOperationError):
-            other.request(other.spot, "POST", "/sapi/v1/asset/transfer", {"amount": "1"})
-        self.assertTrue(all(call.args[1] == "GET" for call in other._request_impl.call_args_list))
-        other._request_impl.return_value = {"orderId": 456, "orderStatus": "SUCCESS"}
-        with self.assertRaisesRegex(RuntimeError, "编号"):
-            other.get_convert_order_status(quote_id="original")
-        self.assertEqual(self.journal.active_entries()[0]["state"], "submitted")
-        other._request_impl.return_value = {"orderId": 123, "orderStatus": "SUCCESS"}
-        other.get_convert_order_status(quote_id="original")
-        self.assertEqual(self.journal.active_entries(), [])
-        other._request_impl.return_value = {"tranId": 456}
-        other.request(other.spot, "POST", "/sapi/v1/asset/transfer", {"amount": "1"})
-        self.assertEqual(other._request_impl.call_args.args[1], "POST")
 
 
-    def test_restore_guard_survives_reload_and_requires_exact_confirmation(self):
-        self.journal.begin("exchange-funds", "scope", {"amount": "1"})
-        self.journal.file_path.unlink()
-        with self.assertRaises(RuntimeError):
-            self.journal.active_entries()
-        other = OperationJournal(self.journal.file_path, secret_box=self.box)
-        self.assertTrue(snapshot(other)["recovery_required"])
-        with self.assertRaises(ValueError):
-            other.acknowledge_recovery("确认")
-        other.acknowledge_recovery("已核对全部操作")
-        self.assertEqual(len(other.active_entries()), 1)
+
+
 
     def test_withdraw_network_validation_precedes_post(self):
         client = self.exchange()
@@ -405,16 +253,6 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertFalse(roots["ROOT"].exists())
             self.assertTrue(roots["UNITS"].exists())
 
-    def test_uncertain_funds_do_not_block_cleanup_sell(self):
-        from tests.test_exchange_execution_safety import _Client
-        client = _Client()
-        client._uncertain_write_error = UnconfirmedOperationError("funds pending")
-        client.journal.begin("exchange-funds", client._order_scope(), {"path": "/sapi/v1/asset/transfer"})
-        with client.cleanup_requests_after_stop():
-            order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET", "side": "SELL", "quantity": "1"})
-        self.assertEqual(order["status"], "FILLED")
-        self.assertEqual(len(client.journal.active_entries()), 1)
-        self.assertIsNotNone(client._uncertain_write_error)
 
 
 if __name__ == "__main__":

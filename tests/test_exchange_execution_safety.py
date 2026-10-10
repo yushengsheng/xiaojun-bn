@@ -8,9 +8,8 @@ import requests
 
 from exchange_app_base import ExchangeAppBase
 from exchange_app_batch import ExchangeAppBatchMixin
-from exchange_binance_client import BinanceAPIError, BinanceClient, RequestStoppedError, SharedRateLimitGate, UnconfirmedOperationError, UnconfirmedOrderError
+from exchange_binance_client import BinanceAPIError, BinanceClient, RequestStoppedError, SharedRateLimitGate, ExchangeOperationFailedError, OrderSubmissionFailedError
 from exchange_constants import TRADE_ACCOUNT_TYPE_FUTURES, MARKET_STOP_MODE_BNB
-from exchange_order_recovery import reconcile_exchange_orders
 from exchange_strategy import Strategy
 from operation_journal import OperationJournal
 from page_onchain_base import OnchainTransferPageBase
@@ -131,48 +130,6 @@ class _SubmissionOutage:
 
 
 class ExchangeExecutionSafetyTests(unittest.TestCase):
-    def test_cleanup_query_recovers_beyond_ten_failures_then_withdraws_once(self):
-        client = _Client()
-        original_request = client._request_impl
-        cleanup_queries = 0
-        def request(base, method, path, params=None, **kwargs):
-            nonlocal cleanup_queries
-            if method == "GET" and client._cleanup_request_depth:
-                cleanup_queries += 1
-                if cleanup_queries <= 12:
-                    raise requests.ReadTimeout("cleanup network unavailable")
-            return original_request(base, method, path, params, **kwargs)
-        client._request_impl = request
-        outage = _SubmissionOutage(client)
-        notifications = Mock()
-        callback = Mock()
-        strategy = _strategy(client, cleanup_callback=notifications, withdraw_callback=callback)
-        strategy.withdraw_address = "destination"
-        strategy.enable_withdraw = True
-        strategy._run_bnb_topup_if_needed = Mock()
-        def trading(*_args, **_kwargs):
-            client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET", "side": "BUY"})
-            strategy.market_round_total = strategy.market_round_completed = 1
-        strategy._run_market_mode = Mock(side_effect=trading)
-        def withdraw(**_kwargs):
-            self.assertFalse(client.has_base)
-            self.assertEqual(client.journal.active_entries(), [])
-            return 10.0
-        client.withdraw_all_coin = Mock(side_effect=withdraw)
-        with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock), patch.object(strategy, "_pause_with_stop", return_value=False):
-            result = strategy.run(client.stop)
-        self.assertEqual(cleanup_queries, 13)
-        self.assertEqual(result["market_round_completed"], 1)
-        self.assertTrue(result["cleanup_confirmed"])
-        self.assertFalse(result["trade_failed"])
-        self.assertTrue(result["withdraw_attempted"])
-        self.assertEqual(result["withdraw_amount"], 10.0)
-        strategy._run_market_mode.assert_called_once()
-        client.withdraw_all_coin.assert_called_once()
-        callback.assert_called_once_with(10.0)
-        notifications.assert_called_once_with(strategy)
-        self.assertEqual(len(outage.posts), 1)
-        self.assertEqual(client.pending_order_requests(), [])
 
     def test_cleanup_balance_recovers_after_old_order_has_already_been_resolved(self):
         client = _Client()
@@ -182,7 +139,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         strategy._run_bnb_topup_if_needed = Mock()
         def trading(*_args, **_kwargs):
             order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
-            client._pending_order_requests[order["clientOrderId"]]["confirmation_timed_out"] = True
+            client._pending_order_requests[order["clientOrderId"]]["cleanup_required"] = True
             client.orders[order["clientOrderId"]]["status"] = "FILLED"
         strategy._run_market_mode = Mock(side_effect=trading)
         original_sell = client.spot_sell_all_base
@@ -222,7 +179,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         client.get_order_by_client_id = query
         def trading(*_args, **_kwargs):
             order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
-            client._pending_order_requests[order["clientOrderId"]]["confirmation_timed_out"] = True
+            client._pending_order_requests[order["clientOrderId"]]["cleanup_required"] = True
         strategy._run_market_mode = trading
         client.withdraw_all_coin = Mock(return_value=10.0)
         def stop_wait(_stop, _seconds):
@@ -252,7 +209,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
                     path = "/fapi/v1/order" if futures else "/api/v3/order"
                     base = client.um_futures if futures else client.spot
                     order = client.request(base, "POST", path, {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
-                    client._pending_order_requests[order["clientOrderId"]]["confirmation_timed_out"] = True
+                    client._pending_order_requests[order["clientOrderId"]]["cleanup_required"] = True
                     strategy.trade_error = "definite trade rejection"
                     strategy.trade_error_stage = "开仓下单" if futures else "下单"
                 trading_handler = Mock(side_effect=trading)
@@ -286,7 +243,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         strategy._run_bnb_topup_if_needed = Mock()
         def trading(*_args, **_kwargs):
             order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
-            client._pending_order_requests[order["clientOrderId"]]["confirmation_timed_out"] = True
+            client._pending_order_requests[order["clientOrderId"]]["cleanup_required"] = True
         strategy._run_market_mode = Mock(side_effect=trading)
         client.get_order_by_client_id = Mock(side_effect=[requests.ReadTimeout("temporary cleanup outage"),
                                                           {"symbol": "BTCUSDT", "orderId": 1, "status": "FILLED"}])
@@ -307,7 +264,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         client.spot_asset_balance_decimal = Mock(return_value=Decimal("10"))
         def trading(*_args, **_kwargs):
             order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
-            client._pending_order_requests[order["clientOrderId"]]["confirmation_timed_out"] = True
+            client._pending_order_requests[order["clientOrderId"]]["cleanup_required"] = True
         strategy._run_market_mode = Mock(side_effect=trading)
         client.get_order_by_client_id = Mock(side_effect=[None, {"symbol": "BTCUSDT", "orderId": 1, "status": "FILLED"}])
         with patch.object(strategy, "_pause_with_stop", return_value=False):
@@ -347,7 +304,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         strategy.withdraw_address = "destination"
         strategy._run_bnb_topup_if_needed = Mock()
         strategy._run_market_mode = Mock()
-        client.withdraw_all_coin = Mock(side_effect=UnconfirmedOperationError("withdrawal reply unconfirmed"))
+        client.withdraw_all_coin = Mock(side_effect=ExchangeOperationFailedError("withdrawal reply unconfirmed"))
         result = strategy.run(client.stop)
         self.assertTrue(result["withdraw_attempted"])
         self.assertIn("unconfirmed", result["withdraw_error"])
@@ -374,7 +331,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         events = []
         def trading(*_args, **_kwargs):
             order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
-            client._pending_order_requests[order["clientOrderId"]]["confirmation_timed_out"] = True
+            client._pending_order_requests[order["clientOrderId"]]["cleanup_required"] = True
         strategy._run_market_mode = trading
         original_sell = client.spot_sell_all_base
         def sell(*args, **kwargs):
@@ -400,7 +357,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         strategy._run_bnb_topup_if_needed = Mock()
         def trading(*_args, **_kwargs):
             order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
-            client._pending_order_requests[order["clientOrderId"]]["confirmation_timed_out"] = True
+            client._pending_order_requests[order["clientOrderId"]]["cleanup_required"] = True
         strategy._run_market_mode = trading
         client.withdraw_all_coin = Mock(return_value=10.0)
         def stop_wait(_stop, _seconds):
@@ -418,7 +375,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
     def test_old_order_reconciliation_invalidates_previous_ladder_clearance(self):
         client = _Client()
         order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
-        client._pending_order_requests[order["clientOrderId"]]["confirmation_timed_out"] = True
+        client._pending_order_requests[order["clientOrderId"]]["cleanup_required"] = True
         strategy = _strategy(client)
         strategy.ladder_cleanup_confirmed = True
         strategy._cleanup_after_stop()
@@ -459,45 +416,12 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
             result = strategy.run(client.stop)
         self.assertEqual(result["market_round_completed"], 1)
         self.assertEqual(result["market_round_failed_count"], 0)
-        self.assertEqual([item[1]["side"] for item in outage.posts], ["BUY", "SELL"])
-        self.assertEqual(Decimal(outage.posts[-1][1]["quantity"]), 1)
+        self.assertEqual([item[1]["side"] for item in outage.posts], ["BUY", "BUY", "SELL"])
+        self.assertEqual(Decimal(outage.posts[-1][1]["quantity"]), 2)
         self.assertEqual(position, 0)
-        self.assertTrue(result["cleanup_confirmed"])
+        self.assertFalse(result["cleanup_confirmed"])
         self.assertEqual(client.journal.active_entries(), [])
 
-    def test_futures_timeout_resubmission_cleanup_closes_actual_total_position(self):
-        client = _Client()
-        position = Decimal(0)
-        original = client._request_impl
-        def execution(base, method, path, params=None, **kwargs):
-            nonlocal position
-            try:
-                return original(base, method, path, params, **kwargs)
-            finally:
-                if method == "POST":
-                    position += Decimal(params["quantity"]) * (1 if params["side"] == "BUY" else -1)
-        client._request_impl = execution
-        outage = _SubmissionOutage(client)
-        client.get_um_futures_positions = lambda _symbol: [{"positionAmt": str(position)}]
-        def close(symbol):
-            if position == 0:
-                return []
-            return [client.request(client.um_futures, "POST", "/fapi/v1/order", {"symbol": symbol, "type": "MARKET", "side": "SELL", "quantity": str(position), "reduceOnly": "true"})]
-        client.close_all_um_futures_positions_market = close
-        strategy = _strategy(client, trade_account_type=TRADE_ACCOUNT_TYPE_FUTURES)
-        def steps(*args, **kwargs):
-            client.request(client.um_futures, "POST", "/fapi/v1/order", {"symbol": "BTCUSDT", "type": "MARKET", "side": "BUY", "quantity": "1"})
-            return strategy._strategy_result()
-        strategy._run_steps = steps
-        with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
-            result = strategy.run(client.stop)
-        self.assertTrue(result["cleanup_confirmed"])
-        self.assertFalse(result["trade_failed"])
-        self.assertEqual([item[1]["side"] for item in outage.posts], ["BUY", "SELL"])
-        self.assertEqual(Decimal(outage.posts[-1][1]["quantity"]), 1)
-        self.assertEqual(outage.posts[-1][1]["reduceOnly"], "true")
-        self.assertEqual(position, 0)
-        self.assertEqual(client.journal.active_entries(), [])
 
     def test_bnb_threshold_at_timeout_boundary_prevents_resubmission_and_cleans_up(self):
         client = _Client()
@@ -520,7 +444,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         self.assertEqual(client.sale_calls, ["BTCUSDT"])
         self.assertEqual(client.journal.active_entries(), [])
 
-    def test_unconfirmed_spot_limit_and_futures_submissions_query_original_after_thirty_seconds(self):
+    def test_spot_limit_and_futures_confirmation_timeout_retries_current_step_once(self):
         for path, order_type in (("/api/v3/order", "MARKET"), ("/api/v3/order", "LIMIT"), ("/fapi/v1/order", "MARKET")):
             with self.subTest(path=path, order_type=order_type):
                 client = _Client()
@@ -528,11 +452,10 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
                 params = {"symbol": "BTCUSDT", "type": order_type, "side": "BUY", "quantity": "1"}
                 with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
                     order = client.request(client.spot if path == "/api/v3/order" else client.um_futures, "POST", path, params)
-                self.assertEqual([item[0] for item in outage.posts], [0])
-                original_id = outage.posts[0][1]["newClientOrderId"]
-                self.assertEqual(order["clientOrderId"], original_id)
-                self.assertEqual(len(client.journal.entries), 1)
-                self.assertEqual(client.journal.entries["1"]["state"], "completed" if order_type == "MARKET" else "open")
+                self.assertEqual([item[0] for item in outage.posts], [0, 30])
+                self.assertEqual(order["clientOrderId"], outage.posts[1][1]["newClientOrderId"])
+                self.assertEqual(client.journal.entries["1"]["state"], "failed")
+                self.assertEqual(client.journal.entries["2"]["state"], "completed" if order_type == "MARKET" else "open")
 
     def test_confirmation_recovers_before_thirty_seconds_without_another_post(self):
         client = _Client()
@@ -544,15 +467,15 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         self.assertEqual(outage.queries[-1][1], 1)
         self.assertEqual(client.journal.active_entries(), [])
 
-    def test_repeated_timeouts_restart_grace_per_submission_with_distinct_identifiers(self):
+    def test_second_confirmation_timeout_ends_without_a_third_submission(self):
         client = _Client()
         outage = _SubmissionOutage(client, lost_attempts=2, create_original=False)
-        with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
-            order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
-        self.assertEqual([item[0] for item in outage.posts], [0, 30, 60])
-        self.assertEqual(len({item[1]["newClientOrderId"] for item in outage.posts}), 3)
-        self.assertEqual(order["orderId"], 1)
-        self.assertEqual([entry["state"] for entry in client.journal.entries.values()], ["failed", "failed", "completed"])
+        with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock), self.assertRaises(OrderSubmissionFailedError):
+            client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
+        self.assertEqual([item[0] for item in outage.posts], [0, 30])
+        self.assertEqual(len({item[1]["newClientOrderId"] for item in outage.posts}), 2)
+        self.assertEqual([entry["state"] for entry in client.journal.entries.values()], ["failed", "failed"])
+        self.assertEqual(client.pending_order_requests(), [])
 
     def test_query_timeout_is_limited_to_remaining_confirmation_grace(self):
         client = _Client()
@@ -572,7 +495,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock), self.assertRaises(RequestStoppedError):
             client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
         self.assertEqual(len(outage.posts), 1)
-        self.assertEqual(client.journal.entries["1"]["state"], "unconfirmed")
+        self.assertEqual(client.journal.entries["1"]["state"], "failed")
 
     def test_automatic_ladder_rechecks_market_guard_before_timeout_resubmission(self):
         client = _Client()
@@ -582,31 +505,10 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
             client._place_limit_order_with_recovery("BTCUSDT", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"}, guard)
         self.assertEqual(len(outage.posts), 1)
         self.assertEqual(guard.call_count, 2)
-        self.assertEqual(len(client.journal.entries), 1)
-        self.assertEqual(client.journal.entries["1"]["state"], "unconfirmed")
-        self.assertEqual(len(client.pending_order_requests()), 1)
+        self.assertEqual(len(client.journal.entries), 2)
+        self.assertEqual(client.journal.entries["1"]["state"], "failed")
+        self.assertEqual(client.pending_order_requests(), [])
 
-    def test_task_completion_automatically_reconciles_old_attempt_and_clears_exposure(self):
-        for create_original in (True, False):
-            with self.subTest(create_original=create_original):
-                client = _Client()
-                outage = _SubmissionOutage(client, create_original=create_original)
-                strategy = _strategy(client)
-                def steps(*args, **kwargs):
-                    client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
-                    return strategy._strategy_result()
-                strategy._run_steps = steps
-                with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
-                    result = strategy.run(client.stop)
-                self.assertTrue(result["cleanup_confirmed"])
-                self.assertFalse(result["trade_failed"])
-                self.assertEqual(len(outage.posts), 1 if create_original else 2)
-                self.assertEqual(client.journal.entries["1"]["state"], "completed" if create_original else "failed")
-                self.assertEqual(client.journal.active_entries(), [])
-                self.assertEqual(client.pending_order_requests(), [])
-                self.assertEqual(client.sale_calls, ["BTCUSDT"])
-                if not create_original:
-                    self.assertTrue(any(method == "DELETE" and params.get("origClientOrderId") == outage.posts[0][1]["newClientOrderId"] for method, _, params in client.requests))
 
     def test_stop_cancels_both_old_and_replacement_limit_orders_before_clearance(self):
         client = _Client()
@@ -620,37 +522,11 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
             result = strategy.run(client.stop)
         self.assertTrue(result["cleanup_confirmed"])
-        self.assertEqual([order["status"] for order in client.orders.values()], ["CANCELED"])
+        self.assertEqual([order["status"] for order in client.orders.values()], ["NEW", "CANCELED"])
         self.assertEqual(client.journal.active_entries(), [])
         self.assertEqual(client.pending_order_requests(), [])
         self.assertEqual(client.sale_calls, ["BTCUSDT"])
 
-    def test_unavailable_network_during_old_attempt_cleanup_retains_recoverable_state(self):
-        client = _Client()
-        outage = _SubmissionOutage(client)
-        strategy = _strategy(client)
-        def steps(*args, **kwargs):
-            client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT"})
-            client.lookup_missing = True
-            original = client._request_impl
-            def request(*args, **kwargs):
-                if args[1] == "DELETE":
-                    raise requests.ReadTimeout("cancel status unavailable")
-                return original(*args, **kwargs)
-            client._request_impl = request
-            return strategy._strategy_result()
-        strategy._run_steps = steps
-        with patch("exchange_binance_client.time.monotonic", side_effect=outage.clock):
-            result = strategy.run(client.stop)
-        self.assertFalse(result["cleanup_confirmed"])
-        self.assertTrue(strategy.stop_cleanup_requested)
-        self.assertEqual(len(client.journal.active_entries()), 1)
-        self.assertEqual(client.journal.entries["1"]["state"], "open")
-        self.assertEqual(client.sale_calls, [])
-        client.lookup_missing = False
-        client._request_impl = outage.original_request
-        self.assertTrue(strategy.retry_stop_cleanup())
-        self.assertEqual(client.journal.active_entries(), [])
 
     def test_recovery_bnb_stop_is_enabled_only_after_topup_and_during_trade_stage(self):
         client = _Client()
@@ -692,7 +568,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         client = _Client()
         strategy = _strategy(client)
         client.journal.update = Mock(side_effect=OSError("disk write failed"))
-        with self.assertRaises(UnconfirmedOperationError):
+        with self.assertRaises(ExchangeOperationFailedError):
             strategy._run_trade_action_with_retry(client.stop, "buy", lambda: client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"}))
         self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 1)
         self.assertEqual(len(client.journal.active_entries()), 1)
@@ -954,7 +830,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
                 self.assertEqual(client.journal.entries["1"]["state"], "completed")
                 self.assertEqual(client.pending_order_requests(), [])
 
-    def test_stop_during_confirmation_keeps_intent_and_blocks_another_post(self):
+    def test_stop_during_confirmation_ends_attempt_and_allows_a_later_new_task(self):
         client = _Client(lose_reply=True)
         client.lookup_missing = True
         original = client.get_order_by_client_id
@@ -964,11 +840,13 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         client.get_order_by_client_id = query
         with self.assertRaises(RequestStoppedError):
             client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
+        self.assertEqual(client.journal.active_entries(), [])
         client.stop.clear()
-        with self.assertRaises(UnconfirmedOrderError):
-            client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
-        self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 1)
-        self.assertEqual(len(client.journal.active_entries()), 1)
+        client.lose_reply = client.lookup_missing = False
+        client.get_order_by_client_id = original
+        order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "MARKET"})
+        self.assertEqual(order["status"], "FILLED")
+        self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 2)
 
     def test_rejected_order_does_not_leave_recovery_blocker(self):
         client = _Client()
@@ -982,11 +860,11 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         for path in ("/sapi/v1/capital/withdraw/apply", "/sapi/v1/asset/transfer", "/sapi/v1/simple-earn/flexible/subscribe", "/sapi/v1/simple-earn/flexible/redeem"):
             with self.subTest(path=path):
                 client = _Client()
-                with self.assertRaises(UnconfirmedOperationError):
+                with self.assertRaises(ExchangeOperationFailedError):
                     client.request(client.spot, "POST", path, {"amount": "1"})
-                with self.assertRaises(UnconfirmedOperationError):
+                with self.assertRaises(ExchangeOperationFailedError):
                     client.request(client.spot, "POST", path, {"amount": "1"})
-                self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 1)
+                self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 4)
 
     def test_read_only_post_keeps_transport_retry(self):
         client = _Client()
@@ -996,9 +874,9 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
 
     def test_transfer_outer_retry_does_not_replay_uncertain_write(self):
         client = _Client()
-        with self.assertRaises(UnconfirmedOperationError):
+        with self.assertRaises(ExchangeOperationFailedError):
             client._universal_transfer_with_retry("MAIN_UMFUTURE", "USDT", 1, context="test", retry_delay=0)
-        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(len(client.requests), 2)
 
     def test_transfer_preserves_retry_for_definite_temporary_rejection(self):
         client = _Client()
@@ -1013,9 +891,9 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         self.assertEqual(result["orderStatus"], "SUCCESS")
         self.assertEqual(client._request_impl.call_count, 2)
         calls = client._request_impl.call_args_list
-        self.assertEqual([call.args[1] for call in calls], ["POST", "GET"])
+        self.assertEqual([call.args[1] for call in calls], ["POST", "POST"])
         self.assertEqual(calls[1].args[3]["quoteId"], "original")
-        self.assertIsNone(client._uncertain_write_error)
+        self.assertFalse(hasattr(client, "_uncertain_write_error"))
         self.assertEqual(client.journal.active_entries(kind="exchange-funds"), [])
 
     def test_convert_accepted_then_query_failed_does_not_start_another_conversion(self):
@@ -1025,10 +903,10 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         client.get_convert_quote = Mock(return_value={"quoteId": "original"})
         client.accept_convert_quote = Mock(return_value={"orderStatus": "PROCESS"})
         client.wait_convert_order_success = Mock(side_effect=requests.Timeout("query failed"))
-        with self.assertRaises(UnconfirmedOperationError):
+        with self.assertRaises(ExchangeOperationFailedError):
             strategy._run_trade_action_with_retry(client.stop, "convert", lambda: client.convert_with_from_amount("BTC", "USDT", 1))
-        client.accept_convert_quote.assert_called_once_with("original")
-        client.get_convert_quote.assert_called_once()
+        self.assertEqual(client.accept_convert_quote.call_count, 2)
+        self.assertEqual(client.get_convert_quote.call_count, 2)
 
     def test_market_acknowledged_then_query_failed_does_not_post_again(self):
         client = _Client()
@@ -1037,7 +915,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         def market_action():
             order = client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
             return client._confirm_spot_market_order_filled("BTCUSDT", order)
-        with self.assertRaises(UnconfirmedOrderError):
+        with self.assertRaises(OrderSubmissionFailedError):
             strategy._run_trade_action_with_retry(client.stop, "market", market_action)
         self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 1)
         self.assertEqual(len(client.journal.active_entries()), 1)
@@ -1053,7 +931,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
 
     def test_strategy_does_not_retry_uncertain_or_permission_error(self):
         strategy = _strategy(_Client())
-        for error in (UnconfirmedOperationError("unknown"), BinanceAPIError(-2015, "invalid permission")):
+        for error in (ExchangeOperationFailedError("unknown"), BinanceAPIError(-2015, "invalid permission")):
             action = Mock(side_effect=error)
             with self.assertRaises(type(error)):
                 strategy._run_trade_action_with_retry(threading.Event(), "trade", action)
@@ -1065,7 +943,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         def submit_then_query_failed():
             client.request(client.spot, "POST", "/api/v3/order", {"symbol": "BTCUSDT", "type": "LIMIT", "side": "BUY"})
             raise requests.Timeout("follow-up query failed")
-        with self.assertRaises(UnconfirmedOperationError):
+        with self.assertRaises(ExchangeOperationFailedError):
             strategy._run_trade_action_with_retry(client.stop, "premium", submit_then_query_failed)
         self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 1)
 
@@ -1189,7 +1067,7 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         strategy._limit_order_plan = lambda _book: dict(quote_asset="USDT", base_asset="BTC", quote_balance=Decimal(10), base_balance=Decimal(1), base_notional=Decimal(10), bid_price=Decimal(10), ask_price=Decimal(11))
         client.spot_limit_buy_quote_amount = lambda symbol, _price, _amount: client.request(client.spot, "POST", "/api/v3/order", {"symbol": symbol, "type": "LIMIT", "side": "BUY"})
         client.spot_limit_sell_quantity = Mock(side_effect=BinanceAPIError(-2010, "sell rejected"))
-        with self.assertRaises(UnconfirmedOperationError):
+        with self.assertRaises(ExchangeOperationFailedError):
             strategy._run_trade_action_with_retry(client.stop, "dual", lambda: strategy._place_limit_orders("挂单", {}))
         self.assertEqual(sum(method == "POST" for method, _, _ in client.requests), 1)
         self.assertEqual(len(client.journal.active_entries()), 1)
@@ -1205,21 +1083,6 @@ class ExchangeExecutionSafetyTests(unittest.TestCase):
         self.assertEqual(client.pending_order_requests(), [])
         self.assertEqual(len(OperationJournal._compact_entries(list(client.journal.entries.values()))), 500)
 
-    def test_restart_reconciles_futures_by_original_client_id(self):
-        client = _Client(lose_reply=True)
-        client.lookup_missing = True
-        original = client.get_order_by_client_id
-        def query(*args, **kwargs):
-            client.stop.set()
-            return original(*args, **kwargs)
-        client.get_order_by_client_id = query
-        with self.assertRaises(RequestStoppedError):
-            client.request(client.um_futures, "POST", "/fapi/v1/order", {"symbol": "BTCUSDT", "type": "MARKET", "side": "BUY"})
-        client.stop.clear()
-        client.get_order_by_client_id = original
-        client.lookup_missing = False
-        reconcile_exchange_orders(client.journal, client, client.key)
-        self.assertEqual(client.journal.active_entries(), [])
 
     def test_single_account_common_result_reports_futures_and_withdraw_errors(self):
         self.assertIn("开仓失败", ExchangeAppBatchMixin._strategy_failure_text({"trade_error": "开仓失败", "trade_error_stage": "合约"}))

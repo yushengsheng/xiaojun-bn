@@ -8,7 +8,7 @@ from decimal import Decimal
 from unittest.mock import patch
 import requests
 
-from exchange_binance_client import BinanceAPIError, BinanceClient, UnconfirmedOrderError
+from exchange_binance_client import BinanceAPIError, BinanceClient, OrderSubmissionFailedError
 from exchange_auto_ladder import (
     AutoLadderSettings, AutoLadderSettingsStore, price_risk_reason, price_risk_safe, reversal_count,
     trade_is_recent, volume_and_price_signal, export_auto_ladder_settings, import_auto_ladder_settings,
@@ -818,7 +818,7 @@ class AutoLadderTests(unittest.TestCase):
     def test_unconfirmed_order_stops_account_and_records_recovery_blocker(self):
         class UnconfirmedClient(_BnbStopLadderClient):
             def spot_limit_buy_quote_amount(self, *_args, **_kwargs):
-                raise UnconfirmedOrderError("BTCUSDT", "xja-unknown")
+                raise OrderSubmissionFailedError("BTCUSDT", "xja-unknown")
         class Journal:
             def __init__(self):
                 self.payload = None
@@ -841,8 +841,8 @@ class AutoLadderTests(unittest.TestCase):
         strategy.operation_scope = "account:test"
         strategy._run_ladder_mode(stop)
         self.assertIn("xja-unknown", strategy.trade_error)
-        self.assertEqual(journal.payload["client_order_id"], "xja-unknown")
-        self.assertEqual(journal.state, "open")
+        self.assertIsNone(journal.payload)
+        self.assertIsNone(journal.state)
 
     def test_market_client_uses_closed_quote_volume_not_taker_volume(self):
         client = BinanceClient.__new__(BinanceClient)

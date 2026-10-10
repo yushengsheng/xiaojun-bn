@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,11 +31,43 @@ class OperationJournal:
     _operation_locks: dict[tuple[str, str, str], threading.RLock] = {}
     _path_locks_guard = threading.Lock()
 
-    def __init__(self, file_path: Path, *, secret_box=None):
+    def __init__(self, file_path: Path, *, secret_box=None, fail_unconfirmed=False):
         self.file_path = Path(file_path)
         self.secret_box = secret_box or SECRET_BOX
+        self.fail_unconfirmed = bool(fail_unconfirmed)
         with self._path_locks_guard:
             self._lock = self._path_locks.setdefault(str(self.file_path.resolve()), threading.RLock())
+        if self.fail_unconfirmed:
+            with self._lock:
+                data = self._load_locked(allow_recovery=True)
+                if self._fail_old_exchange_results(data):
+                    self._save_locked(data)
+
+    @staticmethod
+    def _fail_old_exchange_results(data):
+        changed = bool(data.pop("recovery_required", False))
+        for entry in data.get("entries", []):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("state") in TERMINAL_STATES:
+                continue
+            payload = entry.get("payload", {})
+            if entry.get("kind") in {"exchange-funds", "exchange-order"}:
+                entry.update(state="failed", updated_at=_utc_now())
+                payload["reason"] = "missing-result-on-restart"
+                changed = True
+            elif entry.get("kind") == "stock-task" and (
+                payload.get("conversion") or payload.get("funding_transfer")
+                or payload.get("active") and not payload["active"].get("orderId")
+            ):
+                payload.update(conversion=None, funding_transfer=None,
+                               reason="missing-result-on-restart")
+                if payload.get("active") and not payload["active"].get("orderId"):
+                    payload["active"] = None
+                if not payload.get("active") and Decimal(str(payload.get("inventory", "0"))) == 0:
+                    entry.update(state="failed", updated_at=_utc_now())
+                changed = True
+        return changed
 
     def operation_lock(self, kind: str, scope: str):
         """Serialize check + intent + submission across clients for one account."""
@@ -53,6 +86,9 @@ class OperationJournal:
             migrate_legacy=True,
             recovery_marker_key="recovery_required",
         )
+        if raw.get("recovery_required") and self.fail_unconfirmed:
+            self._fail_old_exchange_results(raw)
+            self._save_locked(raw)
         if raw.get("recovery_required") and not allow_recovery:
             raise RuntimeError("操作账本已从备份恢复，须核对交易所及链上记录后解除恢复保护；禁止直接重试资金操作")
         return dict(raw)

@@ -33,7 +33,7 @@ try:
   stack.enter_context(patch.object(r,'_create_binance_client',return_value=client))
   stack.enter_context(patch.object(r,'_ensure_trade_symbol_supported',return_value='USDT'))
   stack.enter_context(patch.object(r,'wait_for_usdt',return_value=True))
-  stack.enter_context(patch.object(r,'_reconcile_exchange_orders'))
+  stack.enter_context(patch.object(r,'_assert_account_cleanup_finished'))
   stack.enter_context(patch.object(r,'_run_strategy_with_spot_statistics',return_value=({'withdraw_amount':0,'ladder_cleanup_confirmed':True,'market_round_failed_count':0},'')))
   stack.enter_context(patch('exchange_app_batch.Strategy'))
   stack.enter_context(patch('exchange_app_batch.AutoLadderMarketObserver'))
