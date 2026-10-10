@@ -218,4 +218,4 @@ class ExchangeResultPolicyTests(unittest.TestCase):
         self.assertFalse({'operation_review', 'operation_resolve'} & MUTATIONS)
         root = Path(__file__).resolve().parents[1]
         for name in ('exchange_app_base.py', 'linux_exchange/static/index.html', 'linux_exchange/static/app.js'):
-            self.assertNotIn('核对未确认', (root / name).read_text())
+            self.assertNotIn('核对未确认', (root / name).read_text(encoding='utf-8'))
