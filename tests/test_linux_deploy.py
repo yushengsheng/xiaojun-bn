@@ -19,7 +19,7 @@ class LinuxDeploymentTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.base = Path(temporary.name)
+        self.base = Path(temporary.name).resolve()
         self.root = self.base / 'app'
         self.config = self.base / 'config'
         self.data = self.base / 'data'
