@@ -34,6 +34,18 @@ class LinuxInstallTests(unittest.TestCase):
             install.dependencies(False)
             run.assert_not_called()
 
+    def test_install_subprocesses_have_a_bounded_deadline(self):
+        with patch.object(install.subprocess, 'run') as run:
+            install.run('apt-get', 'update')
+        self.assertEqual(run.call_args.kwargs['timeout'], 900)
+
+    @unittest.skipUnless(os.name == 'posix', 'Bash syntax is checked on Linux/macOS')
+    def test_automatic_installer_bash_syntax_and_help(self):
+        script = Path(__file__).resolve().parents[1] / 'install-linux.sh'
+        subprocess.run(['bash', '-n', str(script)], check=True, timeout=10)
+        result = subprocess.run(['bash', str(script), '--help'], check=True, capture_output=True, text=True, timeout=10)
+        self.assertIn('--version vX.Y.Z', result.stdout)
+
     def test_auto_updates_defer_only_trading_worker_restart(self):
         directory = self.fixture() / 'needrestart'
         directory.mkdir()

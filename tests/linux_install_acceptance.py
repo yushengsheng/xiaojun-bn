@@ -6,6 +6,7 @@ import http.cookiejar
 import json
 import os
 import secrets
+import shutil
 from datetime import datetime
 import socket
 import ssl
@@ -62,7 +63,7 @@ def main():
         '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', str(key), '-out', str(cert))
     sentinel = socket.socket(); sentinel.bind(('127.0.0.1', 35123)); sentinel.listen()
     try:
-        command = ['python3', str(root/'source/linux_exchange/install.py'), '--source', str(root/'source'),
+        command = ['python3', str(root/'source/linux_exchange/deploy.py'), '--source', str(root/'source'),
                    '--host', '127.0.0.1', '--tls-cert', str(cert), '--tls-key', str(key)]
         subprocess.run(command, check=True)
         origin = 'https://127.0.0.1:26483'
@@ -113,7 +114,7 @@ def main():
         assert pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
         data = Path('/var/lib/xiaojun-exchange')
         snapshot = {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in data.iterdir() if p.is_file()}
-        retry = subprocess.run(command, capture_output=True)
+        retry = subprocess.run(['python3', str(root/'source/linux_exchange/install.py'), *command[2:]], capture_output=True)
         assert retry.returncode != 0, 'Existing installation overwritten'
         assert all(hashlib.sha256((data/name).read_bytes()).hexdigest()==value for name,value in snapshot.items())
         assert pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
@@ -128,7 +129,41 @@ def main():
         assert '127.0.0.1:18880' in run('ss','-lnt')
         for name, command_name in (('sing-box','version'),('hysteria','version'),('xray','version')):
             run(f'/opt/xiaojun-exchange/proxy-bin/{name}',command_name)
-        print('LINUX INSTALL ACCEPTANCE OK: HTTPS, initialization, CSRF, services, isolation, cleanup and overwrite refusal')
+        # The automatic entrypoint must be a no-op for an identical release.
+        deployment = ['python3', str(root/'source/linux_exchange/deploy.py'), '--source', str(root/'source')]
+        run(*deployment)
+        assert pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
+        # Upgrade a disposable copy of this verified release to a distinct version.
+        # Only service/payload boundaries are real; no exchange account is present.
+        updated = root / 'upgrade-source'; shutil.copytree(root/'source', updated)
+        numbers = list(map(int, (updated/'version.txt').read_text().strip()[1:].split('.')))
+        numbers[2] += 1
+        upgraded_version = 'v' + '.'.join(map(str, numbers))
+        (updated/'version.txt').write_text(upgraded_version)
+        manifest = json.loads((updated/'linux-release-manifest.json').read_text())
+        manifest['version.txt'] = hashlib.sha256((updated/'version.txt').read_bytes()).hexdigest()
+        (updated/'linux-release-manifest.json').write_text(json.dumps(manifest))
+        protected = {p: p.read_bytes() for p in data.glob('*.json*')}
+        tls_key = Path('/etc/xiaojun-exchange/tls/privkey.pem').read_bytes()
+        upgrade = ['python3', str(updated/'linux_exchange/deploy.py'), '--source', str(updated)]
+        run(*upgrade, '--check')
+        assert pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
+        run(*upgrade)
+        assert (Path('/opt/xiaojun-exchange/current')/'version.txt').read_text() == upgraded_version
+        upgraded_pid = run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
+        assert pid != upgraded_pid
+        assert all(p.read_bytes() == content for p, content in protected.items()), 'Upgrade changed encrypted data'
+        assert Path('/etc/xiaojun-exchange/tls/privkey.pem').read_bytes() == tls_key
+        _, body = request('/api/health'); assert json.loads(body) == dict(configured=True, unlocked=False, busy=False)
+        response, body = request('/api/login', {'password':password}, {'Origin':origin})
+        _, body = request('/api/state'); assert json.loads(body)['settings']['max_threads'] == 2
+        run(*upgrade)
+        assert upgraded_pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
+        downgrade = subprocess.run(deployment, capture_output=True)
+        assert downgrade.returncode != 0
+        assert upgraded_pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
+        assert sentinel.getsockname()[1] == 35123
+        print('LINUX INSTALL ACCEPTANCE OK: HTTPS, initialization, CSRF, services, isolation, cleanup, automatic install/upgrade, no-op, encrypted data preservation and downgrade refusal')
     finally:
         sentinel.close()
 

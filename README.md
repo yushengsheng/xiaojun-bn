@@ -142,15 +142,17 @@ py -3 -m venv .venv
 
 Linux 版通过 HTTPS 网页管理交易所账号、策略、参与账号与任务启停，实时显示运行及报错日志。界面和账号导入、右键菜单、操作确认沿用桌面逻辑。服务器独立运行，本地电脑关机不会停止已启动的任务；服务器重启后需重新解锁。桌面版继续支持交易所和链上板块，Linux 版只支持交易所。
 
-新服务器支持 Ubuntu 24.04、Debian 12/13 x86_64、Python 3.11+ 和 systemd。开放面板端口（默认 TCP 26483）及自动证书验证 TCP 80，将下面的 `公网IPv4` 替换为服务器地址：
+支持 Ubuntu 24.04、Debian 12/13 x86_64、Python 3.11+ 和 systemd。新装和升级均运行同一条命令；脚本查询最新正式发行版，自动识别本机状态：
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fL https://github.com/yushengsheng/xiaojun-bn/releases/latest/download/install-linux.sh -o install-linux.sh && sudo bash install-linux.sh --host 公网IPv4
+curl --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 --retry 3 -fL https://github.com/yushengsheng/xiaojun-bn/releases/latest/download/install-linux.sh -o install-linux.sh && sudo bash install-linux.sh
 ```
 
-没有 `curl` 时先运行 `sudo apt-get update && sudo apt-get install -y curl`。无需域名或付费服务；也可使用 `--host 完整域名`。`--port` 可改面板端口，`--backend-port` 可改仅本机监听的内部端口；`--check` 只执行预检。自备证书使用 `--tls-cert 完整证书路径 --tls-key 私钥路径`，无需 TCP 80，由原证书工具负责续期。
+没有 `curl` 时先运行 `sudo apt-get update && sudo apt-get install -y curl`。首次安装会要求输入公网 IPv4 或完整域名，也可直接加 `--host 公网IPv4或域名`；无需域名或付费服务。新装须开放面板端口（默认 TCP 26483）及自动证书验证 TCP 80。`--port` 可改面板端口，`--backend-port` 可改仅本机监听的内部端口；`--check` 只执行预检。自备证书使用 `--tls-cert 完整证书路径 --tls-key 私钥路径`，无需 TCP 80，由原证书工具负责续期。
 
-安装器会校验发行包和代理内核哈希，使用独立目录、服务账号及 nginx，拒绝覆盖已有安装或占用端口。安装成功后在服务器读取初始化码，在网页设置自己的程序密码；不会迁移本地账号或自动开始交易。请勿在已有交易服务器重复安装。
+未安装则新装；已安装旧版则在空闲时升级；版本相同直接跳过，不重启服务。默认只跟随 GitHub 正式 Release，尚未发布的源码提交不会自动部署；`--version vX.Y.Z` 可指定正式版本，但拒绝降级。新装校验端口，使用独立目录、服务账号及 nginx；成功后读取初始化码，在网页设置程序密码。
+
+升级会校验发行包、文件清单和代理内核，沿用原账号、密码、设置、证书、端口和恢复记录。交易或清理任务运行中、状态无法确认、安装不完整或服务被自定义修改时拒绝升级；等待空闲或排除问题后重跑同一命令。先准备新环境，再短暂停网页入口并复查空闲，随后切换版本；启动检查失败自动回退。升级后需重新解锁，不自动启动交易。断电/强制终止留下升级标记时保留现场，需检查备份后人工恢复。旧版本及部署备份不自动删除，升级至少需要 1 GiB 可用空间。
 
 服务自动清理缓存、轮转日志并限制资源使用，账号与未完成订单记录保留。详见 [Linux 运行说明](linux_exchange/README.md)。
 

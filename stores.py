@@ -7,6 +7,7 @@ import json
 import math
 import os
 import tempfile
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
@@ -55,7 +56,17 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8", *, new
             fp.write(content)
             fp.flush()
             os.fsync(fp.fileno())
-        os.replace(tmp_name, path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_name, path)
+                break
+            except PermissionError as exc:
+                # Windows scanners can briefly hold the destination without
+                # delete sharing. Retry the same complete, fsynced file only;
+                # never truncate/remove the previous config to bypass a lock.
+                if getattr(exc, 'winerror', None) not in (5, 32, 33) or attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
         try:
             os.chmod(path, 0o600)
         except Exception:

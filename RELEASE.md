@@ -116,12 +116,21 @@ verified assets, then publishes all six assets together only after the existing
 source audit and both packaged GUI selftests pass. No second publishing path is
 permitted. `RELEASE_NOTES.md` describes the version's user-visible changes.
 
-The installer supports fresh Ubuntu 24.04 and Debian 12/13 x86_64 hosts with
-Python 3.11+ and systemd. It refuses existing installations and occupied ports,
-uses dedicated users/directories/venvs and an independent nginx service, and
-starts locked without accounts. Automatic IP/domain TLS uses the pinned
-Certbot lock and TCP 80; supplied certificates omit port 80 and retain renewal
-responsibility with the supplying tool. A live financial worker is never
-upgraded by this first-install command.
+The installer supports Ubuntu 24.04 and Debian 12/13 x86_64 hosts with Python
+3.11+ and systemd. The same `install-linux.sh` resolves the latest published
+Release on every run (or accepts `--version vX.Y.Z`), verifies its archive, and
+dispatches to `linux_exchange/deploy.py`. Fresh hosts use the existing isolated
+installer; identical releases are a no-op. Upgrades stage code and locked venvs
+before stopping the web entrypoint and rechecking worker idleness. Active or
+unknown trading state, custom units/drop-ins, modified payloads, incomplete
+transactions and downgrades are refused. Health-check failure restores the
+previous code, runtimes and service configuration; existing encrypted data,
+credentials, TLS and ports are preserved. Retain previous releases and private
+deployment backups; a power loss leaves a journal and blocks further upgrades
+until manual recovery. The clean Linux runner tests fresh HTTPS installation,
+automatic upgrade, settings/certificate preservation, no-op and downgrade
+refusal. Automatic IP/domain TLS uses the pinned Certbot lock and TCP 80;
+supplied certificates retain renewal responsibility with the supplying tool.
+No deployment starts trading or resumes interrupted commands automatically.
 
 If new internal modules are added, update the workflow hidden imports when needed so packaged builds remain complete. If selftest modules are split, keep `tools/pyinstaller_common_args.py` and `tests/test_packaging_args.py` in sync.

@@ -27,6 +27,7 @@ TIMERS = ('xiaojun-exchange-maintenance.timer', 'xiaojun-exchange-logrotate.time
 
 
 def run(*args, **kwargs):
+    kwargs.setdefault('timeout', 900)
     return subprocess.run(list(args), check=True, **kwargs)
 
 

@@ -71,7 +71,6 @@ def build(version, output, runtime_dir=None, root=ROOT):
         raise ValueError('Version must be an exact vX.Y.Z tag')
     payload = source_files(root)
     payload['version.txt'] = version.encode()
-    payload['install-linux.sh'] = payload['install-linux.sh'].replace(b'__RELEASE_VERSION__', version.encode())
     pins = json.loads(payload['linux_exchange/deploy/proxy-runtimes.json'])
     for name, pin in pins.items():
         payload[f'bin/{name}'] = proxy_binary(name, pin, runtime_dir)
