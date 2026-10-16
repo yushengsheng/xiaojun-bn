@@ -301,7 +301,9 @@ def install(args, version, manifest):
     else:
         raise ValueError('执行服务检查未通过，请检查本项目服务日志')
     marker.unlink(missing_ok=True)
-    print(f'安装成功：{version}\n网页：https://{args.host}:{args.port}/\n读取首次初始化码：sudo cat {token}\n在网页录入初始化码并设置程序密码。关闭网页不停止服务器任务。')
+    print(f'安装成功：{version}\n网页：https://{args.host}:{args.port}/')
+    if not getattr(args, 'defer_password_setup', False):
+        print(f'读取首次初始化码：sudo cat {token}\n在网页录入初始化码并设置程序密码。关闭网页不停止服务器任务。')
     if custom:
         print('使用自备证书：请由原证书管理工具负责续期。')
 
@@ -315,6 +317,7 @@ def main(argv=None):
     parser.add_argument('--tls-cert'); parser.add_argument('--tls-key')
     parser.add_argument('--check', action='store_true', help='只检查，不安装或更改服务')
     parser.add_argument('--retry-incomplete', action='store_true', help='重试尚未创建服务的首次安装；拒绝清理运行数据')
+    parser.add_argument('--defer-password-setup', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
         if args.retry_incomplete:

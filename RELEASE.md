@@ -132,5 +132,17 @@ automatic upgrade, settings/certificate preservation, no-op and downgrade
 refusal. Automatic IP/domain TLS uses the pinned Certbot lock and TCP 80;
 supplied certificates retain renewal responsibility with the supplying tool.
 No deployment starts trading or resumes interrupted commands automatically.
+The simple command accepts `IP PORT 'PASSWORD'`. Fresh installation initializes
+that password through the existing local worker API and returns locked. For
+upgrades an empty password retains the existing password; an explicit new
+password prompts for the old one before touching deployment state, then rewraps
+the same master key through the existing password-change API. Passwords are
+passed to the Python installer over stdin, never subprocess arguments or logs.
+Private snapshots preserve password wrappers, ownership and setup state for
+rollback; interrupted initialization retains a new key rather than orphaning
+data. The Linux acceptance gate tests explicit initialization, changed/retained
+passwords and encrypted settings. Isolated service tests cover lost password
+write replies with real encryption and accounts/recovery data. See
+`LINUX_DEPLOY.md` for the copy-and-fill instructions.
 
 If new internal modules are added, update the workflow hidden imports when needed so packaged builds remain complete. If selftest modules are split, keep `tools/pyinstaller_common_args.py` and `tests/test_packaging_args.py` in sync.

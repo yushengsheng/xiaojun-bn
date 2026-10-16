@@ -1,11 +1,14 @@
 """Deployment transactions use real files; service/process boundaries are simulated."""
 import argparse
+import io
 from contextlib import ExitStack
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -91,6 +94,18 @@ class LinuxDeploymentTests(unittest.TestCase):
         for value in (None, {}, {'busy': 0}, {'busy': 'false'}):
             with self.subTest(value=value), patch.object(deploy, 'call', return_value=value), self.assertRaises(ValueError):
                 deploy.health()
+
+    @unittest.skipUnless(os.name == 'posix', 'Real service password transactions run in an isolated Unix process')
+    def test_password_changes_preserve_real_encrypted_accounts_and_recovery(self):
+        result = subprocess.run([sys.executable, str(REPO/'tests/linux_deploy_password_cases.py')], cwd=REPO,
+                                env={**os.environ, 'PYTHONPATH':str(REPO)}, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('LINUX PASSWORD TRANSACTION OK', result.stdout)
+
+    def test_empty_fresh_password_rejected_before_install(self):
+        with patch.object(install.platform, 'system', return_value='Linux'), patch.object(install.platform, 'machine', return_value='x86_64'), patch.object(deploy.os, 'geteuid', return_value=0, create=True), patch.object(deploy.sys, 'stdin', argparse.Namespace(buffer=io.BytesIO(b'\0'))), patch.object(install, 'main') as fresh:
+            self.assertEqual(deploy.main(['--source', str(self.source), '--host', 'panel.example.com', '--credentials-stdin']), 1)
+            fresh.assert_not_called()
 
     def test_fresh_install_dispatch_keeps_existing_installer(self):
         with patch.object(install.platform, 'system', return_value='Linux'), patch.object(install.platform, 'machine', return_value='x86_64'), patch.object(deploy.os, 'geteuid', return_value=0, create=True), patch.object(install, 'main', return_value=0) as fresh:

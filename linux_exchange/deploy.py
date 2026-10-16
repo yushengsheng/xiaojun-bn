@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 from contextlib import contextmanager
 import json
 import os
@@ -49,7 +50,7 @@ def require_idle():
 
 def installed_release():
     root = install.ROOT
-    if (root / '.install-incomplete.json').exists() or (root / '.upgrade-incomplete.json').exists():
+    if any((root / name).exists() for name in ('.install-incomplete.json', '.upgrade-incomplete.json', '.password-incomplete.json')):
         raise ValueError('检测到未完成的安装/升级，请保留现场及备份并检查服务；拒绝覆盖')
     current = root / 'current'
     if root.is_symlink() or not current.is_symlink():
@@ -78,6 +79,23 @@ def backend_port():
     if not match or not 1024 <= int(match[1]) <= 65535:
         raise ValueError('无法识别现有内部端口，拒绝改写服务')
     return int(match[1])
+
+
+def existing_address(args):
+    port = backend_port()
+    path = install.CONFIG / 'server.env'
+    if path.is_symlink():
+        raise ValueError('环境配置路径异常')
+    environment = path.read_text(encoding='utf-8')
+    origins = re.findall(r'^XIAOJUN_PUBLIC_ORIGIN=(https://[^\s]+)$', environment, re.M)
+    if len(origins) != 1:
+        raise ValueError('无法识别已安装的 HTTPS 地址')
+    address = urllib.parse.urlsplit(origins[0])
+    if ((args.host and args.host.lower() != address.hostname) or
+            (args.port is not None and args.port != address.port) or
+            (args.backend_port is not None and args.backend_port != port) or args.tls_cert or args.tls_key):
+        raise ValueError('升级沿用原地址、端口和证书；拒绝更改这些首次安装参数')
+    return port, origins[0], environment
 
 
 def planned_units(old, source, port):
@@ -160,7 +178,8 @@ def sync_directory(directory):
 
 
 def replace_file(path, content):
-    mode = path.stat().st_mode & 0o777
+    info = path.stat()
+    mode = info.st_mode & 0o777
     descriptor, temporary = tempfile.mkstemp(prefix=f'.{path.name}.', dir=path.parent)
     try:
         with os.fdopen(descriptor, 'wb') as stream:
@@ -168,6 +187,7 @@ def replace_file(path, content):
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, mode)
+        os.chown(temporary, info.st_uid, info.st_gid)
         os.replace(temporary, path)
         sync_directory(path.parent)
     finally:
@@ -200,6 +220,124 @@ def catch_termination():
         signal.signal(signal.SIGTERM, previous)
 
 
+def password_login(password, setup_token=None):
+    payload = {'password': password}
+    if setup_token is not None:
+        payload['setup_token'] = setup_token
+    return call('login', payload, socket_path='/run/xiaojun-exchange/worker.sock')
+
+
+def password_rpc(method, payload, session):
+    return call(method, payload, token=session['token'], csrf=session['csrf'],
+                socket_path='/run/xiaojun-exchange/worker.sock')
+
+
+def validate_current_password(args):
+    """Fail before upgrading if a requested password change cannot unlock data."""
+    state = health()
+    if state['busy']:
+        raise ValueError('交易或清理任务仍在运行，请空闲后再升级/改密')
+    if not state.get('configured'):
+        return
+    if not args.old_password:
+        try:
+            args.old_password = getpass.getpass('请输入原程序密码（不回显，仅用于保留原有加密数据）：')
+        except EOFError as exc:
+            raise ValueError('非交互改密请同时提供 --old-password 原密码；留空新密码则不需要原密码') from exc
+    session = password_login(args.old_password)
+    if state.get('unlocked'):
+        password_rpc('logout', {}, session)
+    else:
+        password_rpc('lock', {'password': args.old_password, 'confirmed': True}, session)
+
+
+def apply_password(args):
+    """Use existing worker password APIs; retain encrypted data and restore on failure."""
+    if not args.new_password:
+        return
+    require_idle()
+    port, origin, _ = existing_address(argparse.Namespace(host=None, port=None, backend_port=None,
+                                                         tls_cert=None, tls_key=None))
+    configured_before = health().get('configured')
+    key_existed = (install.DATA / '.secret.key').exists()
+    backup = install.ROOT / 'upgrade-backups' / f'password-{time.time_ns()}'
+    marker = install.ROOT / '.password-incomplete.json'
+    saved = {}
+    try:
+        systemctl('stop', WEB)
+        require_idle()
+        backup.mkdir(parents=True, mode=0o700)
+        for name in ('app_lock.json', 'app_lock.json.bak', '.secret.key', 'setup-token'):
+            path = install.DATA / name
+            if path.is_symlink():
+                raise ValueError('密码文件路径异常，拒绝改密')
+            if path.exists():
+                copy = backup / name
+                shutil.copy2(path, copy)
+                with copy.open('r+b') as stream:
+                    os.fsync(stream.fileno())
+                info = path.stat()
+                saved[path] = dict(backup=str(copy), uid=info.st_uid, gid=info.st_gid, mode=info.st_mode & 0o777)
+            else:
+                saved[path] = None
+        sync_directory(backup)
+        sync_directory(backup.parent)
+        with marker.open('x', encoding='utf-8') as stream:
+            marker.chmod(0o600)
+            json.dump({str(path): value for path, value in saved.items()}, stream)
+            stream.flush(); os.fsync(stream.fileno())
+        sync_directory(marker.parent)
+        state = health()
+        if state.get('configured'):
+            session = password_login(args.old_password)
+            password_rpc('change_password', {'password': args.old_password, 'new_password': args.new_password,
+                                            'confirmed': True}, session)
+        else:
+            token = (install.DATA / 'setup-token').read_text().strip()
+            password_login(args.new_password, token)
+        primary = install.DATA / 'app_lock.json'
+        password_backup = install.DATA / 'app_lock.json.bak'
+        if not password_backup.is_file() or primary.read_bytes() != password_backup.read_bytes():
+            raise ValueError('新密码的主文件与备份未完整保存')
+        # A fresh login decrypts and loads the existing accounts and journals.
+        session = password_login(args.new_password)
+        password_rpc('lock', {'password': args.new_password, 'confirmed': True}, session)
+        if health().get('unlocked') is not False:
+            raise ValueError('密码设置后锁定检查失败')
+        systemctl('start', WEB)
+        wait_healthy(port, origin)
+        marker.unlink(); sync_directory(marker.parent)
+    except BaseException as exc:
+        if marker.exists():
+            if configured_before is False and not key_existed:
+                # A new master key may already protect files created during
+                # initialization. Retain its wrapper instead of orphaning data.
+                systemctl('stop', WORKER)
+                systemctl('start', WORKER, WEB)
+                raise ValueError(f'首次密码初始化未完成，保留密码文件和数据；请检查 {marker}，勿删除密钥或重装') from exc
+            try:
+                # The web entrypoint is stopped and the worker was confirmed idle.
+                systemctl('stop', WORKER)
+                for path, record in saved.items():
+                    if record is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        if not path.exists():
+                            path.touch(mode=record['mode'])
+                        replace_file(path, Path(record['backup']).read_bytes())
+                        os.chown(path, record['uid'], record['gid'])
+                        path.chmod(record['mode'])
+                systemctl('start', WORKER, WEB)
+                wait_healthy(port, origin)
+                marker.unlink(); sync_directory(marker.parent)
+            except BaseException as restore_error:
+                raise ValueError(f'密码设置失败且回退未完成，保留 {marker} 和 {backup}，请人工检查') from restore_error
+        else:
+            systemctl('start', WEB)
+        raise ValueError(f'密码未更改，原有配置已保留；如版本已升级则保留新版源码。原因：{exc}') from exc
+    print('程序密码已设置并验证；打开上方 HTTPS 地址，使用填写的密码登录，无需初始化码。账号与恢复记录保留。')
+
+
 def upgrade(source, version, args):
     version_tuple(version)
     target = install.ROOT / 'releases' / version
@@ -220,38 +358,27 @@ def _upgrade(source, version, args):
     old, old_version, old_manifest = installed_release()
     if version_tuple(version) < version_tuple(old_version):
         raise ValueError(f'拒绝自动降级：{old_version} → {version}')
+    port, origin, original_env = existing_address(args)
     if version == old_version:
         if install.verify_payload(source)[1] != old_manifest:
             raise ValueError('同版本文件清单不同，拒绝替换已安装版本')
-        print(f'已是最新版 {version}，无需升级，现有服务保持运行。')
+        print(f'已是最新版 {version}，无需升级，现有服务保持运行。\n网页：{origin}/')
         return
     if not active(WORKER) or not active(WEB):
         raise ValueError('现有执行/网页服务不正常，无法安全判断状态；请先检查服务')
     require_idle()
-    port = backend_port()
     files = planned_units(old, source, port)
     env_path = install.CONFIG / 'server.env'
-    if env_path.is_symlink():
-        raise ValueError('环境配置路径异常')
-    original_env = env_path.read_text(encoding='utf-8')
     old_pins = json.loads((old / 'linux_exchange/deploy/proxy-runtimes.json').read_text())
     for name, prefix in (('xray', 'XRAY'), ('sing-box', 'SING_BOX'), ('hysteria', 'HYSTERIA')):
         for key, expected in ((f'{prefix}_PATH', str(install.ROOT / 'proxy-bin' / name)),
                               (f'{prefix}_EXECUTABLE_SHA256', old_pins[name]['executable_sha256'])):
             if re.findall(rf'^{key}=(.*)$', original_env, re.M) != [expected]:
                 raise ValueError(f'现有代理环境配置被修改，拒绝覆盖：{key}')
-    origins = re.findall(r'^XIAOJUN_PUBLIC_ORIGIN=(https://[^\s]+)$', original_env, re.M)
-    if len(origins) != 1:
-        raise ValueError('无法识别已安装的 HTTPS 地址')
-    address = urllib.parse.urlsplit(origins[0])
-    if ((args.host and args.host.lower() != address.hostname) or
-            (args.port is not None and args.port != address.port) or
-            (args.backend_port is not None and args.backend_port != port) or args.tls_cert or args.tls_key):
-        raise ValueError('升级沿用原地址、端口和证书；拒绝更改这些首次安装参数')
     if shutil.disk_usage(install.ROOT).free < 1024**3:
         raise ValueError('升级至少需要 1 GiB 可用空间，旧版本和数据不会自动删除')
     if args.check:
-        print(f'升级预检通过：{old_version} → {version}；沿用 {origins[0]}；正式切换前再次确认空闲。')
+        print(f'升级预检通过：{old_version} → {version}；沿用 {origin}；正式切换前再次确认空闲。')
         return
     target = install.ROOT / 'releases' / version
     if target.exists() or target.is_symlink():
@@ -274,7 +401,7 @@ def _upgrade(source, version, args):
     for index, path in enumerate(files):
         copy = backup / f'file-{index}'
         shutil.copy2(path, copy)
-        with copy.open('rb') as stream:
+        with copy.open('r+b') as stream:
             os.fsync(stream.fileno())
         saved[path] = copy
     sync_directory(backup)
@@ -321,7 +448,7 @@ def _upgrade(source, version, args):
         install.install_restart_guard()
         systemctl('daemon-reload')
         systemctl('start', WORKER, WEB)
-        wait_healthy(port, origins[0])
+        wait_healthy(port, origin)
         for unit in paused:
             systemctl('start', unit)
         marker.unlink()
@@ -342,7 +469,7 @@ def _upgrade(source, version, args):
                     replace_file(path, copy.read_bytes())
                 systemctl('daemon-reload')
                 systemctl('start', WORKER, WEB)
-                wait_healthy(port, origins[0])
+                wait_healthy(port, origin)
             else:
                 systemctl('start', WEB)
             for unit in paused:
@@ -352,7 +479,7 @@ def _upgrade(source, version, args):
         except BaseException as rollback_error:
             raise ValueError(f'升级失败且自动回退未完成；保留 {marker} 和 {backup}，请人工检查服务') from rollback_error
         raise ValueError(f'升级未完成，已恢复原版本 {old_version}；配置和数据保留。原因：{exc}') from exc
-    print(f'升级成功：{old_version} → {version}\n网页：{origins[0]}/\n请重新解锁；不会自动启动交易。旧版本及部署备份保留在 {backup}。')
+    print(f'升级成功：{old_version} → {version}\n网页：{origin}/\n请重新解锁；不会自动启动交易。旧版本及部署备份保留在 {backup}。')
 
 
 def main(argv=None):
@@ -364,15 +491,32 @@ def main(argv=None):
     parser.add_argument('--tls-cert'); parser.add_argument('--tls-key')
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--retry-incomplete', action='store_true')
+    parser.add_argument('--credentials-stdin', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    args.new_password = args.old_password = ''
     try:
         if install.platform.system() != 'Linux' or install.platform.machine() not in ('x86_64', 'amd64') or os.geteuid() != 0:
             raise ValueError('须在 Linux x86_64 使用 sudo 运行')
         version, _ = install.verify_payload(args.source)
         existing = any(p.exists() or p.is_symlink() for p in (install.ROOT, install.CONFIG, install.DATA)) or any(install.UNITS.glob('xiaojun-exchange-*'))
+        if args.credentials_stdin:
+            credentials = sys.stdin.buffer.read(8193)
+            if len(credentials) > 8192 or credentials.count(b'\0') != 1:
+                raise ValueError('密码输入格式无效')
+            args.new_password, args.old_password = (value.decode('utf-8') for value in credentials.split(b'\0'))
+            if args.new_password and (not args.new_password.strip() or not 8 <= len(args.new_password) <= 1024):
+                raise ValueError('程序密码需要 8–1024 位，不能全为空白')
+            if not existing and not args.new_password:
+                raise ValueError('首次安装请填写至少8位的自定义密码；只有升级可以留空沿用')
         if existing and not args.retry_incomplete:
+            installed_release()
+            existing_address(args)
+            if args.new_password and not args.check:
+                validate_current_password(args)
             with catch_termination():
                 upgrade(Path(args.source).resolve(), version, args)
+                if not args.check:
+                    apply_password(args)
             return 0
         if not args.host:
             if not sys.stdin.isatty():
@@ -386,7 +530,13 @@ def main(argv=None):
         for name in ('check', 'retry_incomplete'):
             if getattr(args, name):
                 forwarded.append('--' + name.replace('_', '-'))
-        return install.main(forwarded)
+        if args.new_password:
+            forwarded.append('--defer-password-setup')
+        result = install.main(forwarded)
+        if result == 0 and not args.check:
+            with catch_termination():
+                apply_password(args)
+        return result
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as exc:
         print(f'部署未完成：{exc}', file=sys.stderr)
         return 1

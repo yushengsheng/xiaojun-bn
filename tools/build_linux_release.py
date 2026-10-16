@@ -22,7 +22,7 @@ def source_files(root):
     root = Path(root)
     files = list(root.glob('*.py'))
     files += [root / name for name in (
-        'README.md', 'install-linux.sh', 'requirements-linux.txt', 'requirements-linux.lock',
+        'README.md', 'LINUX_DEPLOY.md', 'install-linux.sh', 'requirements-linux.txt', 'requirements-linux.lock',
         'requirements-certbot.txt', 'requirements-certbot.lock')]
     suffixes = {'.py', '.md', '.conf', '.service', '.timer', '.html', '.css', '.js'}
     files += [p for p in (root / 'linux_exchange').rglob('*') if p.suffix in suffixes]

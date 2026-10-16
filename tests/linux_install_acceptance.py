@@ -63,9 +63,10 @@ def main():
         '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', str(key), '-out', str(cert))
     sentinel = socket.socket(); sentinel.bind(('127.0.0.1', 35123)); sentinel.listen()
     try:
+        password = secrets.token_urlsafe(24)
         command = ['python3', str(root/'source/linux_exchange/deploy.py'), '--source', str(root/'source'),
                    '--host', '127.0.0.1', '--tls-cert', str(cert), '--tls-key', str(key)]
-        subprocess.run(command, check=True)
+        subprocess.run([*command, '--credentials-stdin'], input=(password+'\0').encode(), check=True)
         origin = 'https://127.0.0.1:26483'
         cookies = http.cookiejar.CookieJar()
         opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=str(cert))),
@@ -75,13 +76,12 @@ def main():
             req = urllib.request.Request(origin+path, data=body, headers={'Content-Type':'application/json', **(headers or {})})
             with opener.open(req, timeout=15) as response:
                 return response, response.read()
-        _, body = request('/api/health'); assert json.loads(body)['configured'] is False
+        _, body = request('/api/health'); assert json.loads(body) == dict(configured=True, unlocked=False, busy=False)
         try:
             request('/api/state'); raise AssertionError('Unauthenticated state exposed')
         except urllib.error.HTTPError as exc: assert exc.code == 401
-        setup = Path('/var/lib/xiaojun-exchange/setup-token').read_text().strip()
-        password = secrets.token_urlsafe(24)
-        response, body = request('/api/login', {'password':password, 'setup_token':setup}, {'Origin':origin})
+        assert not Path('/var/lib/xiaojun-exchange/setup-token').exists()
+        response, body = request('/api/login', {'password':password}, {'Origin':origin})
         assert all(x in response.headers['Set-Cookie'].lower() for x in ('secure', 'httponly', 'samesite=strict'))
         csrf = json.loads(body)['csrf']; headers = {'Origin':origin,'X-CSRF-Token':csrf}
         _, body = request('/api/state'); assert json.loads(body)['accounts'] == []
@@ -159,11 +159,29 @@ def main():
         _, body = request('/api/state'); assert json.loads(body)['settings']['max_threads'] == 2
         run(*upgrade)
         assert upgraded_pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
+        # Same-version deployment may explicitly change the password. Retain all
+        # encrypted account/settings bytes while rewrapping only the master key.
+        unchanged = {p:p.read_bytes() for p in data.glob('*.json*') if not p.name.startswith('app_lock.json')}
+        new_password = secrets.token_urlsafe(24)
+        changed = subprocess.run([*upgrade, '--credentials-stdin'], input=(new_password+'\0'+password).encode(),
+                                 check=True, capture_output=True)
+        assert new_password.encode() not in changed.stdout + changed.stderr
+        assert all(p.read_bytes() == content for p, content in unchanged.items())
+        assert upgraded_pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
+        try:
+            request('/api/login', {'password':password}, {'Origin':origin})
+            raise AssertionError('Old password still accepted after change')
+        except urllib.error.HTTPError as exc: assert exc.code == 401
+        response, body = request('/api/login', {'password':new_password}, {'Origin':origin})
+        _, body = request('/api/state'); assert json.loads(body)['settings']['max_threads'] == 2
+        hashes = {p:p.read_bytes() for p in data.glob('*.json*')}
+        subprocess.run([*upgrade, '--credentials-stdin'], input=b'\0', check=True)
+        assert all(p.read_bytes() == content for p, content in hashes.items()), 'Blank password must preserve existing password'
         downgrade = subprocess.run(deployment, capture_output=True)
         assert downgrade.returncode != 0
         assert upgraded_pid == run('systemctl','show','xiaojun-exchange-worker.service','--property=MainPID','--value')
         assert sentinel.getsockname()[1] == 35123
-        print('LINUX INSTALL ACCEPTANCE OK: HTTPS, initialization, CSRF, services, isolation, cleanup, automatic install/upgrade, no-op, encrypted data preservation and downgrade refusal')
+        print('LINUX INSTALL ACCEPTANCE OK: HTTPS, custom password, password change/blank retention, CSRF, services, isolation, cleanup, automatic install/upgrade, no-op, encrypted data preservation and downgrade refusal')
     finally:
         sentinel.close()
 

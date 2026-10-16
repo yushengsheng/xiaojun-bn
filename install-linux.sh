@@ -5,13 +5,29 @@ umask 022
 repo="yushengsheng/xiaojun-bn"
 version=""
 args=()
+password=""
+old_password=""
+credentials=0
+if [[ $# -ge 3 && "$1" != -* ]]; then
+    args+=(--host "$1" --port "$2")
+    password="$3"; credentials=1
+    shift 3
+fi
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version)
             [[ $# -ge 2 ]] || { printf '%s\n' '--version 缺少 vX.Y.Z 版本号' >&2; exit 1; }
             version="$2"; shift 2 ;;
+        --password|--old-password)
+            [[ $# -ge 2 ]] || { printf '%s\n' '密码参数缺少值；留空请写两个单引号' >&2; exit 1; }
+            if [[ "$1" == --password ]]; then password="$2"; else old_password="$2"; fi
+            credentials=1; shift 2 ;;
         --help|-h)
-            printf '%s\n' '用法: sudo bash install-linux.sh [--host 公网IPv4或域名] [--check] [--version vX.Y.Z]' \
+            printf '%s\n' "简单用法: sudo bash install-linux.sh 公网IP 面板端口 '自定义密码'" \
+                "保留密码升级: sudo bash install-linux.sh 公网IP 面板端口 ''" \
+                '填写新密码时安全提示原密码；留空沿用。首次密码至少8位。' \
+                '也支持 --host 地址 --port 端口 --password 密码；--old-password 可用于非交互改密。' \
+                '可选 [--check] [--version vX.Y.Z]' \
                 '自动识别：未安装则新装；已有新版本且交易空闲则升级；同版本跳过，拒绝降级。' \
                 '首次安装可输入地址；可选 --port 26483 --backend-port 18880。' \
                 '自备证书：--tls-cert 完整证书 --tls-key 私钥；默认自动证书需开放 TCP 80。' \
@@ -92,4 +108,9 @@ if [[ ! -f "$stage/source/linux_exchange/deploy.py" ]]; then
     printf '%s\n' '此版本尚不支持自动升级；请选择包含 linux_exchange/deploy.py 的新版正式发行包。' >&2
     exit 1
 fi
-python3 "$stage/source/linux_exchange/deploy.py" --source "$stage/source" "${args[@]}"
+if [[ "$credentials" -eq 1 ]]; then
+    printf '%s\0%s' "$password" "$old_password" | python3 "$stage/source/linux_exchange/deploy.py" \
+        --source "$stage/source" --credentials-stdin "${args[@]}"
+else
+    python3 "$stage/source/linux_exchange/deploy.py" --source "$stage/source" "${args[@]}"
+fi
