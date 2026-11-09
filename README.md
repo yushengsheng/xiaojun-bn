@@ -145,13 +145,25 @@ py -3 -m venv .venv
 
 Linux 版通过 HTTPS 网页管理交易所账号、策略、参与账号与任务启停，实时显示运行及报错日志。界面和账号导入、右键菜单、操作确认沿用桌面逻辑。服务器独立运行，本地电脑关机不会停止已启动的任务；服务器重启后需重新解锁。桌面版继续支持交易所和链上板块，Linux 版只支持交易所。
 
-支持 Ubuntu 24.04、Debian 12/13 x86_64、Python 3.11+ 和 systemd。新装和升级均运行同一条命令；脚本查询最新正式发行版，自动识别本机状态：
+支持 Ubuntu 24.04、Debian 12/13 x86_64、Python 3.11+ 和 systemd。新装和升级使用同一安装器，自动识别本机状态。
+
+### 首次安装
 
 ```bash
 curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 https://github.com/yushengsheng/xiaojun-bn/releases/latest/download/install-linux.sh -o install-linux.sh && sudo bash install-linux.sh 你的公网IP 26483 '你的自定义密码'
 ```
 
 只改最后的 IP、端口和单引号内的密码：首次密码至少 8 位，安装后直接访问输出的 HTTPS 地址并用该密码登录，不需要初始化码。升级填写新密码会修改密码，并提示输入原密码（不回显），用于保留原有加密数据；填写 `''` 则沿用原密码、不提示改密。同版本也可修改密码。完整的复制示例、升级、开放端口和故障处理见 [Linux 傻瓜式部署说明](LINUX_DEPLOY.md)。
+
+### 升级到最新正式版
+
+已有安装且交易、查询、撤单和清理任务均空闲时，直接复制以下整条命令。以后无需修改版本号，也无需重新填写 IP、端口或密码：
+
+```bash
+curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 https://github.com/yushengsheng/xiaojun-bn/releases/latest/download/install-linux.sh -o install-linux.sh && sudo bash install-linux.sh --password ''
+```
+
+每次自动获取 GitHub 最新正式版，保留原账号、配置、密码、地址、端口、证书和恢复记录；已是最新版则跳过。`--password ''` 表示沿用原密码，不是清空密码。升级后需重新解锁，不会自动开始交易。
 
 没有 `curl` 时先运行 `sudo apt-get update && sudo apt-get install -y curl`。无需域名或付费服务。新装须开放所选面板端口及自动证书验证 TCP 80；内部端口默认 18880，可用 `--backend-port` 更改。`--check` 只预检。仍兼容 `--host 地址 --port 端口` 的选项形式；自备证书使用 `--tls-cert 完整证书路径 --tls-key 私钥路径`，无需 TCP 80，由原证书工具负责续期。
 

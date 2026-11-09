@@ -40,15 +40,15 @@ https://你的公网IP:你填写的端口/
 
 用命令中填写的密码登录，**不需要用户名，也不需要初始化码**。随后在面板内添加交易所账号和设置策略；部署不会替你添加账号或自动开始交易。关闭浏览器不会停止服务器任务。
 
-## 3. 以后升级，保留原密码
+## 3. 通用升级：自动获取最新正式版，保留原配置和密码
 
-仍运行第一条下载命令，只将最后的密码替换为两个相邻的单引号 `''`。IP 和端口填写原来的值：
+已有安装时，等待交易、查询、撤单和清理任务均空闲后，直接复制以下整条命令。以后无需修改版本号，也无需重新填写 IP、端口或密码：
 
 ```bash
-curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 https://github.com/yushengsheng/xiaojun-bn/releases/latest/download/install-linux.sh -o install-linux.sh && sudo bash install-linux.sh 你的公网IP 26483 ''
+curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 https://github.com/yushengsheng/xiaojun-bn/releases/latest/download/install-linux.sh -o install-linux.sh && sudo bash install-linux.sh --password ''
 ```
 
-脚本自动判断：没有安装则提示首次必须填密码；有新版且交易空闲则升级；已经最新则跳过，不重启服务。**空密码表示沿用原密码，不表示清空密码。** 账号、设置、证书和恢复记录保留。升级后重新登录，不会自动恢复交易。
+命令每次自动获取 GitHub 最新正式版，并读取原来的地址、端口及安装配置。没有安装则提示首次必须填密码；有新版且任务空闲则升级；已经最新则跳过，不重启服务。**`--password ''` 表示沿用原密码，不表示清空密码。** 原账号、配置、密码、证书和恢复记录保留。升级后重新登录，不会自动开始交易。
 
 ## 4. 升级时同时换密码
 
