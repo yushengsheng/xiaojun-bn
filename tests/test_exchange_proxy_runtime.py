@@ -7,9 +7,10 @@ import unittest
 import tempfile
 import json
 import os
+import socket
 from pathlib import Path
 import threading
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from exchange_proxy_runtime import ExchangeProxyRuntime
 from secret_box import SecretBox
@@ -17,6 +18,74 @@ from sensitive_data import redact_sensitive_text
 
 
 class PinnedProxyRuntimeTests(unittest.TestCase):
+    def test_unavailable_udp_does_not_block_the_sing_box_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = ExchangeProxyRuntime(Path(directory))
+            windows_os = Mock(wraps=os)
+            windows_os.name = "nt"
+            def allocate(*, require_udp=False):
+                if require_udp:
+                    raise RuntimeError("test UDP unavailable")
+                return 23081
+            with patch("exchange_proxy_runtime.os", windows_os), \
+                 patch.object(runtime, "_allocate_local_port", side_effect=allocate) as ports, \
+                 patch.object(runtime, "_hidden_process_kwargs", return_value={}), \
+                 patch.object(runtime, "find_xray_executable") as xray, \
+                 patch.object(runtime, "find_sing_box_executable", return_value=Path(directory) / "sing-box"), \
+                 patch.object(runtime, "_wait_ready"), \
+                 patch("exchange_proxy_runtime.subprocess.Popen") as start:
+                self.assertEqual(runtime.ensure_proxy("ss://YWVzLTEyOC1nY206cGFzcw==@example.com:443"), "http://127.0.0.1:23081")
+                self.assertEqual([call.kwargs["require_udp"] for call in ports.call_args_list], [True, False])
+                self.assertEqual(runtime._backend, "sing-box")
+                xray.assert_not_called()
+                start.assert_called_once()
+                runtime.stop()
+
+    def test_dual_protocol_port_can_be_bound_by_tcp_and_udp(self) -> None:
+        port = ExchangeProxyRuntime._allocate_local_port(require_udp=True)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            tcp.bind(("127.0.0.1", port))
+            udp.bind(("127.0.0.1", port))
+
+    def test_dual_protocol_allocation_skips_a_port_rejected_by_tcp(self) -> None:
+        sockets = [MagicMock() for _ in range(4)]
+        for sock in sockets:
+            sock.__enter__.return_value = sock
+        sockets[0].getsockname.return_value = ("127.0.0.1", 50001)
+        sockets[1].bind.side_effect = PermissionError(10013, "test reserved port")
+        sockets[2].getsockname.return_value = ("127.0.0.1", 50002)
+        with patch("exchange_proxy_runtime.socket.socket", side_effect=sockets) as factory:
+            self.assertEqual(ExchangeProxyRuntime._allocate_local_port(require_udp=True), 50002)
+        self.assertEqual([call.args[1] for call in factory.call_args_list], [socket.SOCK_DGRAM, socket.SOCK_STREAM] * 2)
+        sockets[1].bind.assert_called_once_with(("127.0.0.1", 50001))
+        sockets[3].bind.assert_called_once_with(("127.0.0.1", 50002))
+        for sock in sockets:
+            sock.__exit__.assert_called_once()
+
+    def test_dual_protocol_allocation_fails_after_bounded_bind_attempts(self) -> None:
+        sock = MagicMock()
+        sock.__enter__.return_value = sock
+        sock.bind.side_effect = PermissionError(10013, "test bind denied")
+        with patch("exchange_proxy_runtime.socket.socket", return_value=sock):
+            with self.assertRaisesRegex(RuntimeError, "TCP/UDP") as caught:
+                ExchangeProxyRuntime._allocate_local_port(require_udp=True)
+        self.assertEqual(sock.bind.call_count, 32)
+        self.assertIsInstance(caught.exception.__cause__, PermissionError)
+
+    def test_xray_probe_requires_dual_protocol_port(self) -> None:
+        for backend in ("xray", "sing-box", "hysteria"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as directory:
+                runtime = ExchangeProxyRuntime(Path(directory))
+                with patch.object(runtime, "_allocate_local_port", return_value=23080) as allocate, \
+                     patch.object(runtime, "find_xray_executable", return_value=Path(directory) / "xray"), \
+                     patch.object(runtime, "find_sing_box_executable", return_value=Path(directory) / "sing-box"), \
+                     patch.object(runtime, "find_hysteria_executable", return_value=Path(directory) / "hysteria"), \
+                     patch.object(runtime, "_wait_local_port_ready"), \
+                     patch("exchange_proxy_runtime.subprocess.Popen") as start:
+                    self.assertEqual(runtime.probe_backend_launch(backend), backend)
+                    allocate.assert_called_once_with(require_udp=backend == "xray")
+                    start.return_value.terminate.assert_called_once()
+
     HYSTERIA2_URI = (
         "hysteria2://secret-auth@example.com:443/?insecure=1&"
         "pinSHA256=EB%3A70%3A12%3ABF%3A67%3AA3%3A93%3A89%3A95%3ACF%3A84%3A70%3A25%3A20%3A25%3A24%3A"

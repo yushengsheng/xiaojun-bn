@@ -173,6 +173,9 @@ document.addEventListener('DOMContentLoaded',()=>setTimeout(()=>{
                                 os.killpg(process.pid, signal.SIGKILL)
                             except ProcessLookupError:
                                 pass  # Browser exited between poll and signal.
+                            except PermissionError:
+                                if process.poll() is None:
+                                    process.kill()
                         else:
                             process.kill()
                     process.wait(timeout=5)

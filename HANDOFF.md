@@ -13,6 +13,9 @@
 - 最终本地门禁已通过，日志 `.release-v1.1.90-local-gate.log`，含 617 项测试、全部审计及 GUI 自检，已输出 `REGRESSION OK`；下一步提交并推送 main 和同一提交的 v1.1.90 标签。
 - 首次提交 dee43b5 已推送 main 和标签，工作流 42587845078 的 Linux 通过，但 Windows BOM 测试夹具默认 cp1252 编码写入失败。已确认 v1.1.90 Release 不存在，当前只补充 `tests/test_onchain_recovery.py` 该写入的 UTF-8 编码。须重新完成完整门禁、推送修复，然后仅删除失败标签并在修复提交重建 v1.1.90，等待新运行，禁止使用新版本号或手动发布。
 - 修复后的 44 项专项测试及完整本地门禁已通过，日志 `.release-v1.1.90-recovery-gate.log`，已输出 `REGRESSION OK`。下一步提交并推送此单行测试修复及记录，再核对 Release 仍不存在后重建失败标签。
+- 修复提交 40f916c 已完成首次同版本恢复。工作流 42589152175 的 Linux、Windows 源码回归/审计、两个包构建均通过，但 onefile 自检中 Xray 因 UDP 端口绑定被 Windows 拒绝而停止；Release 仍不存在。当前修复仅让 Xray 及其探测要求同一 TCP/UDP 端口可用，不关闭 UDP 或跳过检查；Sing-box/Hysteria 原有分配及后端回退保留，五项新增回归及 22 项代理专项通过。
+- 最终完整门禁已通过，日志 `.release-v1.1.90-final-622-gate.log`，622 项测试、全部审计及 GUI 自检成功且输出 `REGRESSION OK`。仅在该门禁子进程通过 NO_PROXY 显式直连官方 PyPI，未改系统/业务代理设置。网页测试清理仅回退本次 Popen 父进程；日志中的旧两个测试 PID 已通过只读检查确认退出，无外部批量清理。
+- 下一步推送已验证修复，仅在确认无 Release 且旧标签仍指向 40f916c 后按既有流程重建 v1.1.90，再完成 Windows/Linux 干净环境及六项资产验收。
 
 ## 待决定
 

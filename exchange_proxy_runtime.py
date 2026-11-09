@@ -398,10 +398,24 @@ class ExchangeProxyRuntime:
         return text
 
     @staticmethod
-    def _allocate_local_port() -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            return int(sock.getsockname()[1])
+    def _allocate_local_port(*, require_udp: bool = False) -> int:
+        last_error = None
+        for _ in range(32):
+            try:
+                # Let the OS avoid UDP reservations before checking the same TCP port.
+                primary_type = socket.SOCK_DGRAM if require_udp else socket.SOCK_STREAM
+                with socket.socket(socket.AF_INET, primary_type) as sock:
+                    sock.bind(("127.0.0.1", 0))
+                    port = int(sock.getsockname()[1])
+                    if require_udp:
+                        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_sock:
+                            tcp_sock.bind(("127.0.0.1", port))
+                    return port
+            except OSError as exc:
+                if not require_udp:
+                    raise
+                last_error = exc
+        raise RuntimeError("无法分配同时可用的本地 TCP/UDP 端口") from last_error
 
     @staticmethod
     def _collect_executable_candidates(base_dirs: list[Path], exe_names: str | list[str]) -> list[Path]:
@@ -1246,7 +1260,7 @@ class ExchangeProxyRuntime:
         log_handle = None
         self._log_path = None
         try:
-            listen_port = self._allocate_local_port()
+            listen_port = self._allocate_local_port(require_udp=backend_name == "xray")
             log_handle = self._open_runtime_log()
             if backend_name == "hysteria":
                 exe = self.find_hysteria_executable()
@@ -1355,7 +1369,6 @@ class ExchangeProxyRuntime:
             if self.is_hysteria2_uri(raw):
                 return self._ensure_hysteria2_proxy_locked(raw)
             ss_info = self.parse_ss_uri(raw)
-            listen_port = self._allocate_local_port()
             last_exc = None
             backend_errors: list[str] = []
             proc = None
@@ -1365,6 +1378,7 @@ class ExchangeProxyRuntime:
             backends = ("xray", "sing-box") if os.name == "nt" else ("sing-box", "xray")
             for backend in backends:
                 try:
+                    listen_port = self._allocate_local_port(require_udp=backend == "xray")
                     runtime_log_handle = self._open_runtime_log()
                     if backend == "xray":
                         exe = self.find_xray_executable()
