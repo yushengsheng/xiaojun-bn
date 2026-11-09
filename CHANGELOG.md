@@ -1,6 +1,8 @@
 # CHANGELOG
 
 ## 2026-11-09 合约及依赖修复
+- Windows BOM 夹具修复后，44 项链上恢复专项及完整本地门禁再次通过，617 项单元测试、全部审计与 GUI 自检均成功，退出码 0 且输出 `REGRESSION OK`；日志 `.release-v1.1.90-recovery-gate.log`。准备按同版本唯一恢复流程推送修复并重建失败标签。
+- 首次 v1.1.90 GitHub 工作流 42587845078 的 Linux 验收通过，Windows 源码回归在 BOM 测试文档写入时触发默认 cp1252 编码错误，发布前停止且已确认 Release 不存在。仅为该测试夹具显式指定 UTF-8，不改业务逻辑；按固定恢复流程重新验证并在修复提交上重建同一标签。
 - v1.1.90 发布前最终门禁通过：`python3 tools/run_full_regression.py` 退出码 0，617 项单元测试、四项漏洞审计、应用及 GUI 自检通过并输出 `REGRESSION OK`；日志 `.release-v1.1.90-local-gate.log`。发布内容已按当前源码同步至 `RELEASE_NOTES.md`。
 - 开始准备已授权的 GitHub v1.1.90 发布：本地 main 与 origin/main 一致，版本标签本地及远端均未使用；同步本轮与工作区既有链上修复的发布说明，按仓库固定流程重新完成最终工作树门禁后提交和发版。
 - 完成依赖修复后的 `python3 tools/run_full_regression.py`：固定环境按新锁文件重建及哈希安装成功，617 项单元测试、四项漏洞审计、应用及 GUI 自检均通过，退出码 0 并输出 `REGRESSION OK`。额外审计 Linux 测试锁文件也未检出已知漏洞；构建/TLS 锁文件完整依赖解析通过，五个升级包均提供 Python 3.11 的 Windows/macOS/Linux 发行轮包。交易所三个公开 ping 接口使用新证书库均返回 HTTP 200，未带账户凭据或发起资金操作。

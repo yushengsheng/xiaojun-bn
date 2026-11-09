@@ -459,7 +459,7 @@ class BalanceRecoveryTests(unittest.TestCase):
         row=self.record(persist=False)
         self.fund(row)
         line=f'{row.relay_address} - {row.private_key}\n'
-        self.failed_path.write_text('\ufeff'+line+line)
+        self.failed_path.write_text('\ufeff'+line+line, encoding='utf-8')
         self.run_recovery(failed_only=True)
         self.assertEqual(len(self.rpc.sent),1)
         self.assertEqual(self.store.load_records(),[])

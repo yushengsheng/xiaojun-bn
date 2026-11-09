@@ -11,6 +11,8 @@
 - 用户已授权上传 GitHub、干净环境打包并发布新版本；待办见 `TODO.md` 的发布项。目标仓库 yushengsheng/xiaojun-bn，main 起点为 e06d022，待发布版本 v1.1.90，已确认本地与远端未使用。
 - 发布必须遵循已完整读取的 `RELEASE.md`、`RELEASE_GUARDRAILS.md`：最终门禁、提交与推送 main、推送同一提交的标签、等待唯一工作流、验证六项资产。不手动发布或覆盖已有 Release。
 - 最终本地门禁已通过，日志 `.release-v1.1.90-local-gate.log`，含 617 项测试、全部审计及 GUI 自检，已输出 `REGRESSION OK`；下一步提交并推送 main 和同一提交的 v1.1.90 标签。
+- 首次提交 dee43b5 已推送 main 和标签，工作流 42587845078 的 Linux 通过，但 Windows BOM 测试夹具默认 cp1252 编码写入失败。已确认 v1.1.90 Release 不存在，当前只补充 `tests/test_onchain_recovery.py` 该写入的 UTF-8 编码。须重新完成完整门禁、推送修复，然后仅删除失败标签并在修复提交重建 v1.1.90，等待新运行，禁止使用新版本号或手动发布。
+- 修复后的 44 项专项测试及完整本地门禁已通过，日志 `.release-v1.1.90-recovery-gate.log`，已输出 `REGRESSION OK`。下一步提交并推送此单行测试修复及记录，再核对 Release 仍不存在后重建失败标签。
 
 ## 待决定
 
