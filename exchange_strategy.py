@@ -3538,7 +3538,7 @@ class Strategy:
 
             step += 1
             if progress_cb:
-                progress_cb(step, total_steps, "合约轮 %d/%d" % (i + 1, self.futures_rounds))
+                progress_cb(step, total_steps, "合约轮 %d/%d 完成" % (i + 1, self.futures_rounds))
             self.sleep_fn()
 
         if not self.cleanup_exhausted:
@@ -3678,7 +3678,7 @@ class Strategy:
                 network=self.withdraw_network,
                 fee_buffer=self.withdraw_fee_buffer,
                 enable_withdraw=self.enable_withdraw,
-                auto_collect_to_spot=self._is_futures_mode(),
+                auto_collect_to_spot=self.enable_withdraw and self._is_futures_mode(),
             )
             if self.withdraw_callback:
                 self.withdraw_callback(withdraw_amount)

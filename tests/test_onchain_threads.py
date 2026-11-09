@@ -148,7 +148,7 @@ class RestoredOnchainThreadsTests(unittest.TestCase):
         owner.client.erc20_balance_units = 0
         with TemporaryDirectory() as directory, _close_sweep_log_after(), patch(
             'onchain_relay_runner.RELAY_MANUAL_EXPORT_FILE', Path(directory)/'manual.txt'
-        ), patch('onchain_relay_runner.RELAY_SWEEP_LOG_FILE', Path(directory)/'sweep.jsonl'):
+        ), patch('onchain_relay_runner.RELAY_FAILED_EXPORT_FILE', Path(directory)/'failed.txt'), patch('onchain_relay_runner.RELAY_SWEEP_LOG_FILE', Path(directory)/'sweep.jsonl'):
             run_relay_fee_recovery(owner, False, use_progress=False, manage_running_state=False)
         self.assertEqual(owner.client.get_balance_wei.call_count, 6)
         self.assertEqual(_RECORDS, {})

@@ -484,6 +484,65 @@ def _run_gui_selftest_checks_unlocked(checks: list[str]) -> None:
                     raise RuntimeError("GUI 自检失败：链上页面未成功加载")
                 if page.relay_wallet_store.file_path != relay_wallet_path:
                     raise RuntimeError("GUI 自检失败：链上钱包未隔离到自检目录")
+                widgets = [page.root]
+                relay_buttons = {}
+                while widgets:
+                    widget = widgets.pop()
+                    widgets.extend(widget.winfo_children())
+                    if widget.winfo_class() in {"Button", "TButton"}:
+                        relay_buttons[str(widget.cget("text"))] = widget
+                if not {"打开待人工", "打开失败账号", "失败账号回收"}.issubset(relay_buttons):
+                    raise RuntimeError("GUI 自检失败：中转文档或失败账号回收按钮缺失")
+                opened_exports = []
+                recovery_requests = []
+                with temporary_attr_overrides([
+                    (page, "_open_export_file", lambda path, label: opened_exports.append(path)),
+                    (page, "_launch_relay_fee_recovery", lambda **kwargs: recovery_requests.append(kwargs)),
+                ]):
+                    relay_buttons["打开待人工"].invoke()
+                    relay_buttons["打开失败账号"].invoke()
+                    relay_buttons["失败账号回收"].invoke()
+                if opened_exports != [page_onchain_base.RELAY_MANUAL_EXPORT_FILE, page_onchain_base.RELAY_FAILED_EXPORT_FILE]:
+                    raise RuntimeError("GUI 自检失败：中转文档按钮未打开对应文档")
+                if len(recovery_requests) != 1 or recovery_requests[0].get("failed_only") is not True:
+                    raise RuntimeError("GUI 自检失败：失败账号回收按钮未使用失败账号范围")
+                checks.append("onchain-relay-export-and-retry-buttons-gui=ok")
+                target_dialog_errors = []
+                probe_target = "0x" + "9" * 40
+
+                def exercise_required_recovery_target():
+                    dialog = None
+                    try:
+                        dialog = next(widget for widget in page.root.winfo_children()
+                                      if widget.winfo_class() == "Toplevel" and widget.title() == "中转手续费回收确认")
+                        children = [dialog]
+                        entries, buttons = [], {}
+                        while children:
+                            widget = children.pop()
+                            children.extend(widget.winfo_children())
+                            if widget.winfo_class() == "TEntry":
+                                entries.append(widget)
+                            if widget.winfo_class() == "TButton":
+                                buttons[str(widget.cget("text"))] = widget
+                        buttons["确认"].invoke()
+                        if not dialog.winfo_exists():
+                            raise RuntimeError("空收款地址关闭了恢复确认框")
+                        entries[0].insert(0, probe_target)
+                        buttons["确认"].invoke()
+                    except Exception as exc:
+                        target_dialog_errors.append(type(exc).__name__)
+                        if dialog is not None and dialog.winfo_exists():
+                            dialog.destroy()
+
+                app.after(20, exercise_required_recovery_target)
+                target_probe_timeout = app.after(5000, app.destroy)
+                try:
+                    recovered_target = page._ask_relay_fee_recovery_confirm(text="失败文档恢复回收地址自检", require_target=True)
+                finally:
+                    app.after_cancel(target_probe_timeout)
+                if target_dialog_errors or recovered_target != probe_target:
+                    raise RuntimeError("GUI 自检失败：失败文档回收未强制填写统一收款地址")
+                checks.append("onchain-relay-document-target-required-gui=ok")
                 if int(page.tree.cget("height")) != 10:
                     raise RuntimeError("GUI 自检失败：链上账号列表高度不是10行")
                 if str(page.log_tree.winfo_class()) != "Text" or str(page.error_log_tree.winfo_class()) != "Text":

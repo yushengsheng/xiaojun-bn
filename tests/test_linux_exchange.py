@@ -50,6 +50,9 @@ class LinuxServerTests(unittest.TestCase):
     def test_cleanup_retries_five_times_and_same_worker_continues_rounds_and_accounts(self):
         self.run_case("cleanup_next_account")
 
+    def test_futures_completion_keeps_funds_until_selected_asset_withdrawal(self):
+        self.run_case("futures_completion")
+
     def test_web_authentication_csrf_and_credentials(self):
         self.run_case("web")
 

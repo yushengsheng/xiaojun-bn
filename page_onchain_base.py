@@ -7,6 +7,8 @@ import ipaddress
 import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -484,6 +486,7 @@ class OnchainTransferPageBase:
         )
         self.btn_batch_transfer.pack(side=RIGHT)
         ttk.Button(action2, text="中转手续费回收", style="Action.TButton", command=self.start_relay_fee_recovery).pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(action2, text="失败账号回收", style="Action.TButton", command=self.start_failed_relay_fee_recovery).pack(side=RIGHT, padx=(8, 0))
         ttk.Button(action2, text="失败重试", style="Action.TButton", command=self.start_retry_failed).pack(side=RIGHT, padx=(8, 0))
 
         self.log_box = ttk.LabelFrame(main, text="执行日志", padding=8)
@@ -2789,16 +2792,17 @@ class OnchainTransferPageBase:
             return s
         return f"{s[:8]}...{s[-6:]}"
     def _open_export_file(self, path: Path, label: str) -> None:
-        target = Path(path)
+        target = Path(path).absolute()
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             if not target.exists():
-                target.touch()
-            if hasattr(os, "startfile"):
+                target.touch(mode=0o600)
+            if sys.platform == "win32":
                 os.startfile(str(target))
-                self.log(f"{label}：已打开 {target.name}")
-                return
-            messagebox.showinfo("文件路径", f"{label}：{target}")
+            else:
+                command = ["open", "-t", str(target)] if sys.platform == "darwin" else ["xdg-open", str(target)]
+                subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.log(f"{label}：已打开 {target.name}")
         except Exception as exc:
             messagebox.showerror("打开失败", f"{label} 打开失败：{exc}")
     def open_relay_manual_export_file(self) -> None:

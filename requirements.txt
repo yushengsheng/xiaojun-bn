@@ -1,6 +1,6 @@
 annotated-types==0.6.0
 bitarray==3.8.1
-certifi==2025.11.12
+certifi==2026.10.18
 cffi==2.0.0
 charset-normalizer==3.3.2
 ckzg==2.1.7

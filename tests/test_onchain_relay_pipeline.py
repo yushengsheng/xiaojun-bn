@@ -729,6 +729,11 @@ class OnchainRelayPipelineTests(unittest.TestCase):
 
     def setUp(self) -> None:
         _RECORDS.clear()
+        export_dir = TemporaryDirectory()
+        self.addCleanup(export_dir.cleanup)
+        failed_export = patch("onchain_relay_runner.RELAY_FAILED_EXPORT_FILE", Path(export_dir.name) / "failed.txt")
+        failed_export.start()
+        self.addCleanup(failed_export.stop)
         error = patch("onchain_relay_runner.messagebox.showerror", side_effect=lambda _title, text: self.fail(text))
         error.start()
         self.addCleanup(error.stop)

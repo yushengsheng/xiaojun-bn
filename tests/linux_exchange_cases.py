@@ -303,6 +303,46 @@ def cleanup_next_account():
         helper.doCleanups()
 
 
+def futures_completion():
+    from decimal import Decimal
+    s, call, _ = fixture()
+    from test_exchange_futures_completion import _Exchange
+    from test_exchange_cleanup_retry import signed_transport
+    from exchange_binance_client import BinanceClient
+    r = s.runtime
+    r.update_settings({"max_threads": 1, "trade_account_type": "合约", "futures_symbol": "BTCUSDT",
+                       "futures_rounds": 1, "futures_amount": "100", "futures_leverage": 10,
+                       "futures_margin_type": "CROSSED", "min_delay": "0", "max_delay": "0",
+                       "enable_withdraw": False, "withdraw_coin": "USDT"})
+    rows = r.account_records()
+    rows[0].update(address="test-target", network="BSC")
+    r.replace_accounts(rows)
+    exchange = _Exchange()
+    def make_client(key, secret, **kwargs):
+        with patch.object(BinanceClient, "_build_session", return_value=Mock()):
+            client = BinanceClient(key, secret, operation_journal=r.exchange_operation_journal)
+        signed_transport(client, exchange.request)
+        return client
+    try:
+        with patch.object(r, "_create_binance_client", side_effect=make_client), \
+             patch("exchange_binance_client.time.sleep", return_value=None):
+            assert call("command", command())["accepted"]
+            wait_idle(s)
+            assert r.accounts[0]["status_var"].get() == "合约轮 1/1 完成", r.accounts[0]["status_var"].get()
+            assert "成功1" in r.exchange_batch_summary_var.get()
+            assert exchange.balances["UMFUTURE"]["USDT"] == Decimal(36)
+            assert exchange.events[-1][0] == "order"
+            r.update_settings({"withdraw_coin": "USDC"})
+            assert call("command", command("withdraw"))["accepted"]
+            wait_idle(s)
+            assert exchange.events[-1][0] == "withdraw" and exchange.events[-1][1]["coin"] == "USDC"
+            assert all(wallet["USDC"] == 0 for wallet in exchange.balances.values())
+            assert exchange.balances["UMFUTURE"]["USDT"] == Decimal(36)
+            assert "成功1" in r.exchange_batch_summary_var.get()
+    finally:
+        r.close_idle()
+
+
 def failed_result_next_account():
     from decimal import Decimal
     import requests

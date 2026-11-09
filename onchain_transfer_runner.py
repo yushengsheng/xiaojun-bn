@@ -8,7 +8,7 @@ from input_validation import bounded_int, finite_decimal, finite_float, MAX_RETR
 import tkinter as tk
 from tkinter import ttk
 
-from onchain_relay_runner import run_relay_batch, run_relay_fee_recovery
+from onchain_relay_runner import _relay_is_document_recovery, _relay_recovery_records, run_relay_batch, run_relay_fee_recovery
 from page_onchain_base import (
     Decimal,
     InvalidOperation,
@@ -212,7 +212,7 @@ class OnchainTransferRunnerMixin(object):
         if hasattr(self, "mode_var") and self._is_mode_1m():
             return f"1对多单钱包线程数：{params.one_to_many_source_threads}\n"
         return ""
-    def _ask_relay_fee_recovery_confirm(self, *, text: str, default_target: str = "") -> str | None:
+    def _ask_relay_fee_recovery_confirm(self, *, text: str, default_target: str = "", require_target: bool = False) -> str | None:
         parent = getattr(self, "root", None) or getattr(self, "parent", None)
         dialog = tk.Toplevel(parent)
         dialog.title("中转手续费回收确认")
@@ -233,12 +233,17 @@ class OnchainTransferRunnerMixin(object):
         ttk.Label(target_row, text="统一收款地址").pack(side="left")
         target_entry = ttk.Entry(target_row, textvariable=target_var, width=54)
         target_entry.pack(side="left", fill="x", expand=True, padx=(8, 0))
-        ttk.Label(body, text="留空则按记录默认地址回收", style="Subtle.TLabel").pack(anchor="w", pady=(6, 0))
+        hint = "从失败文档恢复钱包必须填写统一收款地址" if require_target else "留空则按记录默认地址回收"
+        ttk.Label(body, text=hint, style="Subtle.TLabel").pack(anchor="w", pady=(6, 0))
         btn_row = ttk.Frame(body)
         btn_row.pack(fill="x", pady=(14, 0))
 
         def confirm():
-            result["target"] = str(target_var.get() or "").strip()
+            target = str(target_var.get() or "").strip()
+            if require_target and not target:
+                messagebox.showwarning("提示", "请填写统一收款地址", parent=dialog)
+                return
+            result["target"] = target
             dialog.destroy()
 
         def cancel():
@@ -526,16 +531,22 @@ class OnchainTransferRunnerMixin(object):
         show_dialog: bool = True,
         run_label: str = "manual",
         sweep_target_override: str = "",
+        failed_only: bool = False,
     ) -> bool:
         if self.is_running:
             messagebox.showwarning("提示", "已有任务在运行")
             return False
-        records = self.relay_wallet_store.load_records()
         batch_filter = {str(value or "").strip() for value in (batch_ids or set()) if str(value or "").strip()}
-        if batch_filter:
-            records = [record for record in records if str(getattr(record, "batch_id", "") or "").strip() in batch_filter]
+        network_var = getattr(self, "network_var", None)
+        failed_network = str(network_var.get() or "").strip().upper() if failed_only and network_var is not None else ""
+        selected_token = getattr(self, "_selected_token", None)
+        failed_token = selected_token(with_message=False) if failed_only and callable(selected_token) else None
+        records = _relay_recovery_records(
+            self, batch_ids=batch_filter, failed_only=failed_only,
+            failed_network=failed_network, failed_token=failed_token,
+        )
         if not records:
-            messagebox.showinfo("提示", "中转钱包.txt 中没有可处理记录")
+            messagebox.showinfo("提示", "失败账号文档和原钱包记录中没有可处理的失败账号" if failed_only else "中转钱包.txt 中没有可处理记录")
             return False
         if not dry_run:
             try:
@@ -545,11 +556,13 @@ class OnchainTransferRunnerMixin(object):
                 return False
         worker_threads = max(1, int(self._runtime_worker_threads()))
         sweep_target_override = str(sweep_target_override or "").strip()
+        document_records = [record for record in records if _relay_is_document_recovery(record)]
+        require_target = bool(document_records) and failed_only
         if confirm:
-            scope_text = f"本次批量 {len(batch_filter)} 个批次" if batch_filter else "全部历史记录"
+            scope_text = "失败账号" if failed_only else f"本次批量 {len(batch_filter)} 个批次" if batch_filter else "全部历史记录"
             text = (
                 f"即将扫描 {scope_text} 中的 {len(records)} 条中转记录，\n"
-                "检测并回收中转钱包中的 BNB / USDT / USDC 余额。\n"
+                "检测并回收中转钱包的原生币及 USDT / USDC 等已知币种余额。\n"
                 "按完整余额先回收达到边际的代币，再回收原生币；\n"
                 "无需原付款第二跳记录，已提交的回收须先核对。\n"
                 "零余额或全部余额低于边际的钱包会在真实回收结束后清理；\n"
@@ -558,7 +571,13 @@ class OnchainTransferRunnerMixin(object):
                 f"回收线程数：{worker_threads}\n\n"
                 "确认继续？"
             )
-            target_input = self._ask_relay_fee_recovery_confirm(text=text, default_target=sweep_target_override)
+            if require_target:
+                networks = " / ".join(sorted({record.network for record in document_records}))
+                symbols = " / ".join(sorted({record.token_symbol for record in document_records if record.token_symbol}))
+                text = f"失败文档恢复钱包：{len(document_records)} 个，网络：{networks}。\n同时核对选中币种：{symbols}。\n必须填写统一收款地址。\n\n{text}"
+            target_input = self._ask_relay_fee_recovery_confirm(
+                text=text, default_target=sweep_target_override, require_target=require_target,
+            )
             if target_input is None:
                 self.log("用户取消了中转手续费回收")
                 return False
@@ -569,6 +588,9 @@ class OnchainTransferRunnerMixin(object):
                 except Exception as exc:
                     messagebox.showerror("参数错误", str(exc))
                     return False
+        if require_target and not sweep_target_override:
+            messagebox.showerror("参数错误", "从失败文档恢复钱包必须明确填写统一收款地址")
+            return False
         target_log = f"，统一回收地址={sweep_target_override}" if sweep_target_override else ""
         self.log(f"开始中转手续费回收：扫描 {len(records)} 条记录，线程数={worker_threads}{target_log}")
         self.stop_requested.clear()
@@ -581,6 +603,9 @@ class OnchainTransferRunnerMixin(object):
                 "show_dialog": show_dialog,
                 "run_label": run_label,
                 "sweep_target_override": sweep_target_override,
+                "failed_only": failed_only,
+                "failed_network": failed_network,
+                "failed_records": records if failed_only else None,
             },
             name="onchain-relay-fee-recovery",
         )
@@ -700,6 +725,18 @@ class OnchainTransferRunnerMixin(object):
             )
         except Exception as exc:
             self.log(f"中转手续费回收启动异常：{exc}")
+            messagebox.showerror("执行异常", str(exc))
+    def start_failed_relay_fee_recovery(self):
+        try:
+            self._launch_relay_fee_recovery(
+                dry_run=bool(self.dry_run_var.get()),
+                confirm=True,
+                show_dialog=True,
+                run_label="manual",
+                failed_only=True,
+            )
+        except Exception as exc:
+            self.log(f"失败账号回收启动异常：{exc}")
             messagebox.showerror("执行异常", str(exc))
     def _run_batch_transfer(self, jobs_data: list[tuple[str, str, str]], params: WithdrawRuntimeParams, dry_run: bool):
         success = 0

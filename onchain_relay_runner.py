@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from tkinter import messagebox
+from uuid import uuid4
 
 from app_defaults import (
     ONCHAIN_CONFIRM_TIMEOUT_SECONDS_DEFAULT,
@@ -33,6 +34,7 @@ RELAY_TRACKED_TOKEN_SYMBOLS = {"USDT", "USDC"}
 RELAY_STABLE_TOKEN_SYMBOLS = {"USDT", "USDC"}
 RELAY_STABLE_TOKEN_DUST_THRESHOLD = Decimal("0.0005")
 RELAY_BNB_DUST_THRESHOLD = Decimal("0.00001")
+RELAY_DOCUMENT_RECOVERY_BATCH_PREFIX = "failed-document-recovery:"
 _RELAY_SWEEP_LOG_LOCK = threading.Lock()
 _RELAY_SWEEP_LOG_HANDLER = None
 
@@ -296,6 +298,60 @@ def _relay_sweep_plan(
 def _relay_recovery_record_needs_scan(record: RelayWalletRecord, *, batch_scoped: bool = False) -> bool:
     # Old status/receipt metadata cannot decide whether a wallet still holds funds.
     return bool(str(getattr(record, "relay_address", "") or "").strip())
+
+
+def _relay_is_document_recovery(record: RelayWalletRecord) -> bool:
+    return record.batch_id.startswith(RELAY_DOCUMENT_RECOVERY_BATCH_PREFIX)
+
+
+def _relay_recovery_records(
+    owner, *, batch_ids: set[str] | None = None, failed_only: bool = False,
+    failed_network: str = "", failed_token: EvmToken | None = None,
+) -> list[RelayWalletRecord]:
+    all_records = owner.relay_wallet_store.load_records()
+    records = list(all_records)
+    batch_filter = {str(value or "").strip() for value in (batch_ids or set()) if str(value or "").strip()}
+    if batch_filter:
+        records = [record for record in records if record.batch_id in batch_filter]
+    if failed_only:
+        addresses = set()
+        document_rows = []
+        if RELAY_FAILED_EXPORT_FILE.exists():
+            for line_number, raw in enumerate(RELAY_FAILED_EXPORT_FILE.read_text(encoding="utf-8-sig").splitlines(), 1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                address = _relay_export_line_address(line)
+                if not address:
+                    raise RuntimeError(f"失败账号文档第 {line_number} 行格式无效，应为地址 - 私钥")
+                addresses.add(address)
+                document_rows.append((line_number, address, line.split(" - ", 1)[1].strip()))
+        records = [record for record in records if record.status.strip().lower() == "failed"
+                   or record.relay_address.lower() in addresses]
+        known_addresses = {record.relay_address.lower() for record in all_records}
+        for line_number, address, exported_key in document_rows:
+            if batch_filter or address in known_addresses:
+                continue
+            network = str(failed_network or "").strip().upper()
+            if network not in {"BSC", "ETH"}:
+                raise RuntimeError("失败文档中有缺少原记录的钱包，请先选择当前回收网络（BSC 或 ETH）")
+            try:
+                private_key = owner.client.credential_to_private_key(exported_key)
+                derived_address = owner.client.address_from_private_key(private_key)
+                if derived_address.lower() != address:
+                    raise ValueError("address mismatch")
+            except Exception:
+                raise RuntimeError(f"失败账号文档第 {line_number} 行地址与私钥校验失败，文档保留") from None
+            token = failed_token or next(token for token in owner.client.get_default_tokens(network) if token.is_native)
+            records.append(RelayWalletRecord(
+                created_at=_utc_now_text(), expires_at="", network=network,
+                source="", target="", relay_address=derived_address, private_key=private_key,
+                status="failed", batch_id=RELAY_DOCUMENT_RECOVERY_BATCH_PREFIX + uuid4().hex,
+                token_symbol=token.symbol, token_contract=token.contract,
+                token_decimals=token.decimals, token_is_native=token.is_native,
+            ))
+            known_addresses.add(address)
+    return records
 
 
 def _relay_record_recovery_token(record: RelayWalletRecord | None) -> EvmToken | None:
@@ -615,47 +671,44 @@ def _relay_export_line_address(line: str) -> str:
     return str(text.split(" - ", 1)[0] or "").strip().lower()
 
 
-def _relay_write_manual_export_file(
+def _relay_write_export_file(
+    export_path,
     rows: list[dict[str, object]],
     *,
     preserve_existing: bool = False,
     replace_addresses: set[str] | None = None,
 ) -> str:
-    export_path = RELAY_MANUAL_EXPORT_FILE
     export_path.parent.mkdir(parents=True, exist_ok=True)
     replace_keys = {
         str(address or "").strip().lower()
         for address in (replace_addresses or set())
         if str(address or "").strip()
     }
+    replace_keys.update(
+        str(row.get("relay_address", "") or "").strip().lower()
+        for row in rows if str(row.get("relay_address", "") or "").strip()
+    )
     if preserve_existing and not rows and not replace_keys:
         return ""
     if not rows:
         if not preserve_existing:
-            try:
-                if export_path.exists():
-                    export_path.unlink()
-            except Exception:
-                pass
+            export_path.unlink(missing_ok=True)
             return ""
     seen: set[str] = set()
     lines: list[str] = []
     if preserve_existing and export_path.exists():
-        try:
-            for raw_line in export_path.read_text(encoding="utf-8").splitlines():
-                line = str(raw_line or "").strip()
-                if not line:
-                    continue
-                address_key = _relay_export_line_address(line)
-                if address_key and address_key in replace_keys:
-                    continue
-                dedupe_key = address_key or line
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                lines.append(line)
-        except Exception:
-            pass
+        for raw_line in export_path.read_text(encoding="utf-8-sig").splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            address_key = _relay_export_line_address(line)
+            if address_key and address_key in replace_keys:
+                continue
+            dedupe_key = address_key or line
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            lines.append(line)
     for row in rows:
         address = str(row.get("relay_address", "") or "").strip()
         private_key = str(row.get("private_key", "") or "").strip()
@@ -668,11 +721,7 @@ def _relay_write_manual_export_file(
         seen.add(dedupe_key)
         lines.append(line)
     if not lines:
-        try:
-            if export_path.exists():
-                export_path.unlink()
-        except Exception:
-            pass
+        export_path.unlink(missing_ok=True)
         return ""
     content = "\n".join(lines)
     if content:
@@ -681,31 +730,28 @@ def _relay_write_manual_export_file(
     return str(export_path)
 
 
-def _relay_write_failed_export_file(records: list[RelayWalletRecord]) -> str:
-    export_path = RELAY_FAILED_EXPORT_FILE
-    export_path.parent.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = []
-    seen: set[str] = set()
-    for record in records:
-        address = str(getattr(record, "relay_address", "") or "").strip()
-        private_key = str(getattr(record, "private_key", "") or "").strip()
-        if not address or not private_key:
-            continue
-        line = f"{address} - {private_key}"
-        if line in seen:
-            continue
-        seen.add(line)
-        lines.append(line)
-    if not lines:
-        try:
-            if export_path.exists():
-                export_path.unlink()
-        except Exception:
-            pass
-        return ""
-    content = "\n".join(lines) + "\n"
-    _atomic_write_text(export_path, content, encoding="utf-8")
-    return str(export_path)
+def _relay_write_manual_export_file(
+    rows: list[dict[str, object]],
+    *,
+    preserve_existing: bool = False,
+    replace_addresses: set[str] | None = None,
+) -> str:
+    return _relay_write_export_file(
+        RELAY_MANUAL_EXPORT_FILE, rows,
+        preserve_existing=preserve_existing, replace_addresses=replace_addresses,
+    )
+
+
+def _relay_write_failed_export_file(
+    records: list[RelayWalletRecord],
+    *,
+    replace_addresses: set[str] | None = None,
+) -> str:
+    return _relay_write_export_file(
+        RELAY_FAILED_EXPORT_FILE,
+        [{"relay_address": record.relay_address, "private_key": record.private_key} for record in records],
+        preserve_existing=True, replace_addresses=replace_addresses,
+    )
 
 
 def _wait_for_transaction_success(owner, network: str, txid: str, *, label: str, timeout_seconds: float | None = None) -> dict:
@@ -1618,18 +1664,37 @@ def run_relay_fee_recovery(
     run_label: str = "manual",
     sweep_timeout_seconds: float | None = None,
     sweep_target_override: str = "",
+    failed_only: bool = False,
+    failed_network: str = "",
+    failed_records: list[RelayWalletRecord] | None = None,
 ):
     dispatch_ui = owner._dispatch_ui
     try:
         batch_id_filter = {str(value or "").strip() for value in (batch_ids or set()) if str(value or "").strip()}
-        records = owner.relay_wallet_store.load_records()
-        if batch_id_filter:
-            records = [record for record in records if str(getattr(record, "batch_id", "") or "").strip() in batch_id_filter]
+        records = list(failed_records) if failed_only and failed_records is not None else _relay_recovery_records(
+            owner, batch_ids=batch_id_filter, failed_only=failed_only, failed_network=failed_network,
+        )
         if not records:
             dispatch_ui(lambda: owner.log("中转手续费回收结束：中转钱包.txt 中没有可处理记录"))
             if show_dialog:
                 dispatch_ui(lambda: messagebox.showinfo("提示", "中转钱包.txt 中没有可处理记录"))
             return
+
+        override_target = str(sweep_target_override or "").strip()
+        if override_target:
+            override_target = owner._validate_recipient_address(override_target, "统一回收地址")
+        document_records = [record for record in records if _relay_is_document_recovery(record)]
+        if document_records and failed_only and not override_target:
+            raise RuntimeError("从失败文档恢复钱包必须明确填写统一收款地址，未执行回收")
+        if document_records and not dry_run:
+            if owner.stop_requested.is_set():
+                return
+            existing_keys = {(record.network, record.batch_id, record.relay_address.lower())
+                             for record in owner.relay_wallet_store.load_records()}
+            new_records = [replace(record, sweep_target=override_target) for record in document_records
+                           if (record.network, record.batch_id, record.relay_address.lower()) not in existing_keys]
+            # Persist the recovered wallet keys before balance checks or broadcasts.
+            owner.relay_wallet_store.append_records(new_records)
 
         jobs: list[tuple[str, str, RelayWalletRecord]] = []
         display_row_counts: dict[str, int] = {}
@@ -1655,9 +1720,6 @@ def run_relay_fee_recovery(
                 dispatch_ui(lambda: messagebox.showinfo("提示", "中转钱包.txt 中没有有效记录"))
             return
 
-        override_target = str(sweep_target_override or "").strip()
-        if override_target:
-            override_target = owner._validate_recipient_address(override_target, "统一回收地址")
         worker_count = max(1, min(owner._runtime_worker_threads(), len(jobs)))
         sweep_timeout_value = _relay_sweep_timeout_seconds(sweep_timeout_seconds)
         progress_keys = owner._unique_row_keys([progress_key for progress_key, _display_row_key, _record in jobs]) if use_progress else []
@@ -1703,6 +1765,8 @@ def run_relay_fee_recovery(
         cleanup_empty_record_keys: set[tuple[str, str]] = set()
         retry_collect_enabled = manual_recovery_enabled
         retry_candidates: dict[tuple[str, str], tuple[int, str, str, RelayWalletRecord]] = {}
+        unresolved_records: dict[str, RelayWalletRecord] = {}
+        records_by_progress_key = {key: record for key, _display_key, record in jobs}
         job_index_by_progress_key = {
             progress_key: index
             for index, (progress_key, _display_row_key, _record) in enumerate(jobs, start=1)
@@ -1755,6 +1819,8 @@ def run_relay_fee_recovery(
                             retry_record,
                         )
                 else:
+                    if outcome in {"failed", "warning", "pending"} or (outcome == "recovered" and cleanup_record is None):
+                        unresolved_records[progress_key] = records_by_progress_key[progress_key]
                     if outcome == "failed":
                         failed += 1
                     elif outcome != "ignored":
@@ -1863,6 +1929,18 @@ def run_relay_fee_recovery(
                                 record = updated
                     if waiting_for_recovery:
                         continue
+
+                    if _relay_is_document_recovery(record):
+                        # A plain export cannot identify a previously submitted
+                        # transaction. Wait for any unknown pending nonce first.
+                        confirmed_nonce = owner.client.get_confirmed_nonce(network, relay_addr)
+                        pending_nonce = owner.client.get_nonce(network, relay_addr)
+                        if pending_nonce != confirmed_nonce:
+                            finish_job(
+                                progress_key, display_row_key, outcome="pending", status_text="确认中",
+                                msg=f"{prefix} 钱包仍有未确认交易，缺少原交易记录；保留钱包及失败文档，暂不再次提交回收",
+                            )
+                            continue
 
                     if _relay_snapshot_cleanup_allowed(owner, network, snapshot):
                         has_balance = _relay_snapshot_has_positive_balance(snapshot)
@@ -2121,23 +2199,21 @@ def run_relay_fee_recovery(
         if recovered_text != "-" or gas_text != "-":
             summary = f"{summary}，回收总额={recovered_text}，gas合计={gas_text}"
         export_path = ""
-        if batch_id_filter:
-            replace_addresses = {
-                str(getattr(record, "relay_address", "") or "").strip()
-                for _progress_key, _display_row_key, record in jobs
-                if str(getattr(record, "relay_address", "") or "").strip()
-            }
-            _relay_write_manual_export_file(
-                manual_export_rows,
-                preserve_existing=True,
-                replace_addresses=replace_addresses,
+        if not dry_run:
+            remaining_addresses = {record.relay_address.lower() for record in owner.relay_wallet_store.load_records()}
+            # A document row has no chain/batch identity. Keep it while any original
+            # record for this address remains, including unprocessed batches/chains.
+            cleared_addresses = {address.lower() for _batch, address in cleanup_empty_record_keys} - remaining_addresses
+            if owner.stop_requested.is_set():
+                cleared_addresses = set()
+            manual_path = _relay_write_manual_export_file(
+                manual_export_rows, preserve_existing=True, replace_addresses=cleared_addresses,
             )
-            if manual_export_rows and RELAY_MANUAL_EXPORT_FILE.exists():
-                export_path = str(RELAY_MANUAL_EXPORT_FILE)
-        elif manual_export_rows:
-            export_path = _relay_write_manual_export_file(manual_export_rows)
-        else:
-            _relay_write_manual_export_file([])
+            if manual_export_rows:
+                export_path = manual_path
+            _relay_write_failed_export_file(
+                list(unresolved_records.values()), replace_addresses=cleared_addresses,
+            )
         gas_text = _relay_totals_text(owner, gas_totals, prefix="预计 ")
         usdt_text = _relay_manual_token_summary_text(owner, "USDT", manual_token_totals, manual_token_wallet_counts)
         usdc_text = _relay_manual_token_summary_text(owner, "USDC", manual_token_totals, manual_token_wallet_counts)
